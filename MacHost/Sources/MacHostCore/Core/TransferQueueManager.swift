@@ -56,6 +56,7 @@ public final class TransferQueueManager: ObservableObject {
     @Published public var tasks: [TransferTask] = []
     @Published public var isProcessing: Bool = false
     @Published public var isGlobalPaused: Bool = false
+    @Published public private(set) var cancelledTaskIds: Set<UUID> = []
     
     public var onTaskCancelled: (@MainActor (UUID) -> Void)?
     public var onTaskPaused: (@MainActor (UUID) -> Void)?
@@ -63,6 +64,10 @@ public final class TransferQueueManager: ObservableObject {
     public var onGlobalCancel: (@MainActor () -> Void)?
     
     public init() {}
+    
+    public func isTaskCancelled(id: UUID) -> Bool {
+        return cancelledTaskIds.contains(id)
+    }
     
     @discardableResult
     public func enqueue(source: FileItem, targetDir: String, isMove: Bool) -> UUID {
@@ -93,6 +98,7 @@ public final class TransferQueueManager: ObservableObject {
     }
     
     public func cancelTask(id: UUID) {
+        cancelledTaskIds.insert(id)
         if let idx = tasks.firstIndex(where: { $0.id == id }) {
             tasks[idx].status = .cancelled
             tasks[idx].speed = 0
@@ -123,6 +129,7 @@ public final class TransferQueueManager: ObservableObject {
     
     public func cancelAll() {
         for i in 0..<tasks.count {
+            cancelledTaskIds.insert(tasks[i].id)
             if tasks[i].status == .running || tasks[i].status == .queued || tasks[i].status == .paused {
                 tasks[i].status = .cancelled
                 tasks[i].speed = 0
@@ -164,6 +171,10 @@ public final class TransferQueueManager: ObservableObject {
     }
     
     public func clearCompleted() {
+        let toRemove = tasks.filter { $0.status == .completed || $0.status == .cancelled }.map(\.id)
+        for id in toRemove {
+            cancelledTaskIds.remove(id)
+        }
         tasks.removeAll(where: { $0.status == .completed || $0.status == .cancelled })
     }
     
@@ -172,6 +183,7 @@ public final class TransferQueueManager: ObservableObject {
         var count = 0
         for i in 0..<tasks.count {
             if tasks[i].status == .failed || tasks[i].status == .cancelled {
+                cancelledTaskIds.remove(tasks[i].id)
                 tasks[i].status = .queued
                 tasks[i].errorMessage = nil
                 tasks[i].progress = 0.0

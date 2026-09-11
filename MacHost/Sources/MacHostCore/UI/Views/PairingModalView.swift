@@ -24,6 +24,7 @@ public struct PairingModalView: View {
     @State private var pairingStatus: String = "Готов к сопряжению"
     @State private var isConnecting: Bool = false
     @State private var history: [SavedConnection] = []
+    @State private var currentFingerprint: String = "SHA256:Ed25519_Xiaomi14Ultra_DaemonFingerprint"
     
     public init() {}
     
@@ -166,7 +167,7 @@ public struct PairingModalView: View {
                     Text("Отпечаток хост-ключа телефона:")
                         .font(.caption)
                         .fontWeight(.bold)
-                    Text("SHA256:Ed25519_Xiaomi14Ultra_DaemonFingerprint")
+                    Text(currentFingerprint)
                         .font(.system(size: 11, design: .monospaced))
                         .padding(6)
                         .background(Color(nsColor: .controlBackgroundColor))
@@ -207,10 +208,14 @@ public struct PairingModalView: View {
                     
                     vm.updateRemoteEndpoint(host: inputHost, port: UInt16(portInt))
                     
+                    let fp = PhoneConnectionManager.shared.fetchHostFingerprint(host: inputHost, port: UInt16(portInt))
+                        ?? "SHA256:Ed25519_Xiaomi14Ultra_DaemonFingerprint"
+                    currentFingerprint = fp
+                    
                     let res = HostKeyStore.shared.verifyOrPin(
                         host: inputHost,
                         port: portInt,
-                        fingerprint: "SHA256:Ed25519_Xiaomi14Ultra_DaemonFingerprint"
+                        fingerprint: fp
                     )
                     
                     isConnecting = false

@@ -61,6 +61,20 @@ public final class SearchService: @unchecked Sendable {
             if PhoneConnectionManager.shared.isDeviceConnected {
                 let escapedPath = PhoneConnectionManager.shellEscape(directoryPath)
                 let escapedPattern = PhoneConnectionManager.shellEscape("*" + cleanQuery + "*")
+                
+                // 1. Точное определение папок через -type d
+                var dirPaths = Set<String>()
+                let dirCmd = "find \(escapedPath) -maxdepth 6 -type d -iname \(escapedPattern) 2>/dev/null"
+                let (dirStatus, dirOut) = PhoneConnectionManager.shared.executeAdbShell(command: dirCmd)
+                if dirStatus == 0 {
+                    for line in dirOut.components(separatedBy: .newlines) {
+                        let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+                        if !trimmed.isEmpty && trimmed != directoryPath {
+                            dirPaths.insert(trimmed)
+                        }
+                    }
+                }
+                
                 let cmd = "find \(escapedPath) -maxdepth 6 -iname \(escapedPattern) 2>/dev/null"
                 let (status, output) = PhoneConnectionManager.shared.executeAdbShell(command: cmd)
                 if status == 0 && !output.isEmpty {
@@ -70,7 +84,7 @@ public final class SearchService: @unchecked Sendable {
                         let trimmed = line.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
                         if trimmed.isEmpty || trimmed == directoryPath { continue }
                         let fileName = URL(fileURLWithPath: trimmed).lastPathComponent
-                        let isDir = !fileName.contains(".")
+                        let isDir = dirPaths.contains(trimmed)
                         let item = FileItem(
                             id: trimmed,
                             name: fileName,

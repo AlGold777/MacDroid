@@ -524,12 +524,7 @@ public final class PhoneConnectionManager: @unchecked Sendable {
         if let saved = UserDefaults.standard.string(forKey: "lastConnectedHost"), !saved.isEmpty {
             priorities.append(saved)
         }
-        if !priorities.contains("192.168.1.18") {
-            priorities.append("192.168.1.18")
-        }
-        if !priorities.contains("192.168.1.19") {
-            priorities.append("192.168.1.19")
-        }
+        
         for ip in priorities {
             if isHostPortReachable(host: ip, port: 2222, timeoutSeconds: 1) {
                 return ip
@@ -550,6 +545,48 @@ public final class PhoneConnectionManager: @unchecked Sendable {
                     return ip
                 }
             }
+        }
+        return nil
+    }
+    
+    /// Получение реального SHA-256 отпечатка открытого хост-ключа сервера через ssh-keyscan
+    public func fetchHostFingerprint(host: String, port: UInt16) -> String? {
+        guard isHostPortReachable(host: host, port: port, timeoutSeconds: 1) else { return nil }
+        
+        let keyscanProc = Process()
+        keyscanProc.executableURL = URL(fileURLWithPath: "/usr/bin/ssh-keyscan")
+        keyscanProc.arguments = ["-p", String(port), "-T", "2", host]
+        let scanPipe = Pipe()
+        keyscanProc.standardOutput = scanPipe
+        keyscanProc.standardError = FileHandle.nullDevice
+        
+        let keygenProc = Process()
+        keygenProc.executableURL = URL(fileURLWithPath: "/usr/bin/ssh-keygen")
+        keygenProc.arguments = ["-lf", "-"]
+        let genPipe = Pipe()
+        keygenProc.standardInput = scanPipe
+        keygenProc.standardOutput = genPipe
+        keygenProc.standardError = FileHandle.nullDevice
+        
+        do {
+            try keyscanProc.run()
+            try keygenProc.run()
+            keyscanProc.waitUntilExit()
+            keygenProc.waitUntilExit()
+            
+            let data = genPipe.fileHandleForReading.readDataToEndOfFile()
+            guard let out = String(data: data, encoding: .utf8), !out.isEmpty else { return nil }
+            
+            for line in out.components(separatedBy: .newlines) {
+                let parts = line.split(separator: " ")
+                for part in parts {
+                    if part.hasPrefix("SHA256:") {
+                        return String(part)
+                    }
+                }
+            }
+        } catch {
+            return nil
         }
         return nil
     }

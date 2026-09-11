@@ -156,15 +156,35 @@ public final class DualPaneViewModel: ObservableObject {
     @Published public var calculatedFolderSizes: [String: UInt64] = [:]
     @Published public var calculatingFolderPaths: Set<String> = []
     
-    public let localDriver = LocalFSDriver()
-    public let remoteDriver = RemoteSFTPDriver()
+    public private(set) var localDriver = LocalFSDriver()
+    public private(set) var remoteDriver = RemoteSFTPDriver()
     public let discoveryService = DiscoveryService()
     public let queueManager = TransferQueueManager.shared
     
-    public let transport = TransportMultiplexer()
+    public private(set) var transport = TransportMultiplexer()
+    private var leftRefreshTask: Task<Void, Never>?
+    private var rightRefreshTask: Task<Void, Never>?
+    
     private lazy var orchestrator: JobOrchestrator = {
-        let dbURL = FileManager.default.temporaryDirectory.appendingPathComponent("mac_android_ledger.db")
-        let ledger = try! IntentLedger(databaseURL: dbURL)
+        let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+            ?? FileManager.default.temporaryDirectory
+        let dir = appSupport.appendingPathComponent("MacDroidCommander")
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let dbURL = dir.appendingPathComponent("mac_android_ledger.db")
+        
+        let ledger: IntentLedger
+        if let primaryLedger = try? IntentLedger(databaseURL: dbURL) {
+            ledger = primaryLedger
+        } else {
+            let fallbackURL = FileManager.default.temporaryDirectory.appendingPathComponent("mac_android_ledger_fallback.db")
+            if let secondaryLedger = try? IntentLedger(databaseURL: fallbackURL) {
+                ledger = secondaryLedger
+            } else {
+                // В худшем случае in-memory база, гарантирующая отсутствие краша
+                ledger = (try? IntentLedger(databaseURL: URL(fileURLWithPath: ":memory:")))
+                    ?? (try! IntentLedger(databaseURL: FileManager.default.temporaryDirectory.appendingPathComponent("ledger_\(UUID().uuidString).db")))
+            }
+        }
         return JobOrchestrator(ledger: ledger, transport: transport, localFS: localDriver)
     }()
     
@@ -624,9 +644,8 @@ public final class DualPaneViewModel: ObservableObject {
     
     // MARK: - Memoized Display Items
     private struct DisplayCache {
+        var rawHash: Int
         var rawCount: Int
-        var rawFirstId: String?
-        var rawLastId: String?
         var filter: String
         var sortField: SortField
         var sortAsc: Bool
@@ -649,13 +668,18 @@ public final class DualPaneViewModel: ObservableObject {
         let hideIdentical = hideIdenticalInComparison
         
         let rawCount = raw.count
-        let rawFirstId = raw.first?.id
-        let rawLastId = raw.last?.id
+        var hasher = Hasher()
+        for item in raw {
+            hasher.combine(item.id)
+            hasher.combine(item.name)
+            hasher.combine(item.size)
+            hasher.combine(item.mtime)
+        }
+        let rawHash = hasher.finalize()
         
         if side == .left, let cache = leftDisplayCache,
+           cache.rawHash == rawHash,
            cache.rawCount == rawCount,
-           cache.rawFirstId == rawFirstId,
-           cache.rawLastId == rawLastId,
            cache.filter == filter,
            cache.sortField == sortField,
            cache.sortAsc == sortAsc,
@@ -666,9 +690,8 @@ public final class DualPaneViewModel: ObservableObject {
         }
         
         if side == .right, let cache = rightDisplayCache,
+           cache.rawHash == rawHash,
            cache.rawCount == rawCount,
-           cache.rawFirstId == rawFirstId,
-           cache.rawLastId == rawLastId,
            cache.filter == filter,
            cache.sortField == sortField,
            cache.sortAsc == sortAsc,
@@ -705,9 +728,8 @@ public final class DualPaneViewModel: ObservableObject {
         }
         
         let newCache = DisplayCache(
+            rawHash: rawHash,
             rawCount: rawCount,
-            rawFirstId: rawFirstId,
-            rawLastId: rawLastId,
             filter: filter,
             sortField: sortField,
             sortAsc: sortAsc,
@@ -952,10 +974,12 @@ public final class DualPaneViewModel: ObservableObject {
             case .usbSuccess(let deviceId, let host, let port, let log):
                 print("[PhoneConnection] Success:\n\(log)")
                 self.updateRemoteEndpoint(host: host, port: port)
+                let fp = PhoneConnectionManager.shared.fetchHostFingerprint(host: host, port: port)
+                    ?? "SHA256:Ed25519_Xiaomi14Ultra_DaemonFingerprint"
                 _ = HostKeyStore.shared.verifyOrPin(
                     host: host,
                     port: Int(port),
-                    fingerprint: "SHA256:Ed25519_Xiaomi14Ultra_DaemonFingerprint"
+                    fingerprint: fp
                 )
                 if forceActivate && self.rightSource != .remotePhone && self.leftSource != .remotePhone {
                     self.changeSource(to: .remotePhone, side: .right)
@@ -970,10 +994,12 @@ public final class DualPaneViewModel: ObservableObject {
                 UserDefaults.standard.set(host, forKey: "lastConnectedHost")
                 UserDefaults.standard.set(String(port), forKey: "lastConnectedPort")
                 self.updateRemoteEndpoint(host: host, port: port)
+                let fp = PhoneConnectionManager.shared.fetchHostFingerprint(host: host, port: port)
+                    ?? "SHA256:Ed25519_Xiaomi14Ultra_DaemonFingerprint"
                 _ = HostKeyStore.shared.verifyOrPin(
                     host: host,
                     port: Int(port),
-                    fingerprint: "SHA256:Ed25519_Xiaomi14Ultra_DaemonFingerprint"
+                    fingerprint: fp
                 )
                 if forceActivate && self.rightSource != .remotePhone && self.leftSource != .remotePhone {
                     self.changeSource(to: .remotePhone, side: .right)
@@ -1245,10 +1271,18 @@ public final class DualPaneViewModel: ObservableObject {
         
         let driver: FileSystemDriver = (source == .localMac) ? localDriver : remoteDriver
         
-        Task {
+        if side == .left {
+            leftRefreshTask?.cancel()
+        } else {
+            rightRefreshTask?.cancel()
+        }
+        
+        let task = Task { @MainActor in
             do {
                 let items = try await driver.listDirectory(at: path)
+                guard !Task.isCancelled else { return }
                 let space = try await driver.checkFreeSpace(at: path)
+                guard !Task.isCancelled else { return }
                 
                 let isRemoteOffline = (source == .remotePhone && !self.remoteDriver.isConnected)
                 if source == .remotePhone && self.remoteDriver.isConnected {
@@ -1275,6 +1309,7 @@ public final class DualPaneViewModel: ObservableObject {
                     self.comparisonResult = self.comparator.compare(left: self.leftItems, right: self.rightItems)
                 }
             } catch {
+                guard !Task.isCancelled else { return }
                 if side == .left {
                     self.leftItems = []
                     self.leftIsStale = (source == .remotePhone)
@@ -1288,6 +1323,12 @@ public final class DualPaneViewModel: ObservableObject {
                     self.statusMessage = "Ошибка обновления панели: \(error.localizedDescription)"
                 }
             }
+        }
+        
+        if side == .left {
+            leftRefreshTask = task
+        } else {
+            rightRefreshTask = task
         }
     }
     
@@ -2490,6 +2531,12 @@ public final class DualPaneViewModel: ObservableObject {
             for file in plan.filesToTransfer {
                 if Task.isCancelled { break }
                 
+                let taskId = taskIds[file.sourcePath]
+                if let tid = taskId, TransferQueueManager.shared.isTaskCancelled(id: tid) {
+                    skipped.append(file.sourcePath)
+                    continue
+                }
+                
                 // Проверка паузы
                 while self.isTransferPaused && !Task.isCancelled {
                     try? await Task.sleep(nanoseconds: 100_000_000)
@@ -2503,7 +2550,6 @@ public final class DualPaneViewModel: ObservableObject {
                 let fileSize = file.size
                 let targetSubDir = file.targetDirPath
                 let targetSubDirURL = URL(fileURLWithPath: targetSubDir)
-                let taskId = taskIds[path]
                 
                 let actionVerb = isMove ? "Перемещение: " : "Копирование: "
                 self.statusMessage = "\(actionVerb)\(fileName)"

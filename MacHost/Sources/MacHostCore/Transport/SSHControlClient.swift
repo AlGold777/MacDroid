@@ -45,6 +45,7 @@ public actor SSHControlClient {
             FileManager.default.createFile(atPath: knownHostsURL.path, contents: Data())
         }
         
+        let sshUser = UserDefaults.standard.string(forKey: "sshUser") ?? NSUserName()
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: "/usr/bin/ssh")
         proc.arguments = [
@@ -55,7 +56,7 @@ public actor SSHControlClient {
             "-o", "ServerAliveInterval=15",
             "-o", "ServerAliveCountMax=2",
             "-p", String(port),
-            "restart@\(host)",
+            "\(sshUser)@\(host)",
             "-s", "sftp"
         ]
         

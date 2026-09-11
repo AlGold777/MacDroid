@@ -103,7 +103,7 @@ public final class SSHProtocolHandler: @unchecked Sendable {
     
     /// Пакет запроса аутентификации публичным ключом Ed25519
     public func createAuthRequestPacket(user: String = "android") throws -> Data {
-        var writer = SFTPPacketWriter()
+        let writer = SFTPPacketWriter()
         writer.appendUInt8(SSHMessageType.userauthRequest.rawValue)
         writer.appendString(user)
         writer.appendString("ssh-connection")
@@ -133,7 +133,7 @@ public final class SSHProtocolHandler: @unchecked Sendable {
     
     /// Пакет открытия канала "session"
     public func createChannelOpenPacket(localChannelId: UInt32 = 0) -> Data {
-        var writer = SFTPPacketWriter()
+        let writer = SFTPPacketWriter()
         writer.appendUInt8(SSHMessageType.channelOpen.rawValue)
         writer.appendString("session")
         writer.appendUInt32(localChannelId)
@@ -146,7 +146,7 @@ public final class SSHProtocolHandler: @unchecked Sendable {
     
     /// Пакет запроса подсистемы "sftp"
     public func createSubsystemRequestPacket(serverChannelId: UInt32) -> Data {
-        var writer = SFTPPacketWriter()
+        let writer = SFTPPacketWriter()
         writer.appendUInt8(SSHMessageType.channelRequest.rawValue)
         writer.appendUInt32(serverChannelId)
         writer.appendString("subsystem")
@@ -159,7 +159,7 @@ public final class SSHProtocolHandler: @unchecked Sendable {
     
     /// Инкапсулирует SFTP пакет в SSH_MSG_CHANNEL_DATA
     public func wrapSFTPInChannelData(sftpPacket: Data, serverChannelId: UInt32) -> Data {
-        var writer = SFTPPacketWriter()
+        let writer = SFTPPacketWriter()
         writer.appendUInt8(SSHMessageType.channelData.rawValue)
         writer.appendUInt32(serverChannelId)
         writer.appendData(sftpPacket)

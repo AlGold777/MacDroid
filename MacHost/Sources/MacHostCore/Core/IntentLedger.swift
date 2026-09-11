@@ -133,7 +133,14 @@ public final class IntentLedger: @unchecked Sendable {
             
             sqlite3_bind_double(stmt, 10, Date().timeIntervalSince1970)
             
-            sqlite3_step(stmt)
+            let stepResult = sqlite3_step(stmt)
+            if stepResult != SQLITE_DONE {
+                let errMsg = String(cString: sqlite3_errmsg(db))
+                print("[IntentLedger] ERROR: Failed to record item state (\(stepResult)): \(errMsg)")
+            }
+        } else {
+            let errMsg = String(cString: sqlite3_errmsg(db))
+            print("[IntentLedger] ERROR: Failed to prepare statement: \(errMsg)")
         }
         sqlite3_finalize(stmt)
     }

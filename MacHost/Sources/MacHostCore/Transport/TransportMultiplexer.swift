@@ -371,7 +371,23 @@ public final class TransportMultiplexer: @unchecked Sendable {
     }
     
     public func getRemoteFileDigest(actionId: String, path: String) async throws -> String {
-        return "sha256_verified_token_\(actionId)"
+        // 1. Попытка через ADB sha256sum (мгновенно и аппаратно ускорено на телефоне)
+        let escaped = PhoneConnectionManager.shellEscape(path)
+        let (status, out) = PhoneConnectionManager.shared.executeAdbShell(command: "sha256sum -- \(escaped)")
+        if status == 0, !out.isEmpty {
+            let parts = out.split(whereSeparator: { $0.isWhitespace })
+            if let first = parts.first, first.count == 64 {
+                return String(first)
+            }
+        }
+        
+        // 2. Если ADB недоступен — читаем через SFTP и вычисляем SHA-256 потоково
+        try await ensureConnected()
+        let stat = try await prepareRead(actionId: actionId, path: path)
+        let readLen = min(stat.size, 1024 * 1024) // До 1 МБ для контрольного отпечатка
+        let chunk = try await readChunk(remotePath: path, offset: 0, length: UInt32(readLen))
+        let hash = SHA256.hash(data: chunk)
+        return hash.compactMap { String(format: "%02x", $0) }.joined()
     }
     
     public func executeDelete(actionId: String, path: String) async throws -> Bool {

@@ -101,7 +101,7 @@ public final class RemoteSFTPDriver: FileSystemDriver, @unchecked Sendable {
             // 1. Открываем каталог через SSH_FXP_OPENDIR
             let openDirReqId = getNextRequestId()
             var currentSftpPath = sftpPath
-            var openDirPacket = packetEngine.createOpenDirPacket(requestId: openDirReqId, path: currentSftpPath)
+            let openDirPacket = packetEngine.createOpenDirPacket(requestId: openDirReqId, path: currentSftpPath)
             var (openRespType, openPayload) = try await sshClient.sendSFTPPacket(packet: openDirPacket)
             
             // Если каталог не найден, проверяем альтернативное сопоставление корня (/emulated/0 <-> /)
@@ -207,7 +207,13 @@ public final class RemoteSFTPDriver: FileSystemDriver, @unchecked Sendable {
                 }
             }
         } catch {
-            // Log & rethrow or handle
+            // Резервная попытка через ADB mkdir -p (если доступен USB/ADB)
+            let escaped = PhoneConnectionManager.shellEscape(path)
+            let (status, adbErr) = PhoneConnectionManager.shared.executeAdbShell(command: "mkdir -p -- \(escaped)")
+            if status == 0 {
+                return
+            }
+            throw NSError(domain: "RemoteSFTPDriver", code: 30, userInfo: [NSLocalizedDescriptionKey: "Не удалось создать каталог «\(path)»: \(error.localizedDescription) (ADB: \(adbErr))"])
         }
     }
     
@@ -302,45 +308,56 @@ public final class RemoteSFTPDriver: FileSystemDriver, @unchecked Sendable {
                 }
             }
         } catch {
-            // Fallback
+            // Резервная попытка через ADB mv (если доступен USB/ADB)
+            let escapedSrc = PhoneConnectionManager.shellEscape(sourcePath)
+            let escapedDst = PhoneConnectionManager.shellEscape(destinationPath)
+            let (status, adbErr) = PhoneConnectionManager.shared.executeAdbShell(command: "mv -- \(escapedSrc) \(escapedDst)")
+            if status == 0 {
+                return
+            }
+            throw NSError(domain: "RemoteSFTPDriver", code: 31, userInfo: [NSLocalizedDescriptionKey: "Не удалось переименовать «\(sourcePath)»: \(error.localizedDescription) (ADB: \(adbErr))"])
         }
     }
     
     private var cachedSpace: (free: UInt64, total: UInt64)?
     private var cachedSpaceTime: Date?
     
-    public func checkFreeSpace(at path: String) async throws -> (free: UInt64, total: UInt64) {
+    private func getCachedSpace() -> (free: UInt64, total: UInt64)? {
         lock.lock()
+        defer { lock.unlock() }
         if let cached = cachedSpace, let time = cachedSpaceTime, Date().timeIntervalSince(time) < 15.0 {
-            lock.unlock()
             return cached
         }
-        lock.unlock()
+        return nil
+    }
+    
+    private func setCachedSpace(_ space: (free: UInt64, total: UInt64)) {
+        lock.lock()
+        defer { lock.unlock() }
+        cachedSpace = space
+        cachedSpaceTime = Date()
+    }
+    
+    public func checkFreeSpace(at path: String) async throws -> (free: UInt64, total: UInt64) {
+        if let cached = getCachedSpace() {
+            return cached
+        }
         
         // 1. Попытка получить через ADB df
         if let adbSpace = PhoneConnectionManager.shared.getStorageSpaceAdb() {
-            lock.lock()
-            cachedSpace = adbSpace
-            cachedSpaceTime = Date()
-            lock.unlock()
+            setCachedSpace(adbSpace)
             return adbSpace
         }
         
         // 2. Попытка запросить df через SSH
         if let sshSpace = await queryStorageSpaceViaSSH() {
-            lock.lock()
-            cachedSpace = sshSpace
-            cachedSpaceTime = Date()
-            lock.unlock()
+            setCachedSpace(sshSpace)
             return sshSpace
         }
         
         // 3. Fallback (дефолтные значения)
         let fallback = (UInt64(280_000_000_000), UInt64(512_000_000_000))
-        lock.lock()
-        cachedSpace = fallback
-        cachedSpaceTime = Date()
-        lock.unlock()
+        setCachedSpace(fallback)
         return fallback
     }
     
@@ -357,6 +374,7 @@ public final class RemoteSFTPDriver: FileSystemDriver, @unchecked Sendable {
             FileManager.default.createFile(atPath: knownHostsURL.path, contents: Data())
         }
         
+        let sshUser = UserDefaults.standard.string(forKey: "sshUser") ?? NSUserName()
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: "/usr/bin/ssh")
         proc.arguments = [
@@ -365,7 +383,7 @@ public final class RemoteSFTPDriver: FileSystemDriver, @unchecked Sendable {
             "-o", "UserKnownHostsFile=\(knownHostsURL.path)",
             "-o", "ConnectTimeout=3",
             "-p", String(port),
-            "restart@\(host)",
+            "\(sshUser)@\(host)",
             "df"
         ]
         

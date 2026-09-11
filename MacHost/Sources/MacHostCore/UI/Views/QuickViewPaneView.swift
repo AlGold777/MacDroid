@@ -73,7 +73,7 @@ public struct QuickViewPaneView: View {
         .onAppear {
             loadImageIfNeeded()
         }
-        .onChange(of: item?.id) { _ in
+        .onChange(of: item?.id) { _, _ in
             loadImageIfNeeded()
         }
     }

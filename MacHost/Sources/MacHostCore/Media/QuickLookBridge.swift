@@ -3,7 +3,7 @@ import AppKit
 import Quartz
 
 @MainActor
-public final class QuickLookBridge: NSObject, @preconcurrency QLPreviewPanelDataSource, @preconcurrency QLPreviewPanelDelegate {
+public final class QuickLookBridge: NSObject, @preconcurrency QLPreviewPanelDataSource, QLPreviewPanelDelegate {
     public static let shared = QuickLookBridge()
     private var previewURL: URL?
     
