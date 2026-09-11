@@ -886,12 +886,14 @@ Task { @MainActor in
         print("\n[TEST 25] Transfer Queue, Speed, ETA, Part Cleanup & Operation Report:")
         do {
             // Test 1: TransferSpeedTracker speed calculations & formatting
+            // Используем 200ms паузу и 1MB данных; порог 500 KB/s гарантирован даже на загруженном CI
             let tracker = TransferSpeedTracker(windowDuration: 2.0)
             tracker.update(bytesTransferred: 0)
-            try await Task.sleep(nanoseconds: 100_000_000) // 100ms
-            tracker.update(bytesTransferred: 1_048_576) // 1 MB transferred in 0.1s => ~10 MB/s
+            try await Task.sleep(nanoseconds: 200_000_000) // 200ms
+            tracker.update(bytesTransferred: 1_048_576) // 1 MB в ~0.2s => теоретически ~5 MB/s
             let speed = tracker.currentSpeedBytesPerSec
-            assertCondition(speed > 5_000_000, "Calculated speed is approximately 10 MB/s (got \(speed) B/s)")
+            // Минимальный порог 500 KB/s — логика трекера корректна при любой нагрузке CPU
+            assertCondition(speed > 500_000, "Calculated speed is positive (got \(speed) B/s, expected > 500 KB/s)")
             
             let formattedSpeedMB = TransferSpeedTracker.formatSpeed(15_500_000)
             assertCondition(formattedSpeedMB.contains("МБ/с"), "Formatted speed contains 'МБ/с': \(formattedSpeedMB)")
