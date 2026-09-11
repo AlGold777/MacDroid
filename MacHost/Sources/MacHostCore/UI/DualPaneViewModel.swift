@@ -939,7 +939,7 @@ public final class DualPaneViewModel: ObservableObject {
     }
     
     /// Подключение к телефону: фоновый запуск ADB/проброс портов и авто-настройка
-    public func connectPhone() {
+    public func connectPhone(forceActivate: Bool = true) {
         guard !isConnectingPhone else { return }
         isConnectingPhone = true
         statusMessage = "Поиск и подключение телефона..."
@@ -957,7 +957,7 @@ public final class DualPaneViewModel: ObservableObject {
                     port: Int(port),
                     fingerprint: "SHA256:Ed25519_Xiaomi14Ultra_DaemonFingerprint"
                 )
-                if self.rightSource != .remotePhone && self.leftSource != .remotePhone {
+                if forceActivate && self.rightSource != .remotePhone && self.leftSource != .remotePhone {
                     self.changeSource(to: .remotePhone, side: .right)
                 } else {
                     if self.leftSource == .remotePhone { self.refreshPane(side: .left) }
@@ -975,7 +975,7 @@ public final class DualPaneViewModel: ObservableObject {
                     port: Int(port),
                     fingerprint: "SHA256:Ed25519_Xiaomi14Ultra_DaemonFingerprint"
                 )
-                if self.rightSource != .remotePhone && self.leftSource != .remotePhone {
+                if forceActivate && self.rightSource != .remotePhone && self.leftSource != .remotePhone {
                     self.changeSource(to: .remotePhone, side: .right)
                 } else {
                     if self.leftSource == .remotePhone { self.refreshPane(side: .left) }
@@ -999,6 +999,7 @@ public final class DualPaneViewModel: ObservableObject {
     public func autoConnectPhoneIfAvailable() {
         guard !isConnectingPhone else { return }
         guard !remoteDriver.isConnected else { return }
+        guard leftSource == .remotePhone || rightSource == .remotePhone else { return }
         
         Task.detached(priority: .userInitiated) {
             // 1. Проверяем наличие USB-устройства через ADB
@@ -1020,7 +1021,8 @@ public final class DualPaneViewModel: ObservableObject {
             
             if hasAdb || hasWifi {
                 await MainActor.run {
-                    self.connectPhone()
+                    guard self.leftSource == .remotePhone || self.rightSource == .remotePhone else { return }
+                    self.connectPhone(forceActivate: false)
                 }
             }
         }
@@ -2339,7 +2341,15 @@ public final class DualPaneViewModel: ObservableObject {
         let group = DispatchGroup()
         
         for provider in providers {
-            if provider.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) {
+            if provider.canLoadObject(ofClass: URL.self) {
+                group.enter()
+                _ = provider.loadObject(ofClass: URL.self) { url, error in
+                    defer { group.leave() }
+                    if let url = url {
+                        localPaths.append(url.path)
+                    }
+                }
+            } else if provider.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) {
                 group.enter()
                 provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier, options: nil) { item, error in
                     defer { group.leave() }
