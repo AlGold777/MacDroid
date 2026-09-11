@@ -1,0 +1,337 @@
+import Foundation
+
+public enum SFTPMessageType: UInt8, Sendable {
+    case initMsg      = 1   // SSH_FXP_INIT
+    case version      = 2   // SSH_FXP_VERSION
+    case open         = 3   // SSH_FXP_OPEN
+    case close        = 4   // SSH_FXP_CLOSE
+    case read         = 5   // SSH_FXP_READ
+    case write        = 6   // SSH_FXP_WRITE
+    case lstat        = 7   // SSH_FXP_LSTAT
+    case fstat        = 8   // SSH_FXP_FSTAT
+    case setstat      = 9   // SSH_FXP_SETSTAT
+    case fsetstat     = 10  // SSH_FXP_FSETSTAT
+    case opendir      = 11  // SSH_FXP_OPENDIR
+    case readdir      = 12  // SSH_FXP_READDIR
+    case remove       = 13  // SSH_FXP_REMOVE
+    case mkdir        = 14  // SSH_FXP_MKDIR
+    case rmdir        = 15  // SSH_FXP_RMDIR
+    case realpath     = 16  // SSH_FXP_REALPATH
+    case stat         = 17  // SSH_FXP_STAT
+    case rename       = 18  // SSH_FXP_RENAME
+    
+    // Ответы сервера:
+    case status       = 101 // SSH_FXP_STATUS
+    case handle       = 102 // SSH_FXP_HANDLE
+    case data         = 103 // SSH_FXP_DATA
+    case name         = 104 // SSH_FXP_NAME
+    case attrs        = 105 // SSH_FXP_ATTRS
+}
+
+public enum SFTPStatusCode: UInt32, Sendable {
+    case ok                 = 0
+    case eof                = 1
+    case noSuchFile         = 2
+    case permissionDenied   = 3
+    case failure            = 4
+    case badMessage         = 5
+    case noConnection       = 6
+    case connectionLost     = 7
+    case opUnsupported      = 8
+}
+
+public struct SFTPNameEntry: Sendable {
+    public let filename: String
+    public let longname: String
+    public let size: UInt64
+    public let mtime: UInt32
+    public let isDirectory: Bool
+    
+    public init(filename: String, longname: String, size: UInt64, mtime: UInt32, isDirectory: Bool) {
+        self.filename = filename.precomposedStringWithCanonicalMapping
+        self.longname = longname.precomposedStringWithCanonicalMapping
+        self.size = size
+        self.mtime = mtime
+        self.isDirectory = isDirectory
+    }
+}
+
+public final class SFTPPacketWriter {
+    private var data = Data()
+    
+    public init() {}
+    
+    public func appendUInt8(_ value: UInt8) {
+        data.append(value)
+    }
+    
+    public func appendUInt32(_ value: UInt32) {
+        var be = value.bigEndian
+        withUnsafeBytes(of: &be) { data.append(contentsOf: $0) }
+    }
+    
+    public func appendUInt64(_ value: UInt64) {
+        var be = value.bigEndian
+        withUnsafeBytes(of: &be) { data.append(contentsOf: $0) }
+    }
+    
+    public func appendString(_ string: String) {
+        let utf8 = Data(string.utf8)
+        appendUInt32(UInt32(utf8.count))
+        data.append(utf8)
+    }
+    
+    public func appendData(_ bytes: Data) {
+        appendUInt32(UInt32(bytes.count))
+        data.append(bytes)
+    }
+    
+    public func buildPacket(type: SFTPMessageType) -> Data {
+        var packet = Data()
+        // Длина всего пакета = 1 (type) + data.count
+        let totalLength = UInt32(1 + data.count)
+        var beLength = totalLength.bigEndian
+        withUnsafeBytes(of: &beLength) { packet.append(contentsOf: $0) }
+        packet.append(type.rawValue)
+        packet.append(data)
+        return packet
+    }
+}
+
+public final class SFTPPacketReader {
+    private let data: Data
+    private var offset: Int = 0
+    
+    public init(data: Data) {
+        self.data = data
+    }
+    
+    public var hasRemaining: Bool {
+        return offset < data.count
+    }
+    
+    public func readUInt8() throws -> UInt8 {
+        guard offset < data.count else { throw NSError(domain: "SFTPPacketReader", code: 1, userInfo: [NSLocalizedDescriptionKey: "Unexpected EOF"]) }
+        let val = data[offset]
+        offset += 1
+        return val
+    }
+    
+    public func readUInt32() throws -> UInt32 {
+        guard offset + 4 <= data.count else { throw NSError(domain: "SFTPPacketReader", code: 1, userInfo: [NSLocalizedDescriptionKey: "Unexpected EOF reading UInt32"]) }
+        let sub = data.subdata(in: offset..<offset+4)
+        offset += 4
+        return sub.withUnsafeBytes { $0.load(as: UInt32.self).bigEndian }
+    }
+    
+    public func readUInt64() throws -> UInt64 {
+        guard offset + 8 <= data.count else { throw NSError(domain: "SFTPPacketReader", code: 1, userInfo: [NSLocalizedDescriptionKey: "Unexpected EOF reading UInt64"]) }
+        let sub = data.subdata(in: offset..<offset+8)
+        offset += 8
+        return sub.withUnsafeBytes { $0.load(as: UInt64.self).bigEndian }
+    }
+    
+    public func readString() throws -> String {
+        let len = Int(try readUInt32())
+        guard offset + len <= data.count else { throw NSError(domain: "SFTPPacketReader", code: 1, userInfo: [NSLocalizedDescriptionKey: "Unexpected EOF reading String"]) }
+        let sub = data.subdata(in: offset..<offset+len)
+        offset += len
+        return String(data: sub, encoding: .utf8) ?? ""
+    }
+    
+    public func readData() throws -> Data {
+        let len = Int(try readUInt32())
+        guard offset + len <= data.count else { throw NSError(domain: "SFTPPacketReader", code: 1, userInfo: [NSLocalizedDescriptionKey: "Unexpected EOF reading Data"]) }
+        let sub = data.subdata(in: offset..<offset+len)
+        offset += len
+        return sub
+    }
+}
+
+public final class SFTPPacketEngine: @unchecked Sendable {
+    public static let version: UInt32 = 3
+    
+    public init() {}
+    
+    public func createInitPacket() -> Data {
+        let writer = SFTPPacketWriter()
+        writer.appendUInt32(Self.version)
+        return writer.buildPacket(type: .initMsg)
+    }
+    
+    public func createOpenDirPacket(requestId: UInt32, path: String) -> Data {
+        let writer = SFTPPacketWriter()
+        writer.appendUInt32(requestId)
+        writer.appendString(path)
+        return writer.buildPacket(type: .opendir)
+    }
+    
+    public func createReadDirPacket(requestId: UInt32, handle: Data) -> Data {
+        let writer = SFTPPacketWriter()
+        writer.appendUInt32(requestId)
+        writer.appendData(handle)
+        return writer.buildPacket(type: .readdir)
+    }
+    
+    public func createClosePacket(requestId: UInt32, handle: Data) -> Data {
+        let writer = SFTPPacketWriter()
+        writer.appendUInt32(requestId)
+        writer.appendData(handle)
+        return writer.buildPacket(type: .close)
+    }
+    
+    public func createMkdirPacket(requestId: UInt32, path: String) -> Data {
+        let writer = SFTPPacketWriter()
+        writer.appendUInt32(requestId)
+        writer.appendString(path)
+        writer.appendUInt32(0) // Dummy attrs flag
+        return writer.buildPacket(type: .mkdir)
+    }
+    
+    public func createRemovePacket(requestId: UInt32, path: String) -> Data {
+        let writer = SFTPPacketWriter()
+        writer.appendUInt32(requestId)
+        writer.appendString(path)
+        return writer.buildPacket(type: .remove)
+    }
+    
+    public func createRenamePacket(requestId: UInt32, oldPath: String, newPath: String) -> Data {
+        let writer = SFTPPacketWriter()
+        writer.appendUInt32(requestId)
+        writer.appendString(oldPath)
+        writer.appendString(newPath)
+        return writer.buildPacket(type: .rename)
+    }
+    
+    public func createOpenPacket(requestId: UInt32, path: String, pflags: UInt32 = 0x00000001) -> Data {
+        // SSH_FXF_READ = 0x00000001, SSH_FXF_WRITE = 0x00000002
+        let writer = SFTPPacketWriter()
+        writer.appendUInt32(requestId)
+        writer.appendString(path)
+        writer.appendUInt32(pflags)
+        writer.appendUInt32(0) // dummy attrs
+        return writer.buildPacket(type: .open)
+    }
+    
+    public func createReadPacket(requestId: UInt32, handle: Data, offset: UInt64, length: UInt32 = 65536) -> Data {
+        let writer = SFTPPacketWriter()
+        writer.appendUInt32(requestId)
+        writer.appendData(handle)
+        writer.appendUInt64(offset)
+        writer.appendUInt32(length)
+        return writer.buildPacket(type: .read)
+    }
+    
+    public func createWritePacket(requestId: UInt32, handle: Data, offset: UInt64, data: Data) -> Data {
+        let writer = SFTPPacketWriter()
+        writer.appendUInt32(requestId)
+        writer.appendData(handle)
+        writer.appendUInt64(offset)
+        writer.appendData(data)
+        return writer.buildPacket(type: .write)
+    }
+    
+    public func createStatPacket(requestId: UInt32, path: String) -> Data {
+        let writer = SFTPPacketWriter()
+        writer.appendUInt32(requestId)
+        writer.appendString(path)
+        return writer.buildPacket(type: .stat)
+    }
+    
+    public func createRmdirPacket(requestId: UInt32, path: String) -> Data {
+        let writer = SFTPPacketWriter()
+        writer.appendUInt32(requestId)
+        writer.appendString(path)
+        return writer.buildPacket(type: .rmdir)
+    }
+    
+    public func parseStatusResponse(data: Data) throws -> (requestId: UInt32, code: SFTPStatusCode, message: String) {
+        let reader = SFTPPacketReader(data: data)
+        let reqId = try reader.readUInt32()
+        let rawCode = try reader.readUInt32()
+        let code = SFTPStatusCode(rawValue: rawCode) ?? .failure
+        let msg = (try? reader.readString()) ?? ""
+        return (reqId, code, msg)
+    }
+    
+    public func parseHandleResponse(data: Data) throws -> (requestId: UInt32, handle: Data) {
+        let reader = SFTPPacketReader(data: data)
+        let reqId = try reader.readUInt32()
+        let handle = try reader.readData()
+        return (reqId, handle)
+    }
+    
+    public func parseAttrsResponse(data: Data) throws -> (requestId: UInt32, size: UInt64, mtime: UInt32, isDirectory: Bool) {
+        let reader = SFTPPacketReader(data: data)
+        let reqId = try reader.readUInt32()
+        let flags = try reader.readUInt32()
+        
+        var size: UInt64 = 0
+        if (flags & 0x00000001) != 0 {
+            size = try reader.readUInt64()
+        }
+        if (flags & 0x00000002) != 0 {
+            _ = try reader.readUInt32()
+            _ = try reader.readUInt32()
+        }
+        var permissions: UInt32 = 0
+        if (flags & 0x00000004) != 0 {
+            permissions = try reader.readUInt32()
+        }
+        var mtime: UInt32 = 0
+        if (flags & 0x00000008) != 0 {
+            _ = try reader.readUInt32()
+            mtime = try reader.readUInt32()
+        }
+        let isDir = (permissions & 0o040000) != 0
+        return (reqId, size, mtime, isDir)
+    }
+    
+    public func parseDataResponse(data: Data) throws -> (requestId: UInt32, data: Data) {
+        let reader = SFTPPacketReader(data: data)
+        let reqId = try reader.readUInt32()
+        let fileData = try reader.readData()
+        return (reqId, fileData)
+    }
+    
+    public func parseNameResponse(data: Data) throws -> [SFTPNameEntry] {
+        let reader = SFTPPacketReader(data: data)
+        let _ = try reader.readUInt32() // requestId
+        let count = try reader.readUInt32()
+        var entries: [SFTPNameEntry] = []
+        
+        for _ in 0..<count {
+            let filename = try reader.readString()
+            let longname = try reader.readString()
+            let flags = try reader.readUInt32()
+            
+            var size: UInt64 = 0
+            if (flags & 0x00000001) != 0 { // SSH_FILEXFER_ATTR_SIZE
+                size = try reader.readUInt64()
+            }
+            if (flags & 0x00000002) != 0 { // SSH_FILEXFER_ATTR_UIDGID
+                _ = try reader.readUInt32()
+                _ = try reader.readUInt32()
+            }
+            var permissions: UInt32 = 0
+            if (flags & 0x00000004) != 0 { // SSH_FILEXFER_ATTR_PERMISSIONS
+                permissions = try reader.readUInt32()
+            }
+            var mtime: UInt32 = 0
+            if (flags & 0x00000008) != 0 { // SSH_FILEXFER_ATTR_ACMODTIME
+                _ = try reader.readUInt32() // atime
+                mtime = try reader.readUInt32()
+            }
+            
+            let isDir = (permissions & 0o040000) != 0 || longname.hasPrefix("d")
+            entries.append(SFTPNameEntry(
+                filename: filename,
+                longname: longname,
+                size: size,
+                mtime: mtime,
+                isDirectory: isDir
+            ))
+        }
+        return entries
+    }
+}

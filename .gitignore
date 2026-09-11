@@ -1,0 +1,21 @@
+.DS_Store
+*.swp
+*~
+
+# macOS build artifacts
+build/
+*.dmg
+MacHost/.build/
+MacHost/.swiftpm/
+
+# Android build artifacts
+AndroidCompanion/.gradle/
+AndroidCompanion/build/
+AndroidCompanion/app/build/
+AndroidCompanion/local.properties
+.gradle/
+
+# Temporary / intermediate files
+*.zip
+*.ser
+.cache/

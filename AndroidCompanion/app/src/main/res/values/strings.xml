@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Mac-Android Companion</string>
+    <string name="service_notification_title">Mac ↔ Android Active</string>
+    <string name="service_notification_text">Фоновый сервис передачи файлов активен</string>
+</resources>
