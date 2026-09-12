@@ -20,6 +20,8 @@ public final class TransportMultiplexer: @unchecked Sendable {
     private let lock = NSLock()
     private var nextReqId: UInt32 = 1
     
+    private var activeConnectTask: Task<Void, Error>?
+    
     public init(host: String = "127.0.0.1", port: UInt16 = 2222) {
         self.sshClient = SSHControlClient(host: host, port: port)
     }
@@ -29,6 +31,17 @@ public final class TransportMultiplexer: @unchecked Sendable {
         defer { lock.unlock() }
         self.sshClient = SSHControlClient(host: host, port: port)
         self.isSftpInitialized = false
+        self.activeConnectTask = nil
+    }
+    
+    public func invalidateSession() {
+        lock.lock()
+        self.isSftpInitialized = false
+        self.activeConnectTask = nil
+        lock.unlock()
+        Task {
+            await sshClient.disconnect()
+        }
     }
     
     private func getNextRequestId() -> UInt32 {
@@ -39,14 +52,26 @@ public final class TransportMultiplexer: @unchecked Sendable {
         return req
     }
     
-    /// Гарантирует активное подключение и инициализацию SFTP-подсистемы
+    /// Гарантирует активное подключение и инициализацию SFTP-подсистемы без гонок конкурентных вызовов
     public func ensureConnected() async throws {
-        if !isSftpInitialized {
+        lock.lock()
+        if isSftpInitialized {
+            lock.unlock()
+            return
+        }
+        if let existing = activeConnectTask {
+            lock.unlock()
+            try await existing.value
+            return
+        }
+        
+        let connectTask = Task { [weak self] () -> Void in
+            guard let self = self else { return }
             do {
-                try await sshClient.connect()
+                try await self.sshClient.connect()
                 // Отправляем SSH_FXP_INIT
-                let initPacket = packetEngine.createInitPacket()
-                let (respType, _) = try await sshClient.sendSFTPPacket(packet: initPacket)
+                let initPacket = self.packetEngine.createInitPacket()
+                let (respType, _) = try await self.sshClient.sendSFTPPacket(packet: initPacket)
                 guard respType == .version else {
                     throw NSError(
                         domain: "TransportMultiplexer",
@@ -54,20 +79,35 @@ public final class TransportMultiplexer: @unchecked Sendable {
                         userInfo: [NSLocalizedDescriptionKey: "Unexpected SFTP init response: \(respType)"]
                     )
                 }
-                isSftpInitialized = true
                 
                 // Авто-определение структуры корня SFTP:
-                let statReqId = getNextRequestId()
-                let statPacket = packetEngine.createStatPacket(requestId: statReqId, path: "/emulated/0")
-                if let (statResp, _) = try? await sshClient.sendSFTPPacket(packet: statPacket) {
+                let statReqId = self.getNextRequestId()
+                let statPacket = self.packetEngine.createStatPacket(requestId: statReqId, path: "/emulated/0")
+                if let (statResp, _) = try? await self.sshClient.sendSFTPPacket(packet: statPacket) {
                     self.rootIsEmulatedZero = (statResp != .attrs)
                 }
+                
+                self.lock.lock()
+                self.isSftpInitialized = true
+                self.lock.unlock()
             } catch {
-                // Если прямое соединение недоступно, пробрасываем ошибку
-                isSftpInitialized = false
+                self.lock.lock()
+                self.isSftpInitialized = false
+                self.lock.unlock()
                 throw error
             }
         }
+        self.activeConnectTask = connectTask
+        lock.unlock()
+        
+        defer {
+            lock.lock()
+            if self.activeConnectTask == connectTask {
+                self.activeConnectTask = nil
+            }
+            lock.unlock()
+        }
+        try await connectTask.value
     }
     
     public var rootIsEmulatedZero: Bool = false
@@ -93,11 +133,30 @@ public final class TransportMultiplexer: @unchecked Sendable {
     
     public func prepareRead(actionId: String, path: String) async throws -> RemoteStat {
         let reqId = getNextRequestId()
-        let sftpPath = toSftpPath(path)
+        var sftpPath = toSftpPath(path)
         
         try await ensureConnected()
         let statPacket = packetEngine.createStatPacket(requestId: reqId, path: sftpPath)
-        let (respType, payload) = try await sshClient.sendSFTPPacket(packet: statPacket)
+        var (respType, payload) = try await sshClient.sendSFTPPacket(packet: statPacket)
+        
+        // Автоматическое переключение альтернативного сопоставления корня (/emulated/0 <-> /)
+        if respType == .status, let (_, code, _) = try? packetEngine.parseStatusResponse(data: payload), code == .noSuchFile {
+            let altPath: String
+            if sftpPath.hasPrefix("/emulated/0") {
+                let sub = String(sftpPath.dropFirst("/emulated/0".count))
+                altPath = sub.isEmpty ? "/" : sub
+            } else {
+                altPath = "/emulated/0" + (sftpPath == "/" ? "" : sftpPath)
+            }
+            let altReqId = getNextRequestId()
+            let altPacket = packetEngine.createStatPacket(requestId: altReqId, path: altPath)
+            if let (altResp, altPayload) = try? await sshClient.sendSFTPPacket(packet: altPacket), altResp == .attrs {
+                self.rootIsEmulatedZero = sftpPath.hasPrefix("/emulated/0")
+                sftpPath = altPath
+                respType = altResp
+                payload = altPayload
+            }
+        }
         
         if respType == .attrs {
             let (_, size, mtime, isDir) = try packetEngine.parseAttrsResponse(data: payload)
@@ -120,12 +179,31 @@ public final class TransportMultiplexer: @unchecked Sendable {
     
     /// Чтение начального чанка файла для безопасной верификации префикса при возобновлении (Resume)
     public func readChunk(remotePath: String, offset: UInt64, length: UInt32) async throws -> Data {
-        let sftpPath = toSftpPath(remotePath)
+        var sftpPath = toSftpPath(remotePath)
         try await ensureConnected()
         
         let openReqId = getNextRequestId()
         let openPacket = packetEngine.createOpenPacket(requestId: openReqId, path: sftpPath, pflags: 0x00000001) // SSH_FXF_READ
-        let (openRespType, openPayload) = try await sshClient.sendSFTPPacket(packet: openPacket)
+        var (openRespType, openPayload) = try await sshClient.sendSFTPPacket(packet: openPacket)
+        
+        if openRespType != .handle {
+            let altPath: String
+            if sftpPath.hasPrefix("/emulated/0") {
+                let sub = String(sftpPath.dropFirst("/emulated/0".count))
+                altPath = sub.isEmpty ? "/" : sub
+            } else {
+                altPath = "/emulated/0" + (sftpPath == "/" ? "" : sftpPath)
+            }
+            let altReqId = getNextRequestId()
+            let altPacket = packetEngine.createOpenPacket(requestId: altReqId, path: altPath, pflags: 0x00000001)
+            if let (altResp, altData) = try? await sshClient.sendSFTPPacket(packet: altPacket), altResp == .handle {
+                self.rootIsEmulatedZero = sftpPath.hasPrefix("/emulated/0")
+                sftpPath = altPath
+                openRespType = altResp
+                openPayload = altData
+            }
+        }
+        
         guard openRespType == .handle else {
             throw NSError(domain: "TransportMultiplexer", code: 20, userInfo: [NSLocalizedDescriptionKey: "Failed to open remote file \(sftpPath) for prefix check"])
         }
@@ -184,7 +262,7 @@ public final class TransportMultiplexer: @unchecked Sendable {
         defer { try? handle.close() }
         
         var written: UInt64 = startOffset
-        let chunkSize: UInt32 = 64 * 1024 // 64 KB SFTP chunks
+        let chunkSize: UInt32 = 256 * 1024 // 256 KB SFTP chunks
         let sftpPath = toSftpPath(remotePath)
         
         do {
@@ -192,8 +270,28 @@ public final class TransportMultiplexer: @unchecked Sendable {
             
             // 1. Открываем удалённый файл на чтение (SSH_FXF_READ = 0x00000001)
             let openReqId = getNextRequestId()
-            let openPacket = packetEngine.createOpenPacket(requestId: openReqId, path: sftpPath, pflags: 0x00000001)
-            let (openRespType, openPayload) = try await sshClient.sendSFTPPacket(packet: openPacket)
+            var currentSftpPath = sftpPath
+            let openPacket = packetEngine.createOpenPacket(requestId: openReqId, path: currentSftpPath, pflags: 0x00000001)
+            var (openRespType, openPayload) = try await sshClient.sendSFTPPacket(packet: openPacket)
+            
+            // Если файл не найден, проверяем альтернативное сопоставление корня (/emulated/0 <-> /)
+            if openRespType != .handle {
+                let altPath: String
+                if currentSftpPath.hasPrefix("/emulated/0") {
+                    let sub = String(currentSftpPath.dropFirst("/emulated/0".count))
+                    altPath = sub.isEmpty ? "/" : sub
+                } else {
+                    altPath = "/emulated/0" + (currentSftpPath == "/" ? "" : currentSftpPath)
+                }
+                let altReqId = getNextRequestId()
+                let altPacket = packetEngine.createOpenPacket(requestId: altReqId, path: altPath, pflags: 0x00000001)
+                if let (altResp, altData) = try? await sshClient.sendSFTPPacket(packet: altPacket), altResp == .handle {
+                    self.rootIsEmulatedZero = currentSftpPath.hasPrefix("/emulated/0")
+                    currentSftpPath = altPath
+                    openRespType = altResp
+                    openPayload = altData
+                }
+            }
             
             guard openRespType == .handle else {
                 var detail = "Response type: \(openRespType)"
@@ -208,32 +306,51 @@ public final class TransportMultiplexer: @unchecked Sendable {
             }
             let (_, fileHandle) = try packetEngine.parseHandleResponse(data: openPayload)
             
-            // 2. Читаем файл потоково
-            while written < totalSize {
+            // 2. Читаем файл потоково со скользящим окном (SFTP Pipelining - 4 пакета / 1 МБ in-flight)
+            let windowCapacity = 4
+            var inFlight = 0
+            var requestOffset = startOffset
+            var pendingReads: [UInt32: (offset: UInt64, length: UInt32)] = [:]
+            
+            while inFlight < windowCapacity && requestOffset < totalSize {
+                let toRead = UInt32(min(UInt64(chunkSize), totalSize - requestOffset))
+                let readReqId = getNextRequestId()
+                let readPacket = packetEngine.createReadPacket(
+                    requestId: readReqId,
+                    handle: fileHandle,
+                    offset: requestOffset,
+                    length: toRead
+                )
+                try await sshClient.writeRawPacket(packet: readPacket)
+                pendingReads[readReqId] = (offset: requestOffset, length: toRead)
+                requestOffset += UInt64(toRead)
+                inFlight += 1
+            }
+            
+            // Обрабатываем ответы и непрерывно досылаем новые запросы в конвейер
+            while written < totalSize && inFlight > 0 {
                 if Task.isCancelled {
                     let closeReqId = getNextRequestId()
                     let closePacket = packetEngine.createClosePacket(requestId: closeReqId, handle: fileHandle)
                     _ = try? await sshClient.sendSFTPPacket(packet: closePacket)
                     throw CancellationError()
                 }
-                let toRead = UInt32(min(UInt64(chunkSize), totalSize - written))
-                let readReqId = getNextRequestId()
-                let readPacket = packetEngine.createReadPacket(
-                    requestId: readReqId,
-                    handle: fileHandle,
-                    offset: written,
-                    length: toRead
-                )
-                let (readRespType, readPayload) = try await sshClient.sendSFTPPacket(packet: readPacket)
+                
+                let (readRespType, readPayload) = try await sshClient.readRawResponse()
+                inFlight -= 1
                 
                 if readRespType == .data {
-                    let (_, chunkData) = try packetEngine.parseDataResponse(data: readPayload)
+                    let (respReqId, chunkData) = try packetEngine.parseDataResponse(data: readPayload)
                     guard !chunkData.isEmpty else { break }
+                    if let req = pendingReads.removeValue(forKey: respReqId) {
+                        try handle.seek(toOffset: req.offset)
+                    }
                     handle.write(chunkData)
                     written += UInt64(chunkData.count)
                     onProgress(written)
                 } else if readRespType == .status {
-                    let (_, code, _) = try packetEngine.parseStatusResponse(data: readPayload)
+                    let (respReqId, code, _) = try packetEngine.parseStatusResponse(data: readPayload)
+                    pendingReads.removeValue(forKey: respReqId)
                     if code == .eof { break }
                     throw NSError(
                         domain: "TransportMultiplexer",
@@ -242,6 +359,22 @@ public final class TransportMultiplexer: @unchecked Sendable {
                     )
                 } else {
                     break
+                }
+                
+                // Досылаем следующий запрос, поддерживая заполненность конвейера
+                if requestOffset < totalSize {
+                    let toRead = UInt32(min(UInt64(chunkSize), totalSize - requestOffset))
+                    let readReqId = getNextRequestId()
+                    let readPacket = packetEngine.createReadPacket(
+                        requestId: readReqId,
+                        handle: fileHandle,
+                        offset: requestOffset,
+                        length: toRead
+                    )
+                    try await sshClient.writeRawPacket(packet: readPacket)
+                    pendingReads[readReqId] = (offset: requestOffset, length: toRead)
+                    requestOffset += UInt64(toRead)
+                    inFlight += 1
                 }
             }
             
@@ -309,7 +442,9 @@ public final class TransportMultiplexer: @unchecked Sendable {
         let (_, fileHandleRemote) = try packetEngine.parseHandleResponse(data: openPayload)
         
         var offset: UInt64 = startOffset
-        let chunkSize: Int = 32 * 1024
+        let chunkSize: Int = 256 * 1024 // 256 KB SFTP chunks
+        let windowCapacity = 4 // Pipelining window: до 1 МБ данных в конвейере
+        var inFlight = 0
         
         while offset < totalSize {
             if Task.isCancelled {
@@ -328,16 +463,37 @@ public final class TransportMultiplexer: @unchecked Sendable {
                 offset: offset,
                 data: dataChunk
             )
-            let (writeRespType, writePayload) = try await sshClient.sendSFTPPacket(packet: writePacket)
+            try await sshClient.writeRawPacket(packet: writePacket)
+            inFlight += 1
+            offset += UInt64(dataChunk.count)
+            
+            // Если окно заполнено — считываем подтверждения с сервера
+            while inFlight >= windowCapacity {
+                let (writeRespType, writePayload) = try await sshClient.readRawResponse()
+                inFlight -= 1
+                if writeRespType == .status {
+                    let (_, code, msg) = try packetEngine.parseStatusResponse(data: writePayload)
+                    if code != .ok {
+                        throw NSError(domain: "TransportMultiplexer", code: Int(code.rawValue), userInfo: [NSLocalizedDescriptionKey: "SFTP write error: \(msg)"])
+                    }
+                }
+                let confirmedBytes = offset > UInt64(inFlight * chunkSize) ? offset - UInt64(inFlight * chunkSize) : offset
+                onProgress(confirmedBytes)
+            }
+        }
+        
+        // Вычитываем оставшиеся подтверждения в конвейере
+        while inFlight > 0 {
+            let (writeRespType, writePayload) = try await sshClient.readRawResponse()
+            inFlight -= 1
             if writeRespType == .status {
                 let (_, code, msg) = try packetEngine.parseStatusResponse(data: writePayload)
                 if code != .ok {
                     throw NSError(domain: "TransportMultiplexer", code: Int(code.rawValue), userInfo: [NSLocalizedDescriptionKey: "SFTP write error: \(msg)"])
                 }
             }
-            offset += UInt64(dataChunk.count)
-            onProgress(offset)
         }
+        onProgress(offset)
         
         let closeReqId = getNextRequestId()
         let closePacket = packetEngine.createClosePacket(requestId: closeReqId, handle: fileHandleRemote)
@@ -397,6 +553,23 @@ public final class TransportMultiplexer: @unchecked Sendable {
             try await ensureConnected()
             let removePacket = packetEngine.createRemovePacket(requestId: reqId, path: sftpPath)
             let (respType, payload) = try await sshClient.sendSFTPPacket(packet: removePacket)
+            if respType == .status {
+                let (_, code, _) = try packetEngine.parseStatusResponse(data: payload)
+                return code == .ok || code == .noSuchFile
+            }
+        } catch {
+            return false
+        }
+        return false
+    }
+    
+    public func setRemoteMtime(path: String, mtime: Int64) async throws -> Bool {
+        let reqId = getNextRequestId()
+        let sftpPath = toSftpPath(path)
+        do {
+            try await ensureConnected()
+            let setstatPacket = packetEngine.createSetstatMtimePacket(requestId: reqId, path: sftpPath, mtime: UInt32(max(0, mtime)))
+            let (respType, payload) = try await sshClient.sendSFTPPacket(packet: setstatPacket)
             if respType == .status {
                 let (_, code, _) = try packetEngine.parseStatusResponse(data: payload)
                 return code == .ok

@@ -22,11 +22,15 @@ public final class RemoteSFTPDriver: FileSystemDriver, @unchecked Sendable {
     public func updateEndpoint(host: String, port: UInt16) {
         lock.lock()
         defer { lock.unlock() }
+        if self.host == host && self.port == port && self.isConnected {
+            return
+        }
         self.host = host
         self.port = port
         self.sshClient = SSHControlClient(host: host, port: port)
         self.isSftpInitialized = false
         self.isConnected = false
+        self.connectionTask = nil
     }
     
     private func getNextRequestId() -> UInt32 {
@@ -37,8 +41,20 @@ public final class RemoteSFTPDriver: FileSystemDriver, @unchecked Sendable {
         return req
     }
     
+    private var connectionTask: Task<Void, Error>?
+    
     private func ensureConnected() async throws {
-        if !isSftpInitialized {
+        if isSftpInitialized && isConnected {
+            return
+        }
+        
+        // Если уже выполняется подключение, дожидаемся существующего Task вместо повторной инициализации
+        if let ongoing = connectionTask {
+            try await ongoing.value
+            return
+        }
+        
+        let task = Task { () -> Void in
             do {
                 try await sshClient.connect()
                 let initPacket = packetEngine.createInitPacket()
@@ -50,8 +66,8 @@ public final class RemoteSFTPDriver: FileSystemDriver, @unchecked Sendable {
                         userInfo: [NSLocalizedDescriptionKey: "Unexpected SFTP init response: \(respType)"]
                     )
                 }
-                isSftpInitialized = true
-                isConnected = true
+                self.isSftpInitialized = true
+                self.isConnected = true
                 
                 // Авто-определение структуры корня SFTP:
                 // Проверяем, существует ли /emulated/0 на сервере.
@@ -62,11 +78,30 @@ public final class RemoteSFTPDriver: FileSystemDriver, @unchecked Sendable {
                     self.rootIsEmulatedZero = (statResp != .attrs)
                 }
             } catch {
-                isSftpInitialized = false
-                isConnected = false
+                self.isSftpInitialized = false
+                self.isConnected = false
                 throw error
             }
         }
+        
+        self.connectionTask = task
+        defer { self.connectionTask = nil }
+        try await task.value
+    }
+    
+    /// Явная инициализация и проверка готовности SFTP-сессии
+    public func warmUpConnection() async throws {
+        try await ensureConnected()
+    }
+    
+    /// Сброс состояния соединения
+    public func disconnect() {
+        lock.lock()
+        defer { lock.unlock() }
+        isSftpInitialized = false
+        isConnected = false
+        connectionTask?.cancel()
+        connectionTask = nil
     }
     
     public var rootIsEmulatedZero: Bool = false
@@ -157,11 +192,19 @@ public final class RemoteSFTPDriver: FileSystemDriver, @unchecked Sendable {
                         ))
                     }
                 } else if readRespType == .status {
-                    let (_, code, _) = try packetEngine.parseStatusResponse(data: readPayload)
+                    let (_, code, msg) = try packetEngine.parseStatusResponse(data: readPayload)
                     if code == .eof { break }
-                    break
+                    throw NSError(
+                        domain: "RemoteSFTPDriver",
+                        code: Int(code.rawValue),
+                        userInfo: [NSLocalizedDescriptionKey: "Ошибка чтения каталога \(nfcPath): \(msg) (код \(code.rawValue))"]
+                    )
                 } else {
-                    break
+                    throw NSError(
+                        domain: "RemoteSFTPDriver",
+                        code: 22,
+                        userInfo: [NSLocalizedDescriptionKey: "Неожиданный ответ сервера при чтении каталога: \(readRespType)"]
+                    )
                 }
             }
             
@@ -232,7 +275,7 @@ public final class RemoteSFTPDriver: FileSystemDriver, @unchecked Sendable {
         let (respType, payload) = try await sshClient.sendSFTPPacket(packet: removePacket)
         if respType == .status {
             let (_, code, _) = try packetEngine.parseStatusResponse(data: payload)
-            if code == .ok {
+            if code == .ok || code == .noSuchFile {
                 return
             }
         }
@@ -243,7 +286,7 @@ public final class RemoteSFTPDriver: FileSystemDriver, @unchecked Sendable {
         let (rmdirResp, rmdirPayload) = try await sshClient.sendSFTPPacket(packet: rmdirPacket)
         if rmdirResp == .status {
             let (_, rmdirCode, _) = try packetEngine.parseStatusResponse(data: rmdirPayload)
-            if rmdirCode == .ok {
+            if rmdirCode == .ok || rmdirCode == .noSuchFile {
                 return
             }
         }
@@ -255,15 +298,42 @@ public final class RemoteSFTPDriver: FileSystemDriver, @unchecked Sendable {
     /// Безопасное удаление директории ТОЛЬКО если она пустая (SSH_FXP_RMDIR)
     public func deleteEmptyDirectory(at path: String) async throws -> Bool {
         let sftpPath = toSftpPath(path)
-        try await ensureConnected()
-        let rmdirReqId = getNextRequestId()
-        let rmdirPacket = packetEngine.createRmdirPacket(requestId: rmdirReqId, path: sftpPath)
-        let (rmdirResp, rmdirPayload) = try await sshClient.sendSFTPPacket(packet: rmdirPacket)
-        if rmdirResp == .status {
-            let (_, rmdirCode, _) = try packetEngine.parseStatusResponse(data: rmdirPayload)
-            return rmdirCode == .ok
+        do {
+            try await ensureConnected()
+            let rmdirReqId = getNextRequestId()
+            let rmdirPacket = packetEngine.createRmdirPacket(requestId: rmdirReqId, path: sftpPath)
+            let (rmdirResp, rmdirPayload) = try await sshClient.sendSFTPPacket(packet: rmdirPacket)
+            if rmdirResp == .status {
+                let (_, rmdirCode, _) = try packetEngine.parseStatusResponse(data: rmdirPayload)
+                if rmdirCode == .ok || rmdirCode == .noSuchFile {
+                    return true
+                }
+                // Альтернативный путь (/emulated/0 <-> /)
+                let altPath: String
+                if sftpPath.hasPrefix("/emulated/0") {
+                    let sub = String(sftpPath.dropFirst("/emulated/0".count))
+                    altPath = sub.isEmpty ? "/" : sub
+                } else {
+                    altPath = "/emulated/0" + (sftpPath == "/" ? "" : sftpPath)
+                }
+                let altReqId = getNextRequestId()
+                let altPacket = packetEngine.createRmdirPacket(requestId: altReqId, path: altPath)
+                if let (altResp, altData) = try? await sshClient.sendSFTPPacket(packet: altPacket), altResp == .status {
+                    let (_, altCode, _) = try packetEngine.parseStatusResponse(data: altData)
+                    if altCode == .ok || altCode == .noSuchFile {
+                        self.rootIsEmulatedZero = sftpPath.hasPrefix("/emulated/0")
+                        return true
+                    }
+                }
+            }
+        } catch {
+            // SFTP сбой — переход к ADB fallback
         }
-        return false
+        
+        // Резервная попытка через ADB rmdir (безопасно: удаляет ТОЛЬКО пустую директорию)
+        let escaped = PhoneConnectionManager.shellEscape(path)
+        let (status, _) = PhoneConnectionManager.shared.executeAdbShell(command: "rmdir -- \(escaped) 2>/dev/null || rm -d -- \(escaped) 2>/dev/null")
+        return status == 0
     }
     
     /// Рекурсивное удаление содержимого директории по SFTP (post-order traversal)

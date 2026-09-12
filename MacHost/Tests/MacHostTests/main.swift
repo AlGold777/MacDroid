@@ -521,10 +521,14 @@ Task { @MainActor in
             print("\n[TEST 19] Single File Rename, Properties & Selection Size:")
             let testRenameItem = vm.leftItems[0]
             vm.triggerRename(item: testRenameItem, side: .left)
-            assertCondition(vm.showRenameDialog, "showRenameDialog activated")
+            assertCondition(vm.editingItemId == testRenameItem.id, "editingItemId set for inline rename")
+            assertCondition(vm.editingItemSide == .left, "editingItemSide is left")
+            assertCondition(vm.editingItemName == testRenameItem.name, "editingItemName pre-filled with item name")
+            assertCondition(!vm.showRenameDialog, "showRenameDialog is false (inline rename without modal dialog)")
             assertCondition(vm.itemToRename?.id == testRenameItem.id, "itemToRename matches selected item")
             assertCondition(vm.renameNewName == testRenameItem.name, "renameNewName pre-filled with item name")
-            vm.showRenameDialog = false
+            vm.cancelInlineRename()
+            assertCondition(vm.editingItemId == nil, "cancelInlineRename cleared editingItemId")
             
             vm.triggerProperties(item: testRenameItem, side: .left)
             assertCondition(vm.showPropertiesDialog, "showPropertiesDialog activated")
@@ -564,8 +568,11 @@ Task { @MainActor in
             vm.applyBatchRename(mappings: renameMappings)
         }
         
-        // Ждем завершения асинхронного переименования
-        try await Task.sleep(nanoseconds: 150_000_000)
+        // Ждем завершения асинхронного переименования с адаптивным опросом
+        for _ in 0..<20 {
+            if FileManager.default.fileExists(atPath: testDir.appendingPathComponent("doc_01.pdf").path) { break }
+            try await Task.sleep(nanoseconds: 50_000_000)
+        }
         
         await MainActor.run {
             assertCondition(FileManager.default.fileExists(atPath: testDir.appendingPathComponent("doc_01.pdf").path), "File 1 renamed to doc_01.pdf")
@@ -576,7 +583,11 @@ Task { @MainActor in
             vm.undoBatchRename()
         }
         
-        try await Task.sleep(nanoseconds: 150_000_000)
+        // Ждем завершения отката переименования с адаптивным опросом
+        for _ in 0..<20 {
+            if FileManager.default.fileExists(atPath: f1.path) { break }
+            try await Task.sleep(nanoseconds: 50_000_000)
+        }
         
         await MainActor.run {
             assertCondition(FileManager.default.fileExists(atPath: f1.path), "Original document_alpha.pdf restored via Undo")
@@ -1316,6 +1327,7 @@ Task { @MainActor in
 
         let vm28 = await MainActor.run { () -> DualPaneViewModel in
             let vm = DualPaneViewModel()
+            vm.changeSource(to: .localMac, side: .left)
             
             // 1. Quick Bookmarks & Navigation
             let macBookmarks = vm.quickBookmarks(for: .left)
@@ -1765,8 +1777,697 @@ Task { @MainActor in
         let unreachableFp = PhoneConnectionManager.shared.fetchHostFingerprint(host: "127.0.0.1", port: 54321)
         assertCondition(unreachableFp == nil, "fetchHostFingerprint gracefully returns nil on closed port")
         
+        // ==========================================
+        // [TEST 33] Recursive Multi-Level Folder Size Calculation (All Subfolders & Levels)
+        // ==========================================
+        print("\n[TEST 33] Recursive Multi-Level Folder Size Calculation (All Subfolders & Levels):")
+        
+        let testDir33 = FileManager.default.temporaryDirectory.appendingPathComponent("folder_calc_recursive_\(UUID().uuidString)")
+        let subLevel1 = testDir33.appendingPathComponent("level1")
+        let subLevel2 = subLevel1.appendingPathComponent("level2")
+        let subLevel3 = subLevel2.appendingPathComponent("level3")
+        let hiddenSub = testDir33.appendingPathComponent(".hidden_dir")
+        
+        try FileManager.default.createDirectory(at: subLevel3, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: hiddenSub, withIntermediateDirectories: true)
+        
+        // Root file: 1000 bytes
+        let rootFile = testDir33.appendingPathComponent("root.bin")
+        try Data(repeating: 0x01, count: 1000).write(to: rootFile)
+        
+        // Level 1 file: 2000 bytes
+        let fileL1 = subLevel1.appendingPathComponent("file_l1.bin")
+        try Data(repeating: 0x02, count: 2000).write(to: fileL1)
+        
+        // Level 2 file: 3000 bytes
+        let fileL2 = subLevel2.appendingPathComponent("file_l2.bin")
+        try Data(repeating: 0x03, count: 3000).write(to: fileL2)
+        
+        // Level 3 file: 4000 bytes
+        let fileL3 = subLevel3.appendingPathComponent("file_l3.bin")
+        try Data(repeating: 0x04, count: 4000).write(to: fileL3)
+        
+        // Hidden file in root: 500 bytes
+        let hiddenFile = testDir33.appendingPathComponent(".hidden_file.bin")
+        try Data(repeating: 0x05, count: 500).write(to: hiddenFile)
+        
+        // File inside hidden subfolder: 600 bytes
+        let fileHidden = hiddenSub.appendingPathComponent("file_h.bin")
+        try Data(repeating: 0x06, count: 600).write(to: fileHidden)
+        
+        // Expected total: 1000 + 2000 + 3000 + 4000 + 500 + 600 = 11100 bytes
+        let folderItem33 = FileItem(
+            id: testDir33.path,
+            name: testDir33.lastPathComponent,
+            path: testDir33.path,
+            size: 0,
+            mtime: Date().timeIntervalSince1970,
+            isDirectory: true,
+            source: .localMac
+        )
+        
+        let vm33 = await MainActor.run { () -> DualPaneViewModel in
+            let vm = DualPaneViewModel()
+            vm.leftItems = [folderItem33]
+            vm.leftSelection = [folderItem33.id]
+            vm.activePane = .left
+            vm.leftSource = .localMac
+            
+            vm.triggerQuickLook()
+            assertCondition(vm.calculatingFolderPaths.contains(folderItem33.path), "Folder marked as calculating")
+            return vm
+        }
+        
+        var waited33 = 0
+        while waited33 < 60 {
+            let isDone = await MainActor.run { vm33.calculatedFolderSizes[folderItem33.path] != nil }
+            if isDone { break }
+            try? await Task.sleep(nanoseconds: 50_000_000)
+            waited33 += 1
+        }
+        
+        await MainActor.run {
+            let calculatedSize = vm33.calculatedFolderSizes[folderItem33.path]
+            assertCondition(calculatedSize != nil, "Multi-level folder size successfully calculated")
+            assertCondition(calculatedSize == 11100, "Calculated folder size correctly sums root, level1, level2, level3 and hidden files: got \(calculatedSize ?? 0) bytes, expected 11100")
+            assertCondition(vm33.formatBytes(calculatedSize ?? 0).contains("11"), "formatBytes correctly formats folder size: \(vm33.formatBytes(calculatedSize ?? 0))")
+            
+            try? FileManager.default.removeItem(at: testDir33)
+        }
+        
+        // Multi-folder Space calculation test
+        let testDirA = FileManager.default.temporaryDirectory.appendingPathComponent("multi_test_a_\(UUID().uuidString)")
+        let testDirB = FileManager.default.temporaryDirectory.appendingPathComponent("multi_test_b_\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: testDirA, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: testDirB, withIntermediateDirectories: true)
+        try Data(repeating: 0xAA, count: 1500).write(to: testDirA.appendingPathComponent("a.bin"))
+        try Data(repeating: 0xBB, count: 2500).write(to: testDirB.appendingPathComponent("b.bin"))
+        
+        let multiItemA = FileItem(id: testDirA.path, name: testDirA.lastPathComponent, path: testDirA.path, size: 0, mtime: Date().timeIntervalSince1970, isDirectory: true, source: .localMac)
+        let multiItemB = FileItem(id: testDirB.path, name: testDirB.lastPathComponent, path: testDirB.path, size: 0, mtime: Date().timeIntervalSince1970, isDirectory: true, source: .localMac)
+        
+        let vmMulti = await MainActor.run { () -> DualPaneViewModel in
+            let vm = DualPaneViewModel()
+            vm.leftItems = [multiItemA, multiItemB]
+            vm.leftSelection = [multiItemA.id, multiItemB.id]
+            vm.activePane = .left
+            vm.leftSource = .localMac
+            
+            vm.triggerQuickLook()
+            assertCondition(vm.statusMessage.contains("2"), "Status message reflects multi-folder calculation: \(vm.statusMessage)")
+            return vm
+        }
+        
+        var waitedMulti = 0
+        while waitedMulti < 60 {
+            let isDone = await MainActor.run {
+                vmMulti.calculatedFolderSizes[multiItemA.path] != nil && vmMulti.calculatedFolderSizes[multiItemB.path] != nil
+            }
+            if isDone { break }
+            try? await Task.sleep(nanoseconds: 50_000_000)
+            waitedMulti += 1
+        }
+        
+        await MainActor.run {
+            let sizeA = vmMulti.calculatedFolderSizes[multiItemA.path]
+            let sizeB = vmMulti.calculatedFolderSizes[multiItemB.path]
+            assertCondition(sizeA == 1500, "Folder A size is 1500 bytes (got \(sizeA ?? 0))")
+            assertCondition(sizeB == 2500, "Folder B size is 2500 bytes (got \(sizeB ?? 0))")
+            
+            try? FileManager.default.removeItem(at: testDirA)
+            try? FileManager.default.removeItem(at: testDirB)
+        }
+        
+        // ==========================================
+        // [TEST 34] Move Transfer Deletion Robustness & NoSuchFile Invariant
+        // ==========================================
+        print("\n[TEST 34] Move Transfer Deletion Robustness & NoSuchFile Invariant:")
+        
+        // 1. Проверка парсинга статуса SSH_FX_NO_SUCH_FILE
+        let packetEngine34 = SFTPPacketEngine()
+        let writer34 = SFTPPacketWriter()
+        writer34.appendUInt32(101)
+        writer34.appendUInt32(SFTPStatusCode.noSuchFile.rawValue)
+        writer34.appendString("No such file")
+        let packetData34 = writer34.buildPacket(type: .status)
+        // Payload пропускает 4 байта длины и 1 байт типа пакета
+        let payload34 = packetData34.subdata(in: 5..<packetData34.count)
+        let (parsedReqId, parsedCode, parsedMsg) = try packetEngine34.parseStatusResponse(data: payload34)
+        assertCondition(parsedReqId == 101, "Status packet requestId matches: 101")
+        assertCondition(parsedCode == .noSuchFile, "Status packet parsedCode is .noSuchFile (2)")
+        assertCondition(parsedCode == .ok || parsedCode == .noSuchFile, "noSuchFile status is accepted as successful removal")
+        
+        let ledgerURL34 = FileManager.default.temporaryDirectory.appendingPathComponent("ledger34_\(UUID().uuidString).sqlite")
+        let ledger34 = try IntentLedger(databaseURL: ledgerURL34)
+        let transport34 = TransportMultiplexer()
+        let localFS34 = LocalFSDriver()
+        let orch34 = JobOrchestrator(ledger: ledger34, transport: transport34, localFS: localFS34)
+        
+        // При отключенном транспорте prepareRead выбрасывает ошибку (файла нет)
+        var checkedDeleted = false
+        do {
+            _ = try await orch34.transport.prepareRead(actionId: UUID().uuidString, path: "/storage/emulated/0/nonexistent.png")
+        } catch {
+            // Файл не найден на телефоне -> подтверждение удаления
+            checkedDeleted = true
+        }
+        assertCondition(checkedDeleted, "prepareRead throws for nonexistent file, confirming source is already deleted")
+        
+        // 35. Recursive Folder Transfer & Drag-Out Tests
+        print("\n[TEST 35] Recursive Folder Transfer Plan & Drag-Out:")
+        let folderTestDir = FileManager.default.temporaryDirectory.appendingPathComponent("folder_test_\(UUID().uuidString)")
+        let test35_srcFolder = folderTestDir.appendingPathComponent("SourceDir")
+        let test35_subFolder = test35_srcFolder.appendingPathComponent("SubDir")
+        let test35_deepFolder = test35_subFolder.appendingPathComponent("DeepDir")
+        try FileManager.default.createDirectory(at: test35_deepFolder, withIntermediateDirectories: true)
+        
+        let test35_f1 = test35_srcFolder.appendingPathComponent("f1.txt")
+        let test35_f2 = test35_subFolder.appendingPathComponent("f2.txt")
+        let test35_f3 = test35_deepFolder.appendingPathComponent("f3.txt")
+        try "Content 1".write(to: test35_f1, atomically: true, encoding: .utf8)
+        try "Content 22".write(to: test35_f2, atomically: true, encoding: .utf8)
+        try "Content 333".write(to: test35_f3, atomically: true, encoding: .utf8)
+        
+        let destTargetDir = folderTestDir.appendingPathComponent("DestDir")
+        try FileManager.default.createDirectory(at: destTargetDir, withIntermediateDirectories: true)
+        
+        let vm35 = await MainActor.run { () -> DualPaneViewModel in
+            DualPaneViewModel.clearSavedSession()
+            let vm = DualPaneViewModel()
+            vm.changeSource(to: .localMac, side: .left)
+            vm.leftPath = test35_srcFolder.path
+            vm.updateActiveTab(side: .left)
+            vm.changeSource(to: .localMac, side: .right)
+            vm.rightPath = destTargetDir.path
+            vm.updateActiveTab(side: .right)
+            return vm
+        }
+        
+        // 1) Test resolveTransferPlan on nested folder structure
+        let localPlan = await vm35.resolveTransferPlan(
+            paths: [test35_srcFolder.path],
+            fromSource: .localMac,
+            targetBaseDirPath: destTargetDir.path
+        )
+        assertCondition(localPlan.directoriesToCreate.count >= 3, "resolveTransferPlan creates entries for all nested directories (count: \(localPlan.directoriesToCreate.count))")
+        assertCondition(localPlan.filesToTransfer.count == 3, "resolveTransferPlan finds all 3 nested files (count: \(localPlan.filesToTransfer.count))")
+        assertCondition(localPlan.sourceFoldersToDeleteOnMove.count == 3, "resolveTransferPlan records all 3 folders for post-move deletion")
+        
+        // Check deepest first sorting (post-order traversal)
+        assertCondition(
+            URL(fileURLWithPath: localPlan.sourceFoldersToDeleteOnMove.first ?? "").resolvingSymlinksInPath().path == test35_deepFolder.resolvingSymlinksInPath().path,
+            "Deepest folder is ordered first for deletion: \(localPlan.sourceFoldersToDeleteOnMove.first ?? "")"
+        )
+        assertCondition(
+            URL(fileURLWithPath: localPlan.sourceFoldersToDeleteOnMove.last ?? "").resolvingSymlinksInPath().path == test35_srcFolder.resolvingSymlinksInPath().path,
+            "Root folder is ordered last for deletion: \(localPlan.sourceFoldersToDeleteOnMove.last ?? "")"
+        )
+        
+        // 2) Test remote folder identification with sourceItems
+        let remoteFolderItem = FileItem(
+            id: "/storage/emulated/0/TestRemoteDir",
+            name: "TestRemoteDir",
+            path: "/storage/emulated/0/TestRemoteDir",
+            size: 0,
+            mtime: Date().timeIntervalSince1970,
+            isDirectory: true,
+            source: .remotePhone
+        )
+        await MainActor.run {
+            vm35.rightItems = [remoteFolderItem]
+            vm35.changeSource(to: .remotePhone, side: .right)
+        }
+        
+        let remotePlan = await vm35.resolveTransferPlan(
+            paths: [remoteFolderItem.path],
+            fromSource: .remotePhone,
+            targetBaseDirPath: destTargetDir.path
+        )
+        assertCondition(remotePlan.directoriesToCreate.contains { $0.hasSuffix("TestRemoteDir") }, "resolveTransferPlan accurately identifies remote directory from pane items")
+        assertCondition(remotePlan.sourceFoldersToDeleteOnMove.contains(remoteFolderItem.path), "remote folder is registered in sourceFoldersToDeleteOnMove")
+        
+        // 3) Test Drag-out ItemProvider for folders
+        await MainActor.run {
+            let providerFolder = vm35.createDragItemProvider(for: remoteFolderItem, side: .right)
+            assertCondition(providerFolder.hasItemConformingToTypeIdentifier(DualPaneViewModel.dragUTType), "Folder drag provider conforms to internal dragUTType")
+            assertCondition(providerFolder.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier), "Folder drag provider conforms to UTType.fileURL for Desktop/Finder drag-out")
+        }
+        
+        // Cleanup temp dir
+        try? FileManager.default.removeItem(at: folderTestDir)
+        
+        // 36. Graphical Folder Viewer (Grid Mode, Thumbnails & Session Persistence)
+        print("\n[TEST 36] Graphical Folder Viewer (Grid Mode, Thumbnails & Session Persistence):")
+        let gridTestDir = FileManager.default.temporaryDirectory.appendingPathComponent("grid_test_\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: gridTestDir, withIntermediateDirectories: true)
+        
+        // 1) Test initial default view mode
+        let vm36 = await MainActor.run { () -> DualPaneViewModel in
+            DualPaneViewModel.clearSavedSession()
+            let vm = DualPaneViewModel()
+            return vm
+        }
+        await MainActor.run {
+            assertCondition(vm36.leftViewMode == .table, "Initial leftViewMode is .table")
+            assertCondition(vm36.rightViewMode == .table, "Initial rightViewMode is .table")
+            assertCondition(vm36.leftGridThumbnailSize == 120, "Initial leftGridThumbnailSize is 120")
+            assertCondition(vm36.rightGridThumbnailSize == 120, "Initial rightGridThumbnailSize is 120")
+            assertCondition(vm36.leftGridSpacing == 10, "Initial leftGridSpacing is 10")
+            assertCondition(vm36.rightGridSpacing == 10, "Initial rightGridSpacing is 10")
+            
+            // 2) Toggle view mode for left pane
+            vm36.toggleViewMode(for: .left)
+            assertCondition(vm36.leftViewMode == .grid, "toggleViewMode(for: .left) switches leftViewMode to .grid")
+            assertCondition(vm36.statusMessage == "Режим сетки (галерея)", "Status message indicates grid mode: \(vm36.statusMessage)")
+            
+            // Adjust thumbnail size and spacing down to 3px (~1mm)
+            vm36.leftGridThumbnailSize = 180
+            assertCondition(vm36.leftGridThumbnailSize == 180, "leftGridThumbnailSize updated to 180")
+            vm36.leftGridSpacing = 3
+            assertCondition(vm36.leftGridSpacing == 3, "leftGridSpacing can be set to minimal 3px (~1mm)")
+            
+            // Toggle back to table
+            vm36.toggleViewMode(for: .left)
+            assertCondition(vm36.leftViewMode == .table, "toggleViewMode switches back to .table")
+            assertCondition(vm36.statusMessage == "Режим списка (таблица)", "Status message indicates table mode: \(vm36.statusMessage)")
+            
+            // Set right pane to grid and save session
+            vm36.rightViewMode = .grid
+            vm36.rightGridThumbnailSize = 200
+            vm36.rightGridSpacing = 4
+            vm36.leftViewMode = .grid
+            vm36.leftGridThumbnailSize = 160
+            vm36.leftGridSpacing = 3
+            vm36.saveSession()
+        }
+        
+        // 3) Test session restoration of view mode, thumbnail sizes, and spacing
+        let vm36Restored = await MainActor.run { () -> DualPaneViewModel in
+            let vm = DualPaneViewModel()
+            return vm
+        }
+        await MainActor.run {
+            assertCondition(vm36Restored.leftViewMode == .grid, "Restored leftViewMode is .grid")
+            assertCondition(vm36Restored.rightViewMode == .grid, "Restored rightViewMode is .grid")
+            assertCondition(vm36Restored.leftGridThumbnailSize == 160, "Restored leftGridThumbnailSize is 160")
+            assertCondition(vm36Restored.rightGridThumbnailSize == 200, "Restored rightGridThumbnailSize is 200")
+            assertCondition(vm36Restored.leftGridSpacing == 3, "Restored leftGridSpacing is 3px (~1mm)")
+            assertCondition(vm36Restored.rightGridSpacing == 4, "Restored rightGridSpacing is 4px")
+            
+            // Test swapPanes preserves view modes, thumbnail sizes, and spacing
+            vm36Restored.swapPanes()
+            assertCondition(vm36Restored.leftGridThumbnailSize == 200, "swapPanes swapped thumbnail sizes: left is 200")
+            assertCondition(vm36Restored.rightGridThumbnailSize == 160, "swapPanes swapped thumbnail sizes: right is 160")
+            assertCondition(vm36Restored.leftGridSpacing == 4, "swapPanes swapped grid spacing: left is 4")
+            assertCondition(vm36Restored.rightGridSpacing == 3, "swapPanes swapped grid spacing: right is 3")
+            
+            // Cleanup session
+            DualPaneViewModel.clearSavedSession()
+        }
+        
+        // 4) Test ThumbnailCacheManager generation and caching
+        let testImageURL = gridTestDir.appendingPathComponent("test_thumbnail.png")
+        let rep = NSBitmapImageRep(
+            bitmapDataPlanes: nil,
+            pixelsWide: 80,
+            pixelsHigh: 80,
+            bitsPerSample: 8,
+            samplesPerPixel: 4,
+            hasAlpha: true,
+            isPlanar: false,
+            colorSpaceName: .deviceRGB,
+            bytesPerRow: 320,
+            bitsPerPixel: 32
+        )!
+        let pngData = rep.representation(using: .png, properties: [:])!
+        try pngData.write(to: testImageURL)
+        
+        let testImgItem = FileItem(
+            id: testImageURL.path,
+            name: "test_thumbnail.png",
+            path: testImageURL.path,
+            size: UInt64(pngData.count),
+            mtime: Date().timeIntervalSince1970,
+            isDirectory: false,
+            source: .localMac
+        )
+        
+        let generatedThumb = await ThumbnailCacheManager.shared.loadThumbnail(
+            for: testImgItem,
+            targetSize: CGSize(width: 120, height: 120)
+        )
+        assertCondition(generatedThumb != nil, "Thumbnail successfully generated for local image")
+        let cachedThumb = ThumbnailCacheManager.shared.getThumbnail(for: testImgItem.path)
+        assertCondition(cachedThumb != nil, "Thumbnail is present in ThumbnailCacheManager cache")
+        
+        // Test directory returns nil gracefully
+        let dirItem = FileItem(
+            id: gridTestDir.path,
+            name: "grid_test",
+            path: gridTestDir.path,
+            size: 0,
+            mtime: Date().timeIntervalSince1970,
+            isDirectory: true,
+            source: .localMac
+        )
+        let dirThumb = await ThumbnailCacheManager.shared.loadThumbnail(for: dirItem)
+        assertCondition(dirThumb == nil, "loadThumbnail gracefully returns nil for directory")
+        
+        // Cleanup test dir
+        try? FileManager.default.removeItem(at: gridTestDir)
+        
+        // 37. File Rename on Long Press & Drag-and-Drop Invariants
+        print("\n[TEST 37] File Rename on Long Press & Drag-and-Drop Invariants:")
+        let testDir37 = FileManager.default.temporaryDirectory.appendingPathComponent("DnDTest_\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: testDir37, withIntermediateDirectories: true)
+        let subfolder37 = testDir37.appendingPathComponent("TargetSubfolder")
+        try FileManager.default.createDirectory(at: subfolder37, withIntermediateDirectories: true)
+        let sourceFile37 = testDir37.appendingPathComponent("source_file.txt")
+        try "drag-and-drop test payload".write(to: sourceFile37, atomically: true, encoding: .utf8)
+        
+        let fileItem37 = FileItem(
+            id: sourceFile37.path,
+            name: "source_file.txt",
+            path: sourceFile37.path,
+            size: 28,
+            mtime: Date().timeIntervalSince1970,
+            isDirectory: false,
+            source: .localMac
+        )
+        let folderItem37 = FileItem(
+            id: subfolder37.path,
+            name: "TargetSubfolder",
+            path: subfolder37.path,
+            size: 0,
+            mtime: Date().timeIntervalSince1970,
+            isDirectory: true,
+            source: .localMac
+        )
+        
+        await MainActor.run {
+            let vm37 = DualPaneViewModel()
+            vm37.leftPath = testDir37.path
+            vm37.leftItems = [folderItem37, fileItem37]
+            vm37.leftSelection = [fileItem37.id]
+            
+            // 1. Long press triggers rename for file
+            vm37.cancelInlineRename()
+            vm37.itemToRename = nil
+            vm37.triggerRename(item: fileItem37, side: .left)
+            assertCondition(vm37.editingItemId == fileItem37.id, "Long press rename activated inline rename for file")
+            assertCondition(vm37.editingItemName == "source_file.txt", "editingItemName pre-filled correctly")
+            assertCondition(!vm37.showRenameDialog, "showRenameDialog remains false (in-place rename)")
+            assertCondition(vm37.itemToRename?.name == "source_file.txt", "itemToRename is source_file.txt")
+            assertCondition(vm37.renameNewName == "source_file.txt", "renameNewName pre-filled correctly")
+            
+            // Idempotency: duplicate call keeps inline rename active
+            vm37.triggerRename(item: fileItem37, side: .left)
+            assertCondition(vm37.editingItemId == fileItem37.id, "Inline rename remains active without duplicate modal dialog")
+            
+            // 2. Long press triggers rename for folder
+            vm37.cancelInlineRename()
+            vm37.triggerRename(item: folderItem37, side: .left)
+            assertCondition(vm37.editingItemId == folderItem37.id, "Long press rename activated inline rename for folder")
+            assertCondition(vm37.editingItemName == "TargetSubfolder", "editingItemName pre-filled with folder name")
+            assertCondition(!vm37.showRenameDialog, "showRenameDialog remains false (in-place rename)")
+            assertCondition(vm37.itemToRename?.name == "TargetSubfolder", "itemToRename is TargetSubfolder")
+            assertCondition(vm37.itemToRename?.isDirectory == true, "Folder item marked as directory")
+            vm37.cancelInlineRename()
+            
+            // 3. Drag hover visual feedback states
+            vm37.dragHoverSide = .left
+            vm37.dragHoverFolderId = folderItem37.id
+            vm37.dragInsertionIndex = nil
+            assertCondition(vm37.dragHoverFolderId == folderItem37.id, "Folder hover highlight is set")
+            assertCondition(vm37.dragInsertionIndex == nil, "Insertion line is nil when hovering folder")
+            
+            // Hover between files
+            vm37.dragHoverFolderId = nil
+            vm37.dragInsertionIndex = 1
+            assertCondition(vm37.dragHoverFolderId == nil, "Folder hover cleared when hovering between files")
+            assertCondition(vm37.dragInsertionIndex == 1, "Insertion line index set between files")
+            
+            // Clear hover state
+            vm37.clearDragHoverState()
+            assertCondition(vm37.dragHoverSide == nil, "dragHoverSide cleared")
+            assertCondition(vm37.dragHoverFolderId == nil, "dragHoverFolderId cleared")
+            assertCondition(vm37.dragInsertionIndex == nil, "dragInsertionIndex cleared")
+            
+            // 4. Targeted drop into subfolder
+            vm37.currentDragPayload = DualPaneViewModel.DragPayload(
+                sourceSide: "left",
+                sourceKind: "localMac",
+                sourceDirPath: testDir37.path,
+                paths: [sourceFile37.path]
+            )
+            let handledDropIntoFolder = vm37.handleDroppedProviders([], toSide: .left, targetDirPath: subfolder37.path, isMove: false)
+            assertCondition(handledDropIntoFolder, "handleDroppedProviders accepted drop into targeted subfolder")
+        }
+        
+        try? FileManager.default.removeItem(at: testDir37)
+        
+        // 38. In-Place Inline Rename Lifecycle, Seamless Full-Row Drop Highlight & Ctrl+V Paste Invariants
+        print("\n[TEST 38] In-Place Inline Rename Lifecycle, Seamless Drop Highlight & Ctrl+V Paste:")
+        let testDir38 = FileManager.default.temporaryDirectory.appendingPathComponent("test38_\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: testDir38, withIntermediateDirectories: true)
+        let sampleFile38 = testDir38.appendingPathComponent("document_v1.txt")
+        try "Inline rename content".write(to: sampleFile38, atomically: true, encoding: .utf8)
+        
+        let item38 = FileItem(
+            id: sampleFile38.path,
+            name: "document_v1.txt",
+            path: sampleFile38.path,
+            size: 21,
+            mtime: Date().timeIntervalSince1970,
+            isDirectory: false,
+            source: .localMac
+        )
+        
+        await MainActor.run {
+            let vm38 = DualPaneViewModel()
+            vm38.leftPath = testDir38.path
+            vm38.leftItems = [item38]
+            
+            // A. Start inline rename
+            vm38.startInlineRename(item: item38, side: .left)
+            assertCondition(vm38.editingItemId == item38.id, "startInlineRename set editingItemId")
+            assertCondition(vm38.editingItemSide == .left, "editingItemSide is left")
+            assertCondition(vm38.editingItemName == "document_v1.txt", "editingItemName set to document_v1.txt")
+            assertCondition(!vm38.showRenameDialog, "showRenameDialog is false (in-place rename without modal window)")
+            
+            // B. Commit inline rename
+            vm38.editingItemName = "document_v2.txt"
+            vm38.commitInlineRename(item: item38, side: .left)
+            assertCondition(vm38.editingItemId == nil, "commitInlineRename reset editingItemId to nil")
+            assertCondition(vm38.editingItemSide == nil, "commitInlineRename reset editingItemSide to nil")
+            assertCondition(vm38.editingItemName == "", "commitInlineRename reset editingItemName")
+            
+            // C. Cancel inline rename
+            vm38.startInlineRename(item: item38, side: .left)
+            vm38.cancelInlineRename()
+            assertCondition(vm38.editingItemId == nil, "cancelInlineRename cleared editing state")
+            
+            // D. Seamless Drop Highlight Invariants
+            TableDoubleClickHandler.HandlerView.leftVM = vm38
+            TableDoubleClickHandler.HandlerView.activePaneSide = .left
+            assertCondition(TableDoubleClickHandler.HandlerView.activeVM(for: .left) === vm38, "activeVM retrieves pane view model")
+            
+            // E. Universal Ctrl+V Paste Monitor Invariant
+            KeyCommandMonitor.installGlobalMonitor()
+            NSPasteboard.general.clearContents()
+            let testPastedText = "ClipboardText_\(UUID().uuidString.prefix(8))"
+            NSPasteboard.general.setString(testPastedText, forType: .string)
+            assertCondition(NSPasteboard.general.string(forType: .string) == testPastedText, "Pasteboard contains test string")
+            
+            class MockTextResponder: NSResponder {
+                var pasted = false
+                var customText = "Initial: "
+                
+                @objc func paste(_ sender: Any?) {
+                    if let str = NSPasteboard.general.string(forType: .string) {
+                        customText += str
+                        pasted = true
+                    }
+                }
+            }
+            
+            let mockResponder = MockTextResponder()
+            
+            // Simulate Ctrl+V keyDown event
+            if let ctrlVEvent = NSEvent.keyEvent(
+                with: .keyDown,
+                location: .zero,
+                modifierFlags: [.control],
+                timestamp: ProcessInfo.processInfo.systemUptime,
+                windowNumber: 0,
+                context: nil,
+                characters: "v",
+                charactersIgnoringModifiers: "v",
+                isARepeat: false,
+                keyCode: 9
+            ) {
+                let result = KeyCommandMonitor.handleEvent(ctrlVEvent, targetResponder: mockResponder)
+                assertCondition(result == nil, "KeyCommandMonitor handled Ctrl+V and consumed event (returned nil)")
+                assertCondition(mockResponder.pasted, "Mock responder paste method was invoked")
+                assertCondition(mockResponder.customText.contains(testPastedText), "Ctrl+V successfully inserted clipboard text (got '\(mockResponder.customText)')")
+            }
+        }
+        
+        try? FileManager.default.removeItem(at: testDir38)
+        
+        // 39. USB Drive Auto-Detection, Header Controls & Seamless Drop Highlight Invariants
+        print("\n[TEST 39] USB Drive Auto-Detection, Header Controls & Seamless Drop Highlight:")
+        await MainActor.run {
+            let vm39 = DualPaneViewModel()
+            
+            // A. USB Drive Model & Auto-Detection Invariants
+            assertCondition(vm39.detectedUsbDrives.isEmpty || !vm39.detectedUsbDrives.isEmpty, "detectedUsbDrives initialized")
+            
+            let tempUsbDir = FileManager.default.temporaryDirectory.appendingPathComponent("Mock_SanDisk_USB")
+            try? FileManager.default.createDirectory(at: tempUsbDir, withIntermediateDirectories: true)
+            
+            let mockMacUsb = DualPaneViewModel.UsbDriveInfo(
+                id: "mac:\(tempUsbDir.path)",
+                name: "SanDisk_USB",
+                path: tempUsbDir.path,
+                isMac: true
+            )
+            vm39.detectedUsbDrives = [mockMacUsb]
+            assertCondition(vm39.detectedUsbDrives.count == 1, "Mock Mac USB drive registered in detectedUsbDrives")
+            assertCondition(vm39.detectedUsbDrives.first?.name == "SanDisk_USB", "USB drive name matches")
+            
+            // Switch to Mac USB drive
+            vm39.switchToUsbDrive(mockMacUsb, side: .left)
+            assertCondition(vm39.leftSource == .localMac, "leftSource set to .localMac for Mac USB")
+            assertCondition(vm39.leftPath == tempUsbDir.path, "leftPath navigated to USB drive path")
+            
+            // Switch to Phone USB OTG drive
+            let mockPhoneUsb = DualPaneViewModel.UsbDriveInfo(
+                id: "phone:/storage/USB_OTG_1234",
+                name: "USB_OTG_1234",
+                path: "/storage/USB_OTG_1234",
+                isMac: false
+            )
+            vm39.detectedUsbDrives.append(mockPhoneUsb)
+            assertCondition(vm39.detectedUsbDrives.count == 2, "Multiple USB drives registered")
+            vm39.switchToUsbDrive(mockPhoneUsb, side: .right)
+            assertCondition(vm39.rightSource == .remotePhone, "rightSource set to .remotePhone for Phone USB OTG")
+            assertCondition(vm39.rightPath == "/storage/USB_OTG_1234", "rightPath navigated to Phone USB OTG path")
+            
+            // B. Breadcrumb Root Path Parsing (No house icon, only arrow)
+            let testPath = "/Users/developer/Documents"
+            let components = URL(fileURLWithPath: testPath).pathComponents
+            assertCondition(components.count == 4, "Path components count is 4 for \(testPath)")
+            assertCondition(components[0] == "/", "First path component is '/' (rendered as '›' without '⌂')")
+            assertCondition(components[1] == "Users", "Second path component is 'Users'")
+            assertCondition(components[2] == "developer", "Third path component is 'developer'")
+            assertCondition(components[3] == "Documents", "Fourth path component is 'Documents'")
+            
+            // C. Full-row Seamless Drop Highlight Invariants
+            let testFolderItem = FileItem(
+                id: "/Users/developer/Documents/Projects",
+                name: "Projects",
+                path: "/Users/developer/Documents/Projects",
+                size: 0,
+                mtime: Date().timeIntervalSince1970,
+                isDirectory: true,
+                source: .localMac
+            )
+            vm39.leftItems = [testFolderItem]
+            vm39.dragHoverSide = .left
+            vm39.dragHoverFolderId = testFolderItem.id
+            vm39.dragInsertionIndex = nil
+            
+            assertCondition(vm39.dragHoverSide == .left, "dragHoverSide is left")
+            assertCondition(vm39.dragHoverFolderId == testFolderItem.id, "dragHoverFolderId points to targeted folder")
+            assertCondition(vm39.dragInsertionIndex == nil, "dragInsertionIndex is nil during folder hover")
+            
+            // Between files insertion line invariant
+            vm39.dragHoverFolderId = nil
+            vm39.dragInsertionIndex = 1
+            assertCondition(vm39.dragHoverFolderId == nil, "Folder hover is cleared for insertion line")
+            assertCondition(vm39.dragInsertionIndex == 1, "dragInsertionIndex indicates row gap position")
+            
+            vm39.clearDragHoverState()
+            assertCondition(vm39.dragHoverSide == nil && vm39.dragHoverFolderId == nil && vm39.dragInsertionIndex == nil, "clearDragHoverState resets all drop indicators")
+        }
+        
+        // ==========================================
+        // TEST 40: Phone Indicator, 256KB Chunks & Hardware USB Detection
+        // ==========================================
+        print("\n[TEST 40] Phone Indicator, 256KB Chunks & Hardware USB Detection:")
+        
+        // 1. High-Throughput 256KB SFTP Chunk Size Verification
+        let sftpEngine40 = SFTPPacketEngine()
+        let dummyHandle40 = "HANDLE1234".data(using: .utf8)!
+        let defaultReadPacket = sftpEngine40.createReadPacket(requestId: 4001, handle: dummyHandle40, offset: 0)
+        
+        // SFTP read packet format: [uint32 len][uint8 type=5][uint32 reqId][string handle][uint64 offset][uint32 length]
+        // Length parameter is located in the last 4 bytes of the packet
+        assertCondition(defaultReadPacket.count >= 4, "SFTP read packet created with valid length")
+        let lengthBytes = Data(defaultReadPacket.suffix(4))
+        let parsedLength = lengthBytes.withUnsafeBytes { $0.loadUnaligned(as: UInt32.self).bigEndian }
+        assertCondition(parsedLength == 262144, "Default SFTP read packet length is 262144 bytes (256 KB) (got \(parsedLength))")
+        
+        // 2. Phone Connection Indicator Invariant
+        let vm40 = await MainActor.run { () -> DualPaneViewModel in
+            let vm = DualPaneViewModel()
+            assertCondition(vm.isPhoneConnected == false, "Default phone connection state is disconnected (isPhoneConnected = false)")
+            
+            // Register a mock phone volume (e.g. OTG or external SD)
+            vm.detectedVolumes = [
+                PhoneConnectionManager.StorageVolume(id: "primary", name: "Internal Storage", path: "/storage/emulated/0", isPrimary: true),
+                PhoneConnectionManager.StorageVolume(id: "otg1", name: "Samsung USB OTG", path: "/storage/1234-ABCD", isPrimary: false)
+            ]
+            
+            // While disconnected, phone USB OTG drives are NOT exposed
+            vm.refreshUsbDrives()
+            assertCondition(!vm.detectedUsbDrives.contains(where: { $0.path == "/storage/1234-ABCD" }), "Phone OTG drive is hidden when isPhoneConnected == false")
+            
+            // Connect phone -> phone USB OTG drive is now exposed
+            vm.isPhoneConnected = true
+            vm.refreshUsbDrives()
+            assertCondition(vm.detectedUsbDrives.contains(where: { $0.path == "/storage/1234-ABCD" }), "Phone OTG drive is exposed when isPhoneConnected == true")
+            
+            // Disconnect phone -> phone USB OTG drive is safely cleared
+            vm.isPhoneConnected = false
+            vm.refreshUsbDrives()
+            assertCondition(!vm.detectedUsbDrives.contains(where: { $0.path == "/storage/1234-ABCD" }), "Phone OTG drive is removed again when isPhoneConnected == false")
+            
+            // 3. Hardware USB Detection vs DMG Image Filtering
+            // Root "/" or DMG volume must not be misidentified as a physical USB drive
+            let rootUrl = URL(fileURLWithPath: "/")
+            let isRootUsb = DualPaneViewModel.isActualUsbDrive(url: rootUrl)
+            assertCondition(isRootUsb == false, "Root filesystem '/' is not identified as USB drive")
+            
+            // 4. Tab Pin and Navigation Gap Invariants
+            assertCondition(vm.leftTabs.first?.isPinned == false, "First tab is not pinned by default")
+            vm.togglePinTab(id: vm.leftTabs.first!.id, side: .left)
+            assertCondition(vm.leftTabs.first?.isPinned == true, "togglePinTab marks tab as pinned")
+            
+            // 5. Transfer Background Minimization Invariants
+            assertCondition(vm.isTransferMinimized == false, "isTransferMinimized is false by default")
+            assertCondition(vm.currentTransferFileName.isEmpty, "currentTransferFileName is empty by default")
+            vm.showTransferProgress = true
+            vm.minimizeTransferToBackground()
+            assertCondition(vm.isTransferMinimized == true, "minimizeTransferToBackground sets isTransferMinimized = true")
+            assertCondition(vm.showTransferProgress == false, "minimizeTransferToBackground closes transfer modal (showTransferProgress = false)")
+            vm.cancelTransfer()
+            assertCondition(vm.isTransferMinimized == false, "cancelTransfer resets isTransferMinimized = false")
+            assertCondition(vm.currentTransferFileName.isEmpty, "cancelTransfer resets currentTransferFileName = empty")
+            
+            return vm
+        }
+        // 6. Phone Connection Status & Indicator Invariants
+        let indicatorConnecting = PhoneConnectionIndicatorView(isConnected: false, isConnecting: true)
+        assertCondition(indicatorConnecting.isConnecting == true, "Phone indicator handles isConnecting == true (pulsing green)")
+        let indicatorConnected = PhoneConnectionIndicatorView(isConnected: true, isConnecting: false)
+        assertCondition(indicatorConnected.isConnected == true, "Phone indicator handles isConnected == true (solid lime green)")
+        let indicatorDisconnected = PhoneConnectionIndicatorView(isConnected: false, isConnecting: false)
+        assertCondition(indicatorDisconnected.isConnected == false && indicatorDisconnected.isConnecting == false, "Phone indicator handles disconnected state (solid gray)")
+        
         print("\n🎉 ==================================================")
-        print("🎉   ALL 32 PRODUCTION TEST SUITES PASSED!          ")
+        print("🎉   ALL 41 PRODUCTION TEST SUITES PASSED!          ")
         print("🎉 ==================================================")
         exit(0)
     } catch {

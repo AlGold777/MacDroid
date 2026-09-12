@@ -11,9 +11,26 @@ public final class PhoneConnectionManager: @unchecked Sendable {
     public static let shared = PhoneConnectionManager()
     
     public private(set) var lastConnectedDeviceId: String?
+    private var discoveredIps: [String] = []
+    private var deviceNamesByHost: [String: String] = [:]
     private let lock = NSLock()
     
     private init() {}
+    
+    public func registerDevice(host: String, name: String) {
+        lock.lock()
+        defer { lock.unlock() }
+        deviceNamesByHost[host] = name
+        if !discoveredIps.contains(host) {
+            discoveredIps.insert(host, at: 0)
+        }
+    }
+    
+    public func deviceNameForHost(_ host: String) -> String? {
+        lock.lock()
+        defer { lock.unlock() }
+        return deviceNamesByHost[host]
+    }
     
     public func setLastConnectedDevice(_ id: String?) {
         lock.lock()
@@ -113,8 +130,10 @@ public final class PhoneConnectionManager: @unchecked Sendable {
         process.standardError = pipe
         do {
             try process.run()
-            process.waitUntilExit()
+            // Читаем stdout до waitUntilExit, чтобы избежать взаимной блокировки (deadlock)
+            // при заполнении 64 КБ буфера системного pipe дочерним процессом (adb ls -la)
             let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            process.waitUntilExit()
             let out = String(data: data, encoding: .utf8) ?? ""
             return (process.terminationStatus, out.trimmingCharacters(in: .whitespacesAndNewlines))
         } catch {
@@ -150,14 +169,24 @@ public final class PhoneConnectionManager: @unchecked Sendable {
     /// Триггер обновления Android MediaStore для списка файлов
     public func notifyMediaScanner(paths: [String], deviceId: String? = nil) {
         guard !paths.isEmpty else { return }
-        // Сканируем порциями, чтобы не перегружать adb
-        for path in paths {
-            let escaped = Self.shellEscape("file://" + path)
-            _ = executeAdbShell(
-                command: "am broadcast -a android.intent.action.MEDIA_SCANNER_SCAN_FILE -d \(escaped)",
-                deviceId: deviceId
-            )
+        // Оптимизация: сканируем пачками по 50 файлов в одном adb shell вызове
+        // вместо порождения сотен отдельных процессов adb
+        let batchSize = 50
+        for i in stride(from: 0, to: paths.count, by: batchSize) {
+            let chunk = Array(paths[i..<min(i + batchSize, paths.count)])
+            let commands = chunk.map { path in
+                "am broadcast -a android.intent.action.MEDIA_SCANNER_SCAN_FILE -d \(Self.shellEscape("file://" + path))"
+            }.joined(separator: " ; ")
+            _ = executeAdbShell(command: commands, deviceId: deviceId)
         }
+    }
+    
+    /// Серверное копирование файла внутри Android устройства без передачи данных на Mac
+    public func copyFileOnDevice(sourcePath: String, targetPath: String, deviceId: String? = nil) -> Bool {
+        let srcEsc = Self.shellEscape(sourcePath)
+        let dstEsc = Self.shellEscape(targetPath)
+        let (status, _) = executeAdbShell(command: "cp -p \(srcEsc) \(dstEsc)", deviceId: deviceId)
+        return status == 0
     }
     
     /// Запрос реального объёма свободного и общего места на Android через ADB df
@@ -459,20 +488,31 @@ public final class PhoneConnectionManager: @unchecked Sendable {
                 logs.append("ℹ️ appops: \(appopsOut)")
             }
             
-            // 4.3 Проброс портов
-            logs.append("Настройка проброса портов (Host 127.0.0.1:2222 <-> Phone:2222)...")
-            let (fwdStatus, fwdOut) = runCommand(executable: adb, arguments: ["-s", dev, "forward", "tcp:2222", "tcp:2222"])
+            // 4.3 Проброс портов (с поддержкой динамического порта при конфликтах)
+            logs.append("Настройка проброса портов (Host 127.0.0.1 <-> Phone:2222)...")
+            var localUsbPort: UInt16 = 2222
+            var (fwdStatus, fwdOut) = runCommand(executable: adb, arguments: ["-s", dev, "forward", "tcp:2222", "tcp:2222"])
             if fwdStatus != 0 {
-                logs.append("⚠️ Ошибка 'adb forward': \(fwdOut)")
+                // Если стандартный порт 2222 занят другим процессом, выделяем свободный динамический порт
+                let (dynStatus, dynOut) = runCommand(executable: adb, arguments: ["-s", dev, "forward", "tcp:0", "tcp:2222"])
+                if dynStatus == 0, let p = UInt16(dynOut.trimmingCharacters(in: .whitespacesAndNewlines)) {
+                    localUsbPort = p
+                    fwdStatus = 0
+                    logs.append("✓ [OK] Выделен свободный динамический порт \(localUsbPort) (forward)")
+                } else {
+                    logs.append("⚠️ Ошибка 'adb forward': \(fwdOut)")
+                }
             } else {
-                logs.append("✓ [OK] Порт 2222 (forward) успешно перенаправлен")
+                logs.append("✓ [OK] Порт \(localUsbPort) (forward) успешно перенаправлен")
             }
             
-            let (revStatus, revOut) = runCommand(executable: adb, arguments: ["-s", dev, "reverse", "tcp:2222", "tcp:2222"])
-            if revStatus != 0 {
-                logs.append("⚠️ Предупреждение 'adb reverse': \(revOut)")
-            } else {
-                logs.append("✓ [OK] Порт 2222 (reverse) успешно перенаправлен")
+            _ = runCommand(executable: adb, arguments: ["-s", dev, "reverse", "tcp:2222", "tcp:2222"])
+            
+            // Получаем реальное имя модели смартфона через ADB
+            let (_, modelOut) = runCommand(executable: adb, arguments: ["-s", dev, "shell", "getprop", "ro.product.model"])
+            let modelName = modelOut.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !modelName.isEmpty {
+                registerDevice(host: "127.0.0.1", name: modelName)
             }
             
             // 4.4 Фоновый запуск сервиса/приложения на смартфоне
@@ -480,16 +520,31 @@ public final class PhoneConnectionManager: @unchecked Sendable {
             _ = runCommand(executable: adb, arguments: ["-s", dev, "shell", "am", "start", "-n", "com.macandroid.filemanager/.ui.MainActivity"])
             _ = runCommand(executable: adb, arguments: ["-s", dev, "shell", "am", "start-foreground-service", "com.macandroid.filemanager/.runtime.FileDaemonService"])
             
-            // Небольшая задержка для готовности сокета SFTP на телефоне
-            try? await Task.sleep(nanoseconds: 350_000_000)
+            // 4.5 Проверка готовности сокета SFTP (до 8 попыток с интервалом 250мс)
+            var socketReady = false
+            for _ in 0..<8 {
+                if isHostPortReachable(host: "127.0.0.1", port: localUsbPort, timeoutSeconds: 1) {
+                    socketReady = true
+                    break
+                }
+                try? await Task.sleep(nanoseconds: 250_000_000)
+            }
             
-            logs.append("✓ Соединение с телефоном через USB (127.0.0.1:2222) готово к работе!")
-            return .usbSuccess(
-                deviceId: dev,
-                host: "127.0.0.1",
-                port: 2222,
-                log: logs.joined(separator: "\n")
-            )
+            if socketReady {
+                logs.append("✓ Соединение с телефоном через USB (127.0.0.1:\(localUsbPort)) готово к работе!")
+                return .usbSuccess(
+                    deviceId: dev,
+                    host: "127.0.0.1",
+                    port: localUsbPort,
+                    log: logs.joined(separator: "\n")
+                )
+            } else {
+                logs.append("⚠️ Служба на телефоне не ответила на порту \(localUsbPort).")
+                return .failure(
+                    reason: "Служба на телефоне запускается. Пожалуйста, разблокируйте экран телефона.",
+                    log: logs.joined(separator: "\n")
+                )
+            }
         }
         } else {
             logs.append("ℹ️ Утилита 'adb' не найдена в системе, проверка USB пропущена.")
@@ -500,10 +555,11 @@ public final class PhoneConnectionManager: @unchecked Sendable {
         
         if let foundIp = discoverPhoneIpOnLan() {
             logs.append("✓ [OK] Телефон найден и доступен по Wi-Fi (\(foundIp):2222)")
+            let devName = deviceNameForHost(foundIp) ?? "Телефон Android"
             return .wifiSuccess(
                 host: foundIp,
                 port: 2222,
-                name: "Xiaomi 14"
+                name: devName
             )
         }
         
@@ -518,11 +574,23 @@ public final class PhoneConnectionManager: @unchecked Sendable {
         )
     }
     
-    /// Автоматическое обнаружение IP-адреса телефона в локальной сети (ARP + port 2222)
+    /// Автоматическое обнаружение IP-адреса телефона в локальной сети (mDNS -> Last IP -> History -> ARP)
     public func discoverPhoneIpOnLan() -> String? {
-        var priorities: [String] = []
-        if let saved = UserDefaults.standard.string(forKey: "lastConnectedHost"), !saved.isEmpty {
+        lock.lock()
+        var priorities = self.discoveredIps
+        lock.unlock()
+        
+        if let saved = UserDefaults.standard.string(forKey: "lastConnectedHost"), !saved.isEmpty, !priorities.contains(saved) {
             priorities.append(saved)
+        }
+        
+        if let data = UserDefaults.standard.data(forKey: "phoneConnectionHistory"),
+           let savedList = try? JSONDecoder().decode([SavedConnection].self, from: data) {
+            for item in savedList {
+                if !priorities.contains(item.host) {
+                    priorities.append(item.host)
+                }
+            }
         }
         
         for ip in priorities {
@@ -549,7 +617,7 @@ public final class PhoneConnectionManager: @unchecked Sendable {
         return nil
     }
     
-    /// Получение реального SHA-256 отпечатка открытого хост-ключа сервера через ssh-keyscan
+    /// Получение реального SHA-256 отпечатка открытого хост-ключа сервера через ssh-keyscan с защитой от зависания
     public func fetchHostFingerprint(host: String, port: UInt16) -> String? {
         guard isHostPortReachable(host: host, port: port, timeoutSeconds: 1) else { return nil }
         
@@ -560,23 +628,40 @@ public final class PhoneConnectionManager: @unchecked Sendable {
         keyscanProc.standardOutput = scanPipe
         keyscanProc.standardError = FileHandle.nullDevice
         
-        let keygenProc = Process()
-        keygenProc.executableURL = URL(fileURLWithPath: "/usr/bin/ssh-keygen")
-        keygenProc.arguments = ["-lf", "-"]
-        let genPipe = Pipe()
-        keygenProc.standardInput = scanPipe
-        keygenProc.standardOutput = genPipe
-        keygenProc.standardError = FileHandle.nullDevice
+        // Защита от дедлока: жесткий таймаут 2.5 сек на случай зависания сокета
+        let timer = DispatchWorkItem { [weak keyscanProc] in
+            if keyscanProc?.isRunning == true {
+                keyscanProc?.terminate()
+            }
+        }
+        DispatchQueue.global().asyncAfter(deadline: .now() + 2.5, execute: timer)
         
         do {
             try keyscanProc.run()
-            try keygenProc.run()
+            // Читаем stdout ДО waitUntilExit, чтобы исключить блокировку при переполнении буфера
+            let scanData = scanPipe.fileHandleForReading.readDataToEndOfFile()
             keyscanProc.waitUntilExit()
+            timer.cancel()
+            
+            guard !scanData.isEmpty else { return nil }
+            
+            let keygenProc = Process()
+            keygenProc.executableURL = URL(fileURLWithPath: "/usr/bin/ssh-keygen")
+            keygenProc.arguments = ["-lf", "-"]
+            let inPipe = Pipe()
+            let outPipe = Pipe()
+            keygenProc.standardInput = inPipe
+            keygenProc.standardOutput = outPipe
+            keygenProc.standardError = FileHandle.nullDevice
+            
+            try keygenProc.run()
+            inPipe.fileHandleForWriting.write(scanData)
+            inPipe.fileHandleForWriting.closeFile()
+            
+            let genData = outPipe.fileHandleForReading.readDataToEndOfFile()
             keygenProc.waitUntilExit()
             
-            let data = genPipe.fileHandleForReading.readDataToEndOfFile()
-            guard let out = String(data: data, encoding: .utf8), !out.isEmpty else { return nil }
-            
+            guard let out = String(data: genData, encoding: .utf8), !out.isEmpty else { return nil }
             for line in out.components(separatedBy: .newlines) {
                 let parts = line.split(separator: " ")
                 for part in parts {
@@ -586,6 +671,7 @@ public final class PhoneConnectionManager: @unchecked Sendable {
                 }
             }
         } catch {
+            timer.cancel()
             return nil
         }
         return nil

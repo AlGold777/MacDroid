@@ -244,7 +244,30 @@ public final class JobOrchestrator: @unchecked Sendable {
                         try? FileManager.default.removeItem(at: tempURL)
                         currentOffset = 0
                     }
-                } else if UInt64(partSize) >= stat.size {
+                } else if UInt64(partSize) == stat.size {
+                    // Оптимизация: файл уже полностью скачан во временный файл .part!
+                    let prefixLen = min(stat.size, 4096)
+                    var prefixValid = false
+                    if let handle = try? FileHandle(forReadingFrom: tempURL) {
+                        let localPrefix = try? handle.read(upToCount: Int(prefixLen))
+                        try? handle.close()
+                        if let localPrefix = localPrefix, localPrefix.count == Int(prefixLen) {
+                            if let remotePrefix = try? await transport.readChunk(remotePath: remotePath, offset: 0, length: UInt32(prefixLen)),
+                               remotePrefix == localPrefix {
+                                prefixValid = true
+                            }
+                        }
+                    }
+                    if prefixValid {
+                        currentOffset = stat.size
+                        downloadSuccess = true
+                        progress(0.85)
+                        break
+                    } else {
+                        try? FileManager.default.removeItem(at: tempURL)
+                        currentOffset = 0
+                    }
+                } else if UInt64(partSize) > stat.size {
                     try? FileManager.default.removeItem(at: tempURL)
                     currentOffset = 0
                 }
@@ -313,6 +336,11 @@ public final class JobOrchestrator: @unchecked Sendable {
         
         try await localFS.renameItem(from: tempURL.path, to: finalURL.path)
         
+        // Оптимизация P2: Сохраняем точный исходный mtime на скачанном файле Mac,
+        // чтобы повторные передачи со стратегией .skipIfIdentical пропускали файл
+        let origMtime = Date(timeIntervalSince1970: TimeInterval(stat.mtime))
+        try? FileManager.default.setAttributes([.modificationDate: origMtime], ofItemAtPath: finalURL.path)
+        
         // 4. Верификация
         let finalVals = try? finalURL.resourceValues(forKeys: [.fileSizeKey])
         let finalSize = UInt64(finalVals?.fileSize ?? 0)
@@ -331,9 +359,17 @@ public final class JobOrchestrator: @unchecked Sendable {
                 let adbRes = PhoneConnectionManager.shared.executeAdbShell(command: "rm -f -- \(escaped)")
                 if adbRes.status == 0 {
                     deleted = true
-                } else {
+                }
+            }
+            if !deleted {
+                // Контрольная проверка: если файл уже отсутствует (удален компаньоном/системой),
+                // prepareRead выбросит ошибку noSuchFile -> удаление оригинала фактически состоялось.
+                do {
+                    _ = try await transport.prepareRead(actionId: UUID().uuidString, path: remotePath)
                     sourceDeletionFailed = true
                     sourceDeletionReason = "Файл успешно загружен на Mac, но не удалось удалить оригинал на телефоне"
+                } catch {
+                    deleted = true
                 }
             }
         }
@@ -419,8 +455,8 @@ public final class JobOrchestrator: @unchecked Sendable {
         var fileName = localSourceURL.lastPathComponent.precomposedStringWithCanonicalMapping
         var remoteFinalPath = (remoteTargetDir as NSString).appendingPathComponent(fileName).precomposedStringWithCanonicalMapping
         
-        // Проверка конфликтов на удалённом устройстве
-        if let existingStat = try? await transport.prepareRead(actionId: actionId, path: remoteFinalPath) {
+        // Проверка конфликтов на удалённом устройстве (только если стратегия не .overwrite)
+        if strategy != .overwrite, let existingStat = try? await transport.prepareRead(actionId: actionId, path: remoteFinalPath) {
             switch strategy {
             case .skip:
                 progress(1.0)
@@ -545,16 +581,23 @@ public final class JobOrchestrator: @unchecked Sendable {
                 throw NSError(domain: "JobOrchestrator", code: 500, userInfo: [NSLocalizedDescriptionKey: "Remote commit (rename) failed for: \(remoteFinalPath)"])
             }
             
+            // 4. Верификация размера файла на телефоне до удаления резервной копии
+            guard let verifiedStat = try? await transport.prepareRead(actionId: actionId, path: remoteFinalPath),
+                  verifiedStat.size == fileSize else {
+                if backupCreated {
+                    _ = try? await transport.executeRename(oldPath: backupPath, newPath: remoteFinalPath)
+                }
+                sm.transition(to: .indeterminate, error: "Целевой файл на телефоне не прошел проверку целостности размера")
+                throw JobOrchestratorError.commitVerificationFailed(path: remoteFinalPath)
+            }
+            
+            // Удаляем резервную копию ТОЛЬКО после успешной верификации целостности целевого файла
             if backupCreated {
                 _ = try? await transport.executeDelete(actionId: actionId, path: backupPath)
             }
             
-            // Верификация размера файла на телефоне
-            guard let verifiedStat = try? await transport.prepareRead(actionId: actionId, path: remoteFinalPath),
-                  verifiedStat.size == fileSize else {
-                sm.transition(to: .indeterminate, error: "Целевой файл на телефоне не прошел проверку целостности размера")
-                throw JobOrchestratorError.commitVerificationFailed(path: remoteFinalPath)
-            }
+            // Восстанавливаем оригинальный mtime на телефоне для консистентности и быстрого пропуска идентичных файлов
+            _ = try? await transport.setRemoteMtime(path: remoteFinalPath, mtime: mtime)
             
             var sourceDeletionFailed = false
             var sourceDeletionReason = ""

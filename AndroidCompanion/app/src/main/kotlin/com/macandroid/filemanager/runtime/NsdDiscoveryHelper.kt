@@ -3,14 +3,18 @@ package com.macandroid.filemanager.runtime
 import android.content.Context
 import android.net.nsd.NsdManager
 import android.net.nsd.NsdServiceInfo
+import android.os.Build
 
 class NsdDiscoveryHelper(private val context: Context) {
     private val nsdManager = context.getSystemService(Context.NSD_SERVICE) as NsdManager
     private var registrationListener: NsdManager.RegistrationListener? = null
 
     fun registerService(port: Int) {
+        val manufacturer = Build.MANUFACTURER.replaceFirstChar { if (it.isLowerCase()) it.titlecase() else it.toString() }
+        val model = Build.MODEL
+        val devName = if (model.startsWith(manufacturer, ignoreCase = true)) model else "$manufacturer $model"
         val serviceInfo = NsdServiceInfo().apply {
-            serviceName = "Xiaomi 14 Ultra (MacDroid)"
+            serviceName = "$devName (MacDroid)"
             serviceType = "_macphone_sftp._tcp"
             setPort(port)
         }

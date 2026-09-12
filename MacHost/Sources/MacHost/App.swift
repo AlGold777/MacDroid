@@ -15,6 +15,10 @@ extension KeyEquivalent {
 struct MacFileManagerApp: App {
     @StateObject private var viewModel = DualPaneViewModel()
 
+    init() {
+        KeyCommandMonitor.installGlobalMonitor()
+    }
+
     var body: some Scene {
         WindowGroup {
             MainContentView()
@@ -188,6 +192,11 @@ struct MacFileManagerApp: App {
                     viewModel.pasteFromClipboard()
                 }
                 .keyboardShortcut("v", modifiers: [.command])
+                
+                Button("Вставить из буфера (Ctrl+V)") {
+                    viewModel.pasteFromClipboard()
+                }
+                .keyboardShortcut("v", modifiers: [.control])
                 
                 Button("Дублировать (Cmd+Shift+D)") {
                     viewModel.duplicateItem()

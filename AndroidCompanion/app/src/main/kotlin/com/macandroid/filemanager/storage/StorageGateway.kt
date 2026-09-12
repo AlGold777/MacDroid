@@ -4,7 +4,14 @@ import android.content.Context
 import android.media.MediaScannerConnection
 import com.macandroid.filemanager.data.ActionJournalDb
 import com.macandroid.filemanager.data.ActionReceipt
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import java.io.File
+import java.util.Collections
 
 class StorageGateway(private val context: Context) {
     private val db = ActionJournalDb.getDatabase(context)
@@ -76,15 +83,83 @@ class StorageGateway(private val context: Context) {
         return deleted
     }
 
-    // Одиночное сканирование с обработкой ошибок
-    fun notifyMediaScanner(path: String) {
+    suspend fun recordCommit(
+        actionId: String,
+        requestHash: String,
+        sourcePath: String,
+        finalTargetFile: File
+    ) {
+        val receipt = ActionReceipt(
+            actionId = actionId,
+            requestHash = requestHash,
+            sourcePath = sourcePath,
+            targetPath = finalTargetFile.absolutePath,
+            status = "COMMITTED",
+            timestamp = System.currentTimeMillis()
+        )
+        dao.insertReceipt(receipt)
+        notifyMediaScanner(finalTargetFile.absolutePath)
+    }
+
+    suspend fun recordDeletion(
+        actionId: String,
+        requestHash: String,
+        deletedFile: File
+    ) {
+        val receipt = ActionReceipt(
+            actionId = actionId,
+            requestHash = requestHash,
+            sourcePath = deletedFile.absolutePath,
+            targetPath = "",
+            status = "DELETED",
+            timestamp = System.currentTimeMillis()
+        )
+        dao.insertReceipt(receipt)
+
+        // Удаление записи из системного каталога MediaStore, чтобы исключить 'битые' превью
         try {
-            MediaScannerConnection.scanFile(
-                context,
-                arrayOf(path),
-                null
-            ) { _, _ -> }
+            val uri = android.provider.MediaStore.Files.getContentUri("external")
+            context.contentResolver.delete(
+                uri,
+                "${android.provider.MediaStore.MediaColumns.DATA} = ?",
+                arrayOf(deletedFile.absolutePath)
+            )
         } catch (ignored: Exception) {}
+        notifyMediaScanner(deletedFile.absolutePath)
+    }
+
+    // Буфер для пакетирования запросов сканирования MediaScanner
+    private val pendingScans = Collections.synchronizedList(mutableListOf<String>())
+    private val scanScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private var scanJob: Job? = null
+
+    // Одиночное или пакетное сканирование с умным дебаунсом (500 мс или по достижении 50 файлов)
+    fun notifyMediaScanner(path: String) {
+        pendingScans.add(path)
+        synchronized(pendingScans) {
+            if (pendingScans.size >= 50) {
+                flushMediaScans()
+                return
+            }
+        }
+        
+        synchronized(this) {
+            scanJob?.cancel()
+            scanJob = scanScope.launch {
+                delay(500)
+                flushMediaScans()
+            }
+        }
+    }
+
+    fun flushMediaScans() {
+        val toScan: List<String>
+        synchronized(pendingScans) {
+            if (pendingScans.isEmpty()) return
+            toScan = ArrayList(pendingScans)
+            pendingScans.clear()
+        }
+        scanFilesBatch(toScan)
     }
 
     // Пакетное сканирование порциями по 100 путей (защита от TransactionTooLargeException в Binder)

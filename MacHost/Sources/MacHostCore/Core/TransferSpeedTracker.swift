@@ -9,6 +9,7 @@ public final class TransferSpeedTracker: @unchecked Sendable {
     
     private let windowDuration: TimeInterval
     private var samples: [Sample] = []
+    private var startIndex: Int = 0
     private let lock = NSLock()
     
     public private(set) var totalTransferredBytes: UInt64 = 0
@@ -23,6 +24,7 @@ public final class TransferSpeedTracker: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         samples.removeAll()
+        startIndex = 0
         totalTransferredBytes = 0
         startTime = Date()
     }
@@ -36,12 +38,16 @@ public final class TransferSpeedTracker: @unchecked Sendable {
         totalTransferredBytes = bytesTransferred
         samples.append(Sample(timestamp: now, bytes: bytesTransferred))
         
-        // Удаляем устаревшие сэмплы за пределами скользящего окна
+        // Удаляем устаревшие сэмплы за пределами скользящего окна с O(1) сдвигом указателя
         let cutoff = now.addingTimeInterval(-windowDuration)
-        while let first = samples.first, first.timestamp < cutoff {
-            // Оставляем хотя бы 2 сэмпла для расчета
-            if samples.count <= 2 { break }
-            samples.removeFirst()
+        while startIndex < (samples.count - 2) && samples[startIndex].timestamp < cutoff {
+            startIndex += 1
+        }
+        
+        // Периодическая компактификация массива вместо постоянного O(N) сдвига при каждом сэмпле
+        if startIndex > 64 {
+            samples.removeSubrange(0..<startIndex)
+            startIndex = 0
         }
     }
     
@@ -50,14 +56,15 @@ public final class TransferSpeedTracker: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         
-        guard samples.count >= 2,
-              let oldest = samples.first,
+        let activeCount = samples.count - startIndex
+        guard activeCount >= 2,
               let newest = samples.last else {
             // Если сэмплов мало, используем общее время
             let elapsed = Date().timeIntervalSince(startTime)
             guard elapsed > 0.1 else { return 0.0 }
             return Double(totalTransferredBytes) / elapsed
         }
+        let oldest = samples[startIndex]
         
         let timeDelta = newest.timestamp.timeIntervalSince(oldest.timestamp)
         guard timeDelta > 0.05 else { return 0.0 }

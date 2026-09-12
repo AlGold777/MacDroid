@@ -48,8 +48,10 @@ public struct SFTPNameEntry: Sendable {
     public let isDirectory: Bool
     
     public init(filename: String, longname: String, size: UInt64, mtime: UInt32, isDirectory: Bool) {
-        self.filename = filename.precomposedStringWithCanonicalMapping
-        self.longname = longname.precomposedStringWithCanonicalMapping
+        // Оптимизация: пропускаем NFC-нормализацию для чистых ASCII-имён
+        self.filename = filename.utf8.allSatisfy({ $0 < 128 }) ? filename : filename.precomposedStringWithCanonicalMapping
+        // longname не требует нормализации, так как используется лишь как служебная строка
+        self.longname = longname
         self.size = size
         self.mtime = mtime
         self.isDirectory = isDirectory
@@ -88,7 +90,8 @@ public final class SFTPPacketWriter {
     
     public func buildPacket(type: SFTPMessageType) -> Data {
         var packet = Data()
-        // Длина всего пакета = 1 (type) + data.count
+        // Оптимизация: резервируем точный размер пакета
+        packet.reserveCapacity(5 + data.count)
         let totalLength = UInt32(1 + data.count)
         var beLength = totalLength.bigEndian
         withUnsafeBytes(of: &beLength) { packet.append(contentsOf: $0) }
@@ -119,24 +122,37 @@ public final class SFTPPacketReader {
     
     public func readUInt32() throws -> UInt32 {
         guard offset + 4 <= data.count else { throw NSError(domain: "SFTPPacketReader", code: 1, userInfo: [NSLocalizedDescriptionKey: "Unexpected EOF reading UInt32"]) }
-        let sub = data.subdata(in: offset..<offset+4)
+        // Оптимизация: прямое чтение без аллокации промежуточного Data.subdata
+        let val = data.withUnsafeBytes { ptr in
+            ptr.loadUnaligned(fromByteOffset: offset, as: UInt32.self).bigEndian
+        }
         offset += 4
-        return sub.withUnsafeBytes { $0.load(as: UInt32.self).bigEndian }
+        return val
     }
     
     public func readUInt64() throws -> UInt64 {
         guard offset + 8 <= data.count else { throw NSError(domain: "SFTPPacketReader", code: 1, userInfo: [NSLocalizedDescriptionKey: "Unexpected EOF reading UInt64"]) }
-        let sub = data.subdata(in: offset..<offset+8)
+        // Оптимизация: прямое чтение без аллокации промежуточного Data.subdata
+        let val = data.withUnsafeBytes { ptr in
+            ptr.loadUnaligned(fromByteOffset: offset, as: UInt64.self).bigEndian
+        }
         offset += 8
-        return sub.withUnsafeBytes { $0.load(as: UInt64.self).bigEndian }
+        return val
     }
     
     public func readString() throws -> String {
         let len = Int(try readUInt32())
         guard offset + len <= data.count else { throw NSError(domain: "SFTPPacketReader", code: 1, userInfo: [NSLocalizedDescriptionKey: "Unexpected EOF reading String"]) }
-        let sub = data.subdata(in: offset..<offset+len)
+        let str: String
+        if len == 0 {
+            str = ""
+        } else {
+            let start = data.startIndex + offset
+            let slice = data[start..<(start + len)]
+            str = String(data: slice, encoding: .utf8) ?? ""
+        }
         offset += len
-        return String(data: sub, encoding: .utf8) ?? ""
+        return str
     }
     
     public func readData() throws -> Data {
@@ -213,7 +229,7 @@ public final class SFTPPacketEngine: @unchecked Sendable {
         return writer.buildPacket(type: .open)
     }
     
-    public func createReadPacket(requestId: UInt32, handle: Data, offset: UInt64, length: UInt32 = 65536) -> Data {
+    public func createReadPacket(requestId: UInt32, handle: Data, offset: UInt64, length: UInt32 = 262144) -> Data {
         let writer = SFTPPacketWriter()
         writer.appendUInt32(requestId)
         writer.appendData(handle)
@@ -229,6 +245,17 @@ public final class SFTPPacketEngine: @unchecked Sendable {
         writer.appendUInt64(offset)
         writer.appendData(data)
         return writer.buildPacket(type: .write)
+    }
+    
+    public func createSetstatMtimePacket(requestId: UInt32, path: String, mtime: UInt32) -> Data {
+        let writer = SFTPPacketWriter()
+        writer.appendUInt32(requestId)
+        writer.appendString(path)
+        // Флаг SSH_FILEXFER_ATTR_ACMODTIME = 0x00000008
+        writer.appendUInt32(0x00000008)
+        writer.appendUInt32(mtime)
+        writer.appendUInt32(mtime)
+        return writer.buildPacket(type: .setstat)
     }
     
     public func createStatPacket(requestId: UInt32, path: String) -> Data {
