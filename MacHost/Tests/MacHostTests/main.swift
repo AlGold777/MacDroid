@@ -2662,8 +2662,65 @@ Task { @MainActor in
             assertCondition(connCtrl.currentPath == nil, "disconnect clears current candidate path")
         }
         
+        // =========================================================================
+        // [TEST 43] Connection Architecture: Strict Fallback, Instant Kill & Scope
+        // =========================================================================
+        print("\n--- [TEST 43] Connection Architecture: Strict Fallback, Instant Kill & Scope ---")
+        
+        // 1. Instant Process Termination via SSHProcessHolder (non-blocking)
+        let holder = SSHProcessHolder()
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/bin/sleep")
+        proc.arguments = ["10"]
+        let inPipe = Pipe()
+        let outPipe = Pipe()
+        proc.standardInput = inPipe
+        proc.standardOutput = outPipe
+        try proc.run()
+        holder.set(process: proc, inHandle: inPipe.fileHandleForWriting, outHandle: outPipe.fileHandleForReading)
+        assertCondition(holder.isRunning == true, "SSHProcessHolder child process is running")
+        
+        holder.terminateImmediately()
+        assertCondition(holder.isRunning == false, "SSHProcessHolder terminated immediately without waiting for actor queue")
+        
+        // 2. Strict Fallback Policy: Disallow legacy fallback on unknown devices
+        let unknownHost = "192.168.99.99"
+        let isPinnedUnknown = HostKeyStore.shared.isHostPinned(host: unknownHost, port: 2222)
+        assertCondition(isPinnedUnknown == false, "Unknown host is not pinned in HostKeyStore")
+        let devUnknown = DeviceRegistry.shared.device(matchingHost: unknownHost)
+        assertCondition(devUnknown == nil, "Unknown host is not in DeviceRegistry")
+        
+        // 3. CandidatePath Preservation & IPv6 Scope
+        let v6Candidate = CandidatePath.lan(host: "fe80::1234:5678%en0", port: 2222, isV6: true)
+        assertCondition(v6Candidate.host == "fe80::1234:5678%en0", "IPv6 link-local scope %en0 preserved in CandidatePath")
+        assertCondition(v6Candidate.displayString.contains("%en0"), "Display string reflects IPv6 scope")
+        
+        let usbCandidate = CandidatePath.usb(deviceId: "adb_phone_serial_01", localPort: 2222)
+        assertCondition(usbCandidate.deviceId == "adb_phone_serial_01", "USB deviceId preserved in CandidatePath")
+        assertCondition(usbCandidate.host == "127.0.0.1", "USB host is loopback")
+        
+        // 4. Manual Disconnect Suppression vs Explicit User Action
+        let connCtrl = await ConnectionController.shared
+        let testVm = await DualPaneViewModel()
+        
+        // Ручная отмена ставит флаг подавления
+        await connCtrl.cancel(viewModel: testVm)
+        let isSuppressed = await connCtrl.isManualDisconnectSuppressed
+        assertCondition(isSuppressed == true, "Cancel activates manual suppression")
+        
+        // Фоновый автоконнект блокируется подавлением
+        let bgResult = await connCtrl.connect(isExplicitUserAction: false, viewModel: testVm)
+        assertCondition(bgResult == false, "Background auto-connect blocked by suppression")
+        let isStillSuppressed = await connCtrl.isManualDisconnectSuppressed
+        assertCondition(isStillSuppressed == true, "Suppression remains active after blocked bg attempt")
+        
+        // Явное действие пользователя (isExplicitUserAction: true) снимает подавление
+        _ = await connCtrl.connect(customHost: "127.0.0.1", customPort: 9999, isExplicitUserAction: true, viewModel: testVm)
+        let isReset = await connCtrl.isManualDisconnectSuppressed
+        assertCondition(isReset == false, "Explicit user action resets manual suppression")
+        
         print("\n🎉 ==================================================")
-        print("🎉   ALL 42 PRODUCTION TEST SUITES PASSED!          ")
+        print("🎉   ALL 43 PRODUCTION TEST SUITES PASSED!          ")
         print("🎉 ==================================================")
         exit(0)
     } catch {

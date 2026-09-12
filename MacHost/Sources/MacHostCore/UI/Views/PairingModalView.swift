@@ -237,6 +237,7 @@ public struct PairingModalView: View {
                         let success = await ConnectionController.shared.connect(
                             customHost: inputHost,
                             customPort: UInt16(portInt),
+                            isExplicitUserAction: true,
                             viewModel: vm
                         )
                         

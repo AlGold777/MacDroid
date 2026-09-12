@@ -1227,14 +1227,26 @@ public final class DualPaneViewModel: ObservableObject {
     }
     
     /// Подключение к телефону: единое управление через ConnectionController (Слой 3)
-    public func connectPhone(forceActivate: Bool = true) {
+    public func connectPhone(
+        targetPath: CandidatePath? = nil,
+        customHost: String? = nil,
+        customPort: UInt16? = nil,
+        forceActivate: Bool = true,
+        isExplicit: Bool = true
+    ) {
         guard !isConnectingPhone else { return }
         isConnectingPhone = true
         statusMessage = "Поиск и подключение телефона..."
         
         Task { @MainActor in
             defer { self.isConnectingPhone = false }
-            let success = await ConnectionController.shared.connect(viewModel: self)
+            let success = await ConnectionController.shared.connect(
+                targetCandidate: targetPath,
+                customHost: customHost,
+                customPort: customPort,
+                isExplicitUserAction: isExplicit,
+                viewModel: self
+            )
             if success {
                 if forceActivate && self.rightSource != .remotePhone && self.leftSource != .remotePhone {
                     self.changeSource(to: .remotePhone, side: .right)
@@ -1273,33 +1285,35 @@ public final class DualPaneViewModel: ObservableObject {
         Task.detached(priority: .userInitiated) { [weak self] in
             guard let self = self else { return }
             // 1. Проверяем наличие USB-устройства через ADB и его политику autoConnect
-            var hasAdb = false
+            var chosenCandidate: CandidatePath? = nil
             if let adb = PhoneConnectionManager.shared.findAdbBinary() {
                 let (status, out) = PhoneConnectionManager.shared.runCommand(executable: adb, arguments: ["devices"])
                 if status == 0 && out.contains("\tdevice") {
                     let devId = PhoneConnectionManager.shared.getConnectedDeviceId()
-                    if let id = devId, let dev = DeviceRegistry.shared.device(withId: id) {
-                        hasAdb = dev.autoConnect
+                    if let id = devId, let dev = DeviceRegistry.shared.device(withId: id), dev.autoConnect {
+                        chosenCandidate = .usb(deviceId: id, localPort: 2222)
                     }
                 }
             }
             
             // 2. Если по USB не обнаружен, сканируем Wi-Fi для доверенных устройств с autoConnect == true
-            var hasWifi = false
-            if !hasAdb {
+            if chosenCandidate == nil {
                 if let foundIp = PhoneConnectionManager.shared.discoverPhoneIpOnLan() {
                     let dev = DeviceRegistry.shared.device(matchingHost: foundIp)
                     if dev?.autoConnect == true {
-                        hasWifi = true
+                        let isV6 = foundIp.contains(":")
+                        chosenCandidate = .lan(host: foundIp, port: 2222, isV6: isV6)
                     }
                 }
             }
             
-            let shouldConnect = hasAdb || hasWifi
+            let candidateToConnect = chosenCandidate
             await MainActor.run {
                 self.isAutoConnecting = false
-                if shouldConnect && !self.isConnectingPhone && !self.remoteDriver.isConnected {
-                    self.connectPhone(forceActivate: false)
+                // Важно: повторная проверка подавления прямо перед коннектом
+                guard !ConnectionController.shared.isManualDisconnectSuppressed else { return }
+                if let candidate = candidateToConnect, !self.isConnectingPhone && !self.remoteDriver.isConnected {
+                    self.connectPhone(targetPath: candidate, forceActivate: false, isExplicit: false)
                 }
             }
         }
