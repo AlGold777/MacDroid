@@ -37,7 +37,7 @@ class EmbeddedServer(
             // Применяем строгую проверку открытого ключа (Public Key Auth)
             passwordAuthenticator = null
 
-            publickeyAuthenticator = PublickeyAuthenticator { username, key: PublicKey, session ->
+            publickeyAuthenticator = PublickeyAuthenticator { _, key: PublicKey, session ->
                 val encodedKey = Base64.getEncoder().encodeToString(key.encoded)
                 if (!authorizedKeysFile.exists() || authorizedKeysFile.length() == 0L) {
                     // SEC-03 FIX: Проверка источника подключения для защиты от несанкционированного TOFU.
@@ -46,7 +46,7 @@ class EmbeddedServer(
                     val clientAddress = session.clientAddress
                     val isLoopback = (clientAddress as? java.net.InetSocketAddress)?.address?.isLoopbackAddress == true
                     if (isLoopback || isPairingModeActive) {
-                        authorizedKeysFile.writeText(encodedKey)
+                        authorizedKeysFile.writeText(encodedKey + "\n")
                         true
                     } else {
                         false
@@ -56,7 +56,26 @@ class EmbeddedServer(
                     val authorizedKeys = authorizedKeysFile.readLines()
                         .map { it.trim() }
                         .filter { it.isNotEmpty() }
-                    encodedKey in authorizedKeys
+                    
+                    if (encodedKey in authorizedKeys) {
+                        return@PublickeyAuthenticator true
+                    }
+                    
+                    // Поддержка строк в формате OpenSSH (ssh-ed25519 AAAAC3... или ssh-rsa ...)
+                    val matchesOpenSsh = authorizedKeys.any { line ->
+                        if (line.startsWith("ssh-")) {
+                            try {
+                                val entry = org.apache.sshd.common.config.keys.AuthorizedKeyEntry.parseAuthorizedKeyEntry(line)
+                                val resolved = entry?.resolvePublicKey(null, null, null)
+                                resolved != null && org.apache.sshd.common.config.keys.KeyUtils.compareKeys(key, resolved)
+                            } catch (_: Throwable) {
+                                false
+                            }
+                        } else {
+                            false
+                        }
+                    }
+                    return@PublickeyAuthenticator matchesOpenSsh
                 }
             }
 
@@ -64,7 +83,7 @@ class EmbeddedServer(
             val rootPath = Paths.get("/storage")
             fileSystemFactory = VirtualFileSystemFactory(rootPath)
 
-            // Обработка команд SSH exec (df, ping и служебные запросы MacHost)
+            // Обработка команд SSH exec (df, ping, authorize_key и служебные запросы MacHost)
             commandFactory = org.apache.sshd.server.command.CommandFactory { _, command ->
                 object : org.apache.sshd.server.command.Command {
                     private var outStream: java.io.OutputStream? = null
@@ -94,6 +113,31 @@ class EmbeddedServer(
                                 exitCallback?.onExit(0)
                             } catch (e: Exception) {
                                 outStream?.write("df error: ${e.message}\n".toByteArray(java.nio.charset.StandardCharsets.UTF_8))
+                                outStream?.flush()
+                                exitCallback?.onExit(1)
+                            }
+                        } else if (trimmed.startsWith("authorize_key ")) {
+                            val newKey = trimmed.substringAfter("authorize_key ").trim()
+                            if (newKey.isNotEmpty()) {
+                                try {
+                                    val currentKeys = if (authorizedKeysFile.exists()) {
+                                        authorizedKeysFile.readLines().map { it.trim() }.filter { it.isNotEmpty() }
+                                    } else {
+                                        emptyList()
+                                    }
+                                    if (!currentKeys.contains(newKey)) {
+                                        authorizedKeysFile.appendText(newKey + "\n")
+                                    }
+                                    outStream?.write("AUTHORIZED_OK\n".toByteArray(java.nio.charset.StandardCharsets.UTF_8))
+                                    outStream?.flush()
+                                    exitCallback?.onExit(0)
+                                } catch (e: Exception) {
+                                    outStream?.write("ERROR: ${e.message}\n".toByteArray(java.nio.charset.StandardCharsets.UTF_8))
+                                    outStream?.flush()
+                                    exitCallback?.onExit(1)
+                                }
+                            } else {
+                                outStream?.write("ERROR_EMPTY_KEY\n".toByteArray(java.nio.charset.StandardCharsets.UTF_8))
                                 outStream?.flush()
                                 exitCallback?.onExit(1)
                             }
