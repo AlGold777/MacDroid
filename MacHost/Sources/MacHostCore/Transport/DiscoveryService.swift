@@ -134,10 +134,8 @@ public final class DiscoveryService: ObservableObject {
     
     /// Настоящий Bonjour/mDNS резолвинг IP-адреса устройства из сетевого пакета
     private func resolveServiceEndpoint(_ endpoint: NWEndpoint, name: String, type: String, domain: String) {
+        // Разрешаем dual-stack (IPv4 и IPv6) без принудительного ограничения
         let params = NWParameters.tcp
-        if let ip = params.defaultProtocolStack.internetProtocol as? NWProtocolIP.Options {
-            ip.version = .v4
-        }
         let conn = NWConnection(to: endpoint, using: params)
         resolvingConnections.append(conn)
         
@@ -154,15 +152,16 @@ public final class DiscoveryService: ObservableObject {
                     case .ipv4(let ip4):
                         resolvedIp = "\(ip4)"
                     case .ipv6(let ip6):
-                        resolvedIp = "\(ip6)"
+                        // Для IPv6 link-local интерфейс (%en0) обязателен для BSD сокетов и OpenSSH
+                        if let iface = ip6.interface?.name, !resolvedIp.contains("%") {
+                            resolvedIp = "\(ip6)%\(iface)"
+                        } else {
+                            resolvedIp = "\(ip6)"
+                        }
                     case .name(let hostName, _):
                         resolvedIp = hostName
                     @unknown default:
                         break
-                    }
-                    // Удаляем технический суффикс интерфейса (например %en0)
-                    if let pct = resolvedIp.firstIndex(of: "%") {
-                        resolvedIp = String(resolvedIp[..<pct])
                     }
                     resolvedPort = Int(port.rawValue)
                 }
@@ -207,7 +206,7 @@ public final class DiscoveryService: ObservableObject {
             }
         }
         
-        conn.start(queue: .global(qos: .userInitiated))
+        conn.start(queue: DispatchQueue.global(qos: .userInitiated))
     }
     
     public func addManualDevice(name: String, host: String, port: Int) {

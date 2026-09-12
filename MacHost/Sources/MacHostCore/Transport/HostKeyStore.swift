@@ -59,6 +59,19 @@ public final class HostKeyStore: @unchecked Sendable {
         saveToDisk()
     }
     
+    public func isHostPinned(host: String, port: Int, deviceId: String? = nil) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        let effectiveDeviceId = deviceId ?? PhoneConnectionManager.shared.getConnectedDeviceId()
+        let key: String
+        if (host == "127.0.0.1" || host == "localhost"), let dev = effectiveDeviceId, !dev.isEmpty {
+            key = "usb_\(dev)"
+        } else {
+            key = "\(host):\(port)"
+        }
+        return pinnedKeys[key] != nil
+    }
+    
     private func loadFromDisk() {
         guard let data = try? Data(contentsOf: storageURL),
               let dict = try? JSONDecoder().decode([String: String].self, from: data) else { return }

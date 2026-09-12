@@ -12,14 +12,15 @@ public final class RemoteSFTPDriver: FileSystemDriver, @unchecked Sendable {
     
     public private(set) var isConnected: Bool = false
     public private(set) var lastSyncTimestamp: Double = 0
+    private var currentAllowLegacyFallback: Bool? = nil
     
-    public init(host: String = "127.0.0.1", port: UInt16 = 2222) {
+    public init(host: String = "127.0.0.1", port: UInt16 = 2222, deviceId: String? = nil) {
         self.host = host
         self.port = port
-        self.sshClient = SSHControlClient(host: host, port: port)
+        self.sshClient = SSHControlClient(host: host, port: port, deviceId: deviceId)
     }
     
-    public func updateEndpoint(host: String, port: UInt16) {
+    public func updateEndpoint(host: String, port: UInt16, deviceId: String? = nil) {
         lock.lock()
         defer { lock.unlock() }
         if self.host == host && self.port == port && self.isConnected {
@@ -27,9 +28,10 @@ public final class RemoteSFTPDriver: FileSystemDriver, @unchecked Sendable {
         }
         self.host = host
         self.port = port
-        self.sshClient = SSHControlClient(host: host, port: port)
+        self.sshClient = SSHControlClient(host: host, port: port, deviceId: deviceId)
         self.isSftpInitialized = false
         self.isConnected = false
+        self.currentAllowLegacyFallback = nil
         self.connectionTask = nil
     }
     
@@ -43,22 +45,27 @@ public final class RemoteSFTPDriver: FileSystemDriver, @unchecked Sendable {
     
     private var connectionTask: Task<Void, Error>?
     
-    private func ensureConnected(allowLegacyFallback: Bool = true) async throws {
-        if isSftpInitialized && isConnected {
+    private func ensureConnected(allowLegacyFallback: Bool? = nil) async throws {
+        let policy = allowLegacyFallback ?? currentAllowLegacyFallback ?? false
+        
+        lock.lock()
+        if isSftpInitialized && isConnected && currentAllowLegacyFallback == policy {
+            lock.unlock()
             return
         }
         
-        // Если уже выполняется подключение, дожидаемся существующего Task вместо повторной инициализации
         if let ongoing = connectionTask {
+            lock.unlock()
             try await ongoing.value
             return
         }
         
+        let client = self.sshClient
         let task = Task { () -> Void in
             do {
-                try await sshClient.connect(allowLegacyFallback: allowLegacyFallback)
-                let initPacket = packetEngine.createInitPacket()
-                let (respType, _) = try await sshClient.sendSFTPPacket(packet: initPacket)
+                try await client.connect(allowLegacyFallback: policy)
+                let initPacket = self.packetEngine.createInitPacket()
+                let (respType, _) = try await client.sendSFTPPacket(packet: initPacket)
                 guard respType == .version else {
                     throw NSError(
                         domain: "RemoteSFTPDriver",
@@ -66,44 +73,66 @@ public final class RemoteSFTPDriver: FileSystemDriver, @unchecked Sendable {
                         userInfo: [NSLocalizedDescriptionKey: "Unexpected SFTP init response: \(respType)"]
                     )
                 }
+                self.lock.lock()
                 self.isSftpInitialized = true
                 self.isConnected = true
+                self.currentAllowLegacyFallback = policy
+                self.lock.unlock()
                 
                 // Авто-определение структуры корня SFTP:
                 // Проверяем, существует ли /emulated/0 на сервере.
                 // Если нет — корень SFTP на смартфоне привязан напрямую к /storage/emulated/0
-                let statReqId = getNextRequestId()
-                let statPacket = packetEngine.createStatPacket(requestId: statReqId, path: "/emulated/0")
-                if let (statResp, _) = try? await sshClient.sendSFTPPacket(packet: statPacket) {
+                let statReqId = self.getNextRequestId()
+                let statPacket = self.packetEngine.createStatPacket(requestId: statReqId, path: "/emulated/0")
+                if let (statResp, _) = try? await client.sendSFTPPacket(packet: statPacket) {
                     self.rootIsEmulatedZero = (statResp != .attrs)
                 }
             } catch {
+                self.lock.lock()
                 self.isSftpInitialized = false
                 self.isConnected = false
+                self.currentAllowLegacyFallback = nil
+                self.lock.unlock()
                 throw error
             }
         }
         
         self.connectionTask = task
-        defer { self.connectionTask = nil }
+        self.lock.unlock()
+        
+        defer {
+            self.lock.lock()
+            self.connectionTask = nil
+            self.lock.unlock()
+        }
         try await task.value
     }
     
     /// Явная инициализация и проверка готовности SFTP-сессии
-    public func warmUpConnection(allowLegacyFallback: Bool = true) async throws {
+    public func warmUpConnection(allowLegacyFallback: Bool = false) async throws {
+        lock.lock()
+        let needsFresh = !isConnected || !isSftpInitialized || (currentAllowLegacyFallback != allowLegacyFallback)
+        lock.unlock()
+        
+        if needsFresh {
+            disconnect()
+        }
         try await ensureConnected(allowLegacyFallback: allowLegacyFallback)
     }
     
-    /// Сброс состояния соединения и активное завершение дочернего процесса OpenSSH
+    /// Сброс состояния соединения и немедленное завершение процесса OpenSSH
     public func disconnect() {
         lock.lock()
         isSftpInitialized = false
         isConnected = false
+        currentAllowLegacyFallback = nil
         connectionTask?.cancel()
         connectionTask = nil
         let client = sshClient
         lock.unlock()
         
+        // Синхронный и мгновенный разрыв процессов и каналов ввода-вывода
+        client.terminateImmediately()
         Task {
             await client.disconnect()
         }

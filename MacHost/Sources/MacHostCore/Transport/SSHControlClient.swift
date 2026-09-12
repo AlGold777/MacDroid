@@ -1,15 +1,87 @@
 import Foundation
 
-public actor SSHControlClient {
+public final class SSHProcessHolder: @unchecked Sendable {
+    private let lock = NSLock()
     private var process: Process?
     private var inHandle: FileHandle?
     private var outHandle: FileHandle?
+    
+    public init() {}
+    
+    public func set(process: Process, inHandle: FileHandle, outHandle: FileHandle) {
+        lock.lock()
+        defer { lock.unlock() }
+        self.process = process
+        self.inHandle = inHandle
+        self.outHandle = outHandle
+    }
+    
+    public func terminateImmediately() {
+        lock.lock()
+        defer { lock.unlock() }
+        if let proc = process, proc.isRunning {
+            proc.terminate()
+        }
+        process = nil
+        try? inHandle?.close()
+        try? outHandle?.close()
+        inHandle = nil
+        outHandle = nil
+    }
+    
+    public var isRunning: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return process?.isRunning == true
+    }
+    
+    public func writeData(_ data: Data) throws {
+        lock.lock()
+        guard let inH = inHandle, let proc = process, proc.isRunning else {
+            lock.unlock()
+            throw NSError(domain: "SSHControlClient", code: 1, userInfo: [NSLocalizedDescriptionKey: "Not connected to Android Daemon"])
+        }
+        let handle = inH
+        lock.unlock()
+        try handle.write(contentsOf: data)
+    }
+    
+    public func readExact(count: Int) throws -> Data {
+        var accumulated = Data()
+        accumulated.reserveCapacity(count)
+        while accumulated.count < count {
+            lock.lock()
+            guard let outH = outHandle, let proc = process, proc.isRunning else {
+                lock.unlock()
+                throw NSError(domain: "SSHControlClient", code: 1, userInfo: [NSLocalizedDescriptionKey: "Not connected to Android Daemon"])
+            }
+            let handle = outH
+            lock.unlock()
+            
+            let needed = count - accumulated.count
+            guard let chunk = try handle.read(upToCount: needed), !chunk.isEmpty else {
+                throw NSError(domain: "SSHControlClient", code: 3, userInfo: [NSLocalizedDescriptionKey: "SFTP connection closed prematurely"])
+            }
+            accumulated.append(chunk)
+        }
+        return accumulated
+    }
+}
+
+public actor SSHControlClient {
+    public let processHolder = SSHProcessHolder()
     private let host: String
     private let port: UInt16
+    private let deviceId: String?
     
-    public init(host: String = "127.0.0.1", port: UInt16 = 2222) {
+    public init(host: String = "127.0.0.1", port: UInt16 = 2222, deviceId: String? = nil) {
         self.host = host
         self.port = port
+        self.deviceId = deviceId
+    }
+    
+    public nonisolated func terminateImmediately() {
+        processHolder.terminateImmediately()
     }
     
     public func connect(allowLegacyFallback: Bool = true) async throws {
@@ -76,11 +148,15 @@ public actor SSHControlClient {
         
         if isLoopback {
             // Для USB (локальный ADB туннель через loopback 127.0.0.1):
-            // MITM исключен на аппаратном уровне ядра macOS (lo0). Отключаем коллизии host key при смене смартфонов
+            // Каждое USB-устройство имеет свой изолированный known_hosts файл с обязательной верификацией:
+            let devTag = deviceId ?? PhoneConnectionManager.shared.getConnectedDeviceId() ?? "usb_default"
+            let usbKnownHostsURL = sshDir.appendingPathComponent("macdroid_known_hosts_\(devTag)")
+            if !FileManager.default.fileExists(atPath: usbKnownHostsURL.path) {
+                FileManager.default.createFile(atPath: usbKnownHostsURL.path, contents: Data())
+            }
             sshArgs.append(contentsOf: [
-                "-o", "StrictHostKeyChecking=no",
-                "-o", "UserKnownHostsFile=/dev/null",
-                "-o", "LogLevel=ERROR"
+                "-o", "StrictHostKeyChecking=accept-new",
+                "-o", "UserKnownHostsFile=\(usbKnownHostsURL.path)"
             ])
         } else {
             // Для Wi-Fi: строгая криптографическая проверка открытого ключа сервера с фиксацией в known_hosts
@@ -105,38 +181,33 @@ public actor SSHControlClient {
         proc.standardError = FileHandle.nullDevice
         
         try proc.run()
-        self.process = proc
-        self.inHandle = inPipe.fileHandleForWriting
-        self.outHandle = outPipe.fileHandleForReading
+        processHolder.set(
+            process: proc,
+            inHandle: inPipe.fileHandleForWriting,
+            outHandle: outPipe.fileHandleForReading
+        )
     }
     
     /// Запись сырого SFTP пакета в канал без ожидания ответа (для поддержки Pipelining / Sliding Window)
     public func writeRawPacket(packet: Data) throws {
-        guard let inH = inHandle, let proc = process, proc.isRunning else {
-            throw NSError(domain: "SSHControlClient", code: 1, userInfo: [NSLocalizedDescriptionKey: "Not connected to Android Daemon"])
-        }
-        try inH.write(contentsOf: packet)
+        try processHolder.writeData(packet)
     }
     
     /// Чтение очередного SFTP ответа из выходного потока
     public func readRawResponse() throws -> (type: SFTPMessageType, payload: Data) {
-        guard let outH = outHandle, let proc = process, proc.isRunning else {
-            throw NSError(domain: "SSHControlClient", code: 1, userInfo: [NSLocalizedDescriptionKey: "Not connected to Android Daemon"])
-        }
-        
-        let lenData = try readExact(handle: outH, count: 4)
+        let lenData = try processHolder.readExact(count: 4)
         let packetLength = Int(lenData.withUnsafeBytes { $0.load(as: UInt32.self).bigEndian })
         guard packetLength >= 1 else {
             throw NSError(domain: "SSHControlClient", code: 4, userInfo: [NSLocalizedDescriptionKey: "Invalid SFTP packet length (\(packetLength))"])
         }
         
-        let typeData = try readExact(handle: outH, count: 1)
+        let typeData = try processHolder.readExact(count: 1)
         guard let msgType = SFTPMessageType(rawValue: typeData[0]) else {
             throw NSError(domain: "SSHControlClient", code: 5, userInfo: [NSLocalizedDescriptionKey: "Unknown SFTP message type (\(typeData[0]))"])
         }
         
         let payloadLen = packetLength - 1
-        let payload = payloadLen > 0 ? try readExact(handle: outH, count: payloadLen) : Data()
+        let payload = payloadLen > 0 ? try processHolder.readExact(count: payloadLen) : Data()
         return (msgType, payload)
     }
     
@@ -149,27 +220,7 @@ public actor SSHControlClient {
         return ["status": "ok"]
     }
     
-    private func readExact(handle: FileHandle, count: Int) throws -> Data {
-        var accumulated = Data()
-        accumulated.reserveCapacity(count)
-        while accumulated.count < count {
-            let needed = count - accumulated.count
-            guard let chunk = try handle.read(upToCount: needed), !chunk.isEmpty else {
-                throw NSError(domain: "SSHControlClient", code: 3, userInfo: [NSLocalizedDescriptionKey: "SFTP connection closed prematurely"])
-            }
-            accumulated.append(chunk)
-        }
-        return accumulated
-    }
-    
     public func disconnect() {
-        if let proc = process, proc.isRunning {
-            proc.terminate()
-        }
-        process = nil
-        try? inHandle?.close()
-        try? outHandle?.close()
-        inHandle = nil
-        outHandle = nil
+        processHolder.terminateImmediately()
     }
 }
