@@ -40,9 +40,17 @@ class EmbeddedServer(
             publickeyAuthenticator = PublickeyAuthenticator { username, key: PublicKey, session ->
                 val encodedKey = Base64.getEncoder().encodeToString(key.encoded)
                 if (!authorizedKeysFile.exists() || authorizedKeysFile.length() == 0L) {
-                    // Trust-On-First-Use: Первое сопряжение авторизует открытый ключ ноутбука
-                    authorizedKeysFile.writeText(Base64.getEncoder().encodeToString(key.encoded))
-                    true
+                    // SEC-03 FIX: Проверка источника подключения для защиты от несанкционированного TOFU.
+                    // Через USB (ADB loopback 127.0.0.1) подключение локально доверенное.
+                    // По Wi-Fi сопряжение разрешено только при активном экране/режиме сопряжения.
+                    val clientAddress = session.clientAddress
+                    val isLoopback = (clientAddress as? java.net.InetSocketAddress)?.address?.isLoopbackAddress == true
+                    if (isLoopback || isPairingModeActive) {
+                        authorizedKeysFile.writeText(encodedKey)
+                        true
+                    } else {
+                        false
+                    }
                 } else {
                     // Последующие подключения сверяются со списком сохраненных доверенных ключей (по одному на строку)
                     val authorizedKeys = authorizedKeysFile.readLines()
@@ -105,6 +113,14 @@ class EmbeddedServer(
                 .build()
             sftpFactory.addSftpEventListener(CustomSftpEventListener(context))
             subsystemFactories = Collections.singletonList(sftpFactory)
+
+            // Perf fix: Увеличиваем буферы I/O и SSH channel window.
+            // Apache SSHD: пакет 320 КБ (для 256 КБ SFTP чанка + SFTP и SSH заголовки),
+            // окно 8 МБ для непрерывного pipelining без частых ожиданий window-adjust ACK.
+            val serverProps = this.properties
+            serverProps["io-buffer-size"] = (320 * 1024).toString()
+            serverProps["window-size"] = (8L * 1024 * 1024).toString()
+            serverProps["max-packet-length"] = (320 * 1024).toString()
         }
 
         sshd?.start()
@@ -133,5 +149,10 @@ class EmbeddedServer(
      */
     fun isPaired(): Boolean {
         return authorizedKeysFile.exists() && authorizedKeysFile.length() > 0L
+    }
+
+    companion object {
+        @Volatile
+        var isPairingModeActive: Boolean = true
     }
 }

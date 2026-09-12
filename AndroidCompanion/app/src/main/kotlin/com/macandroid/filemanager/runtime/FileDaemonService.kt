@@ -12,6 +12,10 @@ import android.os.PowerManager
 import androidx.core.app.NotificationCompat
 import com.macandroid.filemanager.server.EmbeddedServer
 import com.macandroid.filemanager.ui.MainActivity
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
 
 class FileDaemonService : Service() {
     private var wakeLock: PowerManager.WakeLock? = null
@@ -72,16 +76,18 @@ class FileDaemonService : Service() {
             startForeground(1001, notification)
         }
 
-        // Запуск SSHD сервера и mDNS публикации
-        server = EmbeddedServer(this, port = 2222)
-        server?.start()
-
         val wm = applicationContext.getSystemService(WIFI_SERVICE) as? android.net.wifi.WifiManager
         wifiLock = wm?.createWifiLock(android.net.wifi.WifiManager.WIFI_MODE_FULL_HIGH_PERF, "MacDroid::WifiLock")
         wifiLock?.acquire()
 
-        discoveryHelper = NsdDiscoveryHelper(this)
-        discoveryHelper?.registerService(2222)
+        // Оптимизация: фоновый запуск SSHD сервера и mDNS публикации для исключения ANR/фризов UI потока
+        CoroutineScope(SupervisorJob() + Dispatchers.IO).launch {
+            server = EmbeddedServer(this@FileDaemonService, port = 2222)
+            server?.start()
+
+            discoveryHelper = NsdDiscoveryHelper(this@FileDaemonService)
+            discoveryHelper?.registerService(2222)
+        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -121,6 +127,15 @@ class FileDaemonService : Service() {
             if (it.isHeld) it.release()
         }
         super.onDestroy()
+    }
+
+    override fun onTimeout(startId: Int) {
+        super.onTimeout(startId)
+        // SYS-02 FIX: Корректная обработка 6-часового лимита dataSync на Android 14+ (API 34)
+        try {
+            stopForeground(STOP_FOREGROUND_REMOVE)
+        } catch (ignored: Exception) {}
+        stopSelf(startId)
     }
 
     override fun onBind(intent: Intent?): IBinder? = null

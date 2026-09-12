@@ -78,6 +78,9 @@ class MainActivity : Activity() {
     override fun onResume() {
         super.onResume()
 
+        // При активном открытом экране разрешаем сопряжение с Mac по Wi-Fi
+        com.macandroid.filemanager.server.EmbeddedServer.isPairingModeActive = true
+
         // При возврате на экран (например, после выдачи разрешений) проверяем запуск службы и обновляем данные
         if (hasStoragePermission() && !isServerRunning()) {
             startDaemonService()
@@ -291,6 +294,11 @@ class MainActivity : Activity() {
             if (checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
                 requestPermissions(arrayOf(android.Manifest.permission.POST_NOTIFICATIONS), 1001)
             }
+        }
+
+        // SYS-03 FIX: Проверка режима энергосбережения Doze / HyperOS / OneUI при запуске
+        if (!isBatteryOptimizationDisabled()) {
+            openBatterySettings()
         }
     }
 

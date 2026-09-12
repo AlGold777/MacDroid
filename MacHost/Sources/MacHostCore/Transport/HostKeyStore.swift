@@ -20,11 +20,18 @@ public final class HostKeyStore: @unchecked Sendable {
         loadFromDisk()
     }
     
-    public func verifyOrPin(host: String, port: Int, fingerprint: String) -> HostKeyStatus {
+    public func verifyOrPin(host: String, port: Int, deviceId: String? = nil, fingerprint: String) -> HostKeyStatus {
         lock.lock()
         defer { lock.unlock() }
         
-        let key = "\(host):\(port)"
+        let effectiveDeviceId = deviceId ?? PhoneConnectionManager.shared.getConnectedDeviceId()
+        let key: String
+        if (host == "127.0.0.1" || host == "localhost"), let dev = effectiveDeviceId, !dev.isEmpty {
+            key = "usb_\(dev)"
+        } else {
+            key = "\(host):\(port)"
+        }
+        
         if let existing = pinnedKeys[key] {
             if existing == fingerprint {
                 return .trusted
@@ -38,10 +45,17 @@ public final class HostKeyStore: @unchecked Sendable {
         }
     }
     
-    public func unpin(host: String, port: Int) {
+    public func unpin(host: String, port: Int, deviceId: String? = nil) {
         lock.lock()
         defer { lock.unlock() }
-        pinnedKeys.removeValue(forKey: "\(host):\(port)")
+        let effectiveDeviceId = deviceId ?? PhoneConnectionManager.shared.getConnectedDeviceId()
+        let key: String
+        if (host == "127.0.0.1" || host == "localhost"), let dev = effectiveDeviceId, !dev.isEmpty {
+            key = "usb_\(dev)"
+        } else {
+            key = "\(host):\(port)"
+        }
+        pinnedKeys.removeValue(forKey: key)
         saveToDisk()
     }
     
