@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 
 public final class QuickLookCacheManager: @unchecked Sendable {
     public static let shared = QuickLookCacheManager()
@@ -6,6 +7,9 @@ public final class QuickLookCacheManager: @unchecked Sendable {
     private let fileManager = FileManager.default
     public let cacheDir: URL
     public var maxDiskBytes: UInt64 = 1024 * 1024 * 1024 // 1 GB LRU Limit
+    
+    private var inFlightTasks: [URL: Task<URL, Error>] = [:]
+    private let lock = NSLock()
     
     public init(customCacheDir: URL? = nil) {
         if let customDir = customCacheDir {
@@ -20,14 +24,19 @@ public final class QuickLookCacheManager: @unchecked Sendable {
     public func cacheURL(for item: FileItem) -> URL {
         let ext = URL(fileURLWithPath: item.name).pathExtension
         let baseName = URL(fileURLWithPath: item.name).deletingPathExtension().lastPathComponent
-        let pathHash = abs(item.path.hashValue)
+        // Оптимизация P2: Включаем deviceId, path, size и mtime в ключ кэша.
+        // Это предотвращает коллизии разных телефонов и возврат устаревших данных при изменении файла
+        let deviceId = PhoneConnectionManager.shared.getConnectedDeviceId() ?? "phone"
+        let keyData = Data("\(deviceId):\(item.path):\(item.size):\(Int64(item.mtime))".utf8)
+        let pathHash = SHA256.hash(data: keyData)
+            .prefix(8).map { String(format: "%02x", $0) }.joined()
         let safeBase = baseName.addingPercentEncoding(withAllowedCharacters: .alphanumerics) ?? "preview"
         
         let filename: String
         if ext.isEmpty {
-            filename = "\(safeBase)_\(pathHash)_\(item.size)"
+            filename = "\(safeBase)_\(pathHash)_\(item.size)_\(Int64(item.mtime))"
         } else {
-            filename = "\(safeBase)_\(pathHash)_\(item.size).\(ext)"
+            filename = "\(safeBase)_\(pathHash)_\(item.size)_\(Int64(item.mtime)).\(ext)"
         }
         return cacheDir.appendingPathComponent(filename)
     }
@@ -57,22 +66,40 @@ public final class QuickLookCacheManager: @unchecked Sendable {
         }
         
         let targetURL = cacheURL(for: item)
-        let partURL = targetURL.appendingPathExtension("part")
         
-        try? fileManager.removeItem(at: partURL)
-        try? fileManager.removeItem(at: targetURL)
-        
-        do {
-            try await downloader(item.path, partURL, item.size, onProgress)
-            
-            // Атомарное перемещение из .part в целевой файл кэша
-            try fileManager.moveItem(at: partURL, to: targetURL)
-            cleanupDiskIfNeeded()
-            return targetURL
-        } catch {
-            try? fileManager.removeItem(at: partURL)
-            throw error
+        // Оптимизация P2: Дедупликация конкурентных запросов одного и того же файла
+        lock.lock()
+        if let existingTask = inFlightTasks[targetURL] {
+            lock.unlock()
+            return try await existingTask.value
         }
+        
+        let task = Task<URL, Error> { [weak self] () -> URL in
+            guard let self = self else { throw CancellationError() }
+            let partURL = targetURL.appendingPathExtension("part")
+            try? self.fileManager.removeItem(at: partURL)
+            try? self.fileManager.removeItem(at: targetURL)
+            
+            do {
+                try await downloader(item.path, partURL, item.size, onProgress)
+                try self.fileManager.moveItem(at: partURL, to: targetURL)
+                self.cleanupDiskIfNeeded()
+                return targetURL
+            } catch {
+                try? self.fileManager.removeItem(at: partURL)
+                throw error
+            }
+        }
+        inFlightTasks[targetURL] = task
+        lock.unlock()
+        
+        defer {
+            lock.lock()
+            inFlightTasks.removeValue(forKey: targetURL)
+            lock.unlock()
+        }
+        
+        return try await task.value
     }
     
     public func fetchFile(

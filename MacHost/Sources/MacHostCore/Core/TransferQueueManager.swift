@@ -54,6 +54,11 @@ public final class TransferQueueManager: ObservableObject {
     public static let shared = TransferQueueManager()
     
     @Published public var tasks: [TransferTask] = []
+    // O(1) индексация задач по UUID вместо O(N) линейного поиска
+    private var taskIndex: [UUID: Int] = [:]
+    // Троттлинг обновлений прогресса (макс. 15 Гц)
+    private var lastProgressUpdate: [UUID: CFAbsoluteTime] = [:]
+    private let progressThrottleInterval: CFAbsoluteTime = 1.0 / 15.0  // ~67ms
     @Published public var isProcessing: Bool = false
     @Published public var isGlobalPaused: Bool = false
     @Published public private(set) var cancelledTaskIds: Set<UUID> = []
@@ -64,6 +69,27 @@ public final class TransferQueueManager: ObservableObject {
     public var onGlobalCancel: (@MainActor () -> Void)?
     
     public init() {}
+    
+    /// Пересоздаёт индекс O(1) lookup после структурных изменений массива tasks
+    private func rebuildIndex() {
+        taskIndex.removeAll(keepingCapacity: true)
+        for (idx, task) in tasks.enumerated() {
+            taskIndex[task.id] = idx
+        }
+    }
+    
+    /// O(1) поиск индекса задачи по UUID
+    private func indexOf(_ id: UUID) -> Int? {
+        guard let idx = taskIndex[id], idx < tasks.count, tasks[idx].id == id else {
+            // Фоллбэк на линейный поиск при рассинхронизации
+            if let found = tasks.firstIndex(where: { $0.id == id }) {
+                taskIndex[id] = found
+                return found
+            }
+            return nil
+        }
+        return idx
+    }
     
     public func isTaskCancelled(id: UUID) -> Bool {
         return cancelledTaskIds.contains(id)
@@ -77,12 +103,13 @@ public final class TransferQueueManager: ObservableObject {
             isMove: isMove,
             totalBytes: source.size
         )
+        taskIndex[task.id] = tasks.count
         tasks.append(task)
         return task.id
     }
     
     public func pauseTask(id: UUID) {
-        if let idx = tasks.firstIndex(where: { $0.id == id }) {
+        if let idx = indexOf(id) {
             tasks[idx].status = .paused
             tasks[idx].speed = 0
             tasks[idx].eta = nil
@@ -91,7 +118,7 @@ public final class TransferQueueManager: ObservableObject {
     }
     
     public func resumeTask(id: UUID) {
-        if let idx = tasks.firstIndex(where: { $0.id == id }) {
+        if let idx = indexOf(id) {
             tasks[idx].status = .queued
             onTaskResumed?(id)
         }
@@ -99,7 +126,7 @@ public final class TransferQueueManager: ObservableObject {
     
     public func cancelTask(id: UUID) {
         cancelledTaskIds.insert(id)
-        if let idx = tasks.firstIndex(where: { $0.id == id }) {
+        if let idx = indexOf(id) {
             tasks[idx].status = .cancelled
             tasks[idx].speed = 0
             tasks[idx].eta = nil
@@ -146,15 +173,25 @@ public final class TransferQueueManager: ObservableObject {
         speed: Double = 0.0,
         eta: TimeInterval? = nil
     ) {
-        if let idx = tasks.firstIndex(where: { $0.id == id }) {
+        // Троттлинг: обновляем UI не чаще 15 раз/сек (вместо ~400 раз/сек)
+        let now = CFAbsoluteTimeGetCurrent()
+        let isCompletion = progress >= 1.0
+        if !isCompletion, let lastUpdate = lastProgressUpdate[id],
+           now - lastUpdate < progressThrottleInterval {
+            return
+        }
+        lastProgressUpdate[id] = now
+        
+        if let idx = indexOf(id) {
             tasks[idx].progress = progress
             tasks[idx].bytesTransferred = bytesTransferred
             tasks[idx].speed = speed
             tasks[idx].eta = eta
-            if progress >= 1.0 {
+            if isCompletion {
                 tasks[idx].status = .completed
                 tasks[idx].speed = 0
                 tasks[idx].eta = nil
+                lastProgressUpdate.removeValue(forKey: id)
             } else if tasks[idx].status == .queued {
                 tasks[idx].status = .running
             }
@@ -162,7 +199,7 @@ public final class TransferQueueManager: ObservableObject {
     }
     
     public func markFailed(id: UUID, error: String) {
-        if let idx = tasks.firstIndex(where: { $0.id == id }) {
+        if let idx = indexOf(id) {
             tasks[idx].status = .failed
             tasks[idx].errorMessage = error
             tasks[idx].speed = 0
@@ -174,8 +211,10 @@ public final class TransferQueueManager: ObservableObject {
         let toRemove = tasks.filter { $0.status == .completed || $0.status == .cancelled }.map(\.id)
         for id in toRemove {
             cancelledTaskIds.remove(id)
+            lastProgressUpdate.removeValue(forKey: id)
         }
         tasks.removeAll(where: { $0.status == .completed || $0.status == .cancelled })
+        rebuildIndex()
     }
     
     @discardableResult

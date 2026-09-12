@@ -4,7 +4,10 @@ import android.content.Context
 import android.content.Intent
 import com.macandroid.filemanager.runtime.FileDaemonService
 import com.macandroid.filemanager.storage.StorageGateway
-import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
 import org.apache.sshd.server.session.ServerSession
 import org.apache.sshd.sftp.server.AbstractSftpEventListenerAdapter
 import org.apache.sshd.sftp.server.FileHandle
@@ -18,6 +21,10 @@ class CustomSftpEventListener(
 ) : AbstractSftpEventListenerAdapter() {
 
     private val activeSessions = AtomicInteger(0)
+
+    // Асинхронный scope для операций StorageGateway (SQLite + MediaScanner)
+    // вместо runBlocking, который блокировал SSH-воркер
+    private val ioScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     private fun setSyncActive(active: Boolean) {
         try {
@@ -45,6 +52,8 @@ class CustomSftpEventListener(
         }
     }
 
+    private var lastWakeLockPing: Long = 0
+
     override fun writing(
         session: ServerSession,
         remoteHandle: String,
@@ -54,8 +63,12 @@ class CustomSftpEventListener(
         dataOffset: Int,
         dataLen: Int
     ) {
-        // Подтверждение активности при передаче байтов
-        setSyncActive(true)
+        // Продлеваем WakeLock во время активной передачи не чаще раза в 30 секунд (предотвращает засыпание при долгих передачах без IPC флуда)
+        val now = System.currentTimeMillis()
+        if (now - lastWakeLockPing > 30_000L) {
+            lastWakeLockPing = now
+            setSyncActive(true)
+        }
     }
 
     override fun reading(
@@ -67,37 +80,63 @@ class CustomSftpEventListener(
         dataOffset: Int,
         dataLen: Int
     ) {
-        // Подтверждение активности при чтении
-        setSyncActive(true)
+        val now = System.currentTimeMillis()
+        if (now - lastWakeLockPing > 30_000L) {
+            lastWakeLockPing = now
+            setSyncActive(true)
+        }
     }
 
-    override fun moving(session: ServerSession, src: Path, dst: Path, opts: Collection<java.nio.file.CopyOption>) {
-        val srcFile = src.toFile()
-        val dstFile = dst.toFile()
+    override fun moved(
+        session: ServerSession,
+        src: Path,
+        dst: Path,
+        opts: Collection<java.nio.file.CopyOption>,
+        thrown: Throwable?
+    ) {
+        if (thrown == null) {
+            val srcFile = src.toFile()
+            val dstFile = dst.toFile()
 
-        // Перехват атомарного переименования временного файла .part в целевое имя
-        if (srcFile.name.contains(".part.")) {
-            val actionId = srcFile.name.substringAfter(".part.")
-            runBlocking {
-                storageGateway.commitFileAtomic(
-                    actionId = actionId,
-                    requestHash = "sftp_rename_$actionId",
-                    tempPartFile = srcFile,
-                    finalTargetFile = dstFile
-                )
+            // Перехват успешного переименования временного файла (.part или .mcdpart от MacHost) в целевое имя
+            val isPart = srcFile.name.contains(".part.") || srcFile.name.endsWith(".mcdpart") || srcFile.name.contains(".mcdpart")
+            if (isPart) {
+                val actionId = if (srcFile.name.contains(".part.")) {
+                    srcFile.name.substringAfter(".part.")
+                } else {
+                    srcFile.name.removePrefix(".").substringBeforeLast(".mcdpart")
+                }
+                // Perf fix: асинхронный launch вместо runBlocking,
+                // чтобы не блокировать SSH-воркер на время SQLite + MediaScanner
+                ioScope.launch {
+                    storageGateway.recordCommit(
+                        actionId = actionId,
+                        requestHash = "sftp_rename_$actionId",
+                        sourcePath = srcFile.absolutePath,
+                        finalTargetFile = dstFile
+                    )
+                }
             }
         }
     }
 
-    override fun removing(session: ServerSession, path: Path, isDirectory: Boolean) {
-        val file = path.toFile()
-        val actionId = "del_${file.name}_${System.currentTimeMillis()}"
-        runBlocking {
-            storageGateway.deleteFileVerified(
-                actionId = actionId,
-                requestHash = "sftp_remove_${file.name}",
-                fileToDelete = file
-            )
+    override fun removed(
+        session: ServerSession,
+        path: Path,
+        isDirectory: Boolean,
+        thrown: Throwable?
+    ) {
+        if (thrown == null) {
+            val file = path.toFile()
+            val actionId = "del_${file.name}_${System.currentTimeMillis()}"
+            // Perf fix: асинхронный launch вместо runBlocking
+            ioScope.launch {
+                storageGateway.recordDeletion(
+                    actionId = actionId,
+                    requestHash = "sftp_remove_${file.name}",
+                    deletedFile = file
+                )
+            }
         }
     }
 }

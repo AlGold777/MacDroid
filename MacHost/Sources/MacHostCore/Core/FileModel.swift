@@ -1,8 +1,8 @@
 import Foundation
 
 public enum FileSource: String, CaseIterable, Identifiable, Sendable, Codable {
-    case localMac = "MacBook"
-    case remotePhone = "Xiaomi 14"
+    case localMac = "Mac"
+    case remotePhone = "Phone"
     
     public var id: String { self.rawValue }
     
@@ -13,9 +13,9 @@ public enum FileSource: String, CaseIterable, Identifiable, Sendable, Codable {
     public init(from decoder: Decoder) throws {
         let container = try decoder.singleValueContainer()
         let raw = try container.decode(String.self)
-        if raw == "MacBook (Локально)" || raw == "MacBook" || raw == "localMac" {
+        if raw == "MacBook (Локально)" || raw == "MacBook" || raw == "Mac" || raw == "localMac" {
             self = .localMac
-        } else if raw == "Xiaomi 14 Ultra (Wi-Fi/SFTP)" || raw == "Xiaomi 14" || raw == "remotePhone" {
+        } else if raw == "Xiaomi 14 Ultra (Wi-Fi/SFTP)" || raw == "Xiaomi 14" || raw == "Phone" || raw == "remotePhone" {
             self = .remotePhone
         } else if let s = FileSource(rawValue: raw) {
             self = s
@@ -45,8 +45,9 @@ public struct FileItem: Identifiable, Hashable, Sendable, Codable {
     ) {
         self.id = id
         // Гарантируем каноническую нормализацию Unicode (NFC)
-        self.name = name.precomposedStringWithCanonicalMapping
-        self.path = path.precomposedStringWithCanonicalMapping
+        // Оптимизация: пропускаем NFC для чистых ASCII-строк
+        self.name = name.utf8.allSatisfy({ $0 < 128 }) ? name : name.precomposedStringWithCanonicalMapping
+        self.path = path.utf8.allSatisfy({ $0 < 128 }) ? path : path.precomposedStringWithCanonicalMapping
         self.size = size
         self.mtime = mtime
         self.isDirectory = isDirectory
