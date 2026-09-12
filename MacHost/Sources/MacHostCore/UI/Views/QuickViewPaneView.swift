@@ -134,7 +134,7 @@ public struct QuickViewPaneView: View {
                     Text(ByteCountFormatter.string(fromByteCount: Int64(item.size), countStyle: .file))
                         .font(.system(size: 11, design: .monospaced))
                         .foregroundColor(.secondary)
-                    Text(item.source == .localMac ? "MacBook" : "Xiaomi 14 Ultra")
+                    Text(item.source == .localMac ? "Mac" : "Phone")
                         .font(.system(size: 10, weight: .medium))
                         .foregroundColor(.accentColor)
                 }

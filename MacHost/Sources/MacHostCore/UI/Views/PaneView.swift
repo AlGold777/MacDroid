@@ -117,13 +117,19 @@ public struct PaneView: View {
             // Вкладки панели (Tabs)
             HStack(spacing: 3) {
                 // Навигация: ↑ , ←, → слева от первой tab
+                let navArrowColor = Color(nsColor: NSColor(name: nil) { appearance in
+                    appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+                        ? NSColor(white: 0.85, alpha: 0.7)
+                        : NSColor(red: 28/255.0, green: 26/255.0, blue: 26/255.0, alpha: 0.7)
+                })
+                
                 Button(action: {
                     if vm.activePane != side { vm.activePane = side }
                     vm.navigateUp(side: side)
                 }) {
-                    Image(systemName: "arrow.up")
-                        .font(.system(size: 12, weight: .semibold))
-                        .foregroundColor(.primary)
+                    Image(systemName: "chevron.up")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundColor(navArrowColor)
                         .frame(width: 22, height: 22)
                 }
                 .buttonStyle(.plain)
@@ -133,9 +139,9 @@ public struct PaneView: View {
                     if vm.activePane != side { vm.activePane = side }
                     vm.navigateBack(side: side)
                 }) {
-                    Image(systemName: "arrow.left")
-                        .font(.system(size: 12, weight: .semibold))
-                        .foregroundColor(vm.canNavigateBack(side: side) ? .primary : .secondary.opacity(0.35))
+                    Image(systemName: "chevron.left")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundColor(vm.canNavigateBack(side: side) ? navArrowColor : navArrowColor.opacity(0.3))
                         .frame(width: 22, height: 22)
                 }
                 .buttonStyle(.plain)
@@ -146,27 +152,17 @@ public struct PaneView: View {
                     if vm.activePane != side { vm.activePane = side }
                     vm.navigateForward(side: side)
                 }) {
-                    Image(systemName: "arrow.right")
-                        .font(.system(size: 12, weight: .semibold))
-                        .foregroundColor(vm.canNavigateForward(side: side) ? .primary : .secondary.opacity(0.35))
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundColor(vm.canNavigateForward(side: side) ? navArrowColor : navArrowColor.opacity(0.3))
                         .frame(width: 22, height: 22)
                 }
                 .buttonStyle(.plain)
                 .disabled(!vm.canNavigateForward(side: side))
                 .help("Вперёд (Cmd+])")
                 
-                Divider()
-                    .frame(height: 14)
-                    .padding(.horizontal, 2)
-                
                 ForEach(tabs) { tab in
                     HStack(spacing: 4) {
-                        if tab.isPinned {
-                            Image(systemName: "pin.fill")
-                                .font(.system(size: 9))
-                                .foregroundColor(.orange)
-                        }
-                        
                         if editingTabId == tab.id {
                             TextField("", text: $editingTabTitle, onCommit: {
                                 commitTabRename(tab: tab)
@@ -187,8 +183,16 @@ public struct PaneView: View {
                             .buttonStyle(.plain)
                         } else {
                             Text(tab.title)
-                                .font(.system(size: 13, weight: tab.id == activeTabId ? .bold : .regular))
+                                .font(.system(size: 13, weight: .regular))
                                 .lineLimit(1)
+                        }
+                        
+                        if tab.isPinned {
+                            Image(systemName: "pin.fill")
+                                .font(.system(size: 6.3))
+                                .foregroundColor(.secondary)
+                                .rotationEffect(.degrees(30))
+                                .offset(x: 1.5, y: -1.5)
                         }
                         
                         if !tab.isPinned && tabs.count > 1 && editingTabId != tab.id {
@@ -252,6 +256,22 @@ public struct PaneView: View {
                 .buttonStyle(.plain)
                 
                 Spacer()
+                
+                // Переключатель режима отображения: Сетка (галерея) / Список (таблица)
+                let currentMode = (side == .left ? vm.leftViewMode : vm.rightViewMode)
+                Button(action: {
+                    if vm.activePane != side { vm.activePane = side }
+                    vm.toggleViewMode(for: side)
+                }) {
+                    Image(systemName: currentMode == .table ? "square.grid.2x2" : "line.3.horizontal")
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundColor(currentMode == .grid ? .accentColor : .secondary)
+                        .padding(4)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .help(currentMode == .table ? "Включить режим сетки (просмотрщик) [Cmd+2]" : "Включить режим списка (таблица) [Cmd+1]")
+                .keyboardShortcut(currentMode == .table ? KeyEquivalent("2") : KeyEquivalent("1"), modifiers: .command)
             }
             .padding(.horizontal, 6)
             .padding(.top, 4)
@@ -261,58 +281,108 @@ public struct PaneView: View {
             
             // Заголовок панели: выбор источника (диска), путь (хлебные крошки), фильтр
             HStack(spacing: 6) {
-                // 1. Выбор источника (диска)
-                Menu {
-                    ForEach(FileSource.allCases) { src in
-                        Button(action: {
-                            vm.changeSource(to: src, side: side)
-                        }) {
-                            HStack {
-                                Text(src.rawValue)
-                                if (side == .left ? vm.leftSource : vm.rightSource) == src {
-                                    Image(systemName: "checkmark")
-                                }
-                            }
+                // 1. Выбор источника (диска): кнопки Mac, Phone и автоматически появляющаяся USB
+                HStack(spacing: 3) {
+                    let currentSrc = (side == .left ? vm.leftSource : vm.rightSource)
+                    let currentP = (side == .left ? vm.leftPath : vm.rightPath)
+                    let activeUsb = vm.detectedUsbDrives.first(where: { currentP.hasPrefix($0.path) })
+                    
+                    // Кнопка Mac
+                    Button(action: {
+                        vm.changeSource(to: .localMac, side: side)
+                    }) {
+                        HStack(spacing: 4) {
+                            Image(systemName: "laptopcomputer")
+                                .font(.system(size: 10))
+                            Text("Mac")
+                                .font(.system(size: 11, weight: (currentSrc == .localMac && activeUsb == nil) ? .semibold : .regular))
                         }
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 3)
+                        .background((currentSrc == .localMac && activeUsb == nil) ? Color(nsColor: .selectedControlColor) : Color(nsColor: .controlBackgroundColor).opacity(0.6))
+                        .foregroundColor((currentSrc == .localMac && activeUsb == nil) ? Color(nsColor: .selectedControlTextColor) : .primary)
+                        .cornerRadius(4)
                     }
-                    if !vm.detectedVolumes.isEmpty {
-                        Divider()
-                        ForEach(vm.detectedVolumes) { vol in
+                    .buttonStyle(.plain)
+                    .help("Локальные файлы Mac")
+                    
+                    // Кнопка Phone
+                    Button(action: {
+                        vm.changeSource(to: .remotePhone, side: side)
+                    }) {
+                        HStack(spacing: 4) {
+                            PhoneConnectionIndicatorView(
+                                isConnected: vm.isPhoneConnected && vm.remoteDriver.isConnected,
+                                isConnecting: vm.isConnectingPhone
+                            )
+                            Text("Phone")
+                                .font(.system(size: 11, weight: (currentSrc == .remotePhone && activeUsb == nil) ? .semibold : .regular))
+                        }
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 3)
+                        .background((currentSrc == .remotePhone && activeUsb == nil) ? Color(nsColor: .selectedControlColor) : Color(nsColor: .controlBackgroundColor).opacity(0.6))
+                        .foregroundColor((currentSrc == .remotePhone && activeUsb == nil) ? Color(nsColor: .selectedControlTextColor) : .primary)
+                        .cornerRadius(4)
+                    }
+                    .buttonStyle(.plain)
+                    .help(vm.isConnectingPhone ? "Подключение к телефону..." : ((vm.isPhoneConnected && vm.remoteDriver.isConnected) ? "Телефон подключен" : "Телефон не подключен (нажмите для подключения)"))
+                    
+                    // Автоматическая кнопка USB при подключении внешнего накопителя
+                    if !vm.detectedUsbDrives.isEmpty {
+                        if vm.detectedUsbDrives.count == 1, let singleUsb = vm.detectedUsbDrives.first {
                             Button(action: {
-                                vm.switchToVolume(vol, side: side)
+                                vm.switchToUsbDrive(singleUsb, side: side)
                             }) {
-                                HStack {
-                                    Text("📱 \(vol.name)")
-                                    let currentP = (side == .left ? vm.leftPath : vm.rightPath)
-                                    let currentS = (side == .left ? vm.leftSource : vm.rightSource)
-                                    if currentS == .remotePhone && currentP.hasPrefix(vol.path) {
-                                        Image(systemName: "checkmark")
+                                HStack(spacing: 4) {
+                                    Image(systemName: "externaldrive.fill")
+                                        .font(.system(size: 10))
+                                    Text("USB")
+                                        .font(.system(size: 11, weight: activeUsb != nil ? .semibold : .regular))
+                                }
+                                .padding(.horizontal, 6)
+                                .padding(.vertical, 3)
+                                .background(activeUsb != nil ? Color(nsColor: .selectedControlColor) : Color(nsColor: .controlBackgroundColor).opacity(0.6))
+                                .foregroundColor(activeUsb != nil ? Color(nsColor: .selectedControlTextColor) : .primary)
+                                .cornerRadius(4)
+                            }
+                            .buttonStyle(.plain)
+                            .help("Внешний USB накопитель: \(singleUsb.name)")
+                        } else {
+                            Menu {
+                                ForEach(vm.detectedUsbDrives) { usb in
+                                    Button(action: {
+                                        vm.switchToUsbDrive(usb, side: side)
+                                    }) {
+                                        HStack {
+                                            Text(usb.name)
+                                            if activeUsb?.id == usb.id {
+                                                Image(systemName: "checkmark")
+                                            }
+                                        }
                                     }
                                 }
+                            } label: {
+                                HStack(spacing: 4) {
+                                    Image(systemName: "externaldrive.fill")
+                                        .font(.system(size: 10))
+                                    Text("USB")
+                                        .font(.system(size: 11, weight: activeUsb != nil ? .semibold : .regular))
+                                    Image(systemName: "chevron.down")
+                                        .font(.system(size: 8))
+                                }
+                                .padding(.horizontal, 6)
+                                .padding(.vertical, 3)
+                                .background(activeUsb != nil ? Color(nsColor: .selectedControlColor) : Color(nsColor: .controlBackgroundColor).opacity(0.6))
+                                .foregroundColor(activeUsb != nil ? Color(nsColor: .selectedControlTextColor) : .primary)
+                                .cornerRadius(4)
                             }
+                            .menuStyle(.borderlessButton)
+                            .fixedSize()
+                            .help("Выбор внешнего USB накопителя")
                         }
                     }
-                } label: {
-                    HStack(spacing: 4) {
-                        Image(systemName: (side == .left ? vm.leftSource : vm.rightSource) == .localMac ? "internaldrive" : "iphone")
-                            .font(.system(size: 13))
-                            .foregroundColor(.secondary)
-                        Text((side == .left ? vm.leftSource : vm.rightSource).rawValue)
-                            .font(.system(size: 13, weight: .medium))
-                            .foregroundColor(.primary)
-                            .lineLimit(1)
-                        Image(systemName: "chevron.down")
-                            .font(.system(size: 9, weight: .medium))
-                            .foregroundColor(.secondary)
-                    }
-                    .padding(.horizontal, 6)
-                    .padding(.vertical, 3)
-                    .background(Color(nsColor: .controlBackgroundColor).opacity(0.7))
-                    .cornerRadius(4)
                 }
-                .menuStyle(.borderlessButton)
                 .fixedSize()
-                .help("Выбор диска / источника")
                 
                 // 2. Путь: Переключение между Breadcrumbs и Manual Input (сразу за выбором дисков, без фона)
                 let isEditingPath = (side == .left) ? vm.isEditingLeftPath : vm.isEditingRightPath
@@ -348,24 +418,20 @@ public struct PaneView: View {
                         HStack(spacing: 3) {
                             let components = URL(fileURLWithPath: currentPath).pathComponents
                             ForEach(Array(components.enumerated()), id: \.offset) { index, component in
-                                Button(action: {
-                                    let targetPath: String
-                                    if index == 0 {
-                                        targetPath = (side == .left ? vm.leftSource : vm.rightSource) == .localMac
+                                if index == 0 {
+                                    // Убираем иконку домика, оставляем стрелочку справа от неё (с возможностью навигации и закладками)
+                                    Button(action: {
+                                        let targetPath = (side == .left ? vm.leftSource : vm.rightSource) == .localMac
                                             ? FileManager.default.homeDirectoryForCurrentUser.path
                                             : "/storage/emulated/0"
-                                    } else {
-                                        targetPath = "/" + components[1...index].joined(separator: "/")
+                                        vm.navigateTo(path: targetPath, side: side)
+                                    }) {
+                                        Text("›")
+                                            .font(.system(size: 13, weight: .semibold))
+                                            .foregroundColor(.secondary)
                                     }
-                                    vm.navigateTo(path: targetPath, side: side)
-                                }) {
-                                    Text(component == "/" ? "⌂" : component)
-                                        .font(.system(size: 13, weight: .medium))
-                                        .foregroundColor(.accentColor)
-                                }
-                                .buttonStyle(.plain)
-                                .contextMenu {
-                                    if index == 0 {
+                                    .buttonStyle(.plain)
+                                    .contextMenu {
                                         let bms = vm.quickBookmarks(for: side)
                                         ForEach(bms) { bm in
                                             Button(action: {
@@ -375,11 +441,22 @@ public struct PaneView: View {
                                             }
                                         }
                                     }
-                                }
-                                if index < components.count - 1 {
-                                    Text("›")
-                                        .font(.system(size: 13, weight: .regular))
-                                        .foregroundColor(.secondary)
+                                } else {
+                                    Button(action: {
+                                        let targetPath = "/" + components[1...index].joined(separator: "/")
+                                        vm.navigateTo(path: targetPath, side: side)
+                                    }) {
+                                        Text(component)
+                                            .font(.system(size: 13, weight: .medium))
+                                            .foregroundColor(.secondary)
+                                    }
+                                    .buttonStyle(.plain)
+                                    
+                                    if index < components.count - 1 {
+                                        Text("›")
+                                            .font(.system(size: 13, weight: .regular))
+                                            .foregroundColor(.secondary)
+                                    }
                                 }
                             }
                         }
@@ -394,14 +471,14 @@ public struct PaneView: View {
                 }
                 
                 // 3. Поле фильтра (с иконкой, кнопкой очистки и очисткой по Esc)
-                HStack(spacing: 4) {
+                HStack(spacing: 3) {
                     Image(systemName: "line.3.horizontal.decrease.circle")
                         .foregroundColor(.secondary)
-                        .font(.system(size: 11))
+                        .font(.system(size: 10))
                     
                     TextField("Фильтр...", text: (side == .left ? $vm.leftFilter : $vm.rightFilter))
                         .textFieldStyle(.plain)
-                        .font(.system(size: 12))
+                        .font(.system(size: 11))
                         .onExitCommand {
                             if side == .left {
                                 vm.leftFilter = ""
@@ -421,13 +498,13 @@ public struct PaneView: View {
                         }) {
                             Image(systemName: "xmark.circle.fill")
                                 .foregroundColor(.secondary)
-                                .font(.system(size: 11))
+                                .font(.system(size: 10))
                         }
                         .buttonStyle(.plain)
                         .help("Очистить фильтр (Esc)")
                     }
                 }
-                .padding(.horizontal, 6)
+                .padding(.horizontal, 5)
                 .padding(.vertical, 3)
                 .background(
                     RoundedRectangle(cornerRadius: 6)
@@ -437,16 +514,17 @@ public struct PaneView: View {
                     RoundedRectangle(cornerRadius: 6)
                         .stroke(Color.secondary.opacity(0.3), lineWidth: 1)
                 )
-                .frame(width: 120)
+                .frame(width: 76)
+                .padding(.trailing, 6)
             }
             .padding(6)
             .background(Color(nsColor: .windowBackgroundColor))
             
             if isStale {
                 HStack(spacing: 8) {
-                    Image(systemName: "exclamationmark.triangle.fill")
-                        .foregroundColor(.orange)
-                    Text("Телефон не подключен (Offline)")
+                    Image(systemName: vm.isConnectingPhone ? "arrow.triangle.2.circlepath" : "exclamationmark.triangle.fill")
+                        .foregroundColor(vm.isConnectingPhone ? .accentColor : .orange)
+                    Text(vm.isConnectingPhone ? "Подключение к смартфону..." : "Телефон не подключен (Offline)")
                         .font(.caption)
                         .foregroundColor(.secondary)
                     Spacer()
@@ -460,7 +538,7 @@ public struct PaneView: View {
                                 Text("Поиск...")
                             }
                         } else {
-                            Label("Подключить", systemImage: "arrow.triangle.2.circlepath")
+                            Label("Connect", systemImage: "arrow.triangle.2.circlepath")
                         }
                     }
                     .buttonStyle(.borderedProminent)
@@ -470,7 +548,7 @@ public struct PaneView: View {
                     Button(action: {
                         vm.showPairingDialog = true
                     }) {
-                        Label("Настройки Wi-Fi", systemImage: "wifi")
+                        Label("SFTP", systemImage: "wifi")
                     }
                     .buttonStyle(.bordered)
                     .controlSize(.mini)
@@ -531,22 +609,76 @@ public struct PaneView: View {
             
             if vm.isQuickViewActive && vm.activePane != side {
                 QuickViewPaneView(item: vm.quickViewItem)
+            } else if (side == .left ? vm.leftViewMode : vm.rightViewMode) == .grid {
+                // Режим графического просмотрщика папок (Сетка / Галерея)
+                GridSettingsBarView(side: side)
+                Divider()
+                FileGridPaneView(side: side)
             } else {
                 // Таблица списка файлов с Drag & Drop и сравнением
                 Table(items, selection: selectionBinding, sortOrder: sortOrderBinding) {
                     TableColumn("Имя", value: \FileItem.name) { item in
+                        let isHoverFolder = (item.isDirectory && vm.dragHoverSide == side && vm.dragHoverFolderId == item.id)
+                        let rowIndex = items.firstIndex(where: { $0.id == item.id }) ?? -1
+                        let isInsertTop = (vm.dragHoverSide == side && vm.dragHoverFolderId == nil && vm.dragInsertionIndex == rowIndex)
+                        let isInsertBottom = (vm.dragHoverSide == side && vm.dragHoverFolderId == nil && vm.dragInsertionIndex == items.count && rowIndex == items.count - 1)
+                        
                         HStack(spacing: 6) {
                             Image(systemName: item.isDirectory ? "folder.fill" : fileIconName(for: item.name))
                                 .foregroundColor(item.isDirectory ? .yellow : .blue)
-                            Text(item.name)
-                                .font(.system(size: 13))
+                            
+                            if vm.editingItemId == item.id && vm.editingItemSide == side {
+                                InlineRenameTextField(
+                                    text: $vm.editingItemName,
+                                    isDirectory: item.isDirectory,
+                                    onCommit: {
+                                        vm.commitInlineRename(item: item, side: side)
+                                    },
+                                    onCancel: {
+                                        vm.cancelInlineRename()
+                                    }
+                                )
+                                .frame(height: 22)
+                            } else {
+                                Text(item.name)
+                                    .font(.system(size: 13))
+                                    .onLongPressGesture(minimumDuration: 0.55) {
+                                        if vm.activePane != side { vm.activePane = side }
+                                        if side == .left {
+                                            vm.leftSelection = [item.id]
+                                        } else {
+                                            vm.rightSelection = [item.id]
+                                        }
+                                        vm.triggerRename(item: item, side: side)
+                                    }
+                            }
                             
                             if vm.isComparing {
                                 comparisonBadge(for: item.name)
                             }
                             Spacer(minLength: 0)
                         }
+                        .padding(.vertical, 2)
+                        .padding(.horizontal, 4)
                         .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(
+                            UnevenRoundedRectangle(topLeadingRadius: 4, bottomLeadingRadius: 4, bottomTrailingRadius: 0, topTrailingRadius: 0)
+                                .fill(isHoverFolder ? Color.accentColor.opacity(0.35) : Color.clear)
+                        )
+                        .overlay(alignment: .top) {
+                            if isInsertTop {
+                                Rectangle()
+                                    .fill(Color.accentColor)
+                                    .frame(height: 2)
+                            }
+                        }
+                        .overlay(alignment: .bottom) {
+                            if isInsertBottom {
+                                Rectangle()
+                                    .fill(Color.accentColor)
+                                    .frame(height: 2)
+                            }
+                        }
                         .contentShape(Rectangle())
                         .simultaneousGesture(TapGesture(count: 2).onEnded {
                             print("DUAL_PANE: Cell double tap on \(item.name)")
@@ -561,6 +693,11 @@ public struct PaneView: View {
                     }
                     
                     TableColumn("Размер", value: \FileItem.size) { item in
+                        let isHoverFolder = (item.isDirectory && vm.dragHoverSide == side && vm.dragHoverFolderId == item.id)
+                        let rowIndex = items.firstIndex(where: { $0.id == item.id }) ?? -1
+                        let isInsertTop = (vm.dragHoverSide == side && vm.dragHoverFolderId == nil && vm.dragInsertionIndex == rowIndex)
+                        let isInsertBottom = (vm.dragHoverSide == side && vm.dragHoverFolderId == nil && vm.dragInsertionIndex == items.count && rowIndex == items.count - 1)
+                        
                         HStack {
                             if item.isDirectory {
                                 if vm.calculatingFolderPaths.contains(item.path) {
@@ -583,7 +720,27 @@ public struct PaneView: View {
                             }
                             Spacer(minLength: 0)
                         }
+                        .padding(.vertical, 2)
+                        .padding(.horizontal, 4)
                         .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(
+                            Rectangle()
+                                .fill(isHoverFolder ? Color.accentColor.opacity(0.35) : Color.clear)
+                        )
+                        .overlay(alignment: .top) {
+                            if isInsertTop {
+                                Rectangle()
+                                    .fill(Color.accentColor)
+                                    .frame(height: 2)
+                            }
+                        }
+                        .overlay(alignment: .bottom) {
+                            if isInsertBottom {
+                                Rectangle()
+                                    .fill(Color.accentColor)
+                                    .frame(height: 2)
+                            }
+                        }
                         .contentShape(Rectangle())
                         .simultaneousGesture(TapGesture(count: 2).onEnded {
                             print("DUAL_PANE: Cell double tap on \(item.name)")
@@ -593,13 +750,38 @@ public struct PaneView: View {
                     .width(min: 80, ideal: 100, max: 120)
                     
                     TableColumn("Дата изменения", value: \FileItem.mtime) { item in
+                        let isHoverFolder = (item.isDirectory && vm.dragHoverSide == side && vm.dragHoverFolderId == item.id)
+                        let rowIndex = items.firstIndex(where: { $0.id == item.id }) ?? -1
+                        let isInsertTop = (vm.dragHoverSide == side && vm.dragHoverFolderId == nil && vm.dragInsertionIndex == rowIndex)
+                        let isInsertBottom = (vm.dragHoverSide == side && vm.dragHoverFolderId == nil && vm.dragInsertionIndex == items.count && rowIndex == items.count - 1)
+                        
                         HStack {
                             Text(formatDate(item.mtime))
                                 .font(.system(size: 11))
                                 .foregroundColor(.secondary)
                             Spacer(minLength: 0)
                         }
+                        .padding(.vertical, 2)
+                        .padding(.horizontal, 4)
                         .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(
+                            UnevenRoundedRectangle(topLeadingRadius: 0, bottomLeadingRadius: 0, bottomTrailingRadius: 4, topTrailingRadius: 4)
+                                .fill(isHoverFolder ? Color.accentColor.opacity(0.35) : Color.clear)
+                        )
+                        .overlay(alignment: .top) {
+                            if isInsertTop {
+                                Rectangle()
+                                    .fill(Color.accentColor)
+                                    .frame(height: 2)
+                            }
+                        }
+                        .overlay(alignment: .bottom) {
+                            if isInsertBottom {
+                                Rectangle()
+                                    .fill(Color.accentColor)
+                                    .frame(height: 2)
+                            }
+                        }
                         .contentShape(Rectangle())
                         .simultaneousGesture(TapGesture(count: 2).onEnded {
                             print("DUAL_PANE: Cell double tap on \(item.name)")
@@ -623,7 +805,6 @@ public struct PaneView: View {
                     return .ignored
                 }
                 .onKeyPress(.return, phases: .down) { _ in
-                    print("DUAL_PANE: Table onKeyPress .return")
                     vm.openSelected()
                     return .handled
                 }
@@ -643,14 +824,7 @@ public struct PaneView: View {
                         vm.openItem(item: item, side: side)
                     }
                 )
-                .onDrop(of: [DualPaneViewModel.dragUTType, UTType.fileURL.identifier, UTType.utf8PlainText.identifier], isTargeted: $isDropTarget) { providers in
-                    let isMove = NSEvent.modifierFlags.contains(.command)
-                    return vm.handleDroppedProviders(providers, toSide: side, isMove: isMove)
-                }
-                .overlay(
-                    RoundedRectangle(cornerRadius: 4)
-                        .stroke(isDropTarget ? Color.accentColor : Color.clear, lineWidth: 3)
-                )
+                .onDrop(of: [DualPaneViewModel.dragUTType, UTType.fileURL.identifier, UTType.utf8PlainText.identifier], delegate: PaneTableDropDelegate(side: side, vm: vm, items: items))
             }
             
             Divider()
@@ -660,20 +834,19 @@ public struct PaneView: View {
                 let selectedIds = (side == .left) ? vm.leftSelection : vm.rightSelection
                 if selectedIds.isEmpty {
                     Text("\(items.count) объектов")
-                        .font(.caption2)
+                        .font(.system(size: 11))
                         .foregroundColor(.secondary)
                 } else {
                     let selectedItems = items.filter { selectedIds.contains($0.id) || selectedIds.contains($0.path) }
                     let selectedBytes = selectedItems.reduce(0) { $0 + $1.size }
                     Text("Выделено: \(selectedItems.count) из \(items.count) (\(formatBytes(selectedBytes)))")
-                        .font(.caption2)
-                        .fontWeight(.semibold)
-                        .foregroundColor(.accentColor)
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundColor(.secondary)
                 }
                 Spacer()
                 if freeSpace.total > 0 {
                     Text("Свободно: \(formatBytes(freeSpace.free)) из \(formatBytes(freeSpace.total))")
-                        .font(.caption2)
+                        .font(.system(size: 11))
                         .foregroundColor(.secondary)
                 }
             }
@@ -869,12 +1042,137 @@ public struct PaneView: View {
     }
 }
 
+// MARK: - In-place Inline Renaming Text Field
+public final class CustomRenameNSTextField: NSTextField {
+    public override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        let isControl = event.modifierFlags.contains(.control) && !event.modifierFlags.contains(.command)
+        let chars = event.charactersIgnoringModifiers?.lowercased()
+        let isV = (chars == "v" || event.keyCode == 9)
+        
+        if isControl && isV {
+            if let editor = self.currentEditor() as? NSTextView, editor.isEditable {
+                if let str = NSPasteboard.general.string(forType: .string) {
+                    editor.insertText(str, replacementRange: editor.selectedRange())
+                } else {
+                    editor.paste(nil)
+                }
+                return true
+            }
+        }
+        return super.performKeyEquivalent(with: event)
+    }
+}
+
+public struct InlineRenameTextField: NSViewRepresentable {
+    @Binding public var text: String
+    public let isDirectory: Bool
+    public let onCommit: () -> Void
+    public let onCancel: () -> Void
+    
+    public init(text: Binding<String>, isDirectory: Bool = false, onCommit: @escaping () -> Void, onCancel: @escaping () -> Void) {
+        self._text = text
+        self.isDirectory = isDirectory
+        self.onCommit = onCommit
+        self.onCancel = onCancel
+    }
+    
+    public func makeCoordinator() -> Coordinator {
+        Coordinator(self)
+    }
+    
+    public func makeNSView(context: Context) -> CustomRenameNSTextField {
+        let textField = CustomRenameNSTextField()
+        textField.stringValue = text
+        textField.isBordered = true
+        textField.bezelStyle = .roundedBezel
+        textField.focusRingType = .exterior
+        textField.font = NSFont.systemFont(ofSize: 12)
+        textField.delegate = context.coordinator
+        textField.isEditable = true
+        textField.isSelectable = true
+        textField.drawsBackground = true
+        textField.backgroundColor = NSColor.textBackgroundColor
+        textField.textColor = NSColor.labelColor
+        
+        DispatchQueue.main.async {
+            guard let window = textField.window else { return }
+            window.makeFirstResponder(textField)
+            
+            // Выделяем имя файла без расширения, если это обычный файл
+            if let editor = textField.currentEditor() {
+                let name = textField.stringValue
+                if !self.isDirectory && name.contains(".") && !name.hasPrefix(".") {
+                    let nsName = name as NSString
+                    let ext = nsName.pathExtension
+                    let baseLen = name.count - ext.count - 1
+                    if baseLen > 0 {
+                        editor.selectedRange = NSRange(location: 0, length: baseLen)
+                        return
+                    }
+                }
+                editor.selectedRange = NSRange(location: 0, length: name.count)
+            }
+        }
+        
+        return textField
+    }
+    
+    public func updateNSView(_ nsView: CustomRenameNSTextField, context: Context) {
+        if nsView.stringValue != text && nsView.currentEditor() == nil {
+            nsView.stringValue = text
+        }
+    }
+    
+    public class Coordinator: NSObject, NSTextFieldDelegate {
+        var parent: InlineRenameTextField
+        private var isHandled = false
+        
+        init(_ parent: InlineRenameTextField) {
+            self.parent = parent
+        }
+        
+        public func controlTextDidChange(_ obj: Notification) {
+            if let tf = obj.object as? NSTextField {
+                parent.text = tf.stringValue
+            }
+        }
+        
+        public func control(_ control: NSControl, textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
+            if commandSelector == #selector(NSResponder.insertNewline(_:)) {
+                if !isHandled {
+                    isHandled = true
+                    parent.text = textView.string
+                    parent.onCommit()
+                }
+                return true
+            } else if commandSelector == #selector(NSResponder.cancelOperation(_:)) {
+                if !isHandled {
+                    isHandled = true
+                    parent.onCancel()
+                }
+                return true
+            }
+            return false
+        }
+        
+        public func controlTextDidEndEditing(_ obj: Notification) {
+            guard !isHandled else { return }
+            isHandled = true
+            if let tf = obj.object as? NSTextField {
+                parent.text = tf.stringValue
+                parent.onCommit()
+            }
+        }
+    }
+}
+
+// MARK: - NSTableRowView Swizzling for Persistent Selection & Full-Row Drop Highlight
 extension NSTableRowView {
-    private static var hasSwizzledEmphasized = false
+    private static var hasSwizzledRowView = false
     
     public static func enablePersistentSelectionHighlight() {
-        guard !hasSwizzledEmphasized else { return }
-        hasSwizzledEmphasized = true
+        guard !hasSwizzledRowView else { return }
+        hasSwizzledRowView = true
         
         let origEmp = class_getInstanceMethod(NSTableRowView.self, #selector(getter: isEmphasized))
         let swizEmp = class_getInstanceMethod(NSTableRowView.self, #selector(getter: swizzled_isEmphasized))
@@ -886,6 +1184,12 @@ extension NSTableRowView {
         let swizDraw = class_getInstanceMethod(NSTableRowView.self, #selector(swizzled_drawSelection(in:)))
         if let origDraw = origDraw, let swizDraw = swizDraw {
             method_exchangeImplementations(origDraw, swizDraw)
+        }
+        
+        let origBg = class_getInstanceMethod(NSTableRowView.self, #selector(drawBackground(in:)))
+        let swizBg = class_getInstanceMethod(NSTableRowView.self, #selector(swizzled_drawBackground(in:)))
+        if let origBg = origBg, let swizBg = swizBg {
+            method_exchangeImplementations(origBg, swizBg)
         }
     }
     
@@ -910,8 +1214,81 @@ extension NSTableRowView {
     }
     
     @objc private func swizzled_drawSelection(in dirtyRect: NSRect) {
+        guard let tv = self.findParentTableView() else { return }
+        let rowIndex = tv.row(for: self)
+        let isLeft = (tv === TableDoubleClickHandler.HandlerView.leftTableView)
+        let isRight = (tv === TableDoubleClickHandler.HandlerView.rightTableView)
+        if isLeft || isRight {
+            let side: PaneSide = isLeft ? .left : .right
+            if let vm = TableDoubleClickHandler.HandlerView.activeVM(for: side),
+               vm.dragHoverSide == side,
+               rowIndex >= 0 {
+                let items = (side == .left) ? vm.leftItems : vm.rightItems
+                if rowIndex < items.count && items[rowIndex].isDirectory && vm.dragHoverFolderId == items[rowIndex].id {
+                    // Цельная синяя плашка без разрывов между колонками
+                    NSGraphicsContext.saveGraphicsState()
+                    let highlightRect = NSRect(x: 2, y: 1, width: self.bounds.width - 4, height: self.bounds.height - 2)
+                    let path = NSBezierPath(roundedRect: highlightRect, xRadius: 4, yRadius: 4)
+                    NSColor.controlAccentColor.withAlphaComponent(0.35).setFill()
+                    path.fill()
+                    NSGraphicsContext.restoreGraphicsState()
+                    return
+                }
+            }
+        }
+        
         guard self.isSelected && self.isEmphasized else { return }
         self.swizzled_drawSelection(in: dirtyRect)
+    }
+    
+    @objc private func swizzled_drawBackground(in dirtyRect: NSRect) {
+        self.swizzled_drawBackground(in: dirtyRect)
+        
+        guard let tv = self.findParentTableView() else { return }
+        let rowIndex = tv.row(for: self)
+        guard rowIndex >= 0 else { return }
+        
+        let isLeft = (tv === TableDoubleClickHandler.HandlerView.leftTableView)
+        let isRight = (tv === TableDoubleClickHandler.HandlerView.rightTableView)
+        guard isLeft || isRight else { return }
+        let side: PaneSide = isLeft ? .left : .right
+        
+        guard let vm = TableDoubleClickHandler.HandlerView.activeVM(for: side),
+              vm.dragHoverSide == side else {
+            return
+        }
+        
+        let items = (side == .left) ? vm.leftItems : vm.rightItems
+        guard rowIndex < items.count else { return }
+        let item = items[rowIndex]
+        
+        // 1. Подсветка папки при наведении Drag & Drop: цельная синяя плашка на всю строку без разрывов
+        if item.isDirectory && vm.dragHoverFolderId == item.id {
+            NSGraphicsContext.saveGraphicsState()
+            let highlightRect = NSRect(x: 2, y: 1, width: self.bounds.width - 4, height: self.bounds.height - 2)
+            let path = NSBezierPath(roundedRect: highlightRect, xRadius: 4, yRadius: 4)
+            NSColor.controlAccentColor.withAlphaComponent(0.35).setFill()
+            path.fill()
+            NSGraphicsContext.restoreGraphicsState()
+        }
+        
+        // 2. Синяя линия вставки между строками (цельная линия на всю ширину таблицы)
+        if vm.dragHoverFolderId == nil {
+            if vm.dragInsertionIndex == rowIndex {
+                NSGraphicsContext.saveGraphicsState()
+                let lineRect = NSRect(x: 0, y: 0, width: self.bounds.width, height: 2)
+                NSColor.controlAccentColor.setFill()
+                lineRect.fill()
+                NSGraphicsContext.restoreGraphicsState()
+            }
+            if vm.dragInsertionIndex == items.count && rowIndex == items.count - 1 {
+                NSGraphicsContext.saveGraphicsState()
+                let lineRect = NSRect(x: 0, y: self.bounds.height - 2, width: self.bounds.width, height: 2)
+                NSColor.controlAccentColor.setFill()
+                lineRect.fill()
+                NSGraphicsContext.restoreGraphicsState()
+            }
+        }
     }
 }
 
@@ -945,8 +1322,10 @@ public struct TableDoubleClickHandler: NSViewRepresentable {
         if let tv = nsView.hookedTableView {
             if side == .left {
                 HandlerView.leftTableView = tv
+                HandlerView.leftVM = vm
             } else {
                 HandlerView.rightTableView = tv
+                HandlerView.rightVM = vm
             }
         }
         if vm.activePane == side {
@@ -957,7 +1336,13 @@ public struct TableDoubleClickHandler: NSViewRepresentable {
     public final class HandlerView: NSView {
         public static weak var leftTableView: NSTableView?
         public static weak var rightTableView: NSTableView?
+        public static weak var leftVM: DualPaneViewModel?
+        public static weak var rightVM: DualPaneViewModel?
         public static var activePaneSide: PaneSide = .left
+        
+        public static func activeVM(for side: PaneSide) -> DualPaneViewModel? {
+            return (side == .left) ? leftVM : rightVM
+        }
         
         public static func setActiveSide(_ side: PaneSide) {
             guard activePaneSide != side else { return }
@@ -983,8 +1368,11 @@ public struct TableDoubleClickHandler: NSViewRepresentable {
         var onDoubleClick: ((Int) -> Void)?
         weak var hookedTableView: NSTableView?
         private var eventMonitor: Any?
+        private var longPressWorkItem: DispatchWorkItem?
+        private var mouseDownLocation: NSPoint = .zero
         
         deinit {
+            longPressWorkItem?.cancel()
             if let monitor = eventMonitor {
                 NSEvent.removeMonitor(monitor)
             }
@@ -993,6 +1381,7 @@ public struct TableDoubleClickHandler: NSViewRepresentable {
         public override func viewDidMoveToWindow() {
             super.viewDidMoveToWindow()
             NSTableRowView.enablePersistentSelectionHighlight()
+            KeyCommandMonitor.installGlobalMonitor()
             DispatchQueue.main.async { [weak self] in
                 self?.hookTableView()
                 self?.setupEventMonitor()
@@ -1033,8 +1422,10 @@ public struct TableDoubleClickHandler: NSViewRepresentable {
             hookedTableView = tv
             if side == .left {
                 HandlerView.leftTableView = tv
+                HandlerView.leftVM = vm
             } else {
                 HandlerView.rightTableView = tv
+                HandlerView.rightVM = vm
             }
             if vm?.activePane == side {
                 HandlerView.activePaneSide = side
@@ -1043,22 +1434,29 @@ public struct TableDoubleClickHandler: NSViewRepresentable {
             tv.doubleAction = #selector(onTableDoubleClick(_:))
             tv.allowsMultipleSelection = true
             tv.allowsEmptySelection = true
+            tv.intercellSpacing = NSSize(width: 0, height: tv.intercellSpacing.height)
             setupEventMonitor()
         }
         
         private func setupEventMonitor() {
             guard eventMonitor == nil else { return }
-            eventMonitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown, .keyDown]) { [weak self] event in
+            eventMonitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown, .leftMouseUp, .leftMouseDragged, .rightMouseDown, .keyDown]) { [weak self] event in
                 guard let self = self, let tv = self.hookedTableView, event.window == tv.window else {
                     return event
                 }
                 
                 // KeyDown handling
                 if event.type == .keyDown {
+                    self.longPressWorkItem?.cancel()
+                    self.longPressWorkItem = nil
+                    
                     // Если фокус находится в любом поле ввода текста (поле фильтра, пути, модальном окне),
-                    // клавиши (Backspace, Space, Enter, стрелки) НЕ должны перехватываться таблицей!
+                    // обрабатываем Ctrl+V, Ctrl+C, Ctrl+X, Ctrl+A через KeyCommandMonitor
                     if let firstResponder = tv.window?.firstResponder {
                         if firstResponder is NSText || firstResponder is NSTextView || firstResponder is NSTextField {
+                            if KeyCommandMonitor.handleEvent(event) == nil {
+                                return nil
+                            }
                             return event
                         }
                     }
@@ -1093,6 +1491,22 @@ public struct TableDoubleClickHandler: NSViewRepresentable {
                     return event
                 }
                 
+                if event.type == .leftMouseUp {
+                    self.longPressWorkItem?.cancel()
+                    self.longPressWorkItem = nil
+                    return event
+                }
+                
+                if event.type == .leftMouseDragged {
+                    let currLoc = event.locationInWindow
+                    let dist = hypot(currLoc.x - self.mouseDownLocation.x, currLoc.y - self.mouseDownLocation.y)
+                    if dist > 4 {
+                        self.longPressWorkItem?.cancel()
+                        self.longPressWorkItem = nil
+                    }
+                    return event
+                }
+                
                 let locationInTable = tv.convert(event.locationInWindow, from: nil)
                 guard tv.bounds.contains(locationInTable) else {
                     return event
@@ -1101,6 +1515,10 @@ public struct TableDoubleClickHandler: NSViewRepresentable {
                 let clickedRow = tv.row(at: locationInTable)
                 
                 if event.type == .leftMouseDown {
+                    self.longPressWorkItem?.cancel()
+                    self.longPressWorkItem = nil
+                    self.mouseDownLocation = event.locationInWindow
+                    
                     if tv.window?.firstResponder != tv {
                         tv.window?.makeFirstResponder(tv)
                     }
@@ -1127,6 +1545,8 @@ public struct TableDoubleClickHandler: NSViewRepresentable {
                         
                         // Check for Double Click
                         if event.clickCount == 2 {
+                            self.longPressWorkItem?.cancel()
+                            self.longPressWorkItem = nil
                             print("DUAL_PANE: LeftMouseDown clickCount == 2 on row \(clickedRow), item: \(item.name)")
                             if self.side == .left {
                                 self.vm?.leftSelection = [item.id]
@@ -1135,6 +1555,27 @@ public struct TableDoubleClickHandler: NSViewRepresentable {
                             }
                             self.vm?.openItem(item: item, side: self.side)
                             return nil
+                        } else if event.clickCount == 1 {
+                            // Проверяем клик на колонку с именем файла (колонка 0)
+                            let clickedCol = tv.column(at: locationInTable)
+                            if clickedCol <= 0 {
+                                let itemToRename = item
+                                let currentPaneSide = self.side
+                                let work = DispatchWorkItem { [weak self] in
+                                    guard let self = self, let vm = self.vm else { return }
+                                    print("DUAL_PANE: Long press detected on file name '\(itemToRename.name)' -> triggering rename")
+                                    DispatchQueue.main.async {
+                                        if currentPaneSide == .left {
+                                            vm.leftSelection = [itemToRename.id]
+                                        } else {
+                                            vm.rightSelection = [itemToRename.id]
+                                        }
+                                        vm.triggerRename(item: itemToRename, side: currentPaneSide)
+                                    }
+                                }
+                                self.longPressWorkItem = work
+                                DispatchQueue.main.asyncAfter(deadline: .now() + 0.55, execute: work)
+                            }
                         }
                         
                         if let vm = self.vm {
@@ -1185,6 +1626,9 @@ public struct TableDoubleClickHandler: NSViewRepresentable {
                         }
                     }
                 } else if event.type == .rightMouseDown {
+                    self.longPressWorkItem?.cancel()
+                    self.longPressWorkItem = nil
+                    
                     if tv.window?.firstResponder != tv {
                         tv.window?.makeFirstResponder(tv)
                     }
@@ -1255,6 +1699,199 @@ public struct TableDoubleClickHandler: NSViewRepresentable {
     }
 }
 
+public struct PaneTableDropDelegate: DropDelegate {
+    public let side: PaneSide
+    public let vm: DualPaneViewModel
+    public let items: [FileItem]
+    
+    private static var springLoadTimer: DispatchWorkItem?
+    private static var currentSpringLoadFolderId: String?
+    
+    public init(side: PaneSide, vm: DualPaneViewModel, items: [FileItem]) {
+        self.side = side
+        self.vm = vm
+        self.items = items
+    }
+    
+    public func dropEntered(info: DropInfo) {
+        updateHover(at: info.location)
+    }
+    
+    public func dropUpdated(info: DropInfo) -> DropProposal? {
+        updateHover(at: info.location)
+        let isMove = NSEvent.modifierFlags.contains(.command)
+        return DropProposal(operation: isMove ? .move : .copy)
+    }
+    
+    public func dropExited(info: DropInfo) {
+        cleanDropState()
+    }
+    
+    public func performDrop(info: DropInfo) -> Bool {
+        Self.springLoadTimer?.cancel()
+        Self.springLoadTimer = nil
+        Self.currentSpringLoadFolderId = nil
+        
+        let targetFolderId = vm.dragHoverFolderId
+        cleanDropState()
+        
+        let targetDirPath: String?
+        if let folderId = targetFolderId, let folder = items.first(where: { $0.id == folderId && $0.isDirectory }) {
+            targetDirPath = folder.path
+        } else {
+            targetDirPath = nil
+        }
+        
+        let isMove = NSEvent.modifierFlags.contains(.command)
+        let utTypes: [UTType] = [
+            UTType(DualPaneViewModel.dragUTType) ?? .data,
+            .fileURL,
+            .utf8PlainText,
+            .plainText,
+            .data,
+            .item
+        ]
+        let providers = info.itemProviders(for: utTypes)
+        return vm.handleDroppedProviders(providers, toSide: side, targetDirPath: targetDirPath, isMove: isMove)
+    }
+    
+    private func cleanDropState() {
+        Self.springLoadTimer?.cancel()
+        Self.springLoadTimer = nil
+        Self.currentSpringLoadFolderId = nil
+        if let tv = (side == .left ? TableDoubleClickHandler.HandlerView.leftTableView : TableDoubleClickHandler.HandlerView.rightTableView) {
+            tv.setDropRow(-1, dropOperation: .on)
+            tv.enumerateAvailableRowViews { rowView, _ in
+                rowView.needsDisplay = true
+            }
+            tv.needsDisplay = true
+        }
+        vm.clearDragHoverState()
+    }
+    
+    private func updateHover(at location: CGPoint) {
+        let tv = (side == .left ? TableDoubleClickHandler.HandlerView.leftTableView : TableDoubleClickHandler.HandlerView.rightTableView)
+        
+        let targetRow: Int
+        let isOverFolder: Bool
+        let isInsertTop: Bool
+        
+        if let tv = tv {
+            let screenLoc = NSEvent.mouseLocation
+            let windowLoc = tv.window?.convertPoint(fromScreen: screenLoc) ?? .zero
+            let tableLoc = tv.convert(windowLoc, from: nil)
+            let row = tv.row(at: tableLoc)
+            
+            if row >= 0 && row < items.count {
+                let item = items[row]
+                let rowRect = tv.rect(ofRow: row)
+                let relY = tableLoc.y - rowRect.origin.y
+                
+                if item.isDirectory && relY >= 4 && relY <= (rowRect.height - 4) {
+                    targetRow = row
+                    isOverFolder = true
+                    isInsertTop = false
+                } else {
+                    targetRow = row
+                    isOverFolder = false
+                    isInsertTop = item.isDirectory ? (relY < 4) : (relY < rowRect.height / 2)
+                }
+            } else {
+                targetRow = items.count
+                isOverFolder = false
+                isInsertTop = false
+            }
+            tv.setDropRow(isOverFolder ? targetRow : (isInsertTop ? targetRow : targetRow + 1), dropOperation: isOverFolder ? .on : .above)
+            tv.enumerateAvailableRowViews { rowView, _ in
+                rowView.needsDisplay = true
+            }
+            tv.needsDisplay = true
+        } else {
+            // Fallback расчёт по положению курсора в координатах SwiftUI Table
+            let headerHeight: CGFloat = 24.0
+            let rowHeight: CGFloat = 24.0
+            let y = location.y - headerHeight
+            if y < 0 {
+                targetRow = 0
+                isOverFolder = false
+                isInsertTop = true
+            } else {
+                let estimatedRow = Int(y / rowHeight)
+                if estimatedRow >= 0 && estimatedRow < items.count {
+                    let item = items[estimatedRow]
+                    let relY = y - CGFloat(estimatedRow) * rowHeight
+                    if item.isDirectory && relY >= 4 && relY <= (rowHeight - 4) {
+                        targetRow = estimatedRow
+                        isOverFolder = true
+                        isInsertTop = false
+                    } else {
+                        targetRow = estimatedRow
+                        isOverFolder = false
+                        isInsertTop = (relY < rowHeight / 2)
+                    }
+                } else {
+                    targetRow = items.count
+                    isOverFolder = false
+                    isInsertTop = false
+                }
+            }
+        }
+        
+        if targetRow >= 0 && targetRow < items.count {
+            let item = items[targetRow]
+            if isOverFolder && item.isDirectory {
+                // Наведение на конкретную папку: выделяется синим фоном
+                vm.dragHoverSide = side
+                vm.dragHoverFolderId = item.id
+                vm.dragInsertionIndex = nil
+                
+                // Spring-Loaded Folders: при длительном удерживании (0.8с) папка открывается
+                if Self.currentSpringLoadFolderId != item.id {
+                    Self.springLoadTimer?.cancel()
+                    Self.currentSpringLoadFolderId = item.id
+                    let folderToOpen = item
+                    let work = DispatchWorkItem { [weak vm] in
+                        guard let vm = vm else { return }
+                        if Self.currentSpringLoadFolderId == folderToOpen.id {
+                            print("SPRING_LOAD: Открытие папки '\(folderToOpen.name)' при наведении на панели \(side)")
+                            DispatchQueue.main.async {
+                                vm.openItem(item: folderToOpen, side: side)
+                                Self.currentSpringLoadFolderId = nil
+                                Self.springLoadTimer = nil
+                                vm.clearDragHoverState()
+                            }
+                        }
+                    }
+                    Self.springLoadTimer = work
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.8, execute: work)
+                }
+                return
+            } else {
+                // Наведение между файлами (или на обычный файл) -> синяя линия между файлами
+                Self.springLoadTimer?.cancel()
+                Self.springLoadTimer = nil
+                Self.currentSpringLoadFolderId = nil
+                
+                let insertRow = isInsertTop ? targetRow : targetRow + 1
+                vm.dragHoverSide = side
+                vm.dragHoverFolderId = nil
+                vm.dragInsertionIndex = insertRow
+                return
+            }
+        } else {
+            // Пустая область ниже строк
+            Self.springLoadTimer?.cancel()
+            Self.springLoadTimer = nil
+            Self.currentSpringLoadFolderId = nil
+            
+            let insertRow = items.count
+            vm.dragHoverSide = side
+            vm.dragHoverFolderId = nil
+            vm.dragInsertionIndex = insertRow
+        }
+    }
+}
+
 public struct TabReorderDropDelegate: DropDelegate {
     public let targetTab: PanelTab
     public let side: PaneSide
@@ -1286,4 +1923,42 @@ public struct TabReorderDropDelegate: DropDelegate {
         return true
     }
 }
+
+/// Индикатор состояния подключения телефона (Серый = отключен, Мигающий зеленый = подключение, Салатовый = подключен)
+public struct PhoneConnectionIndicatorView: View {
+    public let isConnected: Bool
+    public let isConnecting: Bool
+    
+    public init(isConnected: Bool, isConnecting: Bool) {
+        self.isConnected = isConnected
+        self.isConnecting = isConnecting
+    }
+    
+    public var body: some View {
+        if isConnecting {
+            PulsingIndicatorCircle()
+        } else {
+            Circle()
+                .fill(isConnected ? Color(red: 0.35, green: 0.88, blue: 0.35) : Color(nsColor: .systemGray).opacity(0.5))
+                .frame(width: 7, height: 7)
+        }
+    }
+}
+
+private struct PulsingIndicatorCircle: View {
+    @State private var isDimmed: Bool = false
+    
+    var body: some View {
+        Circle()
+            .fill(Color(red: 0.35, green: 0.88, blue: 0.35))
+            .frame(width: 7, height: 7)
+            .opacity(isDimmed ? 0.2 : 1.0)
+            .onAppear {
+                withAnimation(.easeInOut(duration: 0.5).repeatForever(autoreverses: true)) {
+                    isDimmed = true
+                }
+            }
+    }
+}
+
 

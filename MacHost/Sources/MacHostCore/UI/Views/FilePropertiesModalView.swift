@@ -41,6 +41,8 @@ public struct FilePropertiesModalView: View {
                     propertyRow(title: "Полный путь:", value: item.path)
                     if !item.isDirectory {
                         propertyRow(title: "Размер:", value: "\(ByteCountFormatter.string(fromByteCount: Int64(item.size), countStyle: .file)) (\(item.size) байт)")
+                    } else if let size = vm.calculatedFolderSizes[item.path] {
+                        propertyRow(title: "Размер:", value: "\(ByteCountFormatter.string(fromByteCount: Int64(size), countStyle: .file)) (\(size) байт)")
                     }
                     if item.mtime > 0 {
                         propertyRow(title: "Изменён:", value: Self.dateFormatter.string(from: Date(timeIntervalSince1970: item.mtime)))

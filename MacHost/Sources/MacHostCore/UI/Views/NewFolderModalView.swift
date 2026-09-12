@@ -114,11 +114,16 @@ public struct TransferProgressModalView: View {
                         .foregroundColor(.orange)
                     }
                     
-                    Button("Отменить передачу") {
+                    Button("Отменить копирование") {
                         vm.cancelTransfer()
                     }
                     .buttonStyle(.bordered)
                     .foregroundColor(.red)
+                    
+                    Button("Фон") {
+                        vm.minimizeTransferToBackground()
+                    }
+                    .buttonStyle(.bordered)
                 }
             }
         }

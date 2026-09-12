@@ -13,10 +13,40 @@ public struct BottomToolbarView: View {
                 ToolButton(systemImage: "folder.badge.plus", tooltip: "Новая папка (F7)") { vm.showNewFolderDialog = true }
                 ToolButton(systemImage: "trash", tooltip: "Удалить (F8)") { vm.triggerDelete() }
                 ToolButton(systemImage: "textformat.abc", tooltip: "Групповое переименование (Ctrl+M)") { vm.triggerBatchRename() }
-                ToolButton(systemImage: "equal.circle", tooltip: "Сравнить папки", isActive: vm.isComparing) { vm.comparePanes() }
-                ToolButton(systemImage: vm.isQuickViewActive ? "eye.fill" : "eye", tooltip: "Быстрый просмотр (Ctrl+Q)", isActive: vm.isQuickViewActive) { vm.toggleQuickView() }
+                ToolButton(systemImage: "rectangle.2.swap", tooltip: "Сравнить папки", isActive: vm.isComparing) { vm.comparePanes() }
                 
                 Spacer()
+                
+                if vm.isTransferMinimized && vm.currentTransferTask != nil && !vm.isTransferCompleted {
+                    Button(action: { vm.showQueueDialog = true }) {
+                        HStack(spacing: 6) {
+                            ProgressView(value: vm.transferProgress, total: 1.0)
+                                .progressViewStyle(.circular)
+                                .controlSize(.mini)
+                            Text("\(Int(vm.transferProgress * 100))%")
+                                .font(.system(size: 11, weight: .semibold))
+                                .foregroundColor(.primary)
+                            if !vm.currentTransferFileName.isEmpty {
+                                Text(vm.currentTransferFileName)
+                                    .font(.system(size: 10))
+                                    .foregroundColor(.secondary)
+                                    .lineLimit(1)
+                                    .truncationMode(.middle)
+                                    .frame(maxWidth: 130)
+                            }
+                        }
+                        .padding(.horizontal, 7)
+                        .padding(.vertical, 3)
+                        .background(Color(nsColor: .controlBackgroundColor))
+                        .cornerRadius(10)
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 10)
+                                .stroke(Color.accentColor.opacity(0.4), lineWidth: 1)
+                        )
+                    }
+                    .buttonStyle(.plain)
+                    .help("Свёрнутая операция: \(vm.currentTransferFileName) (\(Int(vm.transferProgress * 100))%). Нажмите для открытия треков очереди.")
+                }
                 
                 ToolButton(systemImage: "magnifyingglass", tooltip: "Поиск файлов (Cmd+F)") { vm.showSearchDialog = true }
                 
@@ -27,17 +57,6 @@ public struct BottomToolbarView: View {
                 }
                 .buttonStyle(.plain)
                 .help("Очередь операций")
-                
-                if vm.isConnectingPhone {
-                    ProgressView()
-                        .controlSize(.small)
-                        .frame(width: 26, height: 24)
-                        .help("Подключение к телефону...")
-                } else {
-                    ToolButton(systemImage: "rectangle.2.swap", tooltip: "Подключить телефон (фоновый запуск ADB, проброс портов и авто-настройка)") {
-                        vm.connectPhone()
-                    }
-                }
             }
             
             // Ровно посередине

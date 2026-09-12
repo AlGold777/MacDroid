@@ -35,6 +35,15 @@ public struct TransferQueueModalView: View {
                     }
                     .buttonStyle(.bordered)
                     .foregroundColor(.red)
+                    
+                    if vm.isTransferMinimized {
+                        Button("Развернуть") {
+                            vm.isTransferMinimized = false
+                            vm.showTransferProgress = true
+                            dismiss()
+                        }
+                        .buttonStyle(.bordered)
+                    }
                 }
                 
                 if queue.tasks.contains(where: { $0.status == .failed || $0.status == .cancelled }) {
@@ -58,6 +67,38 @@ public struct TransferQueueModalView: View {
             .padding(.top, 12)
             
             Divider()
+            
+            if vm.currentTransferTask != nil && !vm.isTransferCompleted {
+                VStack(alignment: .leading, spacing: 6) {
+                    HStack {
+                        Text(vm.statusMessage)
+                            .font(.system(size: 12, weight: .medium))
+                            .lineLimit(1)
+                        Spacer()
+                        Text("\(Int(vm.transferProgress * 100))%")
+                            .font(.system(size: 12, weight: .bold))
+                    }
+                    ProgressView(value: vm.transferProgress, total: 1.0)
+                        .progressViewStyle(.linear)
+                    HStack {
+                        if !vm.transferSpeed.isEmpty {
+                            Label(vm.transferSpeed, systemImage: "speedometer")
+                                .font(.caption2)
+                                .foregroundColor(.blue)
+                        }
+                        Spacer()
+                        if !vm.transferETA.isEmpty {
+                            Label("Осталось: \(vm.transferETA)", systemImage: "clock")
+                                .font(.caption2)
+                                .foregroundColor(.secondary)
+                        }
+                    }
+                }
+                .padding(.horizontal)
+                .padding(.vertical, 4)
+                
+                Divider()
+            }
             
             if queue.tasks.isEmpty {
                 VStack(spacing: 12) {
