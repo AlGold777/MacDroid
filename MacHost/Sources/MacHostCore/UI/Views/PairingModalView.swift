@@ -1,20 +1,5 @@
 import SwiftUI
 
-public struct SavedConnection: Codable, Identifiable, Hashable, Sendable {
-    public var id: String { "\(host):\(port)" }
-    public let name: String
-    public let host: String
-    public let port: Int
-    public let date: Date
-    
-    public init(name: String, host: String, port: Int, date: Date = Date()) {
-        self.name = name
-        self.host = host
-        self.port = port
-        self.date = date
-    }
-}
-
 public struct PairingModalView: View {
     @EnvironmentObject var vm: DualPaneViewModel
     @Environment(\.dismiss) var dismiss
@@ -24,7 +9,7 @@ public struct PairingModalView: View {
     @State private var pairingStatus: String = "Готов к сопряжению"
     @State private var isConnecting: Bool = false
     @State private var history: [SavedConnection] = []
-    @State private var currentFingerprint: String = "SHA256:Ed25519_Xiaomi14Ultra_DaemonFingerprint"
+    @State private var currentFingerprint: String = "— Ожидание подключения —"
     
     public init() {}
     
@@ -37,7 +22,7 @@ public struct PairingModalView: View {
                 VStack(alignment: .leading) {
                     Text("Безопасное сопряжение (Ed25519)")
                         .font(.headline)
-                    Text("Установка доверенной криптографической связи Mac ↔ Xiaomi 14 Ultra")
+                    Text("Установка доверенной криптографической связи Mac ↔ Android")
                         .font(.caption)
                         .foregroundColor(.secondary)
                 }
@@ -63,6 +48,15 @@ public struct PairingModalView: View {
                                 .font(.caption2)
                                 .foregroundColor(.secondary)
                         }
+                    } else {
+                        Button(action: {
+                            vm.discoveryService.refresh()
+                        }) {
+                            Label("Обновить", systemImage: "arrow.clockwise")
+                                .font(.caption2)
+                        }
+                        .buttonStyle(.plain)
+                        .foregroundColor(.accentColor)
                     }
                 }
                 
@@ -76,7 +70,7 @@ public struct PairingModalView: View {
                                     selectConnection(name: dev.name, host: dev.host, port: dev.port)
                                 }) {
                                     HStack {
-                                        Label("\(dev.name) — \(dev.host):\(dev.port)", systemImage: "wifi")
+                                        Label("\(dev.name) — \(dev.host):\(dev.port) (в сети)", systemImage: "wifi")
                                         if inputHost == dev.host && inputPort == String(dev.port) {
                                             Image(systemName: "checkmark")
                                         }
@@ -91,11 +85,19 @@ public struct PairingModalView: View {
                         if !discovered.isEmpty { Divider() }
                         Section("История подключений") {
                             ForEach(history) { item in
+                                let isLive = discovered.contains(where: { $0.host == item.host })
+                                let matchingLive = discovered.first(where: { $0.name == item.name && $0.host != item.host })
                                 Button(action: {
                                     selectConnection(name: item.name, host: item.host, port: item.port)
                                 }) {
                                     HStack {
-                                        Label("\(item.name) — \(item.host):\(item.port)", systemImage: "clock")
+                                        if let matching = matchingLive {
+                                            Label("\(item.name) — \(item.host) ➔ в сети на \(matching.host)", systemImage: "arrow.triangle.turn.up.right.diamond")
+                                        } else if isLive {
+                                            Label("\(item.name) — \(item.host):\(item.port) (в сети)", systemImage: "wifi")
+                                        } else {
+                                            Label("\(item.name) — \(item.host):\(item.port)", systemImage: "clock")
+                                        }
                                         if inputHost == item.host && inputPort == String(item.port) {
                                             Image(systemName: "checkmark")
                                         }
@@ -150,7 +152,7 @@ public struct PairingModalView: View {
                     Text("IP-адрес телефона:")
                         .font(.caption)
                         .frame(width: 140, alignment: .leading)
-                    TextField("192.168.x.x", text: $inputHost)
+                    TextField("например, 192.168.1.50", text: $inputHost)
                         .textFieldStyle(.roundedBorder)
                 }
                 
@@ -174,9 +176,16 @@ public struct PairingModalView: View {
                         .cornerRadius(4)
                 }
                 
+                Toggle("Автоматически подключаться к этому устройству при запуске", isOn: Binding(
+                    get: { UserDefaults.standard.bool(forKey: "autoConnectEnabled") },
+                    set: { UserDefaults.standard.set($0, forKey: "autoConnectEnabled") }
+                ))
+                .font(.caption)
+                .padding(.top, 4)
+                
                 Text(pairingStatus)
                     .font(.caption)
-                    .foregroundColor(pairingStatus.hasPrefix("✓") ? .green : pairingStatus.hasPrefix("⚠") ? .red : .blue)
+                    .foregroundColor(pairingStatus.hasPrefix("✓") ? .green : pairingStatus.hasPrefix("⚠️") ? .red : .blue)
             }
             .padding(.horizontal)
             
@@ -200,45 +209,72 @@ public struct PairingModalView: View {
                     }
                     let portInt = Int(inputPort) ?? 2222
                     isConnecting = true
+                    pairingStatus = "Проверка доступности и авторизация SFTP..."
                     
-                    // Сохраняем последний успешный адрес и историю
-                    UserDefaults.standard.set(inputHost, forKey: "lastConnectedHost")
-                    UserDefaults.standard.set(inputPort, forKey: "lastConnectedPort")
-                    saveToHistory(host: inputHost, port: portInt)
-                    
-                    vm.updateRemoteEndpoint(host: inputHost, port: UInt16(portInt))
-                    
-                    let fp = PhoneConnectionManager.shared.fetchHostFingerprint(host: inputHost, port: UInt16(portInt))
-                        ?? "SHA256:Ed25519_Xiaomi14Ultra_DaemonFingerprint"
-                    currentFingerprint = fp
-                    
-                    let res = HostKeyStore.shared.verifyOrPin(
-                        host: inputHost,
-                        port: portInt,
-                        fingerprint: fp
-                    )
-                    
-                    isConnecting = false
-                    switch res {
-                    case .trusted:
-                        pairingStatus = "✓ Устройство уже доверенное"
-                    case .pinnedNew:
-                        pairingStatus = "✓ Новый ключ успешно зафиксирован в хранилище"
-                    case .mismatchWarning:
-                        pairingStatus = "⚠️ ВНИМАНИЕ: Ключ не совпадает с сохраненным ранее!"
-                    }
-                    
-                    if vm.rightSource != .remotePhone && vm.leftSource != .remotePhone {
-                        vm.changeSource(to: .remotePhone, side: .right)
-                    } else {
-                        if vm.leftSource == .remotePhone { vm.refreshPane(side: .left) }
-                        if vm.rightSource == .remotePhone { vm.refreshPane(side: .right) }
-                    }
-                    vm.refreshDetectedVolumes()
-                    vm.statusMessage = "✓ Телефон подключен по Wi-Fi (\(inputHost):\(portInt))"
-                    
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-                        dismiss()
+                    Task { @MainActor in
+                        defer { isConnecting = false }
+                        
+                        let reachable = PhoneConnectionManager.shared.isHostPortReachable(host: inputHost, port: UInt16(portInt), timeoutSeconds: 2)
+                        guard reachable else {
+                            pairingStatus = "⚠️ Устройство не отвечает по адресу \(inputHost):\(portInt)"
+                            return
+                        }
+                        
+                        vm.updateRemoteEndpoint(host: inputHost, port: UInt16(portInt))
+                        
+                        let fp = PhoneConnectionManager.shared.fetchHostFingerprint(host: inputHost, port: UInt16(portInt))
+                            ?? "SHA256:Ed25519_DaemonFingerprint"
+                        currentFingerprint = fp
+                        
+                        let res = HostKeyStore.shared.verifyOrPin(
+                            host: inputHost,
+                            port: portInt,
+                            fingerprint: fp
+                        )
+                        
+                        do {
+                            try await vm.remoteDriver.warmUpConnection()
+                            vm.isPhoneConnected = true
+                            vm.transport.rootIsEmulatedZero = vm.remoteDriver.rootIsEmulatedZero
+                            
+                            UserDefaults.standard.set(inputHost, forKey: "lastConnectedHost")
+                            UserDefaults.standard.set(inputPort, forKey: "lastConnectedPort")
+                            saveToHistory(host: inputHost, port: portInt)
+                            
+                            let devName = currentSelectionTitle.components(separatedBy: " — ").first ?? "Телефон Android"
+                            DeviceRegistry.shared.registerOrUpdate(
+                                id: "device_\(inputHost)",
+                                name: devName,
+                                fingerprint: fp,
+                                host: inputHost,
+                                port: UInt16(portInt)
+                            )
+                            
+                            switch res {
+                            case .trusted:
+                                pairingStatus = "✓ Устройство авторизовано (доверенное)"
+                            case .pinnedNew:
+                                pairingStatus = "✓ Ключ успешно зафиксирован в хранилище"
+                            case .mismatchWarning:
+                                pairingStatus = "⚠️ ВНИМАНИЕ: Ключ не совпадает с сохраненным ранее!"
+                            }
+                            
+                            if vm.rightSource != .remotePhone && vm.leftSource != .remotePhone {
+                                vm.changeSource(to: .remotePhone, side: .right)
+                            } else {
+                                if vm.leftSource == .remotePhone { vm.refreshPane(side: .left) }
+                                if vm.rightSource == .remotePhone { vm.refreshPane(side: .right) }
+                            }
+                            vm.refreshDetectedVolumes()
+                            vm.statusMessage = "✓ Телефон подключен по Wi-Fi (\(inputHost):\(portInt))"
+                            
+                            try? await Task.sleep(nanoseconds: 600_000_000)
+                            dismiss()
+                        } catch {
+                            pairingStatus = "⚠️ Ошибка авторизации SFTP: \(error.localizedDescription)"
+                            vm.isPhoneConnected = false
+                            vm.statusMessage = "⚠️ Ошибка SFTP: \(error.localizedDescription)"
+                        }
                     }
                 }
                 .buttonStyle(.borderedProminent)
@@ -250,20 +286,52 @@ public struct PairingModalView: View {
         .frame(minWidth: 520)
         .onAppear {
             loadHistory()
-            // Авто-определение активного IP или восстановление сохранённого
-            if let liveIp = PhoneConnectionManager.shared.discoverPhoneIpOnLan() {
-                inputHost = liveIp
-            } else if let savedHost = UserDefaults.standard.string(forKey: "lastConnectedHost"), !savedHost.isEmpty {
-                inputHost = savedHost
-            } else if let first = history.first {
-                inputHost = first.host
-            } else {
-                inputHost = "192.168.1.18"
+            vm.discoveryService.startDiscovery()
+            
+            // Умный приоритет автоподстановки IP:
+            // 1. Прямо сейчас обнаруженное через mDNS живое устройство
+            if let firstDiscovered = vm.discoveryService.discoveredDevices.first {
+                inputHost = firstDiscovered.host
+                inputPort = String(firstDiscovered.port)
             }
-            if let savedPort = UserDefaults.standard.string(forKey: "lastConnectedPort"), !savedPort.isEmpty {
-                inputPort = savedPort
-            } else if let first = history.first {
+            // 2. Сканирование живого IP (mDNS кэш -> последний успешный IP -> история -> ARP)
+            else if let liveIp = PhoneConnectionManager.shared.discoverPhoneIpOnLan() {
+                inputHost = liveIp
+                if let savedPort = UserDefaults.standard.string(forKey: "lastConnectedPort"), !savedPort.isEmpty {
+                    inputPort = savedPort
+                }
+            }
+            // 3. Последний сохраненный хост (только если доступен в сети прямо сейчас)
+            else if let savedHost = UserDefaults.standard.string(forKey: "lastConnectedHost"),
+                    !savedHost.isEmpty,
+                    PhoneConnectionManager.shared.isHostPortReachable(host: savedHost, port: UInt16(UserDefaults.standard.string(forKey: "lastConnectedPort") ?? "2222") ?? 2222, timeoutSeconds: 1) {
+                inputHost = savedHost
+                if let savedPort = UserDefaults.standard.string(forKey: "lastConnectedPort"), !savedPort.isEmpty {
+                    inputPort = savedPort
+                }
+            }
+            // 4. Первая запись из истории (только если доступна в сети)
+            else if let first = history.first,
+                    PhoneConnectionManager.shared.isHostPortReachable(host: first.host, port: UInt16(first.port), timeoutSeconds: 1) {
+                inputHost = first.host
                 inputPort = String(first.port)
+            }
+            // 5. Если живые устройства не найдены — оставляем поле пустым для ввода
+            else {
+                inputHost = ""
+                inputPort = "2222"
+            }
+        }
+        .onReceive(vm.discoveryService.$discoveredDevices) { devices in
+            guard let live = devices.first else { return }
+            // Если поле было пустым, либо текущий введенный адрес недоступен,
+            // автоматически переключаем на свежеобнаруженный живой IP устройства
+            if inputHost.isEmpty {
+                inputHost = live.host
+                inputPort = String(live.port)
+            } else if inputHost != live.host && !PhoneConnectionManager.shared.isHostPortReachable(host: inputHost, port: UInt16(inputPort) ?? 2222, timeoutSeconds: 1) {
+                inputHost = live.host
+                inputPort = String(live.port)
             }
         }
     }
@@ -282,13 +350,22 @@ public struct PairingModalView: View {
     }
     
     private func selectConnection(name: String, host: String, port: Int) {
-        inputHost = host
-        inputPort = String(port)
+        // Если устройство с таким же именем сейчас обнаружено в mDNS по новому IP,
+        // автоматически используем актуальный IP
+        if let liveDev = vm.discoveryService.discoveredDevices.first(where: { $0.name == name }) {
+            inputHost = liveDev.host
+            inputPort = String(liveDev.port)
+        } else {
+            inputHost = host
+            inputPort = String(port)
+        }
     }
     
     private func saveToHistory(host: String, port: Int) {
         var updated = history.filter { !($0.host == host && $0.port == port) }
-        let name = vm.discoveryService.discoveredDevices.first(where: { $0.host == host && $0.port == port })?.name ?? "Xiaomi 14 Ultra"
+        let name = vm.discoveryService.discoveredDevices.first(where: { $0.host == host && $0.port == port })?.name
+            ?? PhoneConnectionManager.shared.deviceNameForHost(host)
+            ?? "Телефон Android"
         updated.insert(SavedConnection(name: name, host: host, port: port, date: Date()), at: 0)
         if updated.count > 25 {
             updated = Array(updated.prefix(25))
@@ -305,7 +382,8 @@ public struct PairingModalView: View {
             history = saved
         } else if let savedHost = UserDefaults.standard.string(forKey: "lastConnectedHost"), !savedHost.isEmpty {
             let savedPort = Int(UserDefaults.standard.string(forKey: "lastConnectedPort") ?? "2222") ?? 2222
-            history = [SavedConnection(name: "Xiaomi 14 Ultra", host: savedHost, port: savedPort, date: Date())]
+            let devName = PhoneConnectionManager.shared.deviceNameForHost(savedHost) ?? "Телефон Android"
+            history = [SavedConnection(name: devName, host: savedHost, port: savedPort, date: Date())]
         }
     }
     

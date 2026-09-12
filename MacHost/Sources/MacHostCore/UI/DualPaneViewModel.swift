@@ -2,6 +2,7 @@ import Foundation
 import SwiftUI
 import AppKit
 import UniformTypeIdentifiers
+import DiskArbitration
 
 public enum SortField: String, CaseIterable, Sendable {
     case name = "Имя"
@@ -12,6 +13,11 @@ public enum SortField: String, CaseIterable, Sendable {
 public enum PaneSide: String, Sendable {
     case left = "left"
     case right = "right"
+}
+
+public enum PaneViewMode: String, CaseIterable, Sendable {
+    case table = "table"
+    case grid = "grid"
 }
 
 @MainActor
@@ -32,6 +38,26 @@ public final class DualPaneViewModel: ObservableObject {
         }
     }
     
+    // Режимы отображения панелей (Таблица / Графическая сетка)
+    @Published public var leftViewMode: PaneViewMode = .table {
+        didSet { UserDefaults.standard.set(leftViewMode.rawValue, forKey: SessionKey.leftViewMode) }
+    }
+    @Published public var rightViewMode: PaneViewMode = .table {
+        didSet { UserDefaults.standard.set(rightViewMode.rawValue, forKey: SessionKey.rightViewMode) }
+    }
+    @Published public var leftGridThumbnailSize: Double = 120 {
+        didSet { UserDefaults.standard.set(leftGridThumbnailSize, forKey: SessionKey.leftGridThumbnailSize) }
+    }
+    @Published public var rightGridThumbnailSize: Double = 120 {
+        didSet { UserDefaults.standard.set(rightGridThumbnailSize, forKey: SessionKey.rightGridThumbnailSize) }
+    }
+    @Published public var leftGridSpacing: Double = 10 {
+        didSet { UserDefaults.standard.set(leftGridSpacing, forKey: SessionKey.leftGridSpacing) }
+    }
+    @Published public var rightGridSpacing: Double = 10 {
+        didSet { UserDefaults.standard.set(rightGridSpacing, forKey: SessionKey.rightGridSpacing) }
+    }
+    
     // Вкладки левой панели
     @Published public var leftTabs: [PanelTab] = []
     @Published public var leftActiveTabId: UUID = UUID()
@@ -41,9 +67,14 @@ public final class DualPaneViewModel: ObservableObject {
     @Published public var rightActiveTabId: UUID = UUID()
     
     // Состояние левой панели
+    private var leftItemsVersion: Int = 0
+    private var rightItemsVersion: Int = 0
+    
     @Published public var leftSource: FileSource = .localMac
     @Published public var leftPath: String = FileManager.default.homeDirectoryForCurrentUser.path
-    @Published public var leftItems: [FileItem] = []
+    @Published public var leftItems: [FileItem] = [] {
+        didSet { leftItemsVersion &+= 1 }
+    }
     @Published public var leftSelection: Set<String> = []
     @Published public var leftFilter: String = ""
     @Published public var leftSortField: SortField = .name {
@@ -62,7 +93,9 @@ public final class DualPaneViewModel: ObservableObject {
     // Состояние правой панели
     @Published public var rightSource: FileSource = .remotePhone
     @Published public var rightPath: String = "/storage/emulated/0/DCIM"
-    @Published public var rightItems: [FileItem] = []
+    @Published public var rightItems: [FileItem] = [] {
+        didSet { rightItemsVersion &+= 1 }
+    }
     @Published public var rightSelection: Set<String> = []
     @Published public var rightFilter: String = ""
     @Published public var rightSortField: SortField = .name {
@@ -91,6 +124,11 @@ public final class DualPaneViewModel: ObservableObject {
     @Published public var showRenameDialog: Bool = false
     @Published public var itemToRename: FileItem? = nil
     @Published public var renameNewName: String = ""
+    
+    // In-place Inline Rename
+    @Published public var editingItemId: String? = nil
+    @Published public var editingItemSide: PaneSide? = nil
+    @Published public var editingItemName: String = ""
     @Published public var showPropertiesDialog: Bool = false
     @Published public var propertiesItem: FileItem? = nil
     @Published public var showDeleteConfirmDialog: Bool = false
@@ -109,6 +147,17 @@ public final class DualPaneViewModel: ObservableObject {
     @Published public var statusMessage: String = "Готов к работе"
     @Published public var newFolderName: String = ""
     @Published public var showOperationReport: Bool = false
+    
+    // Drag & Drop Visual Feedback
+    @Published public var dragHoverSide: PaneSide? = nil
+    @Published public var dragHoverFolderId: String? = nil
+    @Published public var dragInsertionIndex: Int? = nil
+    
+    public func clearDragHoverState() {
+        dragHoverSide = nil
+        dragHoverFolderId = nil
+        dragInsertionIndex = nil
+    }
     @Published public var isTransferCompleted: Bool = false
     @Published public var transferCompletionMessage: String = ""
     @Published public var operationReport: OperationReport? = nil
@@ -116,6 +165,9 @@ public final class DualPaneViewModel: ObservableObject {
     @Published public var isTransferPaused: Bool = false
     @Published public var currentPreviewTask: Task<Void, Never>? = nil
     @Published public var isConnectingPhone: Bool = false
+    @Published public var isTransferMinimized: Bool = false
+    @Published public var currentTransferFileName: String = ""
+    private var isAutoConnecting: Bool = false
     
     // Буфер обмена (Clipboard)
     @Published public var clipboardItems: [FileItem] = []
@@ -152,13 +204,31 @@ public final class DualPaneViewModel: ObservableObject {
     // Внешние хранилища Android (SD-карты, OTG)
     @Published public var detectedVolumes: [PhoneConnectionManager.StorageVolume] = []
     
+    // Внешние USB накопители (Mac /Volumes и Android OTG)
+    public struct UsbDriveInfo: Identifiable, Hashable {
+        public let id: String
+        public let name: String
+        public let path: String
+        public let isMac: Bool
+        
+        public init(id: String, name: String, path: String, isMac: Bool) {
+            self.id = id
+            self.name = name
+            self.path = path
+            self.isMac = isMac
+        }
+    }
+    @Published public var detectedUsbDrives: [UsbDriveInfo] = []
+    @Published public var isPhoneConnected: Bool = false
+    private var connectionMonitorTimer: Timer?
+    
     // Вычисление размера папок по нажатию Space
     @Published public var calculatedFolderSizes: [String: UInt64] = [:]
     @Published public var calculatingFolderPaths: Set<String> = []
     
     public private(set) var localDriver = LocalFSDriver()
     public private(set) var remoteDriver = RemoteSFTPDriver()
-    public let discoveryService = DiscoveryService()
+    public let discoveryService = DiscoveryService.shared
     public let queueManager = TransferQueueManager.shared
     
     public private(set) var transport = TransportMultiplexer()
@@ -206,15 +276,23 @@ public final class DualPaneViewModel: ObservableObject {
         static let rightActiveTabId = "session.rightActiveTabId"
         static let activePane = "session.activePane"
         static let isQuickViewActive = "session.isQuickViewActive"
+        static let leftViewMode = "session.leftViewMode"
+        static let rightViewMode = "session.rightViewMode"
+        static let leftGridThumbnailSize = "session.leftGridThumbnailSize"
+        static let rightGridThumbnailSize = "session.rightGridThumbnailSize"
+        static let leftGridSpacing = "session.leftGridSpacing"
+        static let rightGridSpacing = "session.rightGridSpacing"
     }
     
     public init() {
         // Восстановление сохранённого адреса телефона
-        let savedHost = UserDefaults.standard.string(forKey: "lastConnectedHost") ?? "192.168.1.18"
+        let savedHost = UserDefaults.standard.string(forKey: "lastConnectedHost") ?? ""
         let savedPort = UInt16(UserDefaults.standard.integer(forKey: "lastConnectedPort"))
         let port = savedPort > 0 ? savedPort : 2222
-        remoteDriver.updateEndpoint(host: savedHost, port: port)
-        transport.updateEndpoint(host: savedHost, port: port)
+        if !savedHost.isEmpty {
+            remoteDriver.updateEndpoint(host: savedHost, port: port)
+            transport.updateEndpoint(host: savedHost, port: port)
+        }
         
         // Восстановление состояния из предыдущей сессии
         restoreSession()
@@ -243,8 +321,8 @@ public final class DualPaneViewModel: ObservableObject {
         refreshPane(side: .right)
         discoveryService.startDiscovery()
         
-        // Автоматическое обнаружение и подключение смартфона по USB при старте
-        if leftSource == .remotePhone || rightSource == .remotePhone {
+        // Автоматическое обнаружение и подключение смартфона при старте (только если включено пользователем в настройках)
+        if UserDefaults.standard.bool(forKey: "autoConnectEnabled") {
             autoConnectPhoneIfAvailable()
         }
         
@@ -269,6 +347,33 @@ public final class DualPaneViewModel: ObservableObject {
                 self?.saveSession()
             }
         }
+        
+        // Инициализация и наблюдение за подключением внешних USB накопителей
+        refreshUsbDrives()
+        NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didMountNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.refreshUsbDrives()
+            }
+        }
+        NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didUnmountNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.refreshUsbDrives()
+            }
+        }
+        
+        // Глобальный перехватчик Ctrl+V, Ctrl+C, Ctrl+X, Ctrl+A в текстовых полях
+        KeyCommandMonitor.installGlobalMonitor()
+        
+        // Фоновый мониторинг связи со смартфоном
+        startConnectionMonitor()
     }
     
     /// Сохранение текущего состояния панелей в UserDefaults
@@ -288,6 +393,12 @@ public final class DualPaneViewModel: ObservableObject {
         defaults.set(rightActiveTabId.uuidString, forKey: SessionKey.rightActiveTabId)
         defaults.set(activePane.rawValue, forKey: SessionKey.activePane)
         defaults.set(isQuickViewActive, forKey: SessionKey.isQuickViewActive)
+        defaults.set(leftViewMode.rawValue, forKey: SessionKey.leftViewMode)
+        defaults.set(rightViewMode.rawValue, forKey: SessionKey.rightViewMode)
+        defaults.set(leftGridThumbnailSize, forKey: SessionKey.leftGridThumbnailSize)
+        defaults.set(rightGridThumbnailSize, forKey: SessionKey.rightGridThumbnailSize)
+        defaults.set(leftGridSpacing, forKey: SessionKey.leftGridSpacing)
+        defaults.set(rightGridSpacing, forKey: SessionKey.rightGridSpacing)
         
         // Сериализация вкладок в JSON (включая флаги закрепления isPinned)
         if let leftTabsData = try? JSONEncoder().encode(leftTabs) {
@@ -317,6 +428,12 @@ public final class DualPaneViewModel: ObservableObject {
         defaults.removeObject(forKey: SessionKey.rightActiveTabId)
         defaults.removeObject(forKey: SessionKey.activePane)
         defaults.removeObject(forKey: SessionKey.isQuickViewActive)
+        defaults.removeObject(forKey: SessionKey.leftViewMode)
+        defaults.removeObject(forKey: SessionKey.rightViewMode)
+        defaults.removeObject(forKey: SessionKey.leftGridThumbnailSize)
+        defaults.removeObject(forKey: SessionKey.rightGridThumbnailSize)
+        defaults.removeObject(forKey: SessionKey.leftGridSpacing)
+        defaults.removeObject(forKey: SessionKey.rightGridSpacing)
     }
     
     public func clearSavedSession() {
@@ -328,18 +445,18 @@ public final class DualPaneViewModel: ObservableObject {
         let defaults = UserDefaults.standard
         
         if let savedLeftSource = defaults.string(forKey: SessionKey.leftSource) {
-            if savedLeftSource == "MacBook (Локально)" || savedLeftSource == "MacBook" {
+            if savedLeftSource == "MacBook (Локально)" || savedLeftSource == "MacBook" || savedLeftSource == "Mac" {
                 leftSource = .localMac
-            } else if savedLeftSource == "Xiaomi 14 Ultra (Wi-Fi/SFTP)" || savedLeftSource == "Xiaomi 14" {
+            } else if savedLeftSource == "Xiaomi 14 Ultra (Wi-Fi/SFTP)" || savedLeftSource == "Xiaomi 14" || savedLeftSource == "Phone" {
                 leftSource = .remotePhone
             } else if let source = FileSource(rawValue: savedLeftSource) {
                 leftSource = source
             }
         }
         if let savedRightSource = defaults.string(forKey: SessionKey.rightSource) {
-            if savedRightSource == "MacBook (Локально)" || savedRightSource == "MacBook" {
+            if savedRightSource == "MacBook (Локально)" || savedRightSource == "MacBook" || savedRightSource == "Mac" {
                 rightSource = .localMac
-            } else if savedRightSource == "Xiaomi 14 Ultra (Wi-Fi/SFTP)" || savedRightSource == "Xiaomi 14" {
+            } else if savedRightSource == "Xiaomi 14 Ultra (Wi-Fi/SFTP)" || savedRightSource == "Xiaomi 14" || savedRightSource == "Phone" {
                 rightSource = .remotePhone
             } else if let source = FileSource(rawValue: savedRightSource) {
                 rightSource = source
@@ -366,6 +483,30 @@ public final class DualPaneViewModel: ObservableObject {
         }
         if defaults.object(forKey: SessionKey.isQuickViewActive) != nil {
             isQuickViewActive = defaults.bool(forKey: SessionKey.isQuickViewActive)
+        }
+        if let savedLeftMode = defaults.string(forKey: SessionKey.leftViewMode),
+           let mode = PaneViewMode(rawValue: savedLeftMode) {
+            leftViewMode = mode
+        }
+        if let savedRightMode = defaults.string(forKey: SessionKey.rightViewMode),
+           let mode = PaneViewMode(rawValue: savedRightMode) {
+            rightViewMode = mode
+        }
+        if defaults.object(forKey: SessionKey.leftGridThumbnailSize) != nil {
+            let size = defaults.double(forKey: SessionKey.leftGridThumbnailSize)
+            if size >= 60 && size <= 300 { leftGridThumbnailSize = size }
+        }
+        if defaults.object(forKey: SessionKey.rightGridThumbnailSize) != nil {
+            let size = defaults.double(forKey: SessionKey.rightGridThumbnailSize)
+            if size >= 60 && size <= 300 { rightGridThumbnailSize = size }
+        }
+        if defaults.object(forKey: SessionKey.leftGridSpacing) != nil {
+            let spacing = defaults.double(forKey: SessionKey.leftGridSpacing)
+            if spacing >= 2 && spacing <= 40 { leftGridSpacing = spacing }
+        }
+        if defaults.object(forKey: SessionKey.rightGridSpacing) != nil {
+            let spacing = defaults.double(forKey: SessionKey.rightGridSpacing)
+            if spacing >= 2 && spacing <= 40 { rightGridSpacing = spacing }
         }
         
         // Валидация путей относительно источника (защита от устаревших несовместимых сессий)
@@ -644,7 +785,7 @@ public final class DualPaneViewModel: ObservableObject {
     
     // MARK: - Memoized Display Items
     private struct DisplayCache {
-        var rawHash: Int
+        var version: Int
         var rawCount: Int
         var filter: String
         var sortField: SortField
@@ -667,18 +808,11 @@ public final class DualPaneViewModel: ObservableObject {
         let comparing = isComparing
         let hideIdentical = hideIdenticalInComparison
         
+        let version = (side == .left) ? leftItemsVersion : rightItemsVersion
         let rawCount = raw.count
-        var hasher = Hasher()
-        for item in raw {
-            hasher.combine(item.id)
-            hasher.combine(item.name)
-            hasher.combine(item.size)
-            hasher.combine(item.mtime)
-        }
-        let rawHash = hasher.finalize()
         
         if side == .left, let cache = leftDisplayCache,
-           cache.rawHash == rawHash,
+           cache.version == version,
            cache.rawCount == rawCount,
            cache.filter == filter,
            cache.sortField == sortField,
@@ -690,7 +824,7 @@ public final class DualPaneViewModel: ObservableObject {
         }
         
         if side == .right, let cache = rightDisplayCache,
-           cache.rawHash == rawHash,
+           cache.version == version,
            cache.rawCount == rawCount,
            cache.filter == filter,
            cache.sortField == sortField,
@@ -728,7 +862,7 @@ public final class DualPaneViewModel: ObservableObject {
         }
         
         let newCache = DisplayCache(
-            rawHash: rawHash,
+            version: version,
             rawCount: rawCount,
             filter: filter,
             sortField: sortField,
@@ -743,6 +877,7 @@ public final class DualPaneViewModel: ObservableObject {
         } else {
             rightDisplayCache = newCache
         }
+        
         return sorted
     }
     
@@ -856,6 +991,9 @@ public final class DualPaneViewModel: ObservableObject {
         let tempIsStale = leftIsStale
         let tempTabs = leftTabs
         let tempActiveTabId = leftActiveTabId
+        let tempViewMode = leftViewMode
+        let tempThumbnailSize = leftGridThumbnailSize
+        let tempSpacing = leftGridSpacing
         
         leftSource = rightSource
         leftPath = rightPath
@@ -868,6 +1006,9 @@ public final class DualPaneViewModel: ObservableObject {
         leftIsStale = rightIsStale
         leftTabs = rightTabs
         leftActiveTabId = rightActiveTabId
+        leftViewMode = rightViewMode
+        leftGridThumbnailSize = rightGridThumbnailSize
+        leftGridSpacing = rightGridSpacing
         
         rightSource = tempSource
         rightPath = tempPath
@@ -880,9 +1021,25 @@ public final class DualPaneViewModel: ObservableObject {
         rightIsStale = tempIsStale
         rightTabs = tempTabs
         rightActiveTabId = tempActiveTabId
+        rightViewMode = tempViewMode
+        rightGridThumbnailSize = tempThumbnailSize
+        rightGridSpacing = tempSpacing
         
         statusMessage = "Панели поменяны местами"
         saveSession()
+    }
+    
+    /// Переключение между режимом таблицы и графической сетки
+    public func toggleViewMode(for side: PaneSide? = nil) {
+        let targetSide = side ?? activePane
+        if targetSide == .left {
+            leftViewMode = (leftViewMode == .table) ? .grid : .table
+        } else {
+            rightViewMode = (rightViewMode == .table) ? .grid : .table
+        }
+        statusMessage = (targetSide == .left ? leftViewMode : rightViewMode) == .grid
+            ? "Режим сетки (галерея)"
+            : "Режим списка (таблица)"
     }
     
     /// Обновление заголовка, пути и источника активной вкладки
@@ -952,12 +1109,6 @@ public final class DualPaneViewModel: ObservableObject {
     public func updateRemoteEndpoint(host: String, port: UInt16) {
         remoteDriver.updateEndpoint(host: host, port: port)
         transport.updateEndpoint(host: host, port: port)
-        if leftSource == .remotePhone {
-            refreshPane(side: .left)
-        }
-        if rightSource == .remotePhone {
-            refreshPane(side: .right)
-        }
     }
     
     /// Подключение к телефону: фоновый запуск ADB/проброс портов и авто-настройка
@@ -975,47 +1126,71 @@ public final class DualPaneViewModel: ObservableObject {
                 print("[PhoneConnection] Success:\n\(log)")
                 self.updateRemoteEndpoint(host: host, port: port)
                 let fp = PhoneConnectionManager.shared.fetchHostFingerprint(host: host, port: port)
-                    ?? "SHA256:Ed25519_Xiaomi14Ultra_DaemonFingerprint"
+                    ?? "SHA256:Ed25519_DaemonFingerprint"
                 _ = HostKeyStore.shared.verifyOrPin(
                     host: host,
                     port: Int(port),
                     fingerprint: fp
                 )
-                if forceActivate && self.rightSource != .remotePhone && self.leftSource != .remotePhone {
-                    self.changeSource(to: .remotePhone, side: .right)
-                } else {
-                    if self.leftSource == .remotePhone { self.refreshPane(side: .left) }
-                    if self.rightSource == .remotePhone { self.refreshPane(side: .right) }
+                do {
+                    try await self.remoteDriver.warmUpConnection()
+                    self.isPhoneConnected = true
+                    self.transport.rootIsEmulatedZero = self.remoteDriver.rootIsEmulatedZero
+                    if forceActivate && self.rightSource != .remotePhone && self.leftSource != .remotePhone {
+                        self.changeSource(to: .remotePhone, side: .right)
+                    } else {
+                        if self.leftSource == .remotePhone { self.refreshPane(side: .left) }
+                        if self.rightSource == .remotePhone { self.refreshPane(side: .right) }
+                    }
+                    self.refreshDetectedVolumes()
+                    self.statusMessage = "✓ Телефон подключен по USB (\(deviceId))"
+                } catch {
+                    print("[PhoneConnection] SFTP warmup error: \(error)")
+                    self.isPhoneConnected = false
+                    self.refreshUsbDrives()
+                    self.statusMessage = "⚠️ Ошибка SFTP: \(error.localizedDescription)"
                 }
-                self.refreshDetectedVolumes()
-                self.statusMessage = "✓ Телефон подключен по USB (\(deviceId))"
                 
             case .wifiSuccess(let host, let port, let name):
                 UserDefaults.standard.set(host, forKey: "lastConnectedHost")
                 UserDefaults.standard.set(String(port), forKey: "lastConnectedPort")
                 self.updateRemoteEndpoint(host: host, port: port)
                 let fp = PhoneConnectionManager.shared.fetchHostFingerprint(host: host, port: port)
-                    ?? "SHA256:Ed25519_Xiaomi14Ultra_DaemonFingerprint"
+                    ?? "SHA256:Ed25519_DaemonFingerprint"
                 _ = HostKeyStore.shared.verifyOrPin(
                     host: host,
                     port: Int(port),
                     fingerprint: fp
                 )
-                if forceActivate && self.rightSource != .remotePhone && self.leftSource != .remotePhone {
-                    self.changeSource(to: .remotePhone, side: .right)
-                } else {
-                    if self.leftSource == .remotePhone { self.refreshPane(side: .left) }
-                    if self.rightSource == .remotePhone { self.refreshPane(side: .right) }
+                do {
+                    try await self.remoteDriver.warmUpConnection()
+                    self.isPhoneConnected = true
+                    self.transport.rootIsEmulatedZero = self.remoteDriver.rootIsEmulatedZero
+                    if forceActivate && self.rightSource != .remotePhone && self.leftSource != .remotePhone {
+                        self.changeSource(to: .remotePhone, side: .right)
+                    } else {
+                        if self.leftSource == .remotePhone { self.refreshPane(side: .left) }
+                        if self.rightSource == .remotePhone { self.refreshPane(side: .right) }
+                    }
+                    self.refreshDetectedVolumes()
+                    self.statusMessage = "✓ Телефон подключен по Wi-Fi (\(name))"
+                } catch {
+                    print("[PhoneConnection] SFTP warmup error: \(error)")
+                    self.isPhoneConnected = false
+                    self.refreshUsbDrives()
+                    self.statusMessage = "⚠️ Ошибка SFTP: \(error.localizedDescription)"
                 }
-                self.refreshDetectedVolumes()
-                self.statusMessage = "✓ Телефон подключен по Wi-Fi (\(name))"
                 
             case .unauthorized(let deviceId, let log):
                 print("[PhoneConnection] Unauthorized:\n\(log)")
+                self.isPhoneConnected = false
+                self.refreshUsbDrives()
                 self.statusMessage = "⚠️ Телефон \(deviceId) не авторизован! Подтвердите 'Отладку по USB' на экране."
                 
             case .failure(let reason, let log):
                 print("[PhoneConnection] Failed:\n\(log)")
+                self.isPhoneConnected = false
+                self.refreshUsbDrives()
                 self.statusMessage = "⚠️ \(reason)"
             }
         }
@@ -1023,11 +1198,19 @@ public final class DualPaneViewModel: ObservableObject {
     
     /// Автоматическое подключение к телефону при обнаружении USB или Wi-Fi связи
     public func autoConnectPhoneIfAvailable() {
-        guard !isConnectingPhone else { return }
-        guard !remoteDriver.isConnected else { return }
-        guard leftSource == .remotePhone || rightSource == .remotePhone else { return }
+        guard !isConnectingPhone && !isAutoConnecting && !remoteDriver.isConnected else {
+            if remoteDriver.isConnected && !isPhoneConnected {
+                isPhoneConnected = true
+            }
+            return
+        }
+        guard !ConnectionController.shared.isManualDisconnectSuppressed else {
+            return
+        }
+        isAutoConnecting = true
         
-        Task.detached(priority: .userInitiated) {
+        Task.detached(priority: .userInitiated) { [weak self] in
+            guard let self = self else { return }
             // 1. Проверяем наличие USB-устройства через ADB
             var hasAdb = false
             if let adb = PhoneConnectionManager.shared.findAdbBinary() {
@@ -1040,24 +1223,149 @@ public final class DualPaneViewModel: ObservableObject {
             // 2. Если по USB не обнаружен, сканируем Wi-Fi (автоопределение)
             var hasWifi = false
             if !hasAdb {
-                if PhoneConnectionManager.shared.discoverPhoneIpOnLan() != nil {
-                    hasWifi = true
+                if let foundIp = PhoneConnectionManager.shared.discoverPhoneIpOnLan() {
+                    let dev = DeviceRegistry.shared.device(matchingHost: foundIp)
+                    // Автоподключение по Wi-Fi выполняется только для доверенных устройств с явным флагом autoConnect
+                    if dev?.autoConnect == true || UserDefaults.standard.bool(forKey: "autoConnectEnabled") {
+                        hasWifi = true
+                    }
                 }
             }
             
-            if hasAdb || hasWifi {
-                await MainActor.run {
-                    guard self.leftSource == .remotePhone || self.rightSource == .remotePhone else { return }
+            let shouldConnect = hasAdb || hasWifi
+            await MainActor.run {
+                self.isAutoConnecting = false
+                if shouldConnect && !self.isConnectingPhone && !self.remoteDriver.isConnected {
                     self.connectPhone(forceActivate: false)
                 }
             }
         }
     }
     
-    // MARK: - Android Storage Volumes (SD-карты, OTG)
+    // MARK: - Android Storage Volumes & External USB Drives (SD-карты, OTG, USB флешки)
     public func refreshDetectedVolumes() {
         let volumes = PhoneConnectionManager.shared.detectStorageVolumes()
         self.detectedVolumes = volumes
+        self.refreshUsbDrives()
+    }
+    
+    /// Проверка, является ли том реальным физическим внешним USB накопителем (исключая DMG и виртуальные диски)
+    public static func isActualUsbDrive(url: URL) -> Bool {
+        guard let session = DASessionCreate(kCFAllocatorDefault) else { return false }
+        guard let disk = DADiskCreateFromVolumePath(kCFAllocatorDefault, session, url as CFURL) else { return false }
+        guard let desc = DADiskCopyDescription(disk) as? [String: Any] else { return false }
+        if let proto = desc[kDADiskDescriptionDeviceProtocolKey as String] as? String {
+            return proto.caseInsensitiveCompare("USB") == .orderedSame
+        }
+        return false
+    }
+    
+    /// Обнаружение подключенных внешних USB накопителей (на Mac в /Volumes и на Android OTG)
+    public func refreshUsbDrives() {
+        var list: [UsbDriveInfo] = []
+        
+        // 1. Проверяем внешние съемные накопители Mac (в /Volumes, исключая корень "/")
+        let keys: [URLResourceKey] = [.volumeIsRemovableKey, .volumeIsEjectableKey, .volumeNameKey]
+        if let urls = FileManager.default.mountedVolumeURLs(includingResourceValuesForKeys: keys, options: [.skipHiddenVolumes]) {
+            for url in urls {
+                guard url.path != "/" && !url.path.isEmpty else { continue }
+                guard let vals = try? url.resourceValues(forKeys: Set(keys)) else { continue }
+                let isRemovable = vals.volumeIsRemovable ?? false
+                let isEjectable = vals.volumeIsEjectable ?? false
+                guard isRemovable || isEjectable else { continue }
+                
+                // Проверяем через DiskArbitration, что шина устройства именно USB, а не виртуальный DMG/RAM-образ
+                if Self.isActualUsbDrive(url: url) {
+                    let name = vals.volumeName ?? url.lastPathComponent
+                    list.append(UsbDriveInfo(id: "mac:\(url.path)", name: name, path: url.path, isMac: true))
+                }
+            }
+        }
+        
+        // 2. Проверяем внешние тома Android (OTG, внешняя SD-карта) только при активном подключении телефона
+        if isPhoneConnected {
+            for vol in detectedVolumes where !vol.isPrimary {
+                list.append(UsbDriveInfo(id: "phone:\(vol.path)", name: vol.name, path: vol.path, isMac: false))
+            }
+        }
+        
+        self.detectedUsbDrives = list
+    }
+    
+    /// Фоновый мониторинг связи со смартфоном (каждые 2.5 сек)
+    public func startConnectionMonitor() {
+        connectionMonitorTimer?.invalidate()
+        connectionMonitorTimer = Timer.scheduledTimer(withTimeInterval: 2.5, repeats: true) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.checkPhoneConnectionState()
+            }
+        }
+    }
+    
+    /// Проверка актуального состояния подключения телефона
+    public func checkPhoneConnectionState() {
+        guard !isConnectingPhone else { return }
+        
+        Task.detached(priority: .utility) { [weak self] in
+            guard let self = self else { return }
+            var isAdbConnected = false
+            if let adb = PhoneConnectionManager.shared.findAdbBinary() {
+                let (status, out) = PhoneConnectionManager.shared.runCommand(executable: adb, arguments: ["devices"])
+                if status == 0 && out.contains("\tdevice") {
+                    isAdbConnected = true
+                }
+            }
+            
+            // Проверяем реальный отклик порта SFTP (USB 127.0.0.1:2222 или сохраненный Wi-Fi)
+            var isSocketActive = false
+            if isAdbConnected {
+                isSocketActive = PhoneConnectionManager.shared.isHostPortReachable(host: "127.0.0.1", port: 2222, timeoutSeconds: 1)
+            } else {
+                let hostToCheck = UserDefaults.standard.string(forKey: "lastConnectedHost") ?? ""
+                let portToCheck: UInt16 = UInt16(UserDefaults.standard.string(forKey: "lastConnectedPort") ?? "2222") ?? 2222
+                if !hostToCheck.isEmpty && hostToCheck != "127.0.0.1" {
+                    isSocketActive = PhoneConnectionManager.shared.isHostPortReachable(host: hostToCheck, port: portToCheck, timeoutSeconds: 1)
+                }
+                if !isSocketActive {
+                    // Проверяем доступность устройства в локальной сети Wi-Fi
+                    if PhoneConnectionManager.shared.discoverPhoneIpOnLan() != nil {
+                        isSocketActive = true
+                    }
+                }
+            }
+            
+            let adbDetected = isAdbConnected
+            let socketDetected = isSocketActive
+            
+            await MainActor.run {
+                if self.remoteDriver.isConnected {
+                    // Если связь была активна, но сокет пропал (отключили кабель или Wi-Fi)
+                    if !socketDetected && !adbDetected {
+                        self.isPhoneConnected = false
+                        self.remoteDriver.disconnect()
+                        self.refreshUsbDrives()
+                        if self.leftSource == .remotePhone { self.refreshPane(side: .left) }
+                        if self.rightSource == .remotePhone { self.refreshPane(side: .right) }
+                        self.statusMessage = "Телефон отключен (связь потеряна)"
+                    } else if !self.isPhoneConnected {
+                        self.isPhoneConnected = true
+                        self.refreshUsbDrives()
+                    }
+                } else {
+                    // Если SFTP драйвер не подключен, индикатор ОБЯЗАН быть серым (не подключен)
+                    if self.isPhoneConnected {
+                        self.isPhoneConnected = false
+                        self.refreshUsbDrives()
+                    }
+                    
+                    // Приоритетное автоподключение:
+                    // Если обнаружено физическое устройство по USB или доступен телефон по Wi-Fi:
+                    if (adbDetected || socketDetected) && !self.isConnectingPhone && !self.isAutoConnecting {
+                        self.autoConnectPhoneIfAvailable()
+                    }
+                }
+            }
+        }
     }
     
     public func switchToVolume(_ volume: PhoneConnectionManager.StorageVolume, side: PaneSide) {
@@ -1079,6 +1387,26 @@ public final class DualPaneViewModel: ObservableObject {
             refreshPane(side: .right)
         }
         statusMessage = "Переход к хранилищу: \(volume.name)"
+    }
+    
+    /// Переключение на внешний USB накопитель
+    public func switchToUsbDrive(_ drive: UsbDriveInfo, side: PaneSide) {
+        if drive.isMac {
+            if (side == .left ? leftSource : rightSource) != .localMac {
+                changeSource(to: .localMac, side: side)
+            }
+            navigateTo(path: drive.path, side: side)
+        } else {
+            if let vol = detectedVolumes.first(where: { $0.path == drive.path }) {
+                switchToVolume(vol, side: side)
+            } else {
+                if (side == .left ? leftSource : rightSource) != .remotePhone {
+                    changeSource(to: .remotePhone, side: side)
+                }
+                navigateTo(path: drive.path, side: side)
+            }
+        }
+        statusMessage = "Переход к USB накопителю: \(drive.name)"
     }
     
     // MARK: - Quick Bookmarks & Navigation
@@ -1281,21 +1609,20 @@ public final class DualPaneViewModel: ObservableObject {
             do {
                 let items = try await driver.listDirectory(at: path)
                 guard !Task.isCancelled else { return }
-                let space = try await driver.checkFreeSpace(at: path)
-                guard !Task.isCancelled else { return }
                 
+                // Оптимизация P2: Сразу публикуем полученные файлы в интерфейс,
+                // не дожидаясь вторичного сетевого запроса свободного места checkFreeSpace
                 let isRemoteOffline = (source == .remotePhone && !self.remoteDriver.isConnected)
                 if source == .remotePhone && self.remoteDriver.isConnected {
+                    self.isPhoneConnected = true
                     self.transport.rootIsEmulatedZero = self.remoteDriver.rootIsEmulatedZero
                 }
                 
                 if side == .left {
                     self.leftItems = items
-                    self.leftFreeSpace = space
                     self.leftIsStale = isRemoteOffline
                 } else {
                     self.rightItems = items
-                    self.rightFreeSpace = space
                     self.rightIsStale = isRemoteOffline
                 }
                 if isRemoteOffline {
@@ -1308,6 +1635,15 @@ public final class DualPaneViewModel: ObservableObject {
                 if self.isComparing {
                     self.comparisonResult = self.comparator.compare(left: self.leftItems, right: self.rightItems)
                 }
+                
+                // Проверка свободного места выполняется вторым шагом без задержки показа файлов
+                if let space = try? await driver.checkFreeSpace(at: path), !Task.isCancelled {
+                    if side == .left {
+                        self.leftFreeSpace = space
+                    } else {
+                        self.rightFreeSpace = space
+                    }
+                }
             } catch {
                 guard !Task.isCancelled else { return }
                 if side == .left {
@@ -1319,6 +1655,8 @@ public final class DualPaneViewModel: ObservableObject {
                 }
                 if source == .remotePhone {
                     self.statusMessage = "Телефон не подключен (Offline)"
+                    self.isPhoneConnected = false
+                    self.refreshUsbDrives()
                 } else {
                     self.statusMessage = "Ошибка обновления панели: \(error.localizedDescription)"
                 }
@@ -1467,9 +1805,16 @@ public final class DualPaneViewModel: ObservableObject {
         }
     }
     
-    // MARK: - Single Rename
+    // MARK: - Single Rename & In-place Inline Rename
     public func triggerRename(item: FileItem? = nil, side: PaneSide? = nil) {
+        startInlineRename(item: item, side: side)
+    }
+    
+    public func startInlineRename(item: FileItem? = nil, side: PaneSide? = nil) {
         let currentSide = side ?? activePane
+        if activePane != currentSide {
+            activePane = currentSide
+        }
         let items = (currentSide == .left) ? leftItems : rightItems
         let selection = (currentSide == .left) ? leftSelection : rightSelection
         
@@ -1490,12 +1835,70 @@ public final class DualPaneViewModel: ObservableObject {
         
         self.itemToRename = target
         self.renameNewName = target.name
-        self.showRenameDialog = true
+        self.editingItemId = target.id
+        self.editingItemSide = currentSide
+        self.editingItemName = target.name
+        self.showRenameDialog = false
+    }
+    
+    public func commitInlineRename(item: FileItem? = nil, side: PaneSide? = nil) {
+        guard let targetItem = item ?? itemToRename ?? (editingItemId != nil ? (editingItemSide == .left ? leftItems : rightItems).first(where: { $0.id == editingItemId }) : nil) else {
+            cancelInlineRename()
+            return
+        }
+        let targetSide = side ?? editingItemSide ?? activePane
+        let trimmed = editingItemName.trimmingCharacters(in: .whitespacesAndNewlines).precomposedStringWithCanonicalMapping
+        
+        cancelInlineRename()
+        
+        guard !trimmed.isEmpty else {
+            errorMessage = "Имя файла не может быть пустым"
+            showErrorAlert = true
+            return
+        }
+        guard !trimmed.contains("/") else {
+            errorMessage = "Имя файла не может содержать символ '/'"
+            showErrorAlert = true
+            return
+        }
+        guard trimmed != targetItem.name else { return }
+        
+        let parentPath = URL(fileURLWithPath: targetItem.path).deletingLastPathComponent().path
+        let newPath = (parentPath as NSString).appendingPathComponent(trimmed).precomposedStringWithCanonicalMapping
+        let driver: FileSystemDriver = (targetItem.source == .localMac) ? localDriver : remoteDriver
+        
+        Task {
+            do {
+                try await driver.renameItem(from: targetItem.path, to: newPath)
+                await MainActor.run {
+                    self.statusMessage = "Переименовано: '\(targetItem.name)' → '\(trimmed)'"
+                    self.refreshPane(side: targetSide)
+                }
+            } catch {
+                await MainActor.run {
+                    self.errorMessage = "Ошибка переименования: \(error.localizedDescription)"
+                    self.showErrorAlert = true
+                }
+            }
+        }
+    }
+    
+    public func cancelInlineRename() {
+        editingItemId = nil
+        editingItemSide = nil
+        editingItemName = ""
     }
     
     public func confirmRename() {
+        if !editingItemName.isEmpty {
+            renameNewName = editingItemName
+        }
         guard let item = itemToRename else { return }
         let trimmed = renameNewName.trimmingCharacters(in: .whitespacesAndNewlines).precomposedStringWithCanonicalMapping
+        editingItemId = nil
+        editingItemSide = nil
+        editingItemName = ""
+        
         guard !trimmed.isEmpty else {
             errorMessage = "Имя файла не может быть пустым"
             showErrorAlert = true
@@ -2082,6 +2485,21 @@ public final class DualPaneViewModel: ObservableObject {
         let source = (side == .left) ? leftSource : rightSource
         let currentItems = (side == .left) ? leftItems : rightItems
         
+        let selectedItems = currentItems.filter { selected.contains($0.id) || selected.contains($0.path) }
+        let selectedFolders = selectedItems.filter { $0.isDirectory }
+        
+        if !selectedFolders.isEmpty {
+            for folder in selectedFolders {
+                calculateFolderSize(for: folder, side: side)
+            }
+            if selectedFolders.count == 1, let firstFolder = selectedFolders.first {
+                statusMessage = "Папка: \(firstFolder.name)"
+            } else {
+                statusMessage = "Подсчет размера для \(selectedFolders.count) папок..."
+            }
+            return
+        }
+        
         guard let first = selected.first,
               let item = currentItems.first(where: { $0.id == first || $0.path == first }) ?? currentItems.first(where: { selected.contains($0.id) || selected.contains($0.path) }) else {
             return
@@ -2156,11 +2574,12 @@ public final class DualPaneViewModel: ObservableObject {
         let path = item.path
         let source = (side == .left) ? leftSource : rightSource
         
+        guard !calculatingFolderPaths.contains(path) else { return }
         calculatingFolderPaths.insert(path)
         
         Task { @MainActor in
             let size: UInt64
-            if source == .localMac {
+            if source == .localMac || item.source == .localMac {
                 size = await calculateFolderSizeLocal(at: path)
             } else {
                 size = await calculateFolderSizeRemote(at: path)
@@ -2178,48 +2597,76 @@ public final class DualPaneViewModel: ObservableObject {
             let url = URL(fileURLWithPath: path)
             guard let enumerator = fileManager.enumerator(
                 at: url,
-                includingPropertiesForKeys: [.fileSizeKey, .isDirectoryKey],
-                options: [.skipsHiddenFiles]
+                includingPropertiesForKeys: [.fileSizeKey, .isDirectoryKey, .isSymbolicLinkKey, .totalFileSizeKey],
+                options: [] // Включаем все скрытые файлы и все уровни вложенных поддиректорий
             ) else { return 0 }
             
             var totalSize: UInt64 = 0
             while let fileURL = enumerator.nextObject() as? URL {
-                guard let resourceValues = try? fileURL.resourceValues(forKeys: [.fileSizeKey, .isDirectoryKey]),
-                      let isDirectory = resourceValues.isDirectory,
-                      !isDirectory,
-                      let fileSize = resourceValues.fileSize else {
+                guard let resourceValues = try? fileURL.resourceValues(forKeys: [.fileSizeKey, .isDirectoryKey, .isSymbolicLinkKey, .totalFileSizeKey]) else {
+                    if let attrs = try? fileManager.attributesOfItem(atPath: fileURL.path),
+                       let type = attrs[.type] as? FileAttributeType,
+                       type == .typeRegular,
+                       let size = attrs[.size] as? UInt64 {
+                        totalSize += size
+                    }
                     continue
                 }
-                totalSize += UInt64(fileSize)
+                
+                // Пропускаем сами каталоги (их содержимое рекурсивно обходится enumerator на любую глубину)
+                if let isDirectory = resourceValues.isDirectory, isDirectory {
+                    continue
+                }
+                
+                // Символические ссылки на каталоги пропускаем во избежание бесконечных циклов
+                if let isSym = resourceValues.isSymbolicLink, isSym {
+                    var isDir: ObjCBool = false
+                    if fileManager.fileExists(atPath: fileURL.path, isDirectory: &isDir), isDir.boolValue {
+                        continue
+                    }
+                }
+                
+                if let fileSize = resourceValues.fileSize ?? resourceValues.totalFileSize {
+                    totalSize += UInt64(fileSize)
+                } else if let attrs = try? fileManager.attributesOfItem(atPath: fileURL.path),
+                          let size = attrs[.size] as? UInt64 {
+                    totalSize += size
+                }
             }
             return totalSize
         }.value
     }
     
     private func calculateFolderSizeRemote(at path: String) async -> UInt64 {
-        // Fast path: adb shell du -sk -- '<path>'
-        let escaped = PhoneConnectionManager.shellEscape(path)
-        let res = PhoneConnectionManager.shared.executeAdbShell(command: "du -sk -- \(escaped)")
-        if res.status == 0, let firstLine = res.output.components(separatedBy: CharacterSet.newlines).first {
-            let tokens = firstLine.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines).components(separatedBy: CharacterSet.whitespaces)
-            if let first = tokens.first, let sizeKb = UInt64(first) {
-                return sizeKb * 1024
+        // Рекурсивный обход директории и всех подпапок любого уровня вложенности (работает через SFTP и ADB fallback)
+        var totalSize: UInt64 = 0
+        var queue: [String] = [path]
+        var visited = Set<String>()
+        visited.insert(path.precomposedStringWithCanonicalMapping)
+        
+        while !queue.isEmpty {
+            guard !Task.isCancelled else { return totalSize }
+            let currentDir = queue.removeFirst()
+            
+            do {
+                let items = try await remoteDriver.listDirectory(at: currentDir)
+                for item in items {
+                    if item.isDirectory {
+                        let normalizedChild = item.path.precomposedStringWithCanonicalMapping
+                        if !visited.contains(normalizedChild) {
+                            visited.insert(normalizedChild)
+                            queue.append(item.path)
+                        }
+                    } else {
+                        totalSize += item.size
+                    }
+                }
+            } catch {
+                continue
             }
         }
         
-        // Fallback: SFTP driver listing
-        do {
-            let items = try await remoteDriver.listDirectory(at: path)
-            var total: UInt64 = 0
-            for it in items {
-                if !it.isDirectory {
-                    total += it.size
-                }
-            }
-            return total
-        } catch {
-            return 0
-        }
+        return totalSize
     }
     
     public func formatBytes(_ b: UInt64) -> String {
@@ -2288,23 +2735,44 @@ public final class DualPaneViewModel: ObservableObject {
                 try? FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
                 let localTargetURL = tempDir.appendingPathComponent(item.name)
                 
-                let semaphore = DispatchSemaphore(value: 0)
                 Task {
                     do {
-                        try await self.orchestrator.executeCopyPhoneToMac(
-                            jobId: UUID().uuidString,
-                            itemId: UUID().uuidString,
-                            remotePath: item.path,
-                            localTargetDir: tempDir,
-                            strategy: .overwrite
-                        ) { _ in }
+                        if item.isDirectory {
+                            // Рекурсивная выгрузка директории со всем содержимым для внешнего приложения (Finder, Desktop)
+                            try FileManager.default.createDirectory(at: localTargetURL, withIntermediateDirectories: true)
+                            let plan = await self.resolveTransferPlan(
+                                paths: [item.path],
+                                fromSource: .remotePhone,
+                                targetBaseDirPath: tempDir.path
+                            )
+                            for dir in plan.directoriesToCreate {
+                                try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+                            }
+                            for file in plan.filesToTransfer {
+                                let subDirURL = URL(fileURLWithPath: file.targetDirPath)
+                                _ = try? await self.orchestrator.executeCopyPhoneToMac(
+                                    jobId: UUID().uuidString,
+                                    itemId: UUID().uuidString,
+                                    remotePath: file.sourcePath,
+                                    localTargetDir: subDirURL,
+                                    strategy: .overwrite
+                                ) { _ in }
+                            }
+                        } else {
+                            try await self.orchestrator.executeCopyPhoneToMac(
+                                jobId: UUID().uuidString,
+                                itemId: UUID().uuidString,
+                                remotePath: item.path,
+                                localTargetDir: tempDir,
+                                strategy: .overwrite
+                            ) { _ in }
+                        }
+                        completionHandler?(localTargetURL as NSURL, nil)
                     } catch {
                         print("DragOut download error: \(error)")
+                        completionHandler?(nil, error)
                     }
-                    semaphore.signal()
                 }
-                _ = semaphore.wait(timeout: .now() + 30.0)
-                completionHandler?(localTargetURL as NSURL, nil)
             }
         }
         
@@ -2318,17 +2786,23 @@ public final class DualPaneViewModel: ObservableObject {
     }
     
     @discardableResult
-    public func handleDroppedProviders(_ providers: [NSItemProvider], toSide: PaneSide, isMove: Bool = false) -> Bool {
-        guard !providers.isEmpty else { return false }
+    public func handleDroppedProviders(
+        _ providers: [NSItemProvider],
+        toSide: PaneSide,
+        targetDirPath: String? = nil,
+        isMove: Bool = false
+    ) -> Bool {
+        guard !providers.isEmpty || self.currentDragPayload != nil else { return false }
+        
+        let destinationDir = targetDirPath ?? ((toSide == .left) ? self.leftPath : self.rightPath)
         
         // 1. Приоритетная проверка внутреннего перетаскивания (inter-pane drag inside app)
         if let payload = self.currentDragPayload {
             self.currentDragPayload = nil
             let fromSource: FileSource = (payload.sourceKind == "localMac") ? .localMac : .remotePhone
-            let currentTargetDir = (toSide == .left) ? self.leftPath : self.rightPath
             
             let sourceDirNorm = (payload.sourceDirPath as NSString).standardizingPath
-            let targetDirNorm = (currentTargetDir as NSString).standardizingPath
+            let targetDirNorm = (destinationDir as NSString).standardizingPath
             let isSameDir = (payload.sourceSide == (toSide == .left ? "left" : "right")) && (sourceDirNorm == targetDirNorm)
             if isSameDir {
                 self.statusMessage = "Файлы уже находятся в этой папке"
@@ -2339,6 +2813,7 @@ public final class DualPaneViewModel: ObservableObject {
                 paths: payload.paths,
                 fromSource: fromSource,
                 toSide: toSide,
+                targetDirPath: destinationDir,
                 isMove: isMove
             )
             return true
@@ -2355,10 +2830,9 @@ public final class DualPaneViewModel: ObservableObject {
                     }
                     DispatchQueue.main.async {
                         let fromSource: FileSource = (payload.sourceKind == "localMac") ? .localMac : .remotePhone
-                        let currentTargetDir = (toSide == .left) ? self.leftPath : self.rightPath
                         
                         let sourceDirNorm = (payload.sourceDirPath as NSString).standardizingPath
-                        let targetDirNorm = (currentTargetDir as NSString).standardizingPath
+                        let targetDirNorm = (destinationDir as NSString).standardizingPath
                         let isSameDir = (payload.sourceSide == (toSide == .left ? "left" : "right")) && (sourceDirNorm == targetDirNorm)
                         if isSameDir {
                             self.statusMessage = "Файлы уже находятся в этой папке"
@@ -2369,6 +2843,7 @@ public final class DualPaneViewModel: ObservableObject {
                             paths: payload.paths,
                             fromSource: fromSource,
                             toSide: toSide,
+                            targetDirPath: destinationDir,
                             isMove: isMove
                         )
                     }
@@ -2417,6 +2892,7 @@ public final class DualPaneViewModel: ObservableObject {
                     paths: localPaths,
                     fromSource: .localMac,
                     toSide: toSide,
+                    targetDirPath: destinationDir,
                     isMove: isMove
                 )
             }
@@ -2448,6 +2924,8 @@ public final class DualPaneViewModel: ObservableObject {
         isTransferPaused = false
         showTransferProgress = false
         isTransferCompleted = false
+        isTransferMinimized = false
+        currentTransferFileName = ""
         TransferQueueManager.shared.cancelAll()
         statusMessage = "Операция отменена"
         Task {
@@ -2455,18 +2933,26 @@ public final class DualPaneViewModel: ObservableObject {
         }
     }
     
+    public func minimizeTransferToBackground() {
+        isTransferMinimized = true
+        showTransferProgress = false
+    }
+    
     public func executeTransfer(
         paths: [String],
         fromSource: FileSource,
         toSide: PaneSide,
+        targetDirPath: String? = nil,
         isMove: Bool
     ) {
         guard !paths.isEmpty else { return }
         
         let targetSource = (toSide == .left) ? leftSource : rightSource
-        let targetDirPath = (toSide == .left) ? leftPath : rightPath
+        let targetDirPath = targetDirPath ?? ((toSide == .left) ? leftPath : rightPath)
         
         showTransferProgress = true
+        isTransferMinimized = false
+        currentTransferFileName = ""
         isTransferCompleted = false
         transferCompletionMessage = ""
         transferProgress = 0.0
@@ -2479,8 +2965,10 @@ public final class DualPaneViewModel: ObservableObject {
         currentTransferTask = Task {
             // Включаем защиту от засыпания Mac во время активной очереди
             NotificationManager.shared.beginSleepPrevention()
+            ThumbnailCacheManager.shared.isThrottledDueToTransfer = true
             defer {
                 NotificationManager.shared.endSleepPrevention()
+                ThumbnailCacheManager.shared.isThrottledDueToTransfer = false
             }
             
             self.statusMessage = "Анализ файлов и структуры папок..."
@@ -2489,6 +2977,9 @@ public final class DualPaneViewModel: ObservableObject {
                 fromSource: fromSource,
                 targetBaseDirPath: targetDirPath
             )
+            if !plan.skippedFolders.isEmpty {
+                self.statusMessage = "Внимание: пропущено защищенных папок (\(plan.skippedFolders.count))"
+            }
             
             // 1. Предварительное создание всех подпапок (включая пустые)
             for dir in plan.directoriesToCreate {
@@ -2552,8 +3043,10 @@ public final class DualPaneViewModel: ObservableObject {
                 let targetSubDirURL = URL(fileURLWithPath: targetSubDir)
                 
                 let actionVerb = isMove ? "Перемещение: " : "Копирование: "
+                self.currentTransferFileName = fileName
                 self.statusMessage = "\(actionVerb)\(fileName)"
                 
+                var lastUIProgressUpdate: CFAbsoluteTime = 0
                 let onProgress: @Sendable (Double) -> Void = { @Sendable pct in
                     Task { @MainActor [weak self] in
                         guard let self = self else { return }
@@ -2565,13 +3058,20 @@ public final class DualPaneViewModel: ObservableObject {
                         let remainingBytes = (totalQueueBytes > totalTransferredNow) ? (totalQueueBytes - totalTransferredNow) : 0
                         let eta = speedTracker.calculateETA(remainingBytes: remainingBytes)
                         
-                        self.transferSpeed = TransferSpeedTracker.formatSpeed(currentSpeed)
-                        self.transferETA = TransferSpeedTracker.formatETA(eta)
-                        
-                        if totalQueueBytes > 0 {
-                            self.transferProgress = min(1.0, Double(totalTransferredNow) / Double(totalQueueBytes))
-                        } else {
-                            self.transferProgress = Double(completedCount) / Double(max(1, totalCount))
+                        // Троттлинг: обновляем @Published свойства UI не чаще 15 раз/сек (~67мс),
+                        // предотвращая лаги SwiftUI при передаче со скоростью 100+ МБ/с
+                        let now = CFAbsoluteTimeGetCurrent()
+                        let isComplete = pct >= 1.0
+                        if isComplete || (now - lastUIProgressUpdate >= 0.067) {
+                            lastUIProgressUpdate = now
+                            self.transferSpeed = TransferSpeedTracker.formatSpeed(currentSpeed)
+                            self.transferETA = TransferSpeedTracker.formatETA(eta)
+                            
+                            if totalQueueBytes > 0 {
+                                self.transferProgress = min(1.0, Double(totalTransferredNow) / Double(totalQueueBytes))
+                            } else {
+                                self.transferProgress = Double(completedCount) / Double(max(1, totalCount))
+                            }
                         }
                         
                         if let tid = taskId {
@@ -2670,28 +3170,44 @@ public final class DualPaneViewModel: ObservableObject {
                         let targetPath = (targetSubDir as NSString).appendingPathComponent(fileName)
                         if isMove {
                             let ok = try await orchestrator.transport.executeRename(oldPath: path, newPath: targetPath)
-                            result = ok ? .transferred : .skipped(reason: "Не удалось переименовать на телефоне")
+                            if ok {
+                                result = .transferred
+                            } else if PhoneConnectionManager.shared.copyFileOnDevice(sourcePath: path, targetPath: targetPath) {
+                                // Обработка EXDEV (Cross-device link): если перенос между разделами (SD-карта / память), копируем и удаляем оригинал
+                                _ = try? await orchestrator.transport.executeDelete(actionId: itemId, path: path)
+                                onProgress(1.0)
+                                result = .transferred
+                            } else {
+                                result = .skipped(reason: "Не удалось переименовать или переместить на телефоне (защита Scoped Storage или разные разделы)")
+                            }
                         } else {
-                            let tempDir = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("MacDroidCommander/PhoneCopy", isDirectory: true)
-                            try? FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
-                            try await orchestrator.executeCopyPhoneToMac(
-                                jobId: jobId,
-                                itemId: itemId,
-                                remotePath: path,
-                                localTargetDir: tempDir,
-                                strategy: .overwrite,
-                                progress: onProgress
-                            )
-                            let tempLocalURL = tempDir.appendingPathComponent(fileName)
-                            result = try await orchestrator.executeCopyMacToPhone(
-                                jobId: jobId,
-                                itemId: itemId,
-                                localSourceURL: tempLocalURL,
-                                remoteTargetDir: targetSubDir,
-                                strategy: strategy,
-                                progress: onProgress
-                            )
-                            try? FileManager.default.removeItem(at: tempLocalURL)
+                            // Оптимизация P1: Прямое серверное копирование файла внутри телефона без прокачки 20 ГБ трафика через Mac
+                            if PhoneConnectionManager.shared.copyFileOnDevice(sourcePath: path, targetPath: targetPath) {
+                                onProgress(1.0)
+                                result = .transferred
+                            } else {
+                                // Фоллбэк: если прямое копирование на телефоне недоступно (нет ADB / беспроводной SFTP без shell)
+                                let tempDir = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("MacDroidCommander/PhoneCopy", isDirectory: true)
+                                try? FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+                                try await orchestrator.executeCopyPhoneToMac(
+                                    jobId: jobId,
+                                    itemId: itemId,
+                                    remotePath: path,
+                                    localTargetDir: tempDir,
+                                    strategy: .overwrite,
+                                    progress: onProgress
+                                )
+                                let tempLocalURL = tempDir.appendingPathComponent(fileName)
+                                result = try await orchestrator.executeCopyMacToPhone(
+                                    jobId: jobId,
+                                    itemId: itemId,
+                                    localSourceURL: tempLocalURL,
+                                    remoteTargetDir: targetSubDir,
+                                    strategy: strategy,
+                                    progress: onProgress
+                                )
+                                try? FileManager.default.removeItem(at: tempLocalURL)
+                            }
                         }
                     }
                     
@@ -2763,7 +3279,14 @@ public final class DualPaneViewModel: ObservableObject {
                             }
                         }
                     } else {
-                        _ = try? await self.remoteDriver.deleteEmptyDirectory(at: folder)
+                        var deleted = (try? await self.remoteDriver.deleteEmptyDirectory(at: folder)) ?? false
+                        if !deleted {
+                            // Безопасная очистка: удаляем ТОЛЬКО временные артефакты передачи (.DS_Store, .mcdpart),
+                            // НИ В КОЕМ СЛУЧАЕ не удаляя произвольные скрытые пользовательские файлы (.*)
+                            let escaped = PhoneConnectionManager.shellEscape(folder)
+                            _ = PhoneConnectionManager.shared.executeAdbShell(command: "find \(escaped) -maxdepth 1 \\( -name '.DS_Store' -o -name '*.mcdpart' -o -name '.*.mcdpart' \\) -type f -delete 2>/dev/null")
+                            deleted = (try? await self.remoteDriver.deleteEmptyDirectory(at: folder)) ?? false
+                        }
                     }
                 }
             }
@@ -2801,6 +3324,8 @@ public final class DualPaneViewModel: ObservableObject {
             if Task.isCancelled {
                 self.showTransferProgress = false
                 self.isTransferCompleted = false
+                self.isTransferMinimized = false
+                self.currentTransferFileName = ""
                 self.statusMessage = "Операция отменена"
             } else if failed.isEmpty {
                 let verb = isMove ? "перемещено" : "скопировано"
@@ -2818,9 +3343,13 @@ public final class DualPaneViewModel: ObservableObject {
                 try? await Task.sleep(nanoseconds: 1_800_000_000)
                 self.showTransferProgress = false
                 self.isTransferCompleted = false
+                self.isTransferMinimized = false
+                self.currentTransferFileName = ""
             } else {
                 self.showTransferProgress = false
                 self.isTransferCompleted = false
+                self.isTransferMinimized = false
+                self.currentTransferFileName = ""
                 self.statusMessage = "Завершено с ошибками. Успешно: \(succeeded.count), Ошибок: \(failed.count)"
                 self.showOperationReport = true
             }
@@ -2844,31 +3373,38 @@ public final class DualPaneViewModel: ObservableObject {
         }
     }
     
-    private func resolveTransferPlan(
+    public func resolveTransferPlan(
         paths: [String],
         fromSource: FileSource,
         targetBaseDirPath: String
-    ) async -> (directoriesToCreate: [String], filesToTransfer: [TransferPlanItem], sourceFoldersToDeleteOnMove: [String]) {
+    ) async -> (directoriesToCreate: [String], filesToTransfer: [TransferPlanItem], sourceFoldersToDeleteOnMove: [String], skippedFolders: [(path: String, reason: String)]) {
         var directoriesToCreate: [String] = []
         var filesToTransfer: [TransferPlanItem] = []
         var sourceFoldersToDeleteOnMove: [String] = []
+        var skippedFolders: [(path: String, reason: String)] = []
         
         for path in paths {
             let fileName = URL(fileURLWithPath: path).lastPathComponent
             var isDir = false
+            let cleanPath = path.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+            let normPath = path.precomposedStringWithCanonicalMapping
             
             if fromSource == .localMac {
                 var isDirectoryObjC: ObjCBool = false
                 let exists = FileManager.default.fileExists(atPath: path, isDirectory: &isDirectoryObjC)
                 isDir = exists && isDirectoryObjC.boolValue
             } else {
-                let sourceItems = (fromSource == leftSource) ? leftItems : rightItems
-                if let item = sourceItems.first(where: { $0.id == path || $0.path == path }) {
+                let allSourceItems = leftItems + rightItems
+                if let item = allSourceItems.first(where: {
+                    $0.id == path || $0.path == path ||
+                    $0.path.precomposedStringWithCanonicalMapping == normPath ||
+                    $0.path.trimmingCharacters(in: CharacterSet(charactersIn: "/")) == cleanPath
+                }) {
                     isDir = item.isDirectory
-                } else {
-                    if let _ = try? await remoteDriver.listDirectory(at: path) {
-                        isDir = true
-                    }
+                } else if let stat = try? await self.transport.prepareRead(actionId: UUID().uuidString, path: path) {
+                    isDir = stat.isDirectory
+                } else if let _ = try? await self.remoteDriver.listDirectory(at: path) {
+                    isDir = true
                 }
             }
             
@@ -2877,8 +3413,12 @@ public final class DualPaneViewModel: ObservableObject {
                 if fromSource == .localMac {
                     size = (try? FileManager.default.attributesOfItem(atPath: path)[.size] as? UInt64) ?? 0
                 } else {
-                    let sourceItems = (fromSource == leftSource) ? leftItems : rightItems
-                    size = sourceItems.first(where: { $0.id == path || $0.path == path })?.size ?? 0
+                    let allSourceItems = leftItems + rightItems
+                    size = allSourceItems.first(where: {
+                        $0.id == path || $0.path == path ||
+                        $0.path.precomposedStringWithCanonicalMapping == normPath ||
+                        $0.path.trimmingCharacters(in: CharacterSet(charactersIn: "/")) == cleanPath
+                    })?.size ?? 0
                 }
                 filesToTransfer.append(TransferPlanItem(
                     sourcePath: path,
@@ -2897,7 +3437,12 @@ public final class DualPaneViewModel: ObservableObject {
                             at: dirURL,
                             includingPropertiesForKeys: [.isDirectoryKey, .fileSizeKey],
                             options: []
-                        ) else { return }
+                        ) else {
+                            if dirURL.path != path {
+                                skippedFolders.append((path: dirURL.path, reason: "Не удалось прочитать локальную папку"))
+                            }
+                            return
+                        }
                         for item in contents {
                             let name = item.lastPathComponent
                             if name.hasPrefix(".") && (name.contains(".part.") || name.hasSuffix(".mcdpart")) { continue }
@@ -2921,8 +3466,18 @@ public final class DualPaneViewModel: ObservableObject {
                     scanLocal(dirURL: URL(fileURLWithPath: path), currentTargetDir: folderTargetBase)
                 } else {
                     func scanRemote(remoteDir: String, currentTargetDir: String) async {
-                        guard let contents = try? await remoteDriver.listDirectory(at: remoteDir) else { return }
-                        for item in contents {
+                        var contents: [FileItem]? = try? await remoteDriver.listDirectory(at: remoteDir)
+                        if contents == nil {
+                            contents = PhoneConnectionManager.shared.listDirectoryAdb(path: remoteDir)
+                        }
+                        guard let validContents = contents else {
+                            if remoteDir != path {
+                                print("scanRemote: failed to list directory at \(remoteDir)")
+                                skippedFolders.append((path: remoteDir, reason: "Папка недоступна или защищена политикой доступа Android"))
+                            }
+                            return
+                        }
+                        for item in validContents {
                             if item.name == "." || item.name == ".." { continue }
                             if item.name.hasPrefix(".") && (item.name.contains(".part.") || item.name.hasSuffix(".mcdpart")) { continue }
                             let subTarget = (currentTargetDir as NSString).appendingPathComponent(item.name)
@@ -2949,7 +3504,7 @@ public final class DualPaneViewModel: ObservableObject {
         // чтобы при переносе сначала удалялись самые глубокие пустые подпапки
         sourceFoldersToDeleteOnMove.sort { $0.count > $1.count }
         
-        return (directoriesToCreate, filesToTransfer, sourceFoldersToDeleteOnMove)
+        return (directoriesToCreate, filesToTransfer, sourceFoldersToDeleteOnMove, skippedFolders)
     }
     
     private func startTransfer(isMove: Bool) {

@@ -17,17 +17,81 @@ public struct DiscoveredDevice: Identifiable, Hashable, Sendable {
     }
 }
 
+public struct SavedConnection: Codable, Identifiable, Hashable, Sendable {
+    public var id: String { "\(host):\(port)" }
+    public let name: String
+    public let host: String
+    public let port: Int
+    public let date: Date
+    
+    public init(name: String, host: String, port: Int, date: Date = Date()) {
+        self.name = name
+        self.host = host
+        self.port = port
+        self.date = date
+    }
+}
+
 @MainActor
 public final class DiscoveryService: ObservableObject {
+    public static let shared = DiscoveryService()
+    
     @Published public var discoveredDevices: [DiscoveredDevice] = []
     @Published public var isSearching: Bool = false
     
     private var browser: NWBrowser?
+    private var searchTimer: Task<Void, Never>?
+    private var resolvingConnections: [NWConnection] = []
     
     public init() {}
     
     public func startDiscovery() {
-        guard browser == nil else { return }
+        if browser != nil {
+            refresh()
+            return
+        }
+        
+        let params = NWParameters()
+        params.includePeerToPeer = true
+        let descriptor = NWBrowser.Descriptor.bonjour(type: "_macphone_sftp._tcp", domain: "local.")
+        let newBrowser = NWBrowser(for: descriptor, using: params)
+        self.browser = newBrowser
+        
+        isSearching = true
+        scheduleSearchTimeout()
+        
+        newBrowser.stateUpdateHandler = { [weak self] state in
+            Task { @MainActor [weak self] in
+                switch state {
+                case .failed, .cancelled:
+                    self?.isSearching = false
+                default:
+                    break
+                }
+            }
+        }
+        
+        newBrowser.browseResultsChangedHandler = { [weak self] results, changes in
+            Task { @MainActor [weak self] in
+                guard let self = self else { return }
+                for result in results {
+                    if case .service(let name, let type, let domain, _) = result.endpoint {
+                        self.resolveServiceEndpoint(result.endpoint, name: name, type: type, domain: domain)
+                    }
+                }
+            }
+        }
+        
+        newBrowser.start(queue: .main)
+    }
+    
+    public func refresh() {
+        isSearching = true
+        scheduleSearchTimeout()
+        
+        // Перезапуск браузера для принудительного mDNS запроса в локальную сеть
+        browser?.cancel()
+        browser = nil
         
         let params = NWParameters()
         params.includePeerToPeer = true
@@ -37,37 +101,119 @@ public final class DiscoveryService: ObservableObject {
         
         newBrowser.stateUpdateHandler = { [weak self] state in
             Task { @MainActor [weak self] in
-                self?.isSearching = (state == .ready)
+                switch state {
+                case .failed, .cancelled:
+                    self?.isSearching = false
+                default:
+                    break
+                }
             }
         }
         
         newBrowser.browseResultsChangedHandler = { [weak self] results, changes in
-            var devices: [DiscoveredDevice] = []
-            for result in results {
-                if case .service(let name, let type, let domain, _) = result.endpoint {
-                    let defaultHost = UserDefaults.standard.string(forKey: "lastConnectedHost") ?? "192.168.1.18"
-                    devices.append(DiscoveredDevice(
-                        id: "\(name).\(type)\(domain)",
-                        name: name,
-                        host: defaultHost,
-                        port: 2222
-                    ))
-                }
-            }
             Task { @MainActor [weak self] in
-                // Сохраняем добавленные вручную устройства
-                let manuals = self?.discoveredDevices.filter { $0.isManual } ?? []
-                self?.discoveredDevices = manuals + devices
+                guard let self = self else { return }
+                for result in results {
+                    if case .service(let name, let type, let domain, _) = result.endpoint {
+                        self.resolveServiceEndpoint(result.endpoint, name: name, type: type, domain: domain)
+                    }
+                }
             }
         }
         
         newBrowser.start(queue: .main)
     }
     
+    private func scheduleSearchTimeout() {
+        searchTimer?.cancel()
+        searchTimer = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 4_000_000_000) // 4 секунды активного поиска
+            self?.isSearching = false
+        }
+    }
+    
+    /// Настоящий Bonjour/mDNS резолвинг IP-адреса устройства из сетевого пакета
+    private func resolveServiceEndpoint(_ endpoint: NWEndpoint, name: String, type: String, domain: String) {
+        let params = NWParameters.tcp
+        if let ip = params.defaultProtocolStack.internetProtocol as? NWProtocolIP.Options {
+            ip.version = .v4
+        }
+        let conn = NWConnection(to: endpoint, using: params)
+        resolvingConnections.append(conn)
+        
+        conn.stateUpdateHandler = { [weak self, weak conn] state in
+            guard let conn = conn else { return }
+            switch state {
+            case .ready:
+                var resolvedIp = ""
+                var resolvedPort = 2222
+                
+                if let remote = conn.currentPath?.remoteEndpoint,
+                   case .hostPort(let host, let port) = remote {
+                    switch host {
+                    case .ipv4(let ip4):
+                        resolvedIp = "\(ip4)"
+                    case .ipv6(let ip6):
+                        resolvedIp = "\(ip6)"
+                    case .name(let hostName, _):
+                        resolvedIp = hostName
+                    @unknown default:
+                        break
+                    }
+                    // Удаляем технический суффикс интерфейса (например %en0)
+                    if let pct = resolvedIp.firstIndex(of: "%") {
+                        resolvedIp = String(resolvedIp[..<pct])
+                    }
+                    resolvedPort = Int(port.rawValue)
+                }
+                
+                conn.cancel()
+                
+                if !resolvedIp.isEmpty {
+                    let dev = DiscoveredDevice(
+                        id: "\(name).\(type)\(domain)",
+                        name: name,
+                        host: resolvedIp,
+                        port: resolvedPort
+                    )
+                    PhoneConnectionManager.shared.registerDevice(host: resolvedIp, name: name)
+                    Task { @MainActor [weak self] in
+                        guard let self = self else { return }
+                        self.resolvingConnections.removeAll { $0 === conn }
+                        if let idx = self.discoveredDevices.firstIndex(where: { $0.id == dev.id || $0.name == dev.name }) {
+                            self.discoveredDevices[idx] = dev
+                        } else {
+                            self.discoveredDevices.append(dev)
+                        }
+                        self.isSearching = false
+                    }
+                }
+                
+            case .failed, .cancelled:
+                conn.cancel()
+                Task { @MainActor [weak self] in
+                    self?.resolvingConnections.removeAll { $0 === conn }
+                }
+                
+            default:
+                break
+            }
+        }
+        
+        // Таймаут на резолвинг каждого устройства (2.5 секунды)
+        DispatchQueue.global().asyncAfter(deadline: .now() + 2.5) { [weak conn] in
+            if conn?.state != .cancelled {
+                conn?.cancel()
+            }
+        }
+        
+        conn.start(queue: .global(qos: .userInitiated))
+    }
+    
     public func addManualDevice(name: String, host: String, port: Int) {
         let manual = DiscoveredDevice(
             id: "manual_\(host)_\(port)",
-            name: name.isEmpty ? "Xiaomi 14 Ultra (Прямой IP)" : name,
+            name: name.isEmpty ? "\(host):\(port)" : name,
             host: host,
             port: port,
             isManual: true
@@ -78,6 +224,12 @@ public final class DiscoveryService: ObservableObject {
     }
     
     public func stopDiscovery() {
+        searchTimer?.cancel()
+        searchTimer = nil
+        for conn in resolvingConnections {
+            conn.cancel()
+        }
+        resolvingConnections.removeAll()
         browser?.cancel()
         browser = nil
         isSearching = false

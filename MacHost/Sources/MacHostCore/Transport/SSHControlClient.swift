@@ -60,12 +60,10 @@ public actor SSHControlClient {
         if FileManager.default.fileExists(atPath: legacyEd25519.path) {
             sshArgs.append(contentsOf: ["-i", legacyEd25519.path])
         }
-        let legacyRsa = sshDir.appendingPathComponent("id_rsa")
-        if FileManager.default.fileExists(atPath: legacyRsa.path) {
-            sshArgs.append(contentsOf: ["-i", legacyRsa.path])
-        }
         
         sshArgs.append(contentsOf: [
+            "-F", "/dev/null", // Полная изоляция от глобальных настроек ~/.ssh/config
+            "-o", "IdentitiesOnly=yes", // Запрет на перебор ключей ssh-agent или произвольных ключей
             "-o", "BatchMode=yes",
             "-o", "ConnectTimeout=5",
             "-o", "ServerAliveInterval=15",
