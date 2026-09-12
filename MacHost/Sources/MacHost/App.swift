@@ -71,6 +71,12 @@ struct MacFileManagerApp: App {
                     viewModel.refreshPane(side: viewModel.activePane)
                 }
                 .keyboardShortcut("r", modifiers: [.command])
+                
+                Divider()
+                
+                Button("Настройки пути...") {
+                    viewModel.showPathDisplaySettings = true
+                }
             }
             
             CommandMenu("Переход") {

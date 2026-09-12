@@ -258,6 +258,12 @@ public final class DualPaneViewModel: ObservableObject {
         return JobOrchestrator(ledger: ledger, transport: transport, localFS: localDriver)
     }()
     
+    // Настройки скрытия префиксов путей в Header
+    @Published public var macHiddenPathPrefix: String = FileManager.default.homeDirectoryForCurrentUser.path
+    @Published public var phoneHiddenPathPrefix: String = "/storage/emulated/0"
+    @Published public var isPathPrefixHidingEnabled: Bool = true
+    @Published public var showPathDisplaySettings: Bool = false
+    
     // MARK: - Session Restore Keys
     private enum SessionKey {
         static let leftPath = "session.leftPath"
@@ -282,6 +288,9 @@ public final class DualPaneViewModel: ObservableObject {
         static let rightGridThumbnailSize = "session.rightGridThumbnailSize"
         static let leftGridSpacing = "session.leftGridSpacing"
         static let rightGridSpacing = "session.rightGridSpacing"
+        static let macHiddenPathPrefix = "session.macHiddenPathPrefix"
+        static let phoneHiddenPathPrefix = "session.phoneHiddenPathPrefix"
+        static let isPathPrefixHidingEnabled = "session.isPathPrefixHidingEnabled"
     }
     
     public init() {
@@ -399,6 +408,9 @@ public final class DualPaneViewModel: ObservableObject {
         defaults.set(rightGridThumbnailSize, forKey: SessionKey.rightGridThumbnailSize)
         defaults.set(leftGridSpacing, forKey: SessionKey.leftGridSpacing)
         defaults.set(rightGridSpacing, forKey: SessionKey.rightGridSpacing)
+        defaults.set(macHiddenPathPrefix, forKey: SessionKey.macHiddenPathPrefix)
+        defaults.set(phoneHiddenPathPrefix, forKey: SessionKey.phoneHiddenPathPrefix)
+        defaults.set(isPathPrefixHidingEnabled, forKey: SessionKey.isPathPrefixHidingEnabled)
         
         // Сериализация вкладок в JSON (включая флаги закрепления isPinned)
         if let leftTabsData = try? JSONEncoder().encode(leftTabs) {
@@ -434,6 +446,9 @@ public final class DualPaneViewModel: ObservableObject {
         defaults.removeObject(forKey: SessionKey.rightGridThumbnailSize)
         defaults.removeObject(forKey: SessionKey.leftGridSpacing)
         defaults.removeObject(forKey: SessionKey.rightGridSpacing)
+        defaults.removeObject(forKey: SessionKey.macHiddenPathPrefix)
+        defaults.removeObject(forKey: SessionKey.phoneHiddenPathPrefix)
+        defaults.removeObject(forKey: SessionKey.isPathPrefixHidingEnabled)
     }
     
     public func clearSavedSession() {
@@ -609,6 +624,106 @@ public final class DualPaneViewModel: ObservableObject {
             rightPath = active.path
             rightSource = active.source
         }
+        
+        // Восстановление настроек скрытия префиксов путей
+        if let savedMacPrefix = defaults.string(forKey: SessionKey.macHiddenPathPrefix), !savedMacPrefix.isEmpty {
+            macHiddenPathPrefix = savedMacPrefix
+        }
+        if let savedPhonePrefix = defaults.string(forKey: SessionKey.phoneHiddenPathPrefix), !savedPhonePrefix.isEmpty {
+            phoneHiddenPathPrefix = savedPhonePrefix
+        }
+        if defaults.object(forKey: SessionKey.isPathPrefixHidingEnabled) != nil {
+            isPathPrefixHidingEnabled = defaults.bool(forKey: SessionKey.isPathPrefixHidingEnabled)
+        }
+    }
+    
+    // MARK: - Path Display Settings
+    public func resetPathDisplaySettings() {
+        macHiddenPathPrefix = FileManager.default.homeDirectoryForCurrentUser.path
+        phoneHiddenPathPrefix = "/storage/emulated/0"
+        isPathPrefixHidingEnabled = true
+        savePathDisplaySettings()
+    }
+    
+    public func savePathDisplaySettings() {
+        let defaults = UserDefaults.standard
+        defaults.set(macHiddenPathPrefix, forKey: SessionKey.macHiddenPathPrefix)
+        defaults.set(phoneHiddenPathPrefix, forKey: SessionKey.phoneHiddenPathPrefix)
+        defaults.set(isPathPrefixHidingEnabled, forKey: SessionKey.isPathPrefixHidingEnabled)
+    }
+    
+    public struct PathBreadcrumb: Identifiable, Equatable {
+        public let id: String
+        public let title: String
+        public let fullPath: String
+        public let isRoot: Bool
+        
+        public init(title: String, fullPath: String, isRoot: Bool = false) {
+            self.id = fullPath + (isRoot ? "#root" : "")
+            self.title = title
+            self.fullPath = fullPath
+            self.isRoot = isRoot
+        }
+    }
+    
+    /// Генерация цепочки хлебных крошек с учетом настроек скрытия базовых префиксов (Mac и Phone)
+    public func breadcrumbs(for path: String, source: FileSource) -> [PathBreadcrumb] {
+        let cleanPath = (path.hasSuffix("/") && path.count > 1) ? String(path.dropLast()) : path
+        
+        let prefixToHide: String? = {
+            guard isPathPrefixHidingEnabled else { return nil }
+            if source == .localMac {
+                let trimmed = macHiddenPathPrefix.trimmingCharacters(in: .whitespacesAndNewlines)
+                let clean = (trimmed.hasSuffix("/") && trimmed.count > 1) ? String(trimmed.dropLast()) : trimmed
+                return clean.isEmpty ? nil : clean
+            } else {
+                let trimmed = phoneHiddenPathPrefix.trimmingCharacters(in: .whitespacesAndNewlines)
+                let clean = (trimmed.hasSuffix("/") && trimmed.count > 1) ? String(trimmed.dropLast()) : trimmed
+                return clean.isEmpty ? nil : clean
+            }
+        }()
+        
+        if let prefix = prefixToHide, !prefix.isEmpty {
+            if cleanPath == prefix {
+                // Мы находимся в скрываемом базовом каталоге: отображаем только стрелочку корня
+                return [PathBreadcrumb(title: "›", fullPath: prefix, isRoot: true)]
+            } else if cleanPath.hasPrefix(prefix + "/") {
+                // Путь находится внутри скрываемого базового каталога
+                var result: [PathBreadcrumb] = [
+                    PathBreadcrumb(title: "›", fullPath: prefix, isRoot: true)
+                ]
+                let relative = cleanPath.dropFirst(prefix.count + 1)
+                let parts = relative.split(separator: "/").map(String.init)
+                var accumulated = prefix
+                for part in parts {
+                    accumulated += "/" + part
+                    result.append(PathBreadcrumb(title: part, fullPath: accumulated, isRoot: false))
+                }
+                return result
+            }
+        }
+        
+        // Обычный путь (не подпадает под скрываемый префикс, либо скрытие отключено)
+        let parts = URL(fileURLWithPath: cleanPath).pathComponents
+        guard !parts.isEmpty else {
+            return [PathBreadcrumb(title: "›", fullPath: "/", isRoot: true)]
+        }
+        
+        var result: [PathBreadcrumb] = []
+        var accumulated = ""
+        for (index, component) in parts.enumerated() {
+            if index == 0 {
+                let targetRoot = (source == .localMac)
+                    ? (FileManager.default.fileExists(atPath: cleanPath) ? "/" : FileManager.default.homeDirectoryForCurrentUser.path)
+                    : "/"
+                result.append(PathBreadcrumb(title: "›", fullPath: targetRoot, isRoot: true))
+                accumulated = ""
+            } else {
+                accumulated += "/" + component
+                result.append(PathBreadcrumb(title: component, fullPath: accumulated, isRoot: false))
+            }
+        }
+        return result
     }
     
     public func toggleActivePane() {
@@ -1111,7 +1226,7 @@ public final class DualPaneViewModel: ObservableObject {
         transport.updateEndpoint(host: host, port: port)
     }
     
-    /// Подключение к телефону: фоновый запуск ADB/проброс портов и авто-настройка
+    /// Подключение к телефону: единое управление через ConnectionController (Слой 3)
     public func connectPhone(forceActivate: Bool = true) {
         guard !isConnectingPhone else { return }
         isConnectingPhone = true
@@ -1119,81 +1234,27 @@ public final class DualPaneViewModel: ObservableObject {
         
         Task { @MainActor in
             defer { self.isConnectingPhone = false }
-            let result = await PhoneConnectionManager.shared.establishConnection()
-            
-            switch result {
-            case .usbSuccess(let deviceId, let host, let port, let log):
-                print("[PhoneConnection] Success:\n\(log)")
-                self.updateRemoteEndpoint(host: host, port: port)
-                let fp = PhoneConnectionManager.shared.fetchHostFingerprint(host: host, port: port)
-                    ?? "SHA256:Ed25519_DaemonFingerprint"
-                _ = HostKeyStore.shared.verifyOrPin(
-                    host: host,
-                    port: Int(port),
-                    fingerprint: fp
-                )
-                do {
-                    try await self.remoteDriver.warmUpConnection()
-                    self.isPhoneConnected = true
-                    self.transport.rootIsEmulatedZero = self.remoteDriver.rootIsEmulatedZero
-                    if forceActivate && self.rightSource != .remotePhone && self.leftSource != .remotePhone {
-                        self.changeSource(to: .remotePhone, side: .right)
-                    } else {
-                        if self.leftSource == .remotePhone { self.refreshPane(side: .left) }
-                        if self.rightSource == .remotePhone { self.refreshPane(side: .right) }
-                    }
-                    self.refreshDetectedVolumes()
-                    self.statusMessage = "✓ Телефон подключен по USB (\(deviceId))"
-                } catch {
-                    print("[PhoneConnection] SFTP warmup error: \(error)")
-                    self.isPhoneConnected = false
-                    self.refreshUsbDrives()
-                    self.statusMessage = "⚠️ Ошибка SFTP: \(error.localizedDescription)"
+            let success = await ConnectionController.shared.connect(viewModel: self)
+            if success {
+                if forceActivate && self.rightSource != .remotePhone && self.leftSource != .remotePhone {
+                    self.changeSource(to: .remotePhone, side: .right)
+                } else {
+                    if self.leftSource == .remotePhone { self.refreshPane(side: .left) }
+                    if self.rightSource == .remotePhone { self.refreshPane(side: .right) }
                 }
-                
-            case .wifiSuccess(let host, let port, let name):
-                UserDefaults.standard.set(host, forKey: "lastConnectedHost")
-                UserDefaults.standard.set(String(port), forKey: "lastConnectedPort")
-                self.updateRemoteEndpoint(host: host, port: port)
-                let fp = PhoneConnectionManager.shared.fetchHostFingerprint(host: host, port: port)
-                    ?? "SHA256:Ed25519_DaemonFingerprint"
-                _ = HostKeyStore.shared.verifyOrPin(
-                    host: host,
-                    port: Int(port),
-                    fingerprint: fp
-                )
-                do {
-                    try await self.remoteDriver.warmUpConnection()
-                    self.isPhoneConnected = true
-                    self.transport.rootIsEmulatedZero = self.remoteDriver.rootIsEmulatedZero
-                    if forceActivate && self.rightSource != .remotePhone && self.leftSource != .remotePhone {
-                        self.changeSource(to: .remotePhone, side: .right)
-                    } else {
-                        if self.leftSource == .remotePhone { self.refreshPane(side: .left) }
-                        if self.rightSource == .remotePhone { self.refreshPane(side: .right) }
-                    }
-                    self.refreshDetectedVolumes()
-                    self.statusMessage = "✓ Телефон подключен по Wi-Fi (\(name))"
-                } catch {
-                    print("[PhoneConnection] SFTP warmup error: \(error)")
-                    self.isPhoneConnected = false
-                    self.refreshUsbDrives()
-                    self.statusMessage = "⚠️ Ошибка SFTP: \(error.localizedDescription)"
-                }
-                
-            case .unauthorized(let deviceId, let log):
-                print("[PhoneConnection] Unauthorized:\n\(log)")
-                self.isPhoneConnected = false
+                self.refreshDetectedVolumes()
+            } else {
                 self.refreshUsbDrives()
-                self.statusMessage = "⚠️ Телефон \(deviceId) не авторизован! Подтвердите 'Отладку по USB' на экране."
-                
-            case .failure(let reason, let log):
-                print("[PhoneConnection] Failed:\n\(log)")
-                self.isPhoneConnected = false
-                self.refreshUsbDrives()
-                self.statusMessage = "⚠️ \(reason)"
             }
         }
+    }
+    
+    /// Явное отключение телефона пользователем с завершением дочерних процессов
+    public func disconnectPhone() {
+        ConnectionController.shared.disconnect(viewModel: self)
+        refreshUsbDrives()
+        if leftSource == .remotePhone { refreshPane(side: .left) }
+        if rightSource == .remotePhone { refreshPane(side: .right) }
     }
     
     /// Автоматическое подключение к телефону при обнаружении USB или Wi-Fi связи
@@ -1211,22 +1272,24 @@ public final class DualPaneViewModel: ObservableObject {
         
         Task.detached(priority: .userInitiated) { [weak self] in
             guard let self = self else { return }
-            // 1. Проверяем наличие USB-устройства через ADB
+            // 1. Проверяем наличие USB-устройства через ADB и его политику autoConnect
             var hasAdb = false
             if let adb = PhoneConnectionManager.shared.findAdbBinary() {
                 let (status, out) = PhoneConnectionManager.shared.runCommand(executable: adb, arguments: ["devices"])
                 if status == 0 && out.contains("\tdevice") {
-                    hasAdb = true
+                    let devId = PhoneConnectionManager.shared.getConnectedDeviceId()
+                    if let id = devId, let dev = DeviceRegistry.shared.device(withId: id) {
+                        hasAdb = dev.autoConnect
+                    }
                 }
             }
             
-            // 2. Если по USB не обнаружен, сканируем Wi-Fi (автоопределение)
+            // 2. Если по USB не обнаружен, сканируем Wi-Fi для доверенных устройств с autoConnect == true
             var hasWifi = false
             if !hasAdb {
                 if let foundIp = PhoneConnectionManager.shared.discoverPhoneIpOnLan() {
                     let dev = DeviceRegistry.shared.device(matchingHost: foundIp)
-                    // Автоподключение по Wi-Fi выполняется только для доверенных устройств с явным флагом autoConnect
-                    if dev?.autoConnect == true || UserDefaults.standard.bool(forKey: "autoConnectEnabled") {
+                    if dev?.autoConnect == true {
                         hasWifi = true
                     }
                 }

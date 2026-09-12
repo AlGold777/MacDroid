@@ -177,8 +177,27 @@ public struct PairingModalView: View {
                 }
                 
                 Toggle("Автоматически подключаться к этому устройству при запуске", isOn: Binding(
-                    get: { UserDefaults.standard.bool(forKey: "autoConnectEnabled") },
-                    set: { UserDefaults.standard.set($0, forKey: "autoConnectEnabled") }
+                    get: {
+                        if let dev = DeviceRegistry.shared.device(matchingHost: inputHost) {
+                            return dev.autoConnect
+                        }
+                        return false
+                    },
+                    set: { newValue in
+                        if let dev = DeviceRegistry.shared.device(matchingHost: inputHost) {
+                            DeviceRegistry.shared.setAutoConnect(id: dev.id, enabled: newValue)
+                        } else if !inputHost.isEmpty {
+                            let devName = currentSelectionTitle.components(separatedBy: " — ").first ?? "Телефон Android"
+                            DeviceRegistry.shared.registerOrUpdate(
+                                id: "device_\(inputHost)",
+                                name: devName,
+                                fingerprint: currentFingerprint.hasPrefix("SHA256:") ? currentFingerprint : "",
+                                host: inputHost,
+                                port: UInt16(Int(inputPort) ?? 2222),
+                                autoConnect: newValue
+                            )
+                        }
+                    }
                 ))
                 .font(.caption)
                 .padding(.top, 4)
@@ -193,6 +212,7 @@ public struct PairingModalView: View {
             
             HStack(spacing: 12) {
                 Button("Отмена") {
+                    ConnectionController.shared.cancel(viewModel: vm)
                     dismiss()
                 }
                 .keyboardShortcut(.cancelAction)
@@ -214,51 +234,18 @@ public struct PairingModalView: View {
                     Task { @MainActor in
                         defer { isConnecting = false }
                         
-                        let reachable = PhoneConnectionManager.shared.isHostPortReachable(host: inputHost, port: UInt16(portInt), timeoutSeconds: 2)
-                        guard reachable else {
-                            pairingStatus = "⚠️ Устройство не отвечает по адресу \(inputHost):\(portInt)"
-                            return
-                        }
-                        
-                        vm.updateRemoteEndpoint(host: inputHost, port: UInt16(portInt))
-                        
-                        let fp = PhoneConnectionManager.shared.fetchHostFingerprint(host: inputHost, port: UInt16(portInt))
-                            ?? "SHA256:Ed25519_DaemonFingerprint"
-                        currentFingerprint = fp
-                        
-                        let res = HostKeyStore.shared.verifyOrPin(
-                            host: inputHost,
-                            port: portInt,
-                            fingerprint: fp
+                        let success = await ConnectionController.shared.connect(
+                            customHost: inputHost,
+                            customPort: UInt16(portInt),
+                            viewModel: vm
                         )
                         
-                        do {
-                            try await vm.remoteDriver.warmUpConnection()
-                            vm.isPhoneConnected = true
-                            vm.transport.rootIsEmulatedZero = vm.remoteDriver.rootIsEmulatedZero
-                            
+                        if success {
                             UserDefaults.standard.set(inputHost, forKey: "lastConnectedHost")
                             UserDefaults.standard.set(inputPort, forKey: "lastConnectedPort")
                             saveToHistory(host: inputHost, port: portInt)
                             
-                            let devName = currentSelectionTitle.components(separatedBy: " — ").first ?? "Телефон Android"
-                            DeviceRegistry.shared.registerOrUpdate(
-                                id: "device_\(inputHost)",
-                                name: devName,
-                                fingerprint: fp,
-                                host: inputHost,
-                                port: UInt16(portInt)
-                            )
-                            
-                            switch res {
-                            case .trusted:
-                                pairingStatus = "✓ Устройство авторизовано (доверенное)"
-                            case .pinnedNew:
-                                pairingStatus = "✓ Ключ успешно зафиксирован в хранилище"
-                            case .mismatchWarning:
-                                pairingStatus = "⚠️ ВНИМАНИЕ: Ключ не совпадает с сохраненным ранее!"
-                            }
-                            
+                            pairingStatus = "✓ Подключение успешно установлено"
                             if vm.rightSource != .remotePhone && vm.leftSource != .remotePhone {
                                 vm.changeSource(to: .remotePhone, side: .right)
                             } else {
@@ -266,14 +253,15 @@ public struct PairingModalView: View {
                                 if vm.rightSource == .remotePhone { vm.refreshPane(side: .right) }
                             }
                             vm.refreshDetectedVolumes()
-                            vm.statusMessage = "✓ Телефон подключен по Wi-Fi (\(inputHost):\(portInt))"
                             
                             try? await Task.sleep(nanoseconds: 600_000_000)
                             dismiss()
-                        } catch {
-                            pairingStatus = "⚠️ Ошибка авторизации SFTP: \(error.localizedDescription)"
-                            vm.isPhoneConnected = false
-                            vm.statusMessage = "⚠️ Ошибка SFTP: \(error.localizedDescription)"
+                        } else {
+                            if case .authFailed(let reason) = ConnectionController.shared.phase {
+                                pairingStatus = "⚠️ Ошибка авторизации: \(reason)"
+                            } else {
+                                pairingStatus = "⚠️ Не удалось подключиться к \(inputHost):\(portInt)"
+                            }
                         }
                     }
                 }

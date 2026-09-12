@@ -52,6 +52,8 @@ public final class ConnectionController: ObservableObject {
     
     private var activeAttemptId: UUID? = nil
     
+    private weak var activeViewModel: DualPaneViewModel?
+    
     public init() {}
     
     /// Проверка, разрешено ли автоподключение для данного устройства с учетом подавления после ручного отключения
@@ -68,6 +70,7 @@ public final class ConnectionController: ObservableObject {
         viewModel: DualPaneViewModel
     ) async -> Bool {
         isManualDisconnectSuppressed = false
+        activeViewModel = viewModel
         let attemptId = UUID()
         activeAttemptId = attemptId
         
@@ -89,7 +92,14 @@ public final class ConnectionController: ObservableObject {
             
             viewModel.updateRemoteEndpoint(host: host, port: port)
             do {
-                try await viewModel.remoteDriver.warmUpConnection()
+                let (fp, isMigrated) = try await authenticateAndWarmUp(
+                    host: host,
+                    port: port,
+                    deviceId: nil,
+                    devName: "Телефон Android",
+                    viewModel: viewModel,
+                    attemptId: attemptId
+                )
                 guard isAttemptValid(attemptId) else { return false }
                 
                 let isV6 = host.contains(":")
@@ -103,12 +113,14 @@ public final class ConnectionController: ObservableObject {
                 viewModel.transport.rootIsEmulatedZero = viewModel.remoteDriver.rootIsEmulatedZero
                 viewModel.statusMessage = "✓ Подключено: \(name) (\(path.displayString))"
                 
+                let effectiveId = !fp.isEmpty ? "dev_\(fp.suffix(12))" : "device_\(host)"
                 DeviceRegistry.shared.registerOrUpdate(
-                    id: "device_\(host)",
+                    id: effectiveId,
                     name: name,
-                    fingerprint: "",
+                    fingerprint: fp,
                     host: host,
-                    port: port
+                    port: port,
+                    isMigrated: isMigrated
                 )
                 return true
             } catch {
@@ -126,12 +138,19 @@ public final class ConnectionController: ObservableObject {
         switch res {
         case .usbSuccess(let deviceId, let host, let port, _):
             viewModel.updateRemoteEndpoint(host: host, port: port)
+            let model = PhoneConnectionManager.shared.deviceNameForHost("127.0.0.1") ?? "Android Device"
             do {
-                try await viewModel.remoteDriver.warmUpConnection()
+                let (fp, isMigrated) = try await authenticateAndWarmUp(
+                    host: host,
+                    port: port,
+                    deviceId: deviceId,
+                    devName: model,
+                    viewModel: viewModel,
+                    attemptId: attemptId
+                )
                 guard isAttemptValid(attemptId) else { return false }
                 
                 let path = CandidatePath.usb(deviceId: deviceId, localPort: port)
-                let model = PhoneConnectionManager.shared.deviceNameForHost("127.0.0.1") ?? "Android Device"
                 currentPath = path
                 currentDeviceName = model
                 phase = .connected(path: path, deviceName: model)
@@ -139,12 +158,14 @@ public final class ConnectionController: ObservableObject {
                 viewModel.transport.rootIsEmulatedZero = viewModel.remoteDriver.rootIsEmulatedZero
                 viewModel.statusMessage = "✓ Подключено по USB (\(model))"
                 
+                let effectiveId = !deviceId.isEmpty ? deviceId : (!fp.isEmpty ? "dev_\(fp.suffix(12))" : "usb_device")
                 DeviceRegistry.shared.registerOrUpdate(
-                    id: deviceId,
+                    id: effectiveId,
                     name: model,
-                    fingerprint: "",
+                    fingerprint: fp,
                     host: host,
-                    port: port
+                    port: port,
+                    isMigrated: isMigrated
                 )
                 return true
             } catch {
@@ -157,7 +178,14 @@ public final class ConnectionController: ObservableObject {
         case .wifiSuccess(let host, let port, let name):
             viewModel.updateRemoteEndpoint(host: host, port: port)
             do {
-                try await viewModel.remoteDriver.warmUpConnection()
+                let (fp, isMigrated) = try await authenticateAndWarmUp(
+                    host: host,
+                    port: port,
+                    deviceId: nil,
+                    devName: name,
+                    viewModel: viewModel,
+                    attemptId: attemptId
+                )
                 guard isAttemptValid(attemptId) else { return false }
                 
                 let isV6 = host.contains(":")
@@ -169,12 +197,14 @@ public final class ConnectionController: ObservableObject {
                 viewModel.transport.rootIsEmulatedZero = viewModel.remoteDriver.rootIsEmulatedZero
                 viewModel.statusMessage = "✓ Подключено по Wi-Fi (\(name))"
                 
+                let effectiveId = !fp.isEmpty ? "dev_\(fp.suffix(12))" : "device_\(host)"
                 DeviceRegistry.shared.registerOrUpdate(
-                    id: "device_\(host)",
+                    id: effectiveId,
                     name: name,
-                    fingerprint: "",
+                    fingerprint: fp,
                     host: host,
-                    port: port
+                    port: port,
+                    isMigrated: isMigrated
                 )
                 return true
             } catch {
@@ -196,17 +226,79 @@ public final class ConnectionController: ObservableObject {
         }
     }
     
-    /// Отмена текущей попытки подключения
-    public func cancel() {
+    /// Аутентификация, валидация Host Key и управляемый переход на изолированный ключ
+    private func authenticateAndWarmUp(
+        host: String,
+        port: UInt16,
+        deviceId: String?,
+        devName: String,
+        viewModel: DualPaneViewModel,
+        attemptId: UUID
+    ) async throws -> (fingerprint: String, isMigrated: Bool) {
+        guard isAttemptValid(attemptId) else {
+            throw NSError(domain: "ConnectionController", code: -1, userInfo: [NSLocalizedDescriptionKey: "Attempt cancelled"])
+        }
+        
+        // 1. Слой 1: Проверка и фиксация отпечатка хост-ключа сервера (HostKeyStore)
+        let fp = PhoneConnectionManager.shared.fetchHostFingerprint(host: host, port: port) ?? ""
+        if !fp.isEmpty {
+            let keyStatus = HostKeyStore.shared.verifyOrPin(
+                host: host,
+                port: Int(port),
+                deviceId: deviceId,
+                fingerprint: fp
+            )
+            if case .mismatchWarning(let expected, let actual) = keyStatus {
+                throw NSError(
+                    domain: "ConnectionController",
+                    code: 403,
+                    userInfo: [NSLocalizedDescriptionKey: "Host Key сервера не совпадает с сохраненным! (Ожидался \(expected), получен \(actual)). Проверьте безопасность сети."]
+                )
+            }
+        }
+        
+        // 2. Слой 3: Проверка статуса миграции на изолированный ключ
+        let existingDev = DeviceRegistry.shared.device(matchingFingerprint: fp)
+            ?? DeviceRegistry.shared.device(matchingHost: host)
+            ?? (deviceId != nil ? DeviceRegistry.shared.device(withId: deviceId!) : nil)
+        
+        let alreadyMigrated = existingDev?.isMigratedToDedicatedKey == true
+        
+        if alreadyMigrated {
+            // Устройство уже мигрировано: строгий режим без фоллбэка на личные ключи пользователя
+            try await viewModel.remoteDriver.warmUpConnection(allowLegacyFallback: false)
+            return (fp, true)
+        } else {
+            // Устройство ещё не мигрировано: сначала пробуем только изолированный macdroid_id_ed25519
+            do {
+                try await viewModel.remoteDriver.warmUpConnection(allowLegacyFallback: false)
+                // Если телефон принял macdroid_id_ed25519 без фоллбэка, фиксируем миграцию
+                return (fp, true)
+            } catch {
+                guard isAttemptValid(attemptId) else {
+                    throw NSError(domain: "ConnectionController", code: -1, userInfo: [NSLocalizedDescriptionKey: "Attempt cancelled"])
+                }
+                // Если телефон отклонил macdroid_id_ed25519, пробуем контролируемый фоллбэк на legacy-ключ
+                try await viewModel.remoteDriver.warmUpConnection(allowLegacyFallback: true)
+                // Подключение удалось через legacy-ключ; миграция остаётся false
+                return (fp, false)
+            }
+        }
+    }
+    
+    /// Отмена текущей попытки подключения с завершением дочерних процессов
+    public func cancel(viewModel: DualPaneViewModel? = nil) {
         isManualDisconnectSuppressed = true
         activeAttemptId = nil
+        let targetVm = viewModel ?? activeViewModel
+        targetVm?.remoteDriver.disconnect()
         phase = .disconnected(reason: "Подключение отменено пользователем")
     }
     
-    /// Явное отключение
+    /// Явное отключение устройства
     public func disconnect(viewModel: DualPaneViewModel) {
         isManualDisconnectSuppressed = true
-        cancel()
+        cancel(viewModel: viewModel)
         currentPath = nil
         currentDeviceName = ""
         viewModel.isPhoneConnected = false

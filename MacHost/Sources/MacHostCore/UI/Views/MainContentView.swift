@@ -74,6 +74,10 @@ public struct MainContentView: View {
             CreateArchiveModalView()
                 .environmentObject(vm)
         }
+        .sheet(isPresented: $vm.showPathDisplaySettings) {
+            PathDisplaySettingsModalView()
+                .environmentObject(vm)
+        }
         .alert("Ошибка файловой операции", isPresented: $vm.showErrorAlert) {
             Button("Понятно", role: .cancel) {}
         } message: {

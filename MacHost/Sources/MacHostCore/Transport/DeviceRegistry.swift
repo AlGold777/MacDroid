@@ -32,7 +32,7 @@ public struct TrustedDevice: Codable, Identifiable, Sendable, Equatable {
     }
 }
 
-/// Реестр доверенных устройств MacDroid Commander
+/// Реестр доверенных устройств MacDroid Commander (потокобезопасный синглтон)
 public final class DeviceRegistry: @unchecked Sendable {
     public static let shared = DeviceRegistry()
     
@@ -65,12 +65,20 @@ public final class DeviceRegistry: @unchecked Sendable {
         return devices[id]
     }
     
+    public func device(matchingFingerprint fp: String) -> TrustedDevice? {
+        guard !fp.isEmpty else { return nil }
+        lock.lock()
+        defer { lock.unlock() }
+        return devices.values.first(where: { $0.pinnedFingerprint == fp })
+    }
+    
     public func device(matchingHost host: String) -> TrustedDevice? {
         lock.lock()
         defer { lock.unlock() }
         return devices.values.first(where: { $0.lastKnownHost == host })
     }
     
+    /// Регистрация или обновление устройства с сохранением идентичности при смене сетевого адреса
     public func registerOrUpdate(
         id: String,
         name: String,
@@ -81,12 +89,17 @@ public final class DeviceRegistry: @unchecked Sendable {
         isMigrated: Bool? = nil
     ) {
         lock.lock()
-        defer {
-            lock.unlock()
-            save()
+        defer { lock.unlock() }
+        
+        // Поиск существующего устройства сначала по стабильному отпечатку ключа, затем по id
+        let effectiveId: String
+        if !fingerprint.isEmpty, let byFp = devices.values.first(where: { $0.pinnedFingerprint == fingerprint }) {
+            effectiveId = byFp.id
+        } else {
+            effectiveId = id
         }
         
-        if var existing = devices[id] {
+        if var existing = devices[effectiveId] {
             existing.name = name
             existing.lastKnownHost = host
             existing.lastKnownPort = port
@@ -100,10 +113,10 @@ public final class DeviceRegistry: @unchecked Sendable {
             if let mig = isMigrated {
                 existing.isMigratedToDedicatedKey = mig
             }
-            devices[id] = existing
+            devices[effectiveId] = existing
         } else {
             let newDev = TrustedDevice(
-                id: id,
+                id: effectiveId,
                 name: name,
                 pinnedFingerprint: fingerprint,
                 lastKnownHost: host,
@@ -112,43 +125,41 @@ public final class DeviceRegistry: @unchecked Sendable {
                 autoConnect: autoConnect ?? false,
                 isMigratedToDedicatedKey: isMigrated ?? false
             )
-            devices[id] = newDev
+            devices[effectiveId] = newDev
         }
+        saveUnderLock()
     }
     
     public func setAutoConnect(id: String, enabled: Bool) {
         lock.lock()
-        defer {
-            lock.unlock()
-            save()
-        }
+        defer { lock.unlock() }
         devices[id]?.autoConnect = enabled
+        saveUnderLock()
     }
     
     public func setMigrated(id: String, migrated: Bool) {
         lock.lock()
-        defer {
-            lock.unlock()
-            save()
-        }
+        defer { lock.unlock() }
         devices[id]?.isMigratedToDedicatedKey = migrated
+        saveUnderLock()
     }
     
     public func remove(id: String) {
         lock.lock()
-        defer {
-            lock.unlock()
-            save()
-        }
+        defer { lock.unlock() }
         devices.removeValue(forKey: id)
+        saveUnderLock()
     }
     
-    // MARK: - Persistence
+    // MARK: - Persistence (выполняется строго внутри захваченного lock)
     
-    private func save() {
+    private func saveUnderLock() {
         let list = Array(devices.values)
-        if let data = try? JSONEncoder().encode(list) {
-            try? data.write(to: storageURL, options: .atomic)
+        do {
+            let data = try JSONEncoder().encode(list)
+            try data.write(to: storageURL, options: .atomic)
+        } catch {
+            print("[DeviceRegistry] Failed to save trusted devices: \(error)")
         }
     }
     
@@ -158,6 +169,8 @@ public final class DeviceRegistry: @unchecked Sendable {
               let list = try? JSONDecoder().decode([TrustedDevice].self, from: data) else {
             return
         }
+        lock.lock()
+        defer { lock.unlock() }
         devices.removeAll()
         for item in list {
             devices[item.id] = item
@@ -165,13 +178,15 @@ public final class DeviceRegistry: @unchecked Sendable {
     }
     
     private func migrateLegacyDataIfNeeded() {
+        lock.lock()
+        defer { lock.unlock() }
         if !devices.isEmpty { return }
         
         // Миграция из UserDefaults phoneConnectionHistory
         if let data = UserDefaults.standard.data(forKey: "phoneConnectionHistory"),
            let legacyList = try? JSONDecoder().decode([SavedConnection].self, from: data) {
             for item in legacyList {
-                let id = "legacy_\(item.host)_\(item.port)"
+                let id = "device_\(item.host)"
                 let dev = TrustedDevice(
                     id: id,
                     name: item.name,
@@ -184,7 +199,7 @@ public final class DeviceRegistry: @unchecked Sendable {
                 )
                 devices[id] = dev
             }
-            save()
+            saveUnderLock()
         }
     }
 }

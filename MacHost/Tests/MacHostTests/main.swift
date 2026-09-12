@@ -2466,8 +2466,204 @@ Task { @MainActor in
         let indicatorDisconnected = PhoneConnectionIndicatorView(isConnected: false, isConnecting: false)
         assertCondition(indicatorDisconnected.isConnected == false && indicatorDisconnected.isConnecting == false, "Phone indicator handles disconnected state (solid gray)")
         
+        // TEST 41: Rename Highlight Suppression & Path Prefix Trimming Settings
+        print("\n[TEST 41] Rename Highlight Suppression & Path Prefix Trimming Settings:")
+        try await MainActor.run {
+            let vm = DualPaneViewModel()
+            
+            // 1. Rename State & Highlight Suppression Invariants
+            let testItem = FileItem(id: "test-rename-id", name: "Report.docx", path: "/test/Report.docx", size: 1024, mtime: 1700000000.0, isDirectory: false)
+            vm.leftItems = [testItem]
+            vm.leftSelection = [testItem.id]
+            assertCondition(vm.leftSelection.contains(testItem.id), "Item is initially selected with blue selection")
+            
+            vm.triggerRename(item: testItem, side: .left)
+            assertCondition(vm.editingItemId == testItem.id, "triggerRename sets editingItemId")
+            assertCondition(vm.editingItemSide == .left, "triggerRename sets editingItemSide to .left")
+            assertCondition(vm.editingItemName == "Report.docx", "editingItemName is pre-filled with file name")
+            assertCondition(vm.showRenameDialog == false, "Modal rename dialog is NOT shown for inline editing")
+            
+            // 2. Default Path Display Settings Invariants
+            let homePath = FileManager.default.homeDirectoryForCurrentUser.path
+            assertCondition(vm.macHiddenPathPrefix == homePath, "Default macHiddenPathPrefix is home directory: \(homePath)")
+            assertCondition(vm.phoneHiddenPathPrefix == "/storage/emulated/0", "Default phoneHiddenPathPrefix is /storage/emulated/0")
+            assertCondition(vm.isPathPrefixHidingEnabled == true, "isPathPrefixHidingEnabled is true by default")
+            assertCondition(vm.showPathDisplaySettings == false, "showPathDisplaySettings is false by default")
+            
+            // 3. Mac Path Breadcrumbs Trimming
+            let macSubPath = homePath + "/Downloads/Work/Project"
+            let macCrumbs = vm.breadcrumbs(for: macSubPath, source: .localMac)
+            assertCondition(macCrumbs.count == 4, "Mac crumbs count is 4 for 3 subdirectories (got \(macCrumbs.count))")
+            assertCondition(macCrumbs[0].isRoot == true, "First Mac crumb is root")
+            assertCondition(macCrumbs[0].title == "›", "First Mac crumb title is '›'")
+            assertCondition(macCrumbs[0].fullPath == homePath, "First Mac crumb points to home: \(homePath)")
+            assertCondition(macCrumbs[1].title == "Downloads", "Second crumb is 'Downloads'")
+            assertCondition(macCrumbs[1].fullPath == homePath + "/Downloads", "Second crumb path is correct")
+            assertCondition(macCrumbs[2].title == "Work", "Third crumb is 'Work'")
+            assertCondition(macCrumbs[3].title == "Project", "Fourth crumb is 'Project'")
+            assertCondition(macCrumbs[3].fullPath == macSubPath, "Final crumb path matches target")
+            
+            // Exact home folder: single root crumb
+            let exactHomeCrumbs = vm.breadcrumbs(for: homePath, source: .localMac)
+            assertCondition(exactHomeCrumbs.count == 1, "Exact home path has 1 root crumb (got \(exactHomeCrumbs.count))")
+            assertCondition(exactHomeCrumbs[0].title == "›" && exactHomeCrumbs[0].fullPath == homePath, "Exact home crumb is root '›'")
+            
+            // Outside home folder (e.g. /Volumes/USB): full path from /
+            let extCrumbs = vm.breadcrumbs(for: "/Volumes/FlashUSB/Docs", source: .localMac)
+            assertCondition(extCrumbs[0].isRoot == true && extCrumbs[0].title == "›", "External crumb root is '›'")
+            assertCondition(extCrumbs[1].title == "Volumes", "External crumb 1 is 'Volumes'")
+            assertCondition(extCrumbs[2].title == "FlashUSB", "External crumb 2 is 'FlashUSB'")
+            assertCondition(extCrumbs[3].title == "Docs", "External crumb 3 is 'Docs'")
+            
+            // 4. Phone Path Breadcrumbs Trimming
+            let phoneSubPath = "/storage/emulated/0/DCIM/Camera/Trip"
+            let phoneCrumbs = vm.breadcrumbs(for: phoneSubPath, source: .remotePhone)
+            assertCondition(phoneCrumbs.count == 4, "Phone crumbs count is 4 (got \(phoneCrumbs.count))")
+            assertCondition(phoneCrumbs[0].isRoot == true, "Phone root crumb isRoot")
+            assertCondition(phoneCrumbs[0].title == "›", "Phone root title is '›'")
+            assertCondition(phoneCrumbs[0].fullPath == "/storage/emulated/0", "Phone root points to /storage/emulated/0")
+            assertCondition(phoneCrumbs[1].title == "DCIM", "Phone crumb 1 is 'DCIM'")
+            assertCondition(phoneCrumbs[1].fullPath == "/storage/emulated/0/DCIM", "Phone crumb 1 path is correct")
+            assertCondition(phoneCrumbs[2].title == "Camera", "Phone crumb 2 is 'Camera'")
+            assertCondition(phoneCrumbs[3].title == "Trip", "Phone crumb 3 is 'Trip'")
+            
+            // Phone root
+            let phoneRootCrumbs = vm.breadcrumbs(for: "/storage/emulated/0", source: .remotePhone)
+            assertCondition(phoneRootCrumbs.count == 1 && phoneRootCrumbs[0].title == "›", "Phone root displays single '›' crumb")
+            
+            // Disabled prefix hiding
+            vm.isPathPrefixHidingEnabled = false
+            let disabledCrumbs = vm.breadcrumbs(for: "/storage/emulated/0/DCIM", source: .remotePhone)
+            assertCondition(disabledCrumbs.contains(where: { $0.title == "storage" }), "Full path includes 'storage' when hiding is disabled")
+            
+            // 5. Custom prefix & reset
+            vm.macHiddenPathPrefix = "/Users/custom_user"
+            vm.phoneHiddenPathPrefix = "/mnt/sdcard"
+            vm.isPathPrefixHidingEnabled = true
+            vm.savePathDisplaySettings()
+            
+            let restoredVM = DualPaneViewModel()
+            assertCondition(restoredVM.macHiddenPathPrefix == "/Users/custom_user", "Custom Mac prefix restored from session")
+            assertCondition(restoredVM.phoneHiddenPathPrefix == "/mnt/sdcard", "Custom Phone prefix restored from session")
+            
+            restoredVM.resetPathDisplaySettings()
+            assertCondition(restoredVM.macHiddenPathPrefix == homePath, "resetPathDisplaySettings restores Mac default: \(homePath)")
+            assertCondition(restoredVM.phoneHiddenPathPrefix == "/storage/emulated/0", "resetPathDisplaySettings restores Phone default: /storage/emulated/0")
+            assertCondition(restoredVM.isPathPrefixHidingEnabled == true, "resetPathDisplaySettings restores isPathPrefixHidingEnabled = true")
+            
+            // Cancel inline rename cleanup
+            vm.cancelInlineRename()
+            assertCondition(vm.editingItemId == nil, "cancelInlineRename clears editingItemId")
+            assertCondition(vm.editingItemSide == nil, "cancelInlineRename clears editingItemSide")
+        }
+        
+        // =========================================================================
+        // [TEST 42] 3-Layer Connection Architecture, DeviceRegistry & Key Migration
+        // =========================================================================
+        print("\n[TEST 42] 3-Layer Connection Architecture & Key Migration Invariants:")
+        
+        let tempRegURL = FileManager.default.temporaryDirectory.appendingPathComponent("test_registry_\(UUID().uuidString).json")
+        defer { try? FileManager.default.removeItem(at: tempRegURL) }
+        
+        let registry = DeviceRegistry(storageURL: tempRegURL)
+        let fp1 = "SHA256:TestServerFingerprintABC123"
+        
+        // 1. Регистрация нового доверенного устройства
+        registry.registerOrUpdate(
+            id: "dev_phone_1",
+            name: "Xiaomi 14 Ultra",
+            fingerprint: fp1,
+            host: "192.168.1.18",
+            port: 2222,
+            autoConnect: true,
+            isMigrated: false
+        )
+        
+        let dev = registry.device(withId: "dev_phone_1")
+        assertCondition(dev != nil, "Device successfully registered in DeviceRegistry")
+        assertCondition(dev?.name == "Xiaomi 14 Ultra", "Device name matches")
+        assertCondition(dev?.pinnedFingerprint == fp1, "Fingerprint correctly pinned")
+        assertCondition(dev?.lastKnownHost == "192.168.1.18", "Last known host matches")
+        assertCondition(dev?.autoConnect == true, "autoConnect flag is true")
+        assertCondition(dev?.isMigratedToDedicatedKey == false, "isMigratedToDedicatedKey is false before migration")
+        
+        // 2. Поиск устройства по отпечатку ключа при смене IP адреса (DHCP)
+        registry.registerOrUpdate(
+            id: "dev_phone_new_ip",
+            name: "Xiaomi 14 Ultra (New IP)",
+            fingerprint: fp1,
+            host: "192.168.1.25",
+            port: 2222
+        )
+        let foundByFp = registry.device(matchingFingerprint: fp1)
+        assertCondition(foundByFp != nil, "Device resolved by cryptographic fingerprint after IP change")
+        assertCondition(foundByFp?.id == "dev_phone_1", "Identity preserved: effectiveId matches original device")
+        assertCondition(foundByFp?.lastKnownHost == "192.168.1.25", "Updated to new host 192.168.1.25")
+        assertCondition(foundByFp?.autoConnect == true, "autoConnect preference preserved across IP updates")
+        
+        // 3. Миграция на изолированный ключ
+        registry.setMigrated(id: "dev_phone_1", migrated: true)
+        let migratedDev = registry.device(withId: "dev_phone_1")
+        assertCondition(migratedDev?.isMigratedToDedicatedKey == true, "Device successfully marked as migrated to dedicated key")
+        
+        // 4. Потокобезопасность DeviceRegistry при конкурентных обращениях
+        let group = DispatchGroup()
+        for i in 0..<20 {
+            group.enter()
+            DispatchQueue.global().async {
+                registry.registerOrUpdate(
+                    id: "dev_concurrent_\(i)",
+                    name: "Device \(i)",
+                    fingerprint: "SHA256:fp_\(i)",
+                    host: "192.168.1.\(100 + i)",
+                    port: 2222
+                )
+                _ = registry.allDevices()
+                _ = registry.device(matchingFingerprint: "SHA256:fp_\(i)")
+                group.leave()
+            }
+        }
+        group.wait()
+        assertCondition(registry.allDevices().count >= 21, "Concurrent thread-safe writes & reads succeeded without crash or race")
+        
+        // 5. HostKeyStore проверка и обнаружение подмены (MITM)
+        let hkStatusNew = HostKeyStore.shared.verifyOrPin(
+            host: "10.0.0.99",
+            port: 2222,
+            fingerprint: "SHA256:ExpectedOriginalKey"
+        )
+        assertCondition(hkStatusNew != nil, "HostKeyStore registered initial key")
+        let hkStatusMismatch = HostKeyStore.shared.verifyOrPin(
+            host: "10.0.0.99",
+            port: 2222,
+            fingerprint: "SHA256:SpoofedMaliciousKey"
+        )
+        if case .mismatchWarning(let exp, let act) = hkStatusMismatch {
+            assertCondition(exp == "SHA256:ExpectedOriginalKey" && act == "SHA256:SpoofedMaliciousKey", "HostKeyStore detected MITM/Key mismatch correctly")
+        } else {
+            assertCondition(false, "HostKeyStore failed to detect key mismatch")
+        }
+        HostKeyStore.shared.unpin(host: "10.0.0.99", port: 2222)
+        
+        // 6. ConnectionController жизненный цикл и подавление автоподключения
+        try await MainActor.run {
+            let connCtrl = ConnectionController.shared
+            assertCondition(connCtrl.phase == .disconnected(reason: nil) || connCtrl.phase == .disconnected(reason: "Телефон отключен"), "Initial connection phase is disconnected")
+            
+            let testVm = DualPaneViewModel()
+            // Ручное отключение подавляет автоподключение
+            connCtrl.cancel(viewModel: testVm)
+            assertCondition(connCtrl.isManualDisconnectSuppressed == true, "Manual cancel suppresses background auto-connect")
+            assertCondition(connCtrl.shouldAttemptAutoConnect(for: "dev_phone_1") == false, "shouldAttemptAutoConnect returns false when suppressed")
+            
+            // Явный вызов disconnect(viewModel:)
+            connCtrl.disconnect(viewModel: testVm)
+            assertCondition(testVm.isPhoneConnected == false, "disconnect(viewModel:) sets isPhoneConnected = false")
+            assertCondition(connCtrl.currentPath == nil, "disconnect clears current candidate path")
+        }
+        
         print("\n🎉 ==================================================")
-        print("🎉   ALL 41 PRODUCTION TEST SUITES PASSED!          ")
+        print("🎉   ALL 42 PRODUCTION TEST SUITES PASSED!          ")
         print("🎉 ==================================================")
         exit(0)
     } catch {

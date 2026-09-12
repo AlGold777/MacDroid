@@ -43,7 +43,7 @@ public final class RemoteSFTPDriver: FileSystemDriver, @unchecked Sendable {
     
     private var connectionTask: Task<Void, Error>?
     
-    private func ensureConnected() async throws {
+    private func ensureConnected(allowLegacyFallback: Bool = true) async throws {
         if isSftpInitialized && isConnected {
             return
         }
@@ -56,7 +56,7 @@ public final class RemoteSFTPDriver: FileSystemDriver, @unchecked Sendable {
         
         let task = Task { () -> Void in
             do {
-                try await sshClient.connect()
+                try await sshClient.connect(allowLegacyFallback: allowLegacyFallback)
                 let initPacket = packetEngine.createInitPacket()
                 let (respType, _) = try await sshClient.sendSFTPPacket(packet: initPacket)
                 guard respType == .version else {
@@ -90,18 +90,23 @@ public final class RemoteSFTPDriver: FileSystemDriver, @unchecked Sendable {
     }
     
     /// Явная инициализация и проверка готовности SFTP-сессии
-    public func warmUpConnection() async throws {
-        try await ensureConnected()
+    public func warmUpConnection(allowLegacyFallback: Bool = true) async throws {
+        try await ensureConnected(allowLegacyFallback: allowLegacyFallback)
     }
     
-    /// Сброс состояния соединения
+    /// Сброс состояния соединения и активное завершение дочернего процесса OpenSSH
     public func disconnect() {
         lock.lock()
-        defer { lock.unlock() }
         isSftpInitialized = false
         isConnected = false
         connectionTask?.cancel()
         connectionTask = nil
+        let client = sshClient
+        lock.unlock()
+        
+        Task {
+            await client.disconnect()
+        }
     }
     
     public var rootIsEmulatedZero: Bool = false

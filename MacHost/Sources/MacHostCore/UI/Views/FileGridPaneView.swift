@@ -591,7 +591,9 @@ public struct FileGridCell: View {
     }
     
     private var cellBackgroundFill: Color {
-        if isDragHoverFolder {
+        if vm.editingItemId == item.id && vm.editingItemSide == side {
+            return Color.clear
+        } else if isDragHoverFolder {
             return Color.accentColor.opacity(0.35)
         } else if isSelected {
             return Color.accentColor.opacity(0.18)
@@ -603,7 +605,9 @@ public struct FileGridCell: View {
     }
     
     private var cellStrokeColor: Color {
-        if isDragHoverFolder || isSelected {
+        if vm.editingItemId == item.id && vm.editingItemSide == side {
+            return Color.clear
+        } else if isDragHoverFolder || isSelected {
             return Color.accentColor
         } else if isHovered {
             return Color.secondary.opacity(0.3)

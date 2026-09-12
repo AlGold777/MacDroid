@@ -416,15 +416,12 @@ public struct PaneView: View {
                 } else {
                     ScrollView(.horizontal, showsIndicators: false) {
                         HStack(spacing: 3) {
-                            let components = URL(fileURLWithPath: currentPath).pathComponents
-                            ForEach(Array(components.enumerated()), id: \.offset) { index, component in
-                                if index == 0 {
-                                    // Убираем иконку домика, оставляем стрелочку справа от неё (с возможностью навигации и закладками)
+                            let source = (side == .left ? vm.leftSource : vm.rightSource)
+                            let crumbs = vm.breadcrumbs(for: currentPath, source: source)
+                            ForEach(Array(crumbs.enumerated()), id: \.element.id) { index, crumb in
+                                if crumb.isRoot {
                                     Button(action: {
-                                        let targetPath = (side == .left ? vm.leftSource : vm.rightSource) == .localMac
-                                            ? FileManager.default.homeDirectoryForCurrentUser.path
-                                            : "/storage/emulated/0"
-                                        vm.navigateTo(path: targetPath, side: side)
+                                        vm.navigateTo(path: crumb.fullPath, side: side)
                                     }) {
                                         Text("›")
                                             .font(.system(size: 13, weight: .semibold))
@@ -440,23 +437,29 @@ public struct PaneView: View {
                                                 Label(bm.name, systemImage: bm.icon)
                                             }
                                         }
+                                        Divider()
+                                        Button(action: {
+                                            vm.showPathDisplaySettings = true
+                                        }) {
+                                            Label("Настройки пути...", systemImage: "folder.badge.gearshape")
+                                        }
                                     }
+                                    .help("Корневой каталог (клик для перехода, правый клик для закладок и настроек пути)")
                                 } else {
                                     Button(action: {
-                                        let targetPath = "/" + components[1...index].joined(separator: "/")
-                                        vm.navigateTo(path: targetPath, side: side)
+                                        vm.navigateTo(path: crumb.fullPath, side: side)
                                     }) {
-                                        Text(component)
+                                        Text(crumb.title)
                                             .font(.system(size: 13, weight: .medium))
                                             .foregroundColor(.secondary)
                                     }
                                     .buttonStyle(.plain)
-                                    
-                                    if index < components.count - 1 {
-                                        Text("›")
-                                            .font(.system(size: 13, weight: .regular))
-                                            .foregroundColor(.secondary)
-                                    }
+                                }
+                                
+                                if index < crumbs.count - 1 {
+                                    Text("›")
+                                        .font(.system(size: 13, weight: .regular))
+                                        .foregroundColor(.secondary)
                                 }
                             }
                         }
@@ -1091,8 +1094,8 @@ public struct InlineRenameTextField: NSViewRepresentable {
         textField.isEditable = true
         textField.isSelectable = true
         textField.drawsBackground = true
-        textField.backgroundColor = NSColor.textBackgroundColor
-        textField.textColor = NSColor.labelColor
+        textField.backgroundColor = NSColor.white
+        textField.textColor = NSColor.black
         
         DispatchQueue.main.async {
             guard let window = textField.window else { return }
@@ -1220,19 +1223,27 @@ extension NSTableRowView {
         let isRight = (tv === TableDoubleClickHandler.HandlerView.rightTableView)
         if isLeft || isRight {
             let side: PaneSide = isLeft ? .left : .right
-            if let vm = TableDoubleClickHandler.HandlerView.activeVM(for: side),
-               vm.dragHoverSide == side,
-               rowIndex >= 0 {
-                let items = (side == .left) ? vm.leftItems : vm.rightItems
-                if rowIndex < items.count && items[rowIndex].isDirectory && vm.dragHoverFolderId == items[rowIndex].id {
-                    // Цельная синяя плашка без разрывов между колонками
-                    NSGraphicsContext.saveGraphicsState()
-                    let highlightRect = NSRect(x: 2, y: 1, width: self.bounds.width - 4, height: self.bounds.height - 2)
-                    let path = NSBezierPath(roundedRect: highlightRect, xRadius: 4, yRadius: 4)
-                    NSColor.controlAccentColor.withAlphaComponent(0.35).setFill()
-                    path.fill()
-                    NSGraphicsContext.restoreGraphicsState()
-                    return
+            if let vm = TableDoubleClickHandler.HandlerView.activeVM(for: side) {
+                // Если элемент в этой строке сейчас переименовывается, скрываем синюю плашку выделения
+                if let editingId = vm.editingItemId, vm.editingItemSide == side, rowIndex >= 0 {
+                    let items = vm.displayItems(for: side)
+                    if rowIndex < items.count && items[rowIndex].id == editingId {
+                        return
+                    }
+                }
+                
+                if vm.dragHoverSide == side, rowIndex >= 0 {
+                    let items = (side == .left) ? vm.leftItems : vm.rightItems
+                    if rowIndex < items.count && items[rowIndex].isDirectory && vm.dragHoverFolderId == items[rowIndex].id {
+                        // Цельная синяя плашка без разрывов между колонками
+                        NSGraphicsContext.saveGraphicsState()
+                        let highlightRect = NSRect(x: 2, y: 1, width: self.bounds.width - 4, height: self.bounds.height - 2)
+                        let path = NSBezierPath(roundedRect: highlightRect, xRadius: 4, yRadius: 4)
+                        NSColor.controlAccentColor.withAlphaComponent(0.35).setFill()
+                        path.fill()
+                        NSGraphicsContext.restoreGraphicsState()
+                        return
+                    }
                 }
             }
         }

@@ -12,7 +12,7 @@ public actor SSHControlClient {
         self.port = port
     }
     
-    public func connect() async throws {
+    public func connect(allowLegacyFallback: Bool = true) async throws {
         disconnect()
         
         // Быстрая проверка доступности порта перед запуском ssh (предотвращает зависание на недоступных IP)
@@ -54,11 +54,13 @@ public actor SSHControlClient {
         var sshArgs = [
             "-i", keyURL.path,
         ]
-        // Обратная совместимость: если устройство было ранее сопряжено с личным ключом пользователя (~/.ssh/id_ed25519 или id_rsa),
-        // передаем его как вторичный кандидат, исключая блокировку существующих пользователей
-        let legacyEd25519 = sshDir.appendingPathComponent("id_ed25519")
-        if FileManager.default.fileExists(atPath: legacyEd25519.path) {
-            sshArgs.append(contentsOf: ["-i", legacyEd25519.path])
+        // Обратная совместимость: если фоллбэк разрешен и устройство еще не мигрировано,
+        // передаем legacy-ключ (~/.ssh/id_ed25519) как вторичный кандидат
+        if allowLegacyFallback {
+            let legacyEd25519 = sshDir.appendingPathComponent("id_ed25519")
+            if FileManager.default.fileExists(atPath: legacyEd25519.path) {
+                sshArgs.append(contentsOf: ["-i", legacyEd25519.path])
+            }
         }
         
         sshArgs.append(contentsOf: [
