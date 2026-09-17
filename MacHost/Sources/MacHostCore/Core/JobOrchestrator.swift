@@ -921,4 +921,117 @@ public final class JobOrchestrator: @unchecked Sendable {
             }
         }
     }
+    
+    public struct BatchItemResult: Sendable {
+        public let itemId: String
+        public let isSuccess: Bool
+        public let result: TransferExecutionResult?
+        public let errorDescription: String?
+        
+        public init(itemId: String, result: TransferExecutionResult) {
+            self.itemId = itemId
+            self.isSuccess = true
+            self.result = result
+            self.errorDescription = nil
+        }
+        
+        public init(itemId: String, error: Error) {
+            self.itemId = itemId
+            self.isSuccess = false
+            self.result = nil
+            self.errorDescription = error.localizedDescription
+        }
+    }
+    
+    /// Пакетная передача файлов Phone -> Mac с пулом конкурентности (по умолчанию до 4)
+    public func executeBatchPhoneToMac(
+        items: [(jobId: String, itemId: String, remotePath: String, localTargetDir: URL, isMove: Bool, strategy: ConflictResolutionStrategy)],
+        maxConcurrent: Int = 4,
+        onItemProgress: (@Sendable (String, Double) -> Void)? = nil
+    ) async -> [BatchItemResult] {
+        let concurrency = max(1, min(maxConcurrent, 8))
+        var results: [BatchItemResult] = []
+        
+        await withTaskGroup(of: BatchItemResult.self) { group in
+            var submitted = 0
+            for item in items {
+                if submitted >= concurrency {
+                    if let res = await group.next() {
+                        results.append(res)
+                    }
+                }
+                submitted += 1
+                group.addTask {
+                    do {
+                        let res = try await self.executeTransfer(
+                            isMove: item.isMove,
+                            jobId: item.jobId,
+                            itemId: item.itemId,
+                            remotePath: item.remotePath,
+                            localTargetDir: item.localTargetDir,
+                            strategy: item.strategy,
+                            progress: { p in
+                                onItemProgress?(item.itemId, p)
+                            }
+                        )
+                        return BatchItemResult(itemId: item.itemId, result: res)
+                    } catch {
+                        return BatchItemResult(itemId: item.itemId, error: error)
+                    }
+                }
+            }
+            
+            for await res in group {
+                results.append(res)
+            }
+        }
+        
+        return results
+    }
+    
+    /// Пакетная передача файлов Mac -> Phone с пулом конкурентности (по умолчанию до 4)
+    public func executeBatchMacToPhone(
+        items: [(jobId: String, itemId: String, localSourceURL: URL, remoteTargetDir: String, isMove: Bool, strategy: ConflictResolutionStrategy)],
+        maxConcurrent: Int = 4,
+        onItemProgress: (@Sendable (String, Double) -> Void)? = nil
+    ) async -> [BatchItemResult] {
+        let concurrency = max(1, min(maxConcurrent, 8))
+        var results: [BatchItemResult] = []
+        
+        await withTaskGroup(of: BatchItemResult.self) { group in
+            var submitted = 0
+            for item in items {
+                if submitted >= concurrency {
+                    if let res = await group.next() {
+                        results.append(res)
+                    }
+                }
+                submitted += 1
+                group.addTask {
+                    do {
+                        let res = try await self.executeUpload(
+                            isMove: item.isMove,
+                            jobId: item.jobId,
+                            itemId: item.itemId,
+                            localSourceURL: item.localSourceURL,
+                            remoteTargetDir: item.remoteTargetDir,
+                            strategy: item.strategy,
+                            progress: { p in
+                                onItemProgress?(item.itemId, p)
+                            }
+                        )
+                        return BatchItemResult(itemId: item.itemId, result: res)
+                    } catch {
+                        return BatchItemResult(itemId: item.itemId, error: error)
+                    }
+                }
+            }
+            
+            for await res in group {
+                results.append(res)
+            }
+        }
+        
+        return results
+    }
 }

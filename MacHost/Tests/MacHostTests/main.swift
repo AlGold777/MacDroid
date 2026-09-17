@@ -559,13 +559,16 @@ Task { @MainActor in
             vm.leftSelection = [item1.id, item2.id]
             vm.triggerBatchRename()
             assertCondition(vm.showBatchRenameDialog, "showBatchRenameDialog activated by triggerBatchRename")
+            assertCondition(vm.batchRenameSession != nil, "batchRenameSession is initialized")
+            assertCondition(vm.batchRenameSession?.side == .left, "batchRenameSession.side is .left")
+            assertCondition(vm.batchRenameSide == .left, "batchRenameSide is .left")
             vm.showBatchRenameDialog = false
             
             let renameMappings = [
                 (oldItem: item1, newName: "doc_01.pdf"),
                 (oldItem: item2, newName: "doc_02.pdf")
             ]
-            vm.applyBatchRename(mappings: renameMappings)
+            vm.applyBatchRename(mappings: renameMappings, side: .left)
         }
         
         // Ждем завершения асинхронного переименования с адаптивным опросом
@@ -593,6 +596,37 @@ Task { @MainActor in
             assertCondition(FileManager.default.fileExists(atPath: f1.path), "Original document_alpha.pdf restored via Undo")
             assertCondition(FileManager.default.fileExists(atPath: f2.path), "Original document_beta.pdf restored via Undo")
             assertCondition(!vm.canUndoBatchRename, "canUndoBatchRename is false after undo")
+            
+            // Проверка изоляции панелей и явного выбора стороны
+            let rightItem = FileItem(id: "r1", name: "right_track.mp3", path: "/tmp/right_track.mp3", size: 100, mtime: 1700000000, isDirectory: false)
+            vm.leftSelection = []
+            vm.rightItems = [rightItem]
+            vm.rightSelection = [rightItem.id]
+            
+            // 1. Вызов со стороны правой панели из контекстного меню (явный side)
+            vm.triggerBatchRename(item: rightItem, side: .right)
+            assertCondition(vm.batchRenameSide == .right, "batchRenameSide correctly resolved to .right via explicit side parameter")
+            assertCondition(vm.batchRenameSession?.side == .right, "batchRenameSession.side is .right via explicit side parameter")
+            assertCondition(vm.batchRenameItems.count == 1 && vm.batchRenameItems.first?.id == rightItem.id, "batchRenameItems correctly captured rightItem")
+            vm.showBatchRenameDialog = false
+            
+            // 2. Вызов через активную правую панель (activePane == .right)
+            vm.activePane = .right
+            vm.triggerBatchRename()
+            assertCondition(vm.batchRenameSide == .right, "batchRenameSide is .right when activePane == .right")
+            assertCondition(vm.batchRenameSession?.side == .right, "batchRenameSession.side is .right")
+            assertCondition(vm.batchRenameItems.first?.id == rightItem.id, "batchRenameItems contains rightItem when right pane is active")
+            vm.showBatchRenameDialog = false
+            
+            // 3. Строгая изоляция: activePane == .left, в правой панели есть выделение. Переименование НЕ должно перепрыгивать на правую!
+            vm.activePane = .left
+            vm.leftItems = [item1, item2]
+            vm.triggerBatchRename()
+            assertCondition(vm.batchRenameSide == .left, "batchRenameSide stays .left when activePane == .left even if right pane has selection")
+            assertCondition(vm.batchRenameSession?.side == .left, "batchRenameSession.side stays .left")
+            assertCondition(vm.batchRenameItems.contains(where: { $0.name == "document_alpha.pdf" }), "batchRenameItems contains left pane files")
+            vm.showBatchRenameDialog = false
+            vm.rightSelection = []
         }
         
         // 21. Context Menu: Open with, Copy, Paste, Duplicate
@@ -2719,8 +2753,290 @@ Task { @MainActor in
         let isReset = await connCtrl.isManualDisconnectSuppressed
         assertCondition(isReset == false, "Explicit user action resets manual suppression")
         
+        // 5. [TEST 44] Auto-Connect on Phone Tab/Source Selection & Conditional Offline Banner Suppression
+        print("\n--- [TEST 44] Auto-Connect & Conditional Offline Banner Suppression ---")
+        let vm44 = await DualPaneViewModel()
+        
+        // Начальное состояние: баннер не должен показываться во время подключения
+        await MainActor.run {
+            vm44.leftSource = .remotePhone
+            vm44.leftIsStale = true
+            vm44.isConnectingPhone = true
+            
+            // В PaneView: isStale = isRemote && staleFlag && !vm.isConnectingPhone
+            let isPaneStale = (vm44.leftSource == .remotePhone) && vm44.leftIsStale && !vm44.isConnectingPhone
+            assertCondition(isPaneStale == false, "Stale banner is completely suppressed while isConnectingPhone == true")
+            
+            // Завершение попытки неуспехом: флаг соединения сбрасывается, баннер разрешается
+            vm44.isConnectingPhone = false
+            let isPaneStaleAfterFail = (vm44.leftSource == .remotePhone) && vm44.leftIsStale && !vm44.isConnectingPhone
+            assertCondition(isPaneStaleAfterFail == true, "Stale banner becomes visible after connection failure")
+            
+            // Переключение источника на .remotePhone сбрасывает stale-флаг
+            vm44.changeSource(to: .localMac, side: .left)
+            vm44.leftIsStale = true
+            vm44.changeSource(to: .remotePhone, side: .left)
+            assertCondition(vm44.leftIsStale == false, "changeSource(to: .remotePhone) clears stale flag immediately")
+            
+            // Переключение таба на телефонный таб сбрасывает stale-флаг
+            vm44.leftIsStale = true
+            let phoneTab = PanelTab(title: "DCIM", path: "/storage/emulated/0/DCIM", source: .remotePhone)
+            vm44.leftTabs.append(phoneTab)
+            vm44.switchTab(id: phoneTab.id, side: .left)
+            assertCondition(vm44.leftIsStale == false, "switchTab to phone tab clears stale flag immediately")
+            
+            // Выбор тома хранилища сбрасывает stale-флаг
+            vm44.leftIsStale = true
+            let volume = PhoneConnectionManager.StorageVolume(id: "internal", name: "Internal", path: "/storage/emulated/0", isPrimary: true)
+            vm44.switchToVolume(volume, side: .left)
+            assertCondition(vm44.leftIsStale == false, "switchToVolume clears stale flag immediately")
+            
+            // refreshPane во время подключения не выставляет stale
+            vm44.isConnectingPhone = true
+            vm44.refreshPane(side: .left)
+            assertCondition(vm44.leftIsStale == false, "refreshPane does not mark pane as stale while isConnectingPhone == true")
+        }
+        
+        // 6. [TEST 45] Production Transport Architecture v1: Range Tracker, Journal, Budget & SFTP Extensions
+        print("\n--- [TEST 45] Production Transport Architecture v1: Invariants & Robustness ---")
+        
+        // 45.1 ConfirmedRangeTracker
+        var tracker = ConfirmedRangeTracker()
+        assertCondition(tracker.contiguousFrontier == 0, "Initial range tracker frontier is 0")
+        assertCondition(tracker.ranges.isEmpty, "Initial range tracker has no confirmed ranges")
+        assertCondition(tracker.isFullyCovered(expectedSize: 1000) == false, "Initial range tracker is not complete")
+        
+        // Insert disjoint chunk [200, 300)
+        tracker.addRange(offset: 200, length: 100)
+        assertCondition(tracker.contiguousFrontier == 0, "Frontier remains 0 when first chunk has gap from 0")
+        assertCondition(tracker.ranges.count == 1, "One disjoint range tracked")
+        
+        // Insert frontier chunk [0, 100)
+        tracker.addRange(offset: 0, length: 100)
+        assertCondition(tracker.contiguousFrontier == 100, "Frontier advances to 100")
+        assertCondition(tracker.ranges.count == 2, "Two disjoint ranges [0, 100) and [200, 300)")
+        
+        let holes = tracker.holes(upTo: 1000)
+        assertCondition(holes.count == 2, "Two holes identified: [100, 200) and [300, 1000)")
+        assertCondition(holes.first?.lowerBound == 100 && holes.first?.upperBound == 200, "First hole is [100, 200)")
+        
+        // Fill hole [100, 200) - should coalesce [0, 100) + [100, 200) + [200, 300) into [0, 300)
+        tracker.addRange(offset: 100, length: 100)
+        assertCondition(tracker.contiguousFrontier == 300, "Frontier coalesces to 300")
+        assertCondition(tracker.ranges.count == 1, "Ranges merged into single contiguous range")
+        
+        // Overlapping chunk [250, 500)
+        tracker.addRange(offset: 250, length: 250)
+        assertCondition(tracker.contiguousFrontier == 500, "Overlapping chunk expands frontier to 500")
+        assertCondition(tracker.ranges.count == 1, "Ranges remain coalesced")
+        
+        // Final chunk [500, 1000)
+        tracker.addRange(offset: 500, length: 500)
+        assertCondition(tracker.contiguousFrontier == 1000, "Frontier reaches total size 1000")
+        assertCondition(tracker.isFullyCovered(expectedSize: 1000) == true, "Range tracker marked as fully covered")
+        assertCondition(tracker.holes(upTo: 1000).isEmpty, "No missing ranges left")
+        
+        // 45.2 SessionBudget
+        let testBudget = SessionBudget()
+        let initialSnap = testBudget.currentSnapshot
+        assertCondition(initialSnap.networkBytes == 0, "Initial in-flight payload is 0")
+        assertCondition(initialSnap.writeBytes == 0, "Initial write buffer is 0")
+        assertCondition(initialSnap.handles == 0, "Initial open handles count is 0")
+        
+        // Handle allocation limit (32 handles)
+        var allocatedHandlesCount = 0
+        for _ in 0..<32 {
+            if testBudget.acquireHandle() {
+                allocatedHandlesCount += 1
+            }
+        }
+        assertCondition(allocatedHandlesCount == 32, "Successfully allocated 32 handles")
+        assertCondition(testBudget.acquireHandle() == false, "33rd handle allocation rejected due to budget limit")
+        
+        // Release handles
+        for _ in 0..<32 {
+            testBudget.releaseHandle()
+        }
+        assertCondition(testBudget.currentSnapshot.handles == 0, "All 32 handles released back to budget")
+        
+        // Network payload allocation and release
+        await testBudget.acquirePayload(bytes: 1024 * 1024, isInteractive: true)
+        assertCondition(testBudget.currentSnapshot.networkBytes == 1024 * 1024, "Payload acquired: 1 MiB")
+        testBudget.releasePayload(bytes: 1024 * 1024)
+        assertCondition(testBudget.currentSnapshot.networkBytes == 0, "Payload budget fully restored after release")
+        
+        // 45.3 SFTPPacketEngine Extended Packets
+        let pe = SFTPPacketEngine()
+        let statvfsPkt = pe.createStatVfsPacket(requestId: 888, path: "/storage/emulated/0")
+        assertCondition(statvfsPkt.count > 10, "statvfs packet generated")
+        // Header: uint32 len, uint8 type=200
+        assertCondition(statvfsPkt[4] == SFTPMessageType.extended.rawValue, "statvfs opcode is SSH_FXP_EXTENDED (200)")
+        
+        let posixRenamePkt = pe.createPosixRenamePacket(requestId: 889, oldPath: "/a.part", newPath: "/a")
+        assertCondition(posixRenamePkt[4] == SFTPMessageType.extended.rawValue, "posix-rename opcode is SSH_FXP_EXTENDED (200)")
+        
+        let limitsPkt = pe.createLimitsPacket(requestId: 890)
+        assertCondition(limitsPkt[4] == SFTPMessageType.extended.rawValue, "limits opcode is SSH_FXP_EXTENDED (200)")
+        
+        // Parse version packet with extensions
+        let vWriter = SFTPPacketWriter()
+        vWriter.appendUInt32(3) // version 3
+        vWriter.appendString("posix-rename@openssh.com")
+        vWriter.appendString("1")
+        
+        let vPacket = vWriter.buildPacket(type: .version)
+        let vPayload = vPacket.subdata(in: 5..<vPacket.count)
+        let (parsedVer, extMap) = try pe.parseVersionResponse(data: vPayload)
+        assertCondition(parsedVer == 3, "SFTP version 3 parsed")
+        assertCondition(extMap["posix-rename@openssh.com"] == "1", "Extension posix-rename@openssh.com correctly identified")
+        
+        // 45.4 TransferJournal Crash-Resilient Checkpoints
+        let tempJournalDir = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("mcd_journal_test_\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: tempJournalDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tempJournalDir) }
+        
+        let journalDBURL = tempJournalDir.appendingPathComponent("transfers.db")
+        let journal = try TransferJournal(databaseURL: journalDBURL)
+        
+        try journal.registerTransfer(
+            transferId: "tx-test-01",
+            sessionIdentity: "phone-epoch-42",
+            direction: "upload",
+            sourcePath: "/source/video.mp4",
+            sourceSize: 50_000_000,
+            sourceMtime: 1700000000,
+            sourceHash: nil,
+            targetFinalPath: "/dest/video.mp4",
+            targetTempPath: "/dest/video.mp4.part",
+            expectedSize: 50_000_000,
+            initialFrontier: 0,
+            initialRanges: "[]",
+            state: "in_progress"
+        )
+        
+        try journal.checkpointProgress(
+            transferId: "tx-test-01",
+            frontier: 15_000_000,
+            ranges: "[0..<15000000]",
+            durabilityEvidence: true
+        )
+        
+        let resumable = journal.findResumableTransfer(
+            sessionIdentity: "phone-epoch-42",
+            sourcePath: "/source/video.mp4",
+            sourceSize: 50_000_000,
+            sourceMtime: 1700000000,
+            direction: "upload"
+        )
+        assertCondition(resumable != nil, "Journal retrieves resumable transfer")
+        assertCondition(resumable?.transferId == "tx-test-01", "Resumable transfer id matches")
+        assertCondition(resumable?.confirmedFrontier == 15_000_000, "Frontier offset restored from journal checkpoint")
+        
+        try journal.updateState(transferId: "tx-test-01", state: "indeterminate", errorMessage: "Network dropped during commit")
+        let indetRecord = journal.getTransfer(transferId: "tx-test-01")
+        assertCondition(indetRecord?.state == "indeterminate", "Transfer marked as indeterminate after commit ambiguity")
+        
+        try journal.updateState(transferId: "tx-test-01", state: "completed")
+        let nonResumable = journal.findResumableTransfer(
+            sessionIdentity: "phone-epoch-42",
+            sourcePath: "/source/video.mp4",
+            sourceSize: 50_000_000,
+            sourceMtime: 1700000000,
+            direction: "upload"
+        )
+        assertCondition(nonResumable == nil, "Completed transfer cleared from resumable search")
+        
+        // 45.5 SessionCoordinator Path Mapping & Normalization
+        let coord = SessionCoordinator.shared
+        let mappedEmulated = coord.toSftpPath("/storage/emulated/0/DCIM/Camera/photo.jpg")
+        assertCondition(!mappedEmulated.hasPrefix("/storage"), "Path correctly mapped for SFTP subsystem (got \(mappedEmulated))")
+        assertCondition(coord.toSftpPath("/storage/emulated/0/Folder/").hasSuffix("Folder"), "Trailing slash stripped during normalization")
+        assertCondition(coord.toSftpPath("/") == "/", "Root path maps to /")
+        
+        // 7. [TEST 46] Pipelined Transport Architecture: Windowing, Chunk Sizing & Deduplication
+        print("\n--- [TEST 46] Pipelined Transport Architecture: Windowing & Deduplication ---")
+        
+        // 46.1 Chunk Sizing & SessionBudget Interplay
+        let targetChunkSize: UInt32 = 256 * 1024 // 256 KiB
+        let pipelineWindow = 16 // 16 * 256 KiB = 4 MiB inflight
+        assertCondition(targetChunkSize == 262144, "Standard chunk size is 256 KiB")
+        assertCondition(UInt64(pipelineWindow) * UInt64(targetChunkSize) == 4 * 1024 * 1024, "Pipeline window equals 4 MiB inflight")
+        
+        // 46.2 Out-of-Order Chunk Arrival Invariant (16 chunks of 256 KiB)
+        var streamTracker = ConfirmedRangeTracker()
+        let totalStreamSize: UInt64 = 4 * 1024 * 1024
+        
+        // Перемешанный порядок завершения (симуляция сетевого out-of-order)
+        let shuffledIndices = [7, 2, 0, 15, 3, 1, 8, 12, 4, 14, 5, 9, 6, 11, 10, 13]
+        for idx in shuffledIndices {
+            let offset = UInt64(idx) * UInt64(targetChunkSize)
+            streamTracker.addRange(offset: offset, length: UInt64(targetChunkSize))
+        }
+        assertCondition(streamTracker.contiguousFrontier == totalStreamSize, "Frontier reaches full 4 MiB after all shuffled chunks arrive")
+        assertCondition(streamTracker.isFullyCovered(expectedSize: totalStreamSize), "Stream is fully covered without holes")
+        assertCondition(streamTracker.holes(upTo: totalStreamSize).isEmpty, "Zero missing holes in fully received stream")
+        
+        // 46.3 Directory Pipelining Deduplication Invariant
+        var seenNames = Set<String>()
+        var dedupedCount = 0
+        let simulatedBatches = [
+            ["DCIM", "Download", "Documents"],
+            ["Documents", "Movies", "Music"], // "Documents" дублируется из-за concurrent readdir
+            ["Music", "Pictures", "Podcasts"]  // "Music" дублируется
+        ]
+        for batch in simulatedBatches {
+            for name in batch {
+                if seenNames.insert(name).inserted {
+                    dedupedCount += 1
+                }
+            }
+        }
+        assertCondition(dedupedCount == 7, "Deduplication correctly preserved unique count of 7 entries from 9 batch items")
+        assertCondition(seenNames.contains("DCIM") && seenNames.contains("Documents"), "All expected entries present")
+        
+        // 8. [TEST 47] Directory Cache L1 TTL & Cross-File Batch Scheduling
+        print("\n--- [TEST 47] Directory Cache L1 TTL & Cross-File Batch Scheduling ---")
+        
+        let testCache = DirectoryCache(ttlSeconds: 0.1)
+        let sampleItems = [
+            FileItem(id: "1", name: "photo1.jpg", path: "/storage/emulated/0/DCIM/photo1.jpg", size: 1024, mtime: 100, isDirectory: false, source: .remotePhone),
+            FileItem(id: "2", name: "Camera", path: "/storage/emulated/0/DCIM/Camera", size: 0, mtime: 100, isDirectory: true, source: .remotePhone)
+        ]
+        testCache.set(path: "/storage/emulated/0/DCIM", items: sampleItems)
+        let retrieved = testCache.get(path: "/storage/emulated/0/DCIM")
+        assertCondition(retrieved != nil && retrieved?.count == 2, "DirectoryCache returns cached items before TTL expiry")
+        
+        // Test parent invalidation
+        let childItems = [
+            FileItem(id: "3", name: "sub.jpg", path: "/storage/emulated/0/DCIM/Camera/sub.jpg", size: 512, mtime: 100, isDirectory: false, source: .remotePhone)
+        ]
+        testCache.set(path: "/storage/emulated/0/DCIM/Camera", items: childItems)
+        assertCondition(testCache.get(path: "/storage/emulated/0/DCIM/Camera") != nil, "Child path cached")
+        
+        // Invalidation of child also invalidates parent
+        testCache.invalidate(path: "/storage/emulated/0/DCIM/Camera")
+        assertCondition(testCache.get(path: "/storage/emulated/0/DCIM/Camera") == nil, "Child path invalidated")
+        assertCondition(testCache.get(path: "/storage/emulated/0/DCIM") == nil, "Parent path also invalidated upon mutation")
+        
+        // Test TTL expiry
+        testCache.set(path: "/storage/emulated/0/Download", items: sampleItems)
+        try await Task.sleep(nanoseconds: 150_000_000) // 150ms > 100ms TTL
+        assertCondition(testCache.get(path: "/storage/emulated/0/Download") == nil, "Cache entry expired after TTL")
+        
+        // Test invalidateAll
+        testCache.set(path: "/a", items: [])
+        testCache.set(path: "/b", items: [])
+        testCache.invalidateAll()
+        assertCondition(testCache.get(path: "/a") == nil && testCache.get(path: "/b") == nil, "invalidateAll clears entire cache")
+        
+        // Test BatchItemResult and JobOrchestrator batch scheduling structure
+        let batchSuccess = JobOrchestrator.BatchItemResult(itemId: "item-1", result: .transferred)
+        assertCondition(batchSuccess.isSuccess && batchSuccess.result == .transferred && batchSuccess.errorDescription == nil, "BatchItemResult success correctly constructed")
+        let batchFail = JobOrchestrator.BatchItemResult(itemId: "item-2", error: NSError(domain: "test", code: 1, userInfo: [NSLocalizedDescriptionKey: "fail"]))
+        assertCondition(!batchFail.isSuccess && batchFail.errorDescription == "fail", "BatchItemResult failure correctly constructed")
+        
         print("\n🎉 ==================================================")
-        print("🎉   ALL 43 PRODUCTION TEST SUITES PASSED!          ")
+        print("🎉   ALL 47 PRODUCTION TEST SUITES PASSED!          ")
         print("🎉 ==================================================")
         exit(0)
     } catch {

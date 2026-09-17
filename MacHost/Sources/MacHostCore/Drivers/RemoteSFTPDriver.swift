@@ -32,6 +32,7 @@ public final class RemoteSFTPDriver: FileSystemDriver, @unchecked Sendable {
     
     public func disconnect() {
         coordinator.disconnect()
+        DirectoryCache.shared.invalidateAll()
     }
     
     public var rootIsEmulatedZero: Bool {
@@ -44,7 +45,14 @@ public final class RemoteSFTPDriver: FileSystemDriver, @unchecked Sendable {
     }
     
     public func listDirectory(at path: String) async throws -> [FileItem] {
+        return try await listDirectory(at: path, forceRefresh: false)
+    }
+    
+    public func listDirectory(at path: String, forceRefresh: Bool) async throws -> [FileItem] {
         let nfcPath = path.precomposedStringWithCanonicalMapping
+        if !forceRefresh, let cached = DirectoryCache.shared.get(path: nfcPath) {
+            return cached
+        }
         let sftpPath = toSftpPath(path)
         self.lastSyncTimestamp = Date().timeIntervalSince1970
         
@@ -163,10 +171,12 @@ public final class RemoteSFTPDriver: FileSystemDriver, @unchecked Sendable {
             let closePacket = packetEngine.createClosePacket(requestId: closeReqId, handle: dirHandle)
             _ = try? await channel.sendRequest(packet: closePacket, requestId: closeReqId)
             
+            DirectoryCache.shared.set(path: nfcPath, items: allEntries)
             return allEntries
             
         } catch {
             if let adbItems = PhoneConnectionManager.shared.listDirectoryAdb(path: nfcPath) {
+                DirectoryCache.shared.set(path: nfcPath, items: adbItems)
                 Task {
                     _ = await PhoneConnectionManager.shared.establishConnection()
                 }
@@ -244,6 +254,7 @@ public final class RemoteSFTPDriver: FileSystemDriver, @unchecked Sendable {
     }
     
     public func createDirectory(at path: String) async throws {
+        defer { DirectoryCache.shared.invalidate(path: path) }
         let sftpPath = toSftpPath(path)
         do {
             try await ensureConnected()
@@ -270,6 +281,7 @@ public final class RemoteSFTPDriver: FileSystemDriver, @unchecked Sendable {
     }
     
     public func deleteItem(at path: String, moveToTrash: Bool) async throws {
+        defer { DirectoryCache.shared.invalidate(path: path) }
         if PhoneConnectionManager.shared.fastDeleteAdb(remotePath: path) {
             return
         }
@@ -307,6 +319,7 @@ public final class RemoteSFTPDriver: FileSystemDriver, @unchecked Sendable {
     }
     
     public func deleteEmptyDirectory(at path: String) async throws -> Bool {
+        defer { DirectoryCache.shared.invalidate(path: path) }
         let sftpPath = toSftpPath(path)
         do {
             try await ensureConnected()
@@ -360,6 +373,10 @@ public final class RemoteSFTPDriver: FileSystemDriver, @unchecked Sendable {
     }
     
     public func renameItem(from sourcePath: String, to destinationPath: String) async throws {
+        defer {
+            DirectoryCache.shared.invalidate(path: sourcePath)
+            DirectoryCache.shared.invalidate(path: destinationPath)
+        }
         let sftpSrc = toSftpPath(sourcePath)
         let sftpDst = toSftpPath(destinationPath)
         do {
