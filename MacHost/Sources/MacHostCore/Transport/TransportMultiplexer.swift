@@ -181,7 +181,6 @@ public final class TransportMultiplexer: @unchecked Sendable {
         }
         defer { try? handle.close() }
         
-        let chunkSize: UInt32 = 128 * 1024 // 128 KiB chunk (согласно P0.3 целевым параметрам)
         let sftpPath = toSftpPath(remotePath)
         
         try await ensureConnected()
@@ -223,33 +222,26 @@ public final class TransportMultiplexer: @unchecked Sendable {
         }
         let (_, remoteHandle) = try packetEngine.parseHandleResponse(data: openPayload)
         
-        // 2. Конвейерное чтение с учетом SessionBudget (окно до 4 запросов в P0)
-        let windowCapacity = 4
-        var activeRequests: [UInt32: Task<(Range<UInt64>, Data), Error>] = [:]
+        // 2. Конвейерное чтение с учетом SessionBudget (окно до 16 запросов по 256 КиБ = 4 МиБ)
+        let effectiveChunkSize: UInt32 = min(UInt32(256 * 1024), UInt32(coordinator.serverLimits?.maxReadLen ?? UInt64(256 * 1024)))
+        let windowCapacity = 16
         var requestOffset = startOffset
         var confirmedBytes = startOffset
+        var activeInflight = 0
         
         do {
-            while (confirmedBytes < totalSize || !activeRequests.isEmpty) {
-                if Task.isCancelled {
-                    throw CancellationError()
-                }
-                
-                // Запускаем запросы в пределах окна и бюджета
-                while activeRequests.count < windowCapacity && requestOffset < totalSize {
-                    let toRead = UInt32(min(UInt64(chunkSize), totalSize - requestOffset))
+            try await withThrowingTaskGroup(of: (Range<UInt64>, Data).self) { group in
+                while activeInflight < windowCapacity && requestOffset < totalSize {
+                    let toRead = UInt32(min(UInt64(effectiveChunkSize), totalSize - requestOffset))
                     let readOffset = requestOffset
                     requestOffset += UInt64(toRead)
                     
                     await budget.acquirePayload(bytes: Int(toRead), isInteractive: false)
-                    
                     let readReqId = channel.allocateRequestId()
                     let readPkt = packetEngine.createReadPacket(requestId: readReqId, handle: remoteHandle, offset: readOffset, length: toRead)
                     
-                    let task = Task<(Range<UInt64>, Data), Error> {
-                        defer {
-                            budget.releasePayload(bytes: Int(toRead))
-                        }
+                    group.addTask {
+                        defer { budget.releasePayload(bytes: Int(toRead)) }
                         let (rType, rPayload) = try await channel.sendRequest(packet: readPkt, requestId: readReqId)
                         if rType == .data {
                             let (_, data) = try self.packetEngine.parseDataResponse(data: rPayload)
@@ -264,21 +256,49 @@ public final class TransportMultiplexer: @unchecked Sendable {
                             throw NSError(domain: "TransportMultiplexer", code: -1, userInfo: [NSLocalizedDescriptionKey: "Unexpected response type \(rType)"])
                         }
                     }
-                    activeRequests[readReqId] = task
+                    activeInflight += 1
                 }
                 
-                guard let (finishedId, finishedTask) = activeRequests.first else {
-                    break
-                }
-                activeRequests.removeValue(forKey: finishedId)
-                
-                let (range, data) = try await finishedTask.value
-                if !data.isEmpty {
-                    try handle.seek(toOffset: range.lowerBound)
-                    handle.write(data)
-                    confirmedBytes = max(confirmedBytes, range.upperBound)
-                    onRangeConfirmed?(range)
-                    onProgress(confirmedBytes)
+                while activeInflight > 0 {
+                    if Task.isCancelled { throw CancellationError() }
+                    guard let (range, data) = try await group.next() else { break }
+                    activeInflight -= 1
+                    
+                    if !data.isEmpty {
+                        try handle.seek(toOffset: range.lowerBound)
+                        handle.write(data)
+                        confirmedBytes = max(confirmedBytes, range.upperBound)
+                        onRangeConfirmed?(range)
+                        onProgress(confirmedBytes)
+                    }
+                    
+                    if requestOffset < totalSize {
+                        let toRead = UInt32(min(UInt64(effectiveChunkSize), totalSize - requestOffset))
+                        let readOffset = requestOffset
+                        requestOffset += UInt64(toRead)
+                        
+                        await budget.acquirePayload(bytes: Int(toRead), isInteractive: false)
+                        let readReqId = channel.allocateRequestId()
+                        let readPkt = packetEngine.createReadPacket(requestId: readReqId, handle: remoteHandle, offset: readOffset, length: toRead)
+                        
+                        group.addTask {
+                            defer { budget.releasePayload(bytes: Int(toRead)) }
+                            let (rType, rPayload) = try await channel.sendRequest(packet: readPkt, requestId: readReqId)
+                            if rType == .data {
+                                let (_, data) = try self.packetEngine.parseDataResponse(data: rPayload)
+                                return (readOffset..<(readOffset + UInt64(data.count)), data)
+                            } else if rType == .status {
+                                let (_, code, msg) = try self.packetEngine.parseStatusResponse(data: rPayload)
+                                if code == .eof {
+                                    return (readOffset..<readOffset, Data())
+                                }
+                                throw NSError(domain: "TransportMultiplexer", code: Int(code.rawValue), userInfo: [NSLocalizedDescriptionKey: "SFTP read error: \(msg)"])
+                            } else {
+                                throw NSError(domain: "TransportMultiplexer", code: -1, userInfo: [NSLocalizedDescriptionKey: "Unexpected response type \(rType)"])
+                            }
+                        }
+                        activeInflight += 1
+                    }
                 }
             }
             
@@ -354,20 +374,16 @@ public final class TransportMultiplexer: @unchecked Sendable {
         }
         let (_, remoteHandle) = try packetEngine.parseHandleResponse(data: openPayload)
         
-        let chunkSize: Int = 128 * 1024 // 128 KiB chunk (P0.3 target)
-        let windowCapacity = 4
-        var activeRequests: [UInt32: Task<Range<UInt64>, Error>] = [:]
+        let effectiveChunkSize = min(256 * 1024, Int(coordinator.serverLimits?.maxWriteLen ?? UInt64(256 * 1024)))
+        let windowCapacity = 16
         var offset: UInt64 = startOffset
         var confirmedBytes = startOffset
+        var activeInflight = 0
         
         do {
-            while (confirmedBytes < totalSize || !activeRequests.isEmpty) {
-                if Task.isCancelled {
-                    throw CancellationError()
-                }
-                
-                while activeRequests.count < windowCapacity && offset < totalSize {
-                    let toRead = min(chunkSize, Int(totalSize - offset))
+            try await withThrowingTaskGroup(of: Range<UInt64>.self) { group in
+                while activeInflight < windowCapacity && offset < totalSize {
+                    let toRead = min(effectiveChunkSize, Int(totalSize - offset))
                     guard let chunk = try fileHandle.read(upToCount: toRead), !chunk.isEmpty else {
                         break
                     }
@@ -376,14 +392,11 @@ public final class TransportMultiplexer: @unchecked Sendable {
                     offset += UInt64(chunk.count)
                     
                     await budget.acquirePayload(bytes: chunk.count, isInteractive: false)
-                    
                     let writeReqId = channel.allocateRequestId()
                     let writePkt = packetEngine.createWritePacket(requestId: writeReqId, handle: remoteHandle, offset: writeOffset, data: chunk)
                     
-                    let task = Task<Range<UInt64>, Error> {
-                        defer {
-                            budget.releasePayload(bytes: chunk.count)
-                        }
+                    group.addTask {
+                        defer { budget.releasePayload(bytes: chunk.count) }
                         let (wType, wPayload) = try await channel.sendRequest(packet: writePkt, requestId: writeReqId)
                         if wType == .status {
                             let (_, code, msg) = try self.packetEngine.parseStatusResponse(data: wPayload)
@@ -395,18 +408,45 @@ public final class TransportMultiplexer: @unchecked Sendable {
                             throw NSError(domain: "TransportMultiplexer", code: -1, userInfo: [NSLocalizedDescriptionKey: "Unexpected write response type \(wType)"])
                         }
                     }
-                    activeRequests[writeReqId] = task
+                    activeInflight += 1
                 }
                 
-                guard let (finishedId, finishedTask) = activeRequests.first else {
-                    break
+                while activeInflight > 0 {
+                    if Task.isCancelled { throw CancellationError() }
+                    guard let range = try await group.next() else { break }
+                    activeInflight -= 1
+                    
+                    confirmedBytes = max(confirmedBytes, range.upperBound)
+                    onRangeConfirmed?(range)
+                    onProgress(confirmedBytes)
+                    
+                    if offset < totalSize {
+                        let toRead = min(effectiveChunkSize, Int(totalSize - offset))
+                        if let chunk = try fileHandle.read(upToCount: toRead), !chunk.isEmpty {
+                            let writeOffset = offset
+                            offset += UInt64(chunk.count)
+                            
+                            await budget.acquirePayload(bytes: chunk.count, isInteractive: false)
+                            let writeReqId = channel.allocateRequestId()
+                            let writePkt = packetEngine.createWritePacket(requestId: writeReqId, handle: remoteHandle, offset: writeOffset, data: chunk)
+                            
+                            group.addTask {
+                                defer { budget.releasePayload(bytes: chunk.count) }
+                                let (wType, wPayload) = try await channel.sendRequest(packet: writePkt, requestId: writeReqId)
+                                if wType == .status {
+                                    let (_, code, msg) = try self.packetEngine.parseStatusResponse(data: wPayload)
+                                    if code != .ok {
+                                        throw NSError(domain: "TransportMultiplexer", code: Int(code.rawValue), userInfo: [NSLocalizedDescriptionKey: "SFTP write error: \(msg)"])
+                                    }
+                                    return writeOffset..<(writeOffset + UInt64(chunk.count))
+                                } else {
+                                    throw NSError(domain: "TransportMultiplexer", code: -1, userInfo: [NSLocalizedDescriptionKey: "Unexpected write response type \(wType)"])
+                                }
+                            }
+                            activeInflight += 1
+                        }
+                    }
                 }
-                activeRequests.removeValue(forKey: finishedId)
-                
-                let range = try await finishedTask.value
-                confirmedBytes = max(confirmedBytes, range.upperBound)
-                onRangeConfirmed?(range)
-                onProgress(confirmedBytes)
             }
             
             // Fsync расширение при поддержке сервером

@@ -158,13 +158,17 @@ class EmbeddedServer(
             sftpFactory.addSftpEventListener(CustomSftpEventListener(context))
             subsystemFactories = Collections.singletonList(sftpFactory)
 
-            // Perf fix: Увеличиваем буферы I/O и SSH channel window.
+            // Perf & FS Limiter: Увеличиваем буферы I/O и SSH channel window, ограничиваем дескрипторы для защиты памяти
             // Apache SSHD: пакет 320 КБ (для 256 КБ SFTP чанка + SFTP и SSH заголовки),
             // окно 8 МБ для непрерывного pipelining без частых ожиданий window-adjust ACK.
             val serverProps = this.properties
             serverProps["io-buffer-size"] = (320 * 1024).toString()
             serverProps["window-size"] = (8L * 1024 * 1024).toString()
             serverProps["max-packet-length"] = (320 * 1024).toString()
+            serverProps["sftp-max-open-handles"] = "32"
+            serverProps["sftp-read-buffer-size"] = (256 * 1024).toString()
+            serverProps["sftp-write-buffer-size"] = (256 * 1024).toString()
+            serverProps["sftp-auto-fsync-on-close"] = "true"
         }
 
         sshd?.start()

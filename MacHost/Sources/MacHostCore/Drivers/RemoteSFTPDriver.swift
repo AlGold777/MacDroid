@@ -89,44 +89,72 @@ public final class RemoteSFTPDriver: FileSystemDriver, @unchecked Sendable {
             
             var allEntries: [FileItem] = []
             
-            // 2. Читаем записи каталога через SSH_FXP_READDIR
-            // Применяем attrs прямо из NAME пакета (без N×STAT)
-            while true {
-                let readDirReqId = channel.allocateRequestId()
-                let readDirPacket = packetEngine.createReadDirPacket(requestId: readDirReqId, handle: dirHandle)
-                let (readRespType, readPayload) = try await channel.sendRequest(packet: readDirPacket, requestId: readDirReqId)
-                
-                if readRespType == .name {
-                    let nameEntries = try packetEngine.parseNameResponse(data: readPayload)
-                    for entry in nameEntries {
-                        if entry.filename == "." || entry.filename == ".." {
-                            continue
-                        }
-                        let itemPath = (nfcPath as NSString).appendingPathComponent(entry.filename).precomposedStringWithCanonicalMapping
-                        allEntries.append(FileItem(
-                            id: itemPath,
-                            name: entry.filename,
-                            path: itemPath,
-                            size: entry.size,
-                            mtime: Double(entry.mtime),
-                            isDirectory: entry.isDirectory,
-                            source: .remotePhone
-                        ))
+            // 2. Читаем записи каталога через SSH_FXP_READDIR с конвейеризацией (pipeline depth 4)
+            var seenFilenames = Set<String>()
+            let pipelineDepth = 4
+            var eofReached = false
+            var inflight = 0
+            
+            try await withThrowingTaskGroup(of: (SFTPMessageType, Data).self) { group in
+                for _ in 0..<pipelineDepth {
+                    let readDirReqId = channel.allocateRequestId()
+                    let readDirPacket = packetEngine.createReadDirPacket(requestId: readDirReqId, handle: dirHandle)
+                    group.addTask {
+                        return try await channel.sendRequest(packet: readDirPacket, requestId: readDirReqId)
                     }
-                } else if readRespType == .status {
-                    let (_, code, msg) = try packetEngine.parseStatusResponse(data: readPayload)
-                    if code == .eof { break }
-                    throw NSError(
-                        domain: "RemoteSFTPDriver",
-                        code: Int(code.rawValue),
-                        userInfo: [NSLocalizedDescriptionKey: "Ошибка чтения каталога \(nfcPath): \(msg) (код \(code.rawValue))"]
-                    )
-                } else {
-                    throw NSError(
-                        domain: "RemoteSFTPDriver",
-                        code: 22,
-                        userInfo: [NSLocalizedDescriptionKey: "Неожиданный ответ сервера при чтении каталога: \(readRespType)"]
-                    )
+                    inflight += 1
+                }
+                
+                while inflight > 0 {
+                    guard let (readRespType, readPayload) = try await group.next() else { break }
+                    inflight -= 1
+                    
+                    if readRespType == .name {
+                        let nameEntries = try packetEngine.parseNameResponse(data: readPayload)
+                        for entry in nameEntries {
+                            if entry.filename == "." || entry.filename == ".." {
+                                continue
+                            }
+                            if seenFilenames.insert(entry.filename).inserted {
+                                let itemPath = (nfcPath as NSString).appendingPathComponent(entry.filename).precomposedStringWithCanonicalMapping
+                                allEntries.append(FileItem(
+                                    id: itemPath,
+                                    name: entry.filename,
+                                    path: itemPath,
+                                    size: entry.size,
+                                    mtime: Double(entry.mtime),
+                                    isDirectory: entry.isDirectory,
+                                    source: .remotePhone
+                                ))
+                            }
+                        }
+                        
+                        if !eofReached {
+                            let nextReqId = channel.allocateRequestId()
+                            let nextPacket = packetEngine.createReadDirPacket(requestId: nextReqId, handle: dirHandle)
+                            group.addTask {
+                                return try await channel.sendRequest(packet: nextPacket, requestId: nextReqId)
+                            }
+                            inflight += 1
+                        }
+                    } else if readRespType == .status {
+                        let (_, code, msg) = try packetEngine.parseStatusResponse(data: readPayload)
+                        if code == .eof {
+                            eofReached = true
+                        } else {
+                            throw NSError(
+                                domain: "RemoteSFTPDriver",
+                                code: Int(code.rawValue),
+                                userInfo: [NSLocalizedDescriptionKey: "Ошибка чтения каталога \(nfcPath): \(msg) (код \(code.rawValue))"]
+                            )
+                        }
+                    } else {
+                        throw NSError(
+                            domain: "RemoteSFTPDriver",
+                            code: 22,
+                            userInfo: [NSLocalizedDescriptionKey: "Неожиданный ответ сервера при чтении каталога: \(readRespType)"]
+                        )
+                    }
                 }
             }
             
