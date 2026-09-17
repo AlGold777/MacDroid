@@ -181,6 +181,68 @@ public final class RemoteSFTPDriver: FileSystemDriver, @unchecked Sendable {
         }
     }
     
+    /// Быстрый запрос метаданных медиа-каталога через системную медиатеку MediaStore Android
+    public func queryMediaStore(folderPath: String) async -> [FileItem]? {
+        let nfcPath = folderPath.precomposedStringWithCanonicalMapping
+        
+        let home = FileManager.default.homeDirectoryForCurrentUser
+        let keyURL = home.appendingPathComponent(".ssh/id_ed25519")
+        guard FileManager.default.fileExists(atPath: keyURL.path) else { return nil }
+        
+        let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        let appDir = appSupport.appendingPathComponent("MacDroidCommander")
+        let knownHostsURL = appDir.appendingPathComponent("known_hosts")
+        
+        let sshUser = UserDefaults.standard.string(forKey: "sshUser") ?? NSUserName()
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/usr/bin/ssh")
+        proc.arguments = [
+            "-i", keyURL.path,
+            "-o", "StrictHostKeyChecking=accept-new",
+            "-o", "UserKnownHostsFile=\(knownHostsURL.path)",
+            "-o", "ConnectTimeout=2",
+            "-p", String(coordinator.port),
+            "\(sshUser)@\(coordinator.host)",
+            "mediastore_query \(nfcPath)"
+        ]
+        
+        let pipe = Pipe()
+        proc.standardOutput = pipe
+        proc.standardError = FileHandle.nullDevice
+        do {
+            try proc.run()
+            proc.waitUntilExit()
+            guard proc.terminationStatus == 0 else { return nil }
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            guard let text = String(data: data, encoding: .utf8), !text.isEmpty, !text.hasPrefix("ERROR") else { return nil }
+            
+            var items: [FileItem] = []
+            let lines = text.components(separatedBy: "\n")
+            for line in lines {
+                let parts = line.components(separatedBy: "\t")
+                if parts.count >= 4 {
+                    let name = parts[0]
+                    let size = UInt64(parts[1]) ?? 0
+                    let mtime = Double(parts[2]) ?? 0
+                    let filePath = parts.count >= 5 ? parts[4] : (nfcPath as NSString).appendingPathComponent(name)
+                    let cleanPath = filePath.precomposedStringWithCanonicalMapping
+                    items.append(FileItem(
+                        id: cleanPath,
+                        name: name,
+                        path: cleanPath,
+                        size: size,
+                        mtime: mtime,
+                        isDirectory: false,
+                        source: .remotePhone
+                    ))
+                }
+            }
+            return items.isEmpty ? nil : items
+        } catch {
+            return nil
+        }
+    }
+    
     public func createDirectory(at path: String) async throws {
         let sftpPath = toSftpPath(path)
         do {

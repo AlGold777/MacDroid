@@ -175,4 +175,55 @@ class StorageGateway(private val context: Context) {
             } catch (ignored: Exception) {}
         }
     }
+
+    // Быстрый опрос медиа-каталога через MediaStore без медленного I/O обхода дерева
+    fun queryMediaFolder(folderPath: String): String {
+        val cleanPath = folderPath.trimEnd('/')
+        val projection = arrayOf(
+            android.provider.MediaStore.MediaColumns.DISPLAY_NAME,
+            android.provider.MediaStore.MediaColumns.SIZE,
+            android.provider.MediaStore.MediaColumns.DATE_MODIFIED,
+            android.provider.MediaStore.MediaColumns.MIME_TYPE,
+            android.provider.MediaStore.MediaColumns.DATA
+        )
+        val uri = android.provider.MediaStore.Files.getContentUri("external")
+        val selection = "${android.provider.MediaStore.MediaColumns.DATA} LIKE ?"
+        val selectionArgs = arrayOf("$cleanPath/%")
+        val sb = StringBuilder()
+        
+        try {
+            context.contentResolver.query(
+                uri,
+                projection,
+                selection,
+                selectionArgs,
+                "${android.provider.MediaStore.MediaColumns.DISPLAY_NAME} ASC"
+            )?.use { cursor ->
+                val nameCol = cursor.getColumnIndex(android.provider.MediaStore.MediaColumns.DISPLAY_NAME)
+                val sizeCol = cursor.getColumnIndex(android.provider.MediaStore.MediaColumns.SIZE)
+                val dateCol = cursor.getColumnIndex(android.provider.MediaStore.MediaColumns.DATE_MODIFIED)
+                val mimeCol = cursor.getColumnIndex(android.provider.MediaStore.MediaColumns.MIME_TYPE)
+                val dataCol = cursor.getColumnIndex(android.provider.MediaStore.MediaColumns.DATA)
+
+                while (cursor.moveToNext()) {
+                    val filePath = if (dataCol >= 0) cursor.getString(dataCol) ?: "" else ""
+                    val name = if (nameCol >= 0) cursor.getString(nameCol) ?: "" else ""
+                    val size = if (sizeCol >= 0) cursor.getLong(sizeCol) else 0L
+                    val mtime = if (dateCol >= 0) cursor.getLong(dateCol) else 0L
+                    val mime = if (mimeCol >= 0) cursor.getString(mimeCol) ?: "" else ""
+                    
+                    if (name.isNotEmpty()) {
+                        sb.append(name).append("\t")
+                            .append(size).append("\t")
+                            .append(mtime).append("\t")
+                            .append(mime).append("\t")
+                            .append(filePath).append("\n")
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            return "ERROR: ${e.message}\n"
+        }
+        return sb.toString()
+    }
 }

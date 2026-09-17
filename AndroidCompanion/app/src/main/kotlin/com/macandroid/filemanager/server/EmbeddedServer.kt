@@ -1,6 +1,7 @@
 package com.macandroid.filemanager.server
 
 import android.content.Context
+import com.macandroid.filemanager.storage.StorageGateway
 import org.apache.sshd.common.file.virtualfs.VirtualFileSystemFactory
 import org.apache.sshd.server.SshServer
 import org.apache.sshd.server.auth.pubkey.PublickeyAuthenticator
@@ -138,6 +139,19 @@ class EmbeddedServer(
                                 }
                             } else {
                                 outStream?.write("ERROR_EMPTY_KEY\n".toByteArray(java.nio.charset.StandardCharsets.UTF_8))
+                                outStream?.flush()
+                                exitCallback?.onExit(1)
+                            }
+                        } else if (trimmed.startsWith("mediastore_query ")) {
+                            val folder = trimmed.substringAfter("mediastore_query ").trim()
+                            try {
+                                val storageGateway = StorageGateway(context)
+                                val result = storageGateway.queryMediaFolder(folder)
+                                outStream?.write(result.toByteArray(java.nio.charset.StandardCharsets.UTF_8))
+                                outStream?.flush()
+                                exitCallback?.onExit(0)
+                            } catch (e: Exception) {
+                                outStream?.write("ERROR: ${e.message}\n".toByteArray(java.nio.charset.StandardCharsets.UTF_8))
                                 outStream?.flush()
                                 exitCallback?.onExit(1)
                             }
