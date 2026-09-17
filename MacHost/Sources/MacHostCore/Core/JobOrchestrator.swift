@@ -11,6 +11,8 @@ public enum JobOrchestratorError: LocalizedError, Sendable {
     case insufficientSpace(required: UInt64, available: UInt64)
     case commitVerificationFailed(path: String)
     case transferInterrupted(reason: String)
+    case unsupportedAtomicReplace(path: String)
+    case indeterminate(reason: String)
     
     public var errorDescription: String? {
         switch self {
@@ -22,6 +24,10 @@ public enum JobOrchestratorError: LocalizedError, Sendable {
             return "Верификация коммита не удалась: файл «\(path)» отсутствует или поврежден после переименования."
         case .transferInterrupted(let reason):
             return "Передача прервана: \(reason)."
+        case .unsupportedAtomicReplace(let path):
+            return "Сервер не поддерживает атомарное замещение posix-rename для «\(path)». Операция отклонена для предотвращения потери данных."
+        case .indeterminate(let reason):
+            return "Неопределенный результат операции: \(reason)."
         }
     }
 }
@@ -201,8 +207,9 @@ public final class JobOrchestrator: @unchecked Sendable {
         )
         sm.transition(to: .running)
         
-        // Формируем имя временного файла с хэш-отпечатком источника для безопасного Resume
+        // 1. Prepare: Формируем имя временного файла и регистрируем в TransferJournal
         let deviceId = PhoneConnectionManager.shared.getConnectedDeviceId() ?? "phone"
+        let sessionIdentity = "\(deviceId):\(transport.coordinator.host):\(transport.coordinator.port)"
         let srcKey = "\(deviceId):\(remotePath):\(stat.size):\(stat.mtime)"
         let fingerprint = SHA256.hash(data: Data(srcKey.utf8)).map { String(format: "%02x", $0) }.joined().prefix(8)
         let tempURL = localTargetDir.appendingPathComponent(".\(name).\(fingerprint).mcdpart")
@@ -211,7 +218,65 @@ public final class JobOrchestrator: @unchecked Sendable {
             unregisterActiveLocalPart(url: tempURL)
         }
         
-        // 2. Потоковая загрузка с поддержкой Resume и Auto-Retry (до 3 попыток с экспоненциальной задержкой)
+        let journal = TransferJournal.shared
+        var rangeTracker = ConfirmedRangeTracker()
+        var currentOffset: UInt64 = 0
+        
+        // Поиск возобновляемой сессии в TransferJournal
+        if let resumable = journal.findResumableTransfer(
+            sessionIdentity: sessionIdentity,
+            sourcePath: remotePath,
+            sourceSize: stat.size,
+            sourceMtime: stat.mtime,
+            direction: "download"
+        ) {
+            let loadedTracker = ConfirmedRangeTracker.deserialize(resumable.rangesBlob)
+            let frontier = loadedTracker.contiguousFrontier
+            if frontier > 0, FileManager.default.fileExists(atPath: tempURL.path) {
+                // Проверяем соответствие префикса
+                let prefixLen = min(frontier, 4096)
+                var prefixValid = false
+                if let handle = try? FileHandle(forReadingFrom: tempURL) {
+                    let localPrefix = try? handle.read(upToCount: Int(prefixLen))
+                    try? handle.close()
+                    if let localPrefix = localPrefix, localPrefix.count == Int(prefixLen) {
+                        if let remotePrefix = try? await transport.readChunk(remotePath: remotePath, offset: 0, length: UInt32(prefixLen)),
+                           remotePrefix == localPrefix {
+                            prefixValid = true
+                        }
+                    }
+                }
+                if prefixValid {
+                    rangeTracker = loadedTracker
+                    currentOffset = frontier
+                } else {
+                    try? FileManager.default.removeItem(at: tempURL)
+                    rangeTracker = ConfirmedRangeTracker()
+                    currentOffset = 0
+                }
+            }
+        } else if FileManager.default.fileExists(atPath: tempURL.path) {
+            // Старый .mcdpart без журнала не считается доказательством покрытия
+            try? FileManager.default.removeItem(at: tempURL)
+        }
+        
+        try? journal.registerTransfer(
+            transferId: actionId,
+            sessionIdentity: sessionIdentity,
+            direction: "download",
+            sourcePath: remotePath,
+            sourceSize: stat.size,
+            sourceMtime: stat.mtime,
+            sourceHash: nil,
+            targetFinalPath: finalURL.path,
+            targetTempPath: tempURL.path,
+            expectedSize: stat.size,
+            initialFrontier: currentOffset,
+            initialRanges: rangeTracker.serialize(),
+            state: "transferring"
+        )
+        
+        // 2. Transfer: Потоковая загрузка с отслеживанием диапазонов
         var attempts = 0
         let maxAttempts = 3
         var downloadSuccess = false
@@ -222,74 +287,35 @@ public final class JobOrchestrator: @unchecked Sendable {
                 throw CancellationError()
             }
             attempts += 1
-            var currentOffset: UInt64 = 0
-            if let existingPartVals = try? tempURL.resourceValues(forKeys: [.fileSizeKey]),
-               let partSize = existingPartVals.fileSize {
-                if partSize > 0 && UInt64(partSize) < stat.size {
-                    currentOffset = UInt64(partSize)
-                    // Верификация префикса существующих данных перед возобновлением
-                    let prefixLen = min(currentOffset, 4096)
-                    var prefixValid = false
-                    if let handle = try? FileHandle(forReadingFrom: tempURL) {
-                        let localPrefix = try? handle.read(upToCount: Int(prefixLen))
-                        try? handle.close()
-                        if let localPrefix = localPrefix, localPrefix.count == Int(prefixLen) {
-                            if let remotePrefix = try? await transport.readChunk(remotePath: remotePath, offset: 0, length: UInt32(prefixLen)),
-                               remotePrefix == localPrefix {
-                                prefixValid = true
-                            }
-                        }
-                    }
-                    if !prefixValid {
-                        try? FileManager.default.removeItem(at: tempURL)
-                        currentOffset = 0
-                    }
-                } else if UInt64(partSize) == stat.size {
-                    // Оптимизация: файл уже полностью скачан во временный файл .part!
-                    let prefixLen = min(stat.size, 4096)
-                    var prefixValid = false
-                    if let handle = try? FileHandle(forReadingFrom: tempURL) {
-                        let localPrefix = try? handle.read(upToCount: Int(prefixLen))
-                        try? handle.close()
-                        if let localPrefix = localPrefix, localPrefix.count == Int(prefixLen) {
-                            if let remotePrefix = try? await transport.readChunk(remotePath: remotePath, offset: 0, length: UInt32(prefixLen)),
-                               remotePrefix == localPrefix {
-                                prefixValid = true
-                            }
-                        }
-                    }
-                    if prefixValid {
-                        currentOffset = stat.size
-                        downloadSuccess = true
-                        progress(0.85)
-                        break
-                    } else {
-                        try? FileManager.default.removeItem(at: tempURL)
-                        currentOffset = 0
-                    }
-                } else if UInt64(partSize) > stat.size {
-                    try? FileManager.default.removeItem(at: tempURL)
-                    currentOffset = 0
-                }
-            }
-            
             do {
                 try await transport.downloadFileStreaming(
                     actionId: actionId,
                     remotePath: remotePath,
                     targetURL: tempURL,
                     totalSize: stat.size,
-                    startOffset: currentOffset
-                ) { bytes in
-                    let pct = Double(bytes) / Double(max(1, stat.size)) * 0.85
-                    progress(pct)
-                }
+                    startOffset: currentOffset,
+                    rangeTracker: rangeTracker,
+                    onRangeConfirmed: { confirmedRange in
+                        rangeTracker.addRange(confirmedRange)
+                        try? journal.checkpointProgress(
+                            transferId: actionId,
+                            frontier: rangeTracker.contiguousFrontier,
+                            ranges: rangeTracker.serialize(),
+                            durabilityEvidence: true
+                        )
+                    },
+                    onProgress: { bytes in
+                        let pct = Double(bytes) / Double(max(1, stat.size)) * 0.85
+                        progress(pct)
+                    }
+                )
                 downloadSuccess = true
             } catch {
                 if Task.isCancelled || error is CancellationError {
                     throw CancellationError()
                 }
                 lastError = error
+                currentOffset = rangeTracker.contiguousFrontier
                 if attempts < maxAttempts {
                     let delaySec = UInt64(attempts)
                     try? await Task.sleep(nanoseconds: delaySec * 1_000_000_000)
@@ -300,6 +326,7 @@ public final class JobOrchestrator: @unchecked Sendable {
         guard downloadSuccess else {
             let finalError = lastError ?? NSError(domain: "JobOrchestrator", code: 2, userInfo: [NSLocalizedDescriptionKey: "Download failed after \(maxAttempts) attempts"])
             sm.transition(to: .failed, error: finalError.localizedDescription)
+            try? journal.updateState(transferId: actionId, state: "failed", errorMessage: finalError.localizedDescription)
             ledger.recordItemState(
                 itemId: itemId,
                 jobId: jobId,
@@ -314,8 +341,27 @@ public final class JobOrchestrator: @unchecked Sendable {
             throw finalError
         }
         
-        // 3. Фаза коммита: COMMITTING
+        // 3. Verify: Проверка целостности и покрытия перед коммитом
+        guard rangeTracker.isFullyCovered(expectedSize: stat.size) else {
+            throw JobOrchestratorError.transferInterrupted(reason: "Обнаружены непокрытые диапазоны байт (дыры) перед коммитом")
+        }
+        
+        let tempVals = try? tempURL.resourceValues(forKeys: [.fileSizeKey])
+        let tempSize = UInt64(tempVals?.fileSize ?? 0)
+        guard tempSize == stat.size else {
+            throw JobOrchestratorError.transferInterrupted(reason: "Размер загруженного файла (\(tempSize)) не совпадает с оригиналом (\(stat.size))")
+        }
+        
+        // Повторная проверка источника (snapshot identity)
+        if let statAfter = try? await transport.prepareRead(actionId: actionId, path: remotePath) {
+            if statAfter.size != stat.size || statAfter.mtime != stat.mtime {
+                throw JobOrchestratorError.transferInterrupted(reason: "Источник изменился во время передачи")
+            }
+        }
+        
+        // 4. Commit: COMMITTING
         sm.transition(to: .committing)
+        try? journal.updateState(transferId: actionId, state: "committing")
         ledger.recordItemState(
             itemId: itemId,
             jobId: jobId,
@@ -327,25 +373,23 @@ public final class JobOrchestrator: @unchecked Sendable {
             mtime: stat.mtime
         )
         
-        // Проверяем размер временного файла перед переименованием
-        let tempVals = try? tempURL.resourceValues(forKeys: [.fileSizeKey])
-        let tempSize = UInt64(tempVals?.fileSize ?? 0)
-        guard tempSize == stat.size else {
-            throw JobOrchestratorError.transferInterrupted(reason: "Размер загруженного файла (\(tempSize)) не совпадает с оригиналом (\(stat.size))")
+        do {
+            try await localFS.renameItem(from: tempURL.path, to: finalURL.path)
+        } catch {
+            sm.transition(to: .indeterminate, error: "Ошибка при локальном переименовании: \(error.localizedDescription)")
+            try? journal.updateState(transferId: actionId, state: "indeterminate", errorMessage: error.localizedDescription)
+            throw error
         }
         
-        try await localFS.renameItem(from: tempURL.path, to: finalURL.path)
-        
-        // Оптимизация P2: Сохраняем точный исходный mtime на скачанном файле Mac,
-        // чтобы повторные передачи со стратегией .skipIfIdentical пропускали файл
         let origMtime = Date(timeIntervalSince1970: TimeInterval(stat.mtime))
         try? FileManager.default.setAttributes([.modificationDate: origMtime], ofItemAtPath: finalURL.path)
         
-        // 4. Верификация
+        // Верификация коммита
         let finalVals = try? finalURL.resourceValues(forKeys: [.fileSizeKey])
         let finalSize = UInt64(finalVals?.fileSize ?? 0)
         guard FileManager.default.fileExists(atPath: finalURL.path) && finalSize == stat.size else {
             sm.transition(to: .indeterminate, error: "Целевой файл поврежден или имеет неверный размер после переименования")
+            try? journal.updateState(transferId: actionId, state: "indeterminate", errorMessage: "Commit verification failed")
             throw JobOrchestratorError.commitVerificationFailed(path: finalURL.path)
         }
         
@@ -499,6 +543,7 @@ public final class JobOrchestrator: @unchecked Sendable {
         )
         
         let deviceId = PhoneConnectionManager.shared.getConnectedDeviceId() ?? "phone"
+        let sessionIdentity = "\(deviceId):\(transport.coordinator.host):\(transport.coordinator.port)"
         let srcKey = "\(deviceId):\(localSourceURL.path):\(fileSize):\(mtime)"
         let fingerprint = SHA256.hash(data: Data(srcKey.utf8)).map { String(format: "%02x", $0) }.joined().prefix(8)
         let remoteTempPath = (remoteTargetDir as NSString).appendingPathComponent(".\(fileName).\(fingerprint).mcdpart").precomposedStringWithCanonicalMapping
@@ -507,13 +552,23 @@ public final class JobOrchestrator: @unchecked Sendable {
             unregisterActiveRemotePart(path: remoteTempPath)
         }
         
-        // Проверяем возможность Resume с оффсета, если на телефоне уже есть валидный частичный .mcdpart
+        let journal = TransferJournal.shared
+        var rangeTracker = ConfirmedRangeTracker()
         var startOffset: UInt64 = 0
-        if let remoteStat = try? await transport.prepareRead(actionId: actionId, path: remoteTempPath) {
-            if remoteStat.size > 0 && remoteStat.size < fileSize {
-                startOffset = remoteStat.size
+        
+        // Проверяем возможность возобновления через TransferJournal
+        if let resumable = journal.findResumableTransfer(
+            sessionIdentity: sessionIdentity,
+            sourcePath: localSourceURL.path,
+            sourceSize: fileSize,
+            sourceMtime: mtime,
+            direction: "upload"
+        ) {
+            let loadedTracker = ConfirmedRangeTracker.deserialize(resumable.rangesBlob)
+            let frontier = loadedTracker.contiguousFrontier
+            if frontier > 0, let remoteStat = try? await transport.prepareRead(actionId: actionId, path: remoteTempPath), remoteStat.size >= frontier {
                 // Префиксная проверка целостности первых байтов перед Resume
-                let prefixLen = min(startOffset, 4096)
+                let prefixLen = min(frontier, 4096)
                 var prefixValid = false
                 if let handle = try? FileHandle(forReadingFrom: localSourceURL) {
                     let localPrefix = try? handle.read(upToCount: Int(prefixLen))
@@ -525,29 +580,77 @@ public final class JobOrchestrator: @unchecked Sendable {
                         }
                     }
                 }
-                if !prefixValid {
+                if prefixValid {
+                    rangeTracker = loadedTracker
+                    startOffset = frontier
+                } else {
                     _ = try? await transport.executeDelete(actionId: actionId, path: remoteTempPath)
+                    rangeTracker = ConfirmedRangeTracker()
                     startOffset = 0
                 }
-            } else if remoteStat.size >= fileSize {
-                _ = try? await transport.executeDelete(actionId: actionId, path: remoteTempPath)
-                startOffset = 0
             }
+        } else if let _ = try? await transport.prepareRead(actionId: actionId, path: remoteTempPath) {
+            // Неизвестный .mcdpart без журнала удаляем перед новой передачей
+            _ = try? await transport.executeDelete(actionId: actionId, path: remoteTempPath)
         }
+        
+        try? journal.registerTransfer(
+            transferId: actionId,
+            sessionIdentity: sessionIdentity,
+            direction: "upload",
+            sourcePath: localSourceURL.path,
+            sourceSize: fileSize,
+            sourceMtime: mtime,
+            sourceHash: nil,
+            targetFinalPath: remoteFinalPath,
+            targetTempPath: remoteTempPath,
+            expectedSize: fileSize,
+            initialFrontier: startOffset,
+            initialRanges: rangeTracker.serialize(),
+            state: "transferring"
+        )
         
         do {
             try await transport.uploadFileStreaming(
                 actionId: actionId,
                 localURL: localSourceURL,
                 remotePath: remoteTempPath,
-                startOffset: startOffset
-            ) { bytes in
-                let pct = Double(bytes) / Double(max(1, fileSize)) * 0.90
-                progress(pct)
+                startOffset: startOffset,
+                rangeTracker: rangeTracker,
+                onRangeConfirmed: { confirmedRange in
+                    rangeTracker.addRange(confirmedRange)
+                    try? journal.checkpointProgress(
+                        transferId: actionId,
+                        frontier: rangeTracker.contiguousFrontier,
+                        ranges: rangeTracker.serialize(),
+                        durabilityEvidence: true
+                    )
+                },
+                onProgress: { bytes in
+                    let pct = Double(bytes) / Double(max(1, fileSize)) * 0.90
+                    progress(pct)
+                }
+            )
+            
+            // 3. Verify: Проверка покрытия перед коммитом
+            guard rangeTracker.isFullyCovered(expectedSize: fileSize) else {
+                throw JobOrchestratorError.transferInterrupted(reason: "Обнаружены непокрытые диапазоны при выгрузке (дыры)")
             }
             
-            // Коммит: переименовываем временный .mcdpart файл в финальный
+            guard let tempStat = try? await transport.prepareRead(actionId: actionId, path: remoteTempPath),
+                  tempStat.size == fileSize else {
+                throw JobOrchestratorError.transferInterrupted(reason: "Размер загруженного на телефон файла не совпадает с оригиналом")
+            }
+            
+            // Проверка поддержки атомарного замещения при существовании целевого файла
+            let targetExists = (try? await transport.prepareRead(actionId: actionId, path: remoteFinalPath)) != nil
+            if targetExists && transport.coordinator.serverExtensions["posix-rename@openssh.com"] == nil {
+                throw JobOrchestratorError.unsupportedAtomicReplace(path: remoteFinalPath)
+            }
+            
+            // 4. Commit: переименовываем временный .mcdpart файл в финальный
             sm.transition(to: .committing)
+            try? journal.updateState(transferId: actionId, state: "committing")
             ledger.recordItemState(
                 itemId: itemId,
                 jobId: jobId,
@@ -559,41 +662,19 @@ public final class JobOrchestrator: @unchecked Sendable {
                 mtime: mtime
             )
             
-            let backupPath = "\(remoteFinalPath).bak.\(actionId)"
-            var backupCreated = false
-            // Если целевой файл существует, перемещаем его во временный бэкап для бесконфликтного RENAME в SFTP v3
-            if (try? await transport.prepareRead(actionId: actionId, path: remoteFinalPath)) != nil {
-                if (try? await transport.executeRename(oldPath: remoteFinalPath, newPath: backupPath)) == true {
-                    backupCreated = true
-                } else {
-                    _ = try? await transport.executeDelete(actionId: actionId, path: backupPath)
-                    if (try? await transport.executeRename(oldPath: remoteFinalPath, newPath: backupPath)) == true {
-                        backupCreated = true
-                    }
-                }
-            }
-            
             let renameSuccess = try await transport.executeRename(oldPath: remoteTempPath, newPath: remoteFinalPath)
             guard renameSuccess else {
-                if backupCreated {
-                    _ = try? await transport.executeRename(oldPath: backupPath, newPath: remoteFinalPath)
-                }
+                sm.transition(to: .indeterminate, error: "Не удалось переименовать временный файл на телефоне")
+                try? journal.updateState(transferId: actionId, state: "indeterminate", errorMessage: "Remote rename failed")
                 throw NSError(domain: "JobOrchestrator", code: 500, userInfo: [NSLocalizedDescriptionKey: "Remote commit (rename) failed for: \(remoteFinalPath)"])
             }
             
-            // 4. Верификация размера файла на телефоне до удаления резервной копии
+            // 5. Верификация размера файла на телефоне после переименования
             guard let verifiedStat = try? await transport.prepareRead(actionId: actionId, path: remoteFinalPath),
                   verifiedStat.size == fileSize else {
-                if backupCreated {
-                    _ = try? await transport.executeRename(oldPath: backupPath, newPath: remoteFinalPath)
-                }
                 sm.transition(to: .indeterminate, error: "Целевой файл на телефоне не прошел проверку целостности размера")
+                try? journal.updateState(transferId: actionId, state: "indeterminate", errorMessage: "Commit verification failed")
                 throw JobOrchestratorError.commitVerificationFailed(path: remoteFinalPath)
-            }
-            
-            // Удаляем резервную копию ТОЛЬКО после успешной верификации целостности целевого файла
-            if backupCreated {
-                _ = try? await transport.executeDelete(actionId: actionId, path: backupPath)
             }
             
             // Восстанавливаем оригинальный mtime на телефоне для консистентности и быстрого пропуска идентичных файлов

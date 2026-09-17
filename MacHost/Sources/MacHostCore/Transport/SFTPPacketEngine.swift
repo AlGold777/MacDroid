@@ -26,6 +26,10 @@ public enum SFTPMessageType: UInt8, Sendable {
     case data         = 103 // SSH_FXP_DATA
     case name         = 104 // SSH_FXP_NAME
     case attrs        = 105 // SSH_FXP_ATTRS
+    
+    // Расширения (Extensions)
+    case extended     = 200 // SSH_FXP_EXTENDED
+    case extendedReply = 201 // SSH_FXP_EXTENDED_REPLY
 }
 
 public enum SFTPStatusCode: UInt32, Sendable {
@@ -55,6 +59,51 @@ public struct SFTPNameEntry: Sendable {
         self.size = size
         self.mtime = mtime
         self.isDirectory = isDirectory
+    }
+}
+
+public struct SFTPStatVfs: Sendable {
+    public let bsize: UInt64
+    public let frsize: UInt64
+    public let blocks: UInt64
+    public let bfree: UInt64
+    public let bavail: UInt64
+    public let files: UInt64
+    public let ffree: UInt64
+    public let favail: UInt64
+    public let fsid: UInt64
+    public let flag: UInt64
+    public let namemax: UInt64
+    
+    public init(
+        bsize: UInt64, frsize: UInt64, blocks: UInt64, bfree: UInt64, bavail: UInt64,
+        files: UInt64, ffree: UInt64, favail: UInt64, fsid: UInt64, flag: UInt64, namemax: UInt64
+    ) {
+        self.bsize = bsize
+        self.frsize = frsize
+        self.blocks = blocks
+        self.bfree = bfree
+        self.bavail = bavail
+        self.files = files
+        self.ffree = ffree
+        self.favail = favail
+        self.fsid = fsid
+        self.flag = flag
+        self.namemax = namemax
+    }
+}
+
+public struct SFTPLimits: Sendable {
+    public let maxPacketLen: UInt64
+    public let maxReadLen: UInt64
+    public let maxWriteLen: UInt64
+    public let maxOpenHandles: UInt64
+    
+    public init(maxPacketLen: UInt64, maxReadLen: UInt64, maxWriteLen: UInt64, maxOpenHandles: UInt64) {
+        self.maxPacketLen = maxPacketLen
+        self.maxReadLen = maxReadLen
+        self.maxWriteLen = maxWriteLen
+        self.maxOpenHandles = maxOpenHandles
     }
 }
 
@@ -360,5 +409,90 @@ public final class SFTPPacketEngine: @unchecked Sendable {
             ))
         }
         return entries
+    }
+    
+    // MARK: - SFTP Version & Extensions
+    
+    public func parseVersionResponse(data: Data) throws -> (version: UInt32, extensions: [String: String]) {
+        let reader = SFTPPacketReader(data: data)
+        let version = try reader.readUInt32()
+        var extensions: [String: String] = [:]
+        while reader.hasRemaining {
+            if let extName = try? reader.readString(), let extData = try? reader.readString() {
+                extensions[extName] = extData
+            } else {
+                break
+            }
+        }
+        return (version, extensions)
+    }
+    
+    public func createStatVfsPacket(requestId: UInt32, path: String) -> Data {
+        let writer = SFTPPacketWriter()
+        writer.appendUInt32(requestId)
+        writer.appendString("statvfs@openssh.com")
+        writer.appendString(path)
+        return writer.buildPacket(type: .extended)
+    }
+    
+    public func parseStatVfsResponse(data: Data) throws -> (requestId: UInt32, statvfs: SFTPStatVfs) {
+        let reader = SFTPPacketReader(data: data)
+        let reqId = try reader.readUInt32()
+        let bsize = try reader.readUInt64()
+        let frsize = try reader.readUInt64()
+        let blocks = try reader.readUInt64()
+        let bfree = try reader.readUInt64()
+        let bavail = try reader.readUInt64()
+        let files = try reader.readUInt64()
+        let ffree = try reader.readUInt64()
+        let favail = try reader.readUInt64()
+        let fsid = try reader.readUInt64()
+        let flag = try reader.readUInt64()
+        let namemax = try reader.readUInt64()
+        let statvfs = SFTPStatVfs(
+            bsize: bsize, frsize: frsize, blocks: blocks, bfree: bfree, bavail: bavail,
+            files: files, ffree: ffree, favail: favail, fsid: fsid, flag: flag, namemax: namemax
+        )
+        return (reqId, statvfs)
+    }
+    
+    public func createPosixRenamePacket(requestId: UInt32, oldPath: String, newPath: String) -> Data {
+        let writer = SFTPPacketWriter()
+        writer.appendUInt32(requestId)
+        writer.appendString("posix-rename@openssh.com")
+        writer.appendString(oldPath)
+        writer.appendString(newPath)
+        return writer.buildPacket(type: .extended)
+    }
+    
+    public func createFsyncPacket(requestId: UInt32, handle: Data) -> Data {
+        let writer = SFTPPacketWriter()
+        writer.appendUInt32(requestId)
+        writer.appendString("fsync@openssh.com")
+        writer.appendData(handle)
+        return writer.buildPacket(type: .extended)
+    }
+    
+    public func createLimitsPacket(requestId: UInt32) -> Data {
+        let writer = SFTPPacketWriter()
+        writer.appendUInt32(requestId)
+        writer.appendString("limits@openssh.com")
+        return writer.buildPacket(type: .extended)
+    }
+    
+    public func parseLimitsResponse(data: Data) throws -> (requestId: UInt32, limits: SFTPLimits) {
+        let reader = SFTPPacketReader(data: data)
+        let reqId = try reader.readUInt32()
+        let maxPacket = try reader.readUInt64()
+        let maxRead = try reader.readUInt64()
+        let maxWrite = try reader.readUInt64()
+        let maxHandles = try reader.readUInt64()
+        let limits = SFTPLimits(
+            maxPacketLen: maxPacket,
+            maxReadLen: maxRead,
+            maxWriteLen: maxWrite,
+            maxOpenHandles: maxHandles
+        )
+        return (reqId, limits)
     }
 }
