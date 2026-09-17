@@ -3035,8 +3035,36 @@ Task { @MainActor in
         let batchFail = JobOrchestrator.BatchItemResult(itemId: "item-2", error: NSError(domain: "test", code: 1, userInfo: [NSLocalizedDescriptionKey: "fail"]))
         assertCondition(!batchFail.isSuccess && batchFail.errorDescription == "fail", "BatchItemResult failure correctly constructed")
         
+        // 9. [TEST 48] Production Observability: TransportMetrics Telemetry Collection
+        print("\n--- [TEST 48] Production Observability: TransportMetrics Telemetry Collection ---")
+        
+        let metrics = TransportMetrics.shared
+        metrics.reset()
+        
+        metrics.recordRTT(milliseconds: 12.5)
+        metrics.recordRTT(milliseconds: 15.5)
+        metrics.recordReadSpeed(bytes: 1024 * 1024, durationSeconds: 0.1) // 10 MiB/s
+        metrics.recordWriteSpeed(bytes: 512 * 1024, durationSeconds: 0.05) // 10 MiB/s
+        metrics.recordInflightPayload(bytes: 4 * 1024 * 1024)
+        metrics.recordReconnect()
+        metrics.recordResumeSavedBytes(256 * 1024)
+        
+        let snap = metrics.snapshot()
+        assertCondition(snap.averageRTTMs == 14.0, "Average RTT calculated correctly (14.0ms)")
+        assertCondition(snap.totalBytesDownloaded == 1024 * 1024, "Total bytes downloaded tracked (1 MiB)")
+        assertCondition(snap.totalBytesUploaded == 512 * 1024, "Total bytes uploaded tracked (512 KiB)")
+        assertCondition(snap.totalResumeSavedBytes == 256 * 1024, "Resume saved bytes tracked (256 KiB)")
+        assertCondition(snap.reconnectCount == 1, "Reconnect count tracked (1)")
+        assertCondition(snap.peakInflightPayload == 4 * 1024 * 1024, "Peak in-flight payload tracked (4 MiB)")
+        assertCondition(snap.recentReadSpeedBps > 0, "Recent read speed recorded")
+        assertCondition(snap.recentWriteSpeedBps > 0, "Recent write speed recorded")
+        
+        metrics.reset()
+        let resetSnap = metrics.snapshot()
+        assertCondition(resetSnap.totalBytesDownloaded == 0 && resetSnap.reconnectCount == 0, "Metrics reset cleared all values")
+        
         print("\n🎉 ==================================================")
-        print("🎉   ALL 47 PRODUCTION TEST SUITES PASSED!          ")
+        print("🎉   ALL 48 PRODUCTION TEST SUITES PASSED!          ")
         print("🎉 ==================================================")
         exit(0)
     } catch {
