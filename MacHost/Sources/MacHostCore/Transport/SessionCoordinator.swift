@@ -173,9 +173,9 @@ public final class SessionCoordinator: @unchecked Sendable {
             "-o", "IPQoS=throughput",
             "-o", "StrictHostKeyChecking=accept-new",
             "-o", "UserKnownHostsFile=\(knownHostsURL.path)",
-            "-p", String(targetPort),
-            "\(sshUser)@\(targetHost)"
+            "-p", String(targetPort)
         ])
+        let sshDestination = "\(sshUser)@\(targetHost)"
         
         // Попытка OpenSSH Multiplexing через ControlMaster
         let socketId = UUID().uuidString.prefix(8)
@@ -192,7 +192,8 @@ public final class SessionCoordinator: @unchecked Sendable {
             masterArgs.append(contentsOf: [
                 "-M",
                 "-S", sockPath,
-                "-N"
+                "-N",
+                sshDestination
             ])
             masterProc.arguments = masterArgs
             masterProc.standardInput = FileHandle.nullDevice
@@ -251,7 +252,7 @@ public final class SessionCoordinator: @unchecked Sendable {
             let singleProc = Process()
             singleProc.executableURL = URL(fileURLWithPath: "/usr/bin/ssh")
             var singleArgs = baseArgs
-            singleArgs.append(contentsOf: ["-s", "sftp"])
+            singleArgs.append(contentsOf: [sshDestination, "-s", "sftp"])
             singleProc.arguments = singleArgs
             
             let inPipe = Pipe()

@@ -22,7 +22,9 @@ public final class SFTPChannel: @unchecked Sendable {
     }
     
     private var pendingRequests: [UInt32: PendingEntry] = [:]
+    private var requestTimeoutWorkItems: [UInt32: DispatchWorkItem] = [:]
     private var initContinuation: CheckedContinuation<(type: SFTPMessageType, payload: Data), Error>?
+    private var initTimeoutWorkItem: DispatchWorkItem?
     
     public static let maxPacketLength: Int = 4 * 1024 * 1024 // 4 MiB жесткий потолок
     
@@ -67,7 +69,29 @@ public final class SFTPChannel: @unchecked Sendable {
                 return
             }
             self.initContinuation = continuation
+            let timeout = DispatchWorkItem { [weak self] in
+                guard let self else { return }
+                self.lock.lock()
+                guard let pending = self.initContinuation else {
+                    self.lock.unlock()
+                    return
+                }
+                self.initContinuation = nil
+                self.lock.unlock()
+                pending.resume(throwing: NSError(
+                    domain: "SFTPChannel",
+                    code: 10,
+                    userInfo: [NSLocalizedDescriptionKey: "Таймаут инициализации SFTP: SSH не ответил за \(Int(timeoutSeconds)) сек."]
+                ))
+            }
+            self.initTimeoutWorkItem?.cancel()
+            self.initTimeoutWorkItem = timeout
             lock.unlock()
+
+            DispatchQueue.global(qos: .userInitiated).asyncAfter(
+                deadline: .now() + timeoutSeconds,
+                execute: timeout
+            )
             
             writerQueue.async { [weak self] in
                 guard let self = self else { return }
@@ -77,6 +101,8 @@ public final class SFTPChannel: @unchecked Sendable {
                     self.lock.lock()
                     let c = self.initContinuation
                     self.initContinuation = nil
+                    self.initTimeoutWorkItem?.cancel()
+                    self.initTimeoutWorkItem = nil
                     self.lock.unlock()
                     c?.resume(throwing: error)
                 }
@@ -101,7 +127,27 @@ public final class SFTPChannel: @unchecked Sendable {
                 
                 // Регистрируем ДО отправки
                 pendingRequests[requestId] = .active(continuation: continuation)
+                let timeout = DispatchWorkItem { [weak self] in
+                    guard let self else { return }
+                    self.lock.lock()
+                    let entry = self.pendingRequests.removeValue(forKey: requestId)
+                    self.requestTimeoutWorkItems.removeValue(forKey: requestId)
+                    self.lock.unlock()
+                    if case .active(let cont) = entry {
+                        cont.resume(throwing: NSError(
+                            domain: "SFTPChannel",
+                            code: 11,
+                            userInfo: [NSLocalizedDescriptionKey: "Таймаут ответа SFTP-запроса (\(Int(timeoutSeconds)) сек.)"]
+                        ))
+                    }
+                }
+                requestTimeoutWorkItems[requestId] = timeout
                 lock.unlock()
+
+                DispatchQueue.global(qos: .userInitiated).asyncAfter(
+                    deadline: .now() + timeoutSeconds,
+                    execute: timeout
+                )
                 
                 // Запись в pipe на выделенной очереди
                 writerQueue.async { [weak self] in
@@ -111,6 +157,7 @@ public final class SFTPChannel: @unchecked Sendable {
                     } catch {
                         self.lock.lock()
                         let entry = self.pendingRequests.removeValue(forKey: requestId)
+                        self.requestTimeoutWorkItems.removeValue(forKey: requestId)?.cancel()
                         self.lock.unlock()
                         if case .active(let cont) = entry {
                             cont.resume(throwing: error)
@@ -194,6 +241,8 @@ public final class SFTPChannel: @unchecked Sendable {
                     lock.lock()
                     let cont = self.initContinuation
                     self.initContinuation = nil
+                    self.initTimeoutWorkItem?.cancel()
+                    self.initTimeoutWorkItem = nil
                     lock.unlock()
                     cont?.resume(returning: (msgType, payload))
                     continue
@@ -208,6 +257,7 @@ public final class SFTPChannel: @unchecked Sendable {
                 
                 lock.lock()
                 let entry = pendingRequests.removeValue(forKey: reqId)
+                requestTimeoutWorkItems.removeValue(forKey: reqId)?.cancel()
                 lock.unlock()
                 
                 switch entry {
@@ -265,6 +315,8 @@ public final class SFTPChannel: @unchecked Sendable {
         
         let pending = self.pendingRequests
         self.pendingRequests.removeAll()
+        let timeouts = self.requestTimeoutWorkItems
+        self.requestTimeoutWorkItems.removeAll()
         lock.unlock()
         
         initCont?.resume(throwing: error)
@@ -273,6 +325,7 @@ public final class SFTPChannel: @unchecked Sendable {
                 cont.resume(throwing: error)
             }
         }
+        timeouts.values.forEach { $0.cancel() }
         
         try? inHandle.close()
         try? outHandle.close()
