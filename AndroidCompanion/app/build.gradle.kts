@@ -12,8 +12,8 @@ android {
         applicationId = "com.macandroid.filemanager"
         minSdk = 26
         targetSdk = 34
-        versionCode = 4
-        versionName = "2.1.2"
+        versionCode = 5
+        versionName = "2.1.3"
     }
 
     buildTypes {

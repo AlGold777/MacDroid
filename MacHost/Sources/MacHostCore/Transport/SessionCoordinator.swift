@@ -218,8 +218,18 @@ public final class SessionCoordinator: @unchecked Sendable {
             
             if sockReady {
                 // Создаем два SFTP канала через slave ssh процессы
-                let chan1 = try spawnSlaveChannel(sockPath: sockPath, channelId: "interactive_\(currentEpoch)", isInteractive: true)
-                let chan2 = try spawnSlaveChannel(sockPath: sockPath, channelId: "bulk_\(currentEpoch)", isInteractive: false)
+                let chan1 = try spawnSlaveChannel(
+                    sockPath: sockPath,
+                    destination: sshDestination,
+                    channelId: "interactive_\(currentEpoch)",
+                    isInteractive: true
+                )
+                let chan2 = try spawnSlaveChannel(
+                    sockPath: sockPath,
+                    destination: sshDestination,
+                    channelId: "bulk_\(currentEpoch)",
+                    isInteractive: false
+                )
                 
                 // Проверяем первый канал init
                 let initPkt = packetEngine.createInitPacket()
@@ -231,11 +241,16 @@ public final class SessionCoordinator: @unchecked Sendable {
                     self.lock.unlock()
                     
                     // Инициализируем и второй канал
-                    let initPkt2 = packetEngine.createInitPacket()
-                    _ = try? await chan2.sendInitPacket(packet: initPkt2)
-                    
                     interactiveChan = chan1
-                    bulkChan = chan2
+                    let initPkt2 = packetEngine.createInitPacket()
+                    if let secondInit = try? await chan2.sendInitPacket(packet: initPkt2), secondInit.type == .version {
+                        bulkChan = chan2
+                    } else {
+                        // Один рабочий канал лучше двух, один из которых
+                        // фактически не прошёл SFTP handshake.
+                        chan2.close()
+                        bulkChan = chan1
+                    }
                     isMultiplexed = true
                 }
             }
@@ -317,14 +332,14 @@ public final class SessionCoordinator: @unchecked Sendable {
         self.lock.unlock()
     }
     
-    private func spawnSlaveChannel(sockPath: String, channelId: String, isInteractive: Bool) throws -> SFTPChannel {
+    private func spawnSlaveChannel(sockPath: String, destination: String, channelId: String, isInteractive: Bool) throws -> SFTPChannel {
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: "/usr/bin/ssh")
         proc.arguments = [
             "-S", sockPath,
             "-F", "/dev/null",
             "-o", "BatchMode=yes",
-            "dummy_host",
+            destination,
             "-s", "sftp"
         ]
         let inPipe = Pipe()
