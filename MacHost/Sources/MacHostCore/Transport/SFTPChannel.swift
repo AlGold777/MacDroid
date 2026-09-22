@@ -8,6 +8,7 @@ public final class SFTPChannel: @unchecked Sendable {
     private let process: Process
     private let inHandle: FileHandle
     private let outHandle: FileHandle
+    private let diagnosticMessage: @Sendable () -> String
     
     private let writerQueue: DispatchQueue
     private let readerQueue: DispatchQueue
@@ -28,7 +29,8 @@ public final class SFTPChannel: @unchecked Sendable {
     
     public static let maxPacketLength: Int = 4 * 1024 * 1024 // 4 MiB жесткий потолок
     
-    public init(channelId: String, isInteractive: Bool, process: Process, inHandle: FileHandle, outHandle: FileHandle) {
+    public init(channelId: String, isInteractive: Bool, process: Process, inHandle: FileHandle, outHandle: FileHandle, diagnosticMessage: @escaping @Sendable () -> String = { "" }) {
+        self.diagnosticMessage = diagnosticMessage
         self.channelId = channelId
         self.isInteractive = isInteractive
         self.process = process
@@ -61,9 +63,10 @@ public final class SFTPChannel: @unchecked Sendable {
     
     /// Инициализация SFTP подсистемы (ожидание SSH_FXP_VERSION до запуска обработки обычных запросов)
     public func sendInitPacket(packet: Data, timeoutSeconds: TimeInterval = 10) async throws -> (type: SFTPMessageType, payload: Data) {
+        try await withTaskCancellationHandler {
         try await withCheckedThrowingContinuation { continuation in
             lock.lock()
-            guard !isClosed else {
+            guard !isClosed && !Task.isCancelled else {
                 lock.unlock()
                 continuation.resume(throwing: NSError(domain: "SFTPChannel", code: 1, userInfo: [NSLocalizedDescriptionKey: "Channel is closed"]))
                 return
@@ -83,6 +86,7 @@ public final class SFTPChannel: @unchecked Sendable {
                     code: 10,
                     userInfo: [NSLocalizedDescriptionKey: "Таймаут инициализации SFTP: SSH не ответил за \(Int(timeoutSeconds)) сек."]
                 ))
+                self.close()
             }
             self.initTimeoutWorkItem?.cancel()
             self.initTimeoutWorkItem = timeout
@@ -108,6 +112,9 @@ public final class SFTPChannel: @unchecked Sendable {
                 }
             }
         }
+        } onCancel: {
+            self.close()
+        }
     }
     
     /// Отправка типизированного запроса с предварительной регистрацией до записи в pipe
@@ -119,6 +126,11 @@ public final class SFTPChannel: @unchecked Sendable {
         return try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { continuation in
                 lock.lock()
+                guard !Task.isCancelled else {
+                    lock.unlock()
+                    continuation.resume(throwing: CancellationError())
+                    return
+                }
                 guard !isClosed else {
                     lock.unlock()
                     continuation.resume(throwing: NSError(domain: "SFTPChannel", code: 1, userInfo: [NSLocalizedDescriptionKey: "Channel is closed"]))
@@ -130,7 +142,8 @@ public final class SFTPChannel: @unchecked Sendable {
                 let timeout = DispatchWorkItem { [weak self] in
                     guard let self else { return }
                     self.lock.lock()
-                    let entry = self.pendingRequests.removeValue(forKey: requestId)
+                    let entry = self.pendingRequests[requestId]
+                    if entry != nil { self.pendingRequests[requestId] = .cancelled }
                     self.requestTimeoutWorkItems.removeValue(forKey: requestId)
                     self.lock.unlock()
                     if case .active(let cont) = entry {
@@ -169,10 +182,15 @@ public final class SFTPChannel: @unchecked Sendable {
             // При отмене задачи помечаем как cancelled, но не удаляем ID,
             // чтобы ответ сервера не врезался в повторно выделенный ID
             self.lock.lock()
-            if let entry = self.pendingRequests[requestId], case .active = entry {
+            let entry = self.pendingRequests[requestId]
+            if case .active = entry {
                 self.pendingRequests[requestId] = .cancelled
             }
+            self.requestTimeoutWorkItems.removeValue(forKey: requestId)?.cancel()
             self.lock.unlock()
+            if case .active(let continuation) = entry {
+                continuation.resume(throwing: CancellationError())
+            }
         }
     }
     
@@ -291,7 +309,8 @@ public final class SFTPChannel: @unchecked Sendable {
             
             let needed = count - accumulated.count
             guard let chunk = try outHandle.read(upToCount: needed), !chunk.isEmpty else {
-                throw NSError(domain: "SFTPChannel", code: 3, userInfo: [NSLocalizedDescriptionKey: "SFTP connection closed prematurely"])
+                let details = diagnosticMessage()
+                throw NSError(domain: "SFTPChannel", code: 3, userInfo: [NSLocalizedDescriptionKey: details.isEmpty ? "SFTP connection closed prematurely" : "SSH: \(details)"])
             }
             accumulated.append(chunk)
         }
@@ -312,6 +331,8 @@ public final class SFTPChannel: @unchecked Sendable {
         
         let initCont = self.initContinuation
         self.initContinuation = nil
+        initTimeoutWorkItem?.cancel()
+        initTimeoutWorkItem = nil
         
         let pending = self.pendingRequests
         self.pendingRequests.removeAll()
@@ -327,10 +348,10 @@ public final class SFTPChannel: @unchecked Sendable {
         }
         timeouts.values.forEach { $0.cancel() }
         
-        try? inHandle.close()
-        try? outHandle.close()
         if process.isRunning {
             process.terminate()
         }
+        try? inHandle.close()
+        try? outHandle.close()
     }
 }

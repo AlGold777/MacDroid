@@ -29,6 +29,7 @@ public final class SessionCoordinator: @unchecked Sendable {
     private var muxSocketPath: String?
     
     private var activeConnectTask: Task<Void, Error>?
+    private var connectingChannels: [SFTPChannel] = []
     
     public init() {}
     
@@ -56,6 +57,7 @@ public final class SessionCoordinator: @unchecked Sendable {
         if self.host == host && self.port == port && self.deviceId == deviceId && isConnected {
             return
         }
+        disconnect()
         self.host = host
         self.port = port
         self.deviceId = deviceId
@@ -86,9 +88,11 @@ public final class SessionCoordinator: @unchecked Sendable {
             return
         }
         
+        disconnect()
+        let epoch = sessionEpoch
         let task = Task { [weak self] () -> Void in
             guard let self = self else { return }
-            try await self.performConnect(allowLegacyFallback: allowLegacyFallback)
+            try await self.performConnect(allowLegacyFallback: allowLegacyFallback, epoch: epoch)
         }
         self.activeConnectTask = task
         lock.unlock()
@@ -103,17 +107,29 @@ public final class SessionCoordinator: @unchecked Sendable {
         try await task.value
     }
     
-    private func performConnect(allowLegacyFallback: Bool) async throws {
-        disconnect()
-        
+    private func performConnect(allowLegacyFallback: Bool, epoch: UInt64) async throws {
         lock.lock()
-        sessionEpoch += 1
+        guard epoch == sessionEpoch, !Task.isCancelled else {
+            lock.unlock()
+            throw CancellationError()
+        }
         budget.reset()
         let currentEpoch = sessionEpoch
         let targetHost = self.host
         let targetPort = self.port
         let devId = self.deviceId
         lock.unlock()
+        defer {
+            lock.lock()
+            if epoch == sessionEpoch {
+                if _interactiveChannel == nil {
+                    connectingChannels.forEach { $0.close() }
+                    cleanupMasterProcess()
+                }
+                connectingChannels.removeAll()
+            }
+            lock.unlock()
+        }
         
         // Быстрая проверка доступности порта
         if !PhoneConnectionManager.shared.isHostPortReachable(host: targetHost, port: targetPort, timeoutSeconds: 1) {
@@ -202,6 +218,11 @@ public final class SessionCoordinator: @unchecked Sendable {
             
             try masterProc.run()
             self.lock.lock()
+            guard epoch == sessionEpoch, !Task.isCancelled else {
+                self.lock.unlock()
+                masterProc.terminate()
+                throw CancellationError()
+            }
             self.masterProcess = masterProc
             self.muxSocketPath = sockPath
             self.lock.unlock()
@@ -213,7 +234,8 @@ public final class SessionCoordinator: @unchecked Sendable {
                     sockReady = true
                     break
                 }
-                try? await Task.sleep(nanoseconds: 100_000_000)
+                if !masterProc.isRunning { break }
+                try await Task.sleep(nanoseconds: 100_000_000)
             }
             
             if sockReady {
@@ -224,12 +246,14 @@ public final class SessionCoordinator: @unchecked Sendable {
                     channelId: "interactive_\(currentEpoch)",
                     isInteractive: true
                 )
+                try trackConnectingChannel(chan1, epoch: epoch)
                 let chan2 = try spawnSlaveChannel(
                     sockPath: sockPath,
                     destination: sshDestination,
                     channelId: "bulk_\(currentEpoch)",
                     isInteractive: false
                 )
+                try trackConnectingChannel(chan2, epoch: epoch)
                 
                 // Проверяем первый канал init
                 let initPkt = packetEngine.createInitPacket()
@@ -255,13 +279,23 @@ public final class SessionCoordinator: @unchecked Sendable {
                 }
             }
         } catch {
+            try Task.checkCancellation()
             // Фолбэк на единый безопасный канал при невозможности мультиплексирования
             isMultiplexed = false
         }
         
         if !isMultiplexed {
+            try Task.checkCancellation()
             // Очищаем неудавшийся мастер-процесс
+            lock.lock()
+            guard epoch == sessionEpoch else {
+                lock.unlock()
+                throw CancellationError()
+            }
+            connectingChannels.forEach { $0.close() }
+            connectingChannels.removeAll()
             cleanupMasterProcess()
+            lock.unlock()
             
             // Запускаем единый SFTP процесс напрямую: ssh ... -s sftp
             let singleProc = Process()
@@ -274,7 +308,9 @@ public final class SessionCoordinator: @unchecked Sendable {
             let outPipe = Pipe()
             singleProc.standardInput = inPipe
             singleProc.standardOutput = outPipe
-            singleProc.standardError = FileHandle.nullDevice
+            let errorPipe = Pipe()
+            singleProc.standardError = errorPipe
+            let diagnostics = SSHDiagnostics(pipe: errorPipe)
             
             try singleProc.run()
             
@@ -283,8 +319,10 @@ public final class SessionCoordinator: @unchecked Sendable {
                 isInteractive: true,
                 process: singleProc,
                 inHandle: inPipe.fileHandleForWriting,
-                outHandle: outPipe.fileHandleForReading
+                outHandle: outPipe.fileHandleForReading,
+                diagnosticMessage: { diagnostics.message }
             )
+            try trackConnectingChannel(chan, epoch: epoch)
             
             let initPkt = packetEngine.createInitPacket()
             let (vType, vPayload) = try await chan.sendInitPacket(packet: initPkt)
@@ -327,9 +365,25 @@ public final class SessionCoordinator: @unchecked Sendable {
         }
         
         self.lock.lock()
+        guard epoch == sessionEpoch, !Task.isCancelled, activeInteractive.isRunning else {
+            self.lock.unlock()
+            activeInteractive.close()
+            bulkChan?.close()
+            throw CancellationError()
+        }
         self._interactiveChannel = activeInteractive
         self._bulkChannel = bulkChan
         self.lock.unlock()
+    }
+
+    private func trackConnectingChannel(_ channel: SFTPChannel, epoch: UInt64) throws {
+        lock.lock()
+        defer { lock.unlock() }
+        guard epoch == sessionEpoch, !Task.isCancelled else {
+            channel.close()
+            throw CancellationError()
+        }
+        connectingChannels.append(channel)
     }
     
     private func spawnSlaveChannel(sockPath: String, destination: String, channelId: String, isInteractive: Bool) throws -> SFTPChannel {
@@ -346,7 +400,9 @@ public final class SessionCoordinator: @unchecked Sendable {
         let outPipe = Pipe()
         proc.standardInput = inPipe
         proc.standardOutput = outPipe
-        proc.standardError = FileHandle.nullDevice
+        let errorPipe = Pipe()
+        proc.standardError = errorPipe
+        let diagnostics = SSHDiagnostics(pipe: errorPipe)
         try proc.run()
         
         return SFTPChannel(
@@ -354,7 +410,8 @@ public final class SessionCoordinator: @unchecked Sendable {
             isInteractive: isInteractive,
             process: proc,
             inHandle: inPipe.fileHandleForWriting,
-            outHandle: outPipe.fileHandleForReading
+            outHandle: outPipe.fileHandleForReading,
+            diagnosticMessage: { diagnostics.message }
         )
     }
     
@@ -373,16 +430,18 @@ public final class SessionCoordinator: @unchecked Sendable {
     
     public func disconnect() {
         lock.lock()
+        sessionEpoch &+= 1
         activeConnectTask?.cancel()
         activeConnectTask = nil
+        connectingChannels.forEach { $0.close() }
+        connectingChannels.removeAll()
         _interactiveChannel?.close()
         _interactiveChannel = nil
         _bulkChannel?.close()
         _bulkChannel = nil
         budget.reset()
-        lock.unlock()
-        
         cleanupMasterProcess()
+        lock.unlock()
     }
     
     public func toSftpPath(_ path: String) -> String {

@@ -222,6 +222,7 @@ public final class DualPaneViewModel: ObservableObject {
     @Published public var isPhoneConnected: Bool = false
     private var connectionMonitorTimer: Timer?
     private var wifiReachabilityMisses: Int = 0
+    private var connectionProbeRunning = false
     private let wifiReachabilityMissLimit = 3
     
     // Вычисление размера папок по нажатию Space
@@ -1383,7 +1384,18 @@ public final class DualPaneViewModel: ObservableObject {
     
     /// Проверка актуального состояния подключения телефона
     public func checkPhoneConnectionState() {
-        guard !isConnectingPhone else { return }
+        guard !isConnectingPhone && !connectionProbeRunning else { return }
+        if !remoteDriver.isConnected {
+            wifiReachabilityMisses = 0
+            if isPhoneConnected {
+                isPhoneConnected = false
+                refreshUsbDrives()
+            }
+            autoConnectPhoneIfAvailable()
+            return
+        }
+        connectionProbeRunning = true
+        let probeEpoch = remoteDriver.coordinator.sessionEpoch
 
         // Проверяем именно текущий endpoint. Ранее монитор после автоматического
         // подключения мог перейти к устаревшему UserDefaults/ARP-адресу и
@@ -1409,10 +1421,11 @@ public final class DualPaneViewModel: ObservableObject {
             
             // Проверяем реальный отклик порта SFTP (USB 127.0.0.1:2222 или сохраненный Wi-Fi)
             var isSocketActive = false
-            if isAdbConnected {
-                isSocketActive = PhoneConnectionManager.shared.isHostPortReachable(host: "127.0.0.1", port: 2222, timeoutSeconds: 1)
-            } else if let endpoint = monitoredWifiEndpoint {
+            if let endpoint = monitoredWifiEndpoint {
                 isSocketActive = PhoneConnectionManager.shared.isHostPortReachable(host: endpoint.host, port: endpoint.port, timeoutSeconds: 1)
+                isAdbConnected = false
+            } else if isAdbConnected {
+                isSocketActive = PhoneConnectionManager.shared.isHostPortReachable(host: "127.0.0.1", port: monitoredPath?.port ?? 2222, timeoutSeconds: 1)
             } else {
                 let hostToCheck = UserDefaults.standard.string(forKey: "lastConnectedHost") ?? ""
                 let portToCheck: UInt16 = UInt16(UserDefaults.standard.string(forKey: "lastConnectedPort") ?? "2222") ?? 2222
@@ -1425,6 +1438,10 @@ public final class DualPaneViewModel: ObservableObject {
             let socketDetected = isSocketActive
             
             await MainActor.run {
+                self.connectionProbeRunning = false
+                guard !self.isConnectingPhone,
+                      self.remoteDriver.coordinator.sessionEpoch == probeEpoch,
+                      ConnectionController.shared.currentPath == monitoredPath else { return }
                 if self.remoteDriver.isConnected {
                     // Если связь была активна, но сокет пропал (отключили кабель или Wi-Fi)
                     if !socketDetected && !adbDetected {

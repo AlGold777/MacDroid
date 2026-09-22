@@ -10,6 +10,7 @@ let package = Package(
         .library(name: "MacHostCore", targets: ["MacHostCore"])
     ],
     targets: [
+        .executableTarget(name: "TransportRegressionTests", dependencies: ["MacHostCore"], path: "Tests/TransportRegressionTests"),
         .target(
             name: "MacHostCore",
             path: "Sources/MacHostCore"
