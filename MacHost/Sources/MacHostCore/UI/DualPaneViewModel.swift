@@ -221,6 +221,8 @@ public final class DualPaneViewModel: ObservableObject {
     @Published public var detectedUsbDrives: [UsbDriveInfo] = []
     @Published public var isPhoneConnected: Bool = false
     private var connectionMonitorTimer: Timer?
+    private var wifiReachabilityMisses: Int = 0
+    private let wifiReachabilityMissLimit = 3
     
     // Вычисление размера папок по нажатию Space
     @Published public var calculatedFolderSizes: [String: UInt64] = [:]
@@ -1382,6 +1384,18 @@ public final class DualPaneViewModel: ObservableObject {
     /// Проверка актуального состояния подключения телефона
     public func checkPhoneConnectionState() {
         guard !isConnectingPhone else { return }
+
+        // Проверяем именно текущий endpoint. Ранее монитор после автоматического
+        // подключения мог перейти к устаревшему UserDefaults/ARP-адресу и
+        // принять краткий сетевой джиттер за отключение телефона.
+        let monitoredPath = ConnectionController.shared.currentPath
+        let monitoredWifiEndpoint: (host: String, port: UInt16)? = {
+            guard let path = monitoredPath else { return nil }
+            if case .lan(let host, let port, _) = path {
+                return (host, port)
+            }
+            return nil
+        }()
         
         Task.detached(priority: .utility) { [weak self] in
             guard let self = self else { return }
@@ -1397,17 +1411,13 @@ public final class DualPaneViewModel: ObservableObject {
             var isSocketActive = false
             if isAdbConnected {
                 isSocketActive = PhoneConnectionManager.shared.isHostPortReachable(host: "127.0.0.1", port: 2222, timeoutSeconds: 1)
+            } else if let endpoint = monitoredWifiEndpoint {
+                isSocketActive = PhoneConnectionManager.shared.isHostPortReachable(host: endpoint.host, port: endpoint.port, timeoutSeconds: 1)
             } else {
                 let hostToCheck = UserDefaults.standard.string(forKey: "lastConnectedHost") ?? ""
                 let portToCheck: UInt16 = UInt16(UserDefaults.standard.string(forKey: "lastConnectedPort") ?? "2222") ?? 2222
                 if !hostToCheck.isEmpty && hostToCheck != "127.0.0.1" {
                     isSocketActive = PhoneConnectionManager.shared.isHostPortReachable(host: hostToCheck, port: portToCheck, timeoutSeconds: 1)
-                }
-                if !isSocketActive {
-                    // Проверяем доступность устройства в локальной сети Wi-Fi
-                    if PhoneConnectionManager.shared.discoverPhoneIpOnLan() != nil {
-                        isSocketActive = true
-                    }
                 }
             }
             
@@ -1418,6 +1428,14 @@ public final class DualPaneViewModel: ObservableObject {
                 if self.remoteDriver.isConnected {
                     // Если связь была активна, но сокет пропал (отключили кабель или Wi-Fi)
                     if !socketDetected && !adbDetected {
+                        if monitoredWifiEndpoint != nil {
+                            // Wi‑Fi может пропустить один-два probe во время
+                            // роуминга между точками доступа. Не рвём SFTP
+                            // сессию, пока пропадание не подтверждено.
+                            self.wifiReachabilityMisses += 1
+                            guard self.wifiReachabilityMisses >= self.wifiReachabilityMissLimit else { return }
+                        }
+                        self.wifiReachabilityMisses = 0
                         self.isPhoneConnected = false
                         self.remoteDriver.disconnect()
                         self.refreshUsbDrives()
@@ -1425,10 +1443,14 @@ public final class DualPaneViewModel: ObservableObject {
                         if self.rightSource == .remotePhone { self.refreshPane(side: .right) }
                         self.statusMessage = "Телефон отключен (связь потеряна)"
                     } else if !self.isPhoneConnected {
+                        self.wifiReachabilityMisses = 0
                         self.isPhoneConnected = true
                         self.refreshUsbDrives()
+                    } else {
+                        self.wifiReachabilityMisses = 0
                     }
                 } else {
+                    self.wifiReachabilityMisses = 0
                     // Если SFTP драйвер не подключен, индикатор ОБЯЗАН быть серым (не подключен)
                     if self.isPhoneConnected {
                         self.isPhoneConnected = false

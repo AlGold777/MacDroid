@@ -190,6 +190,14 @@ public final class ConnectionController: ObservableObject {
                 port: port,
                 isMigrated: isMigrated
             )
+            // Сохраняем фактически использованный endpoint, включая адрес,
+            // найденный через Bonjour/ARP. Это позволяет восстановить Wi‑Fi
+            // после смены интерфейса или перезапуска приложения.
+            if case .lan = candidate {
+                UserDefaults.standard.set(host, forKey: "lastConnectedHost")
+                UserDefaults.standard.set(Int(port), forKey: "lastConnectedPort")
+                Self.rememberConnection(name: devName, host: host, port: port)
+            }
             return true
         } catch {
             guard isAttemptValid(attemptId) else { return false }
@@ -355,6 +363,17 @@ public final class ConnectionController: ObservableObject {
     
     private func isAttemptValid(_ id: UUID) -> Bool {
         return activeAttemptId == id
+    }
+
+    private static func rememberConnection(name: String, host: String, port: UInt16) {
+        let newConnection = SavedConnection(name: name, host: host, port: Int(port))
+        var history = (try? JSONDecoder().decode(
+            [SavedConnection].self,
+            from: UserDefaults.standard.data(forKey: "phoneConnectionHistory") ?? Data()
+        )) ?? []
+        history.removeAll { $0.host == host && $0.port == Int(port) }
+        history.insert(newConnection, at: 0)
+        UserDefaults.standard.set(try? JSONEncoder().encode(Array(history.prefix(8))), forKey: "phoneConnectionHistory")
     }
 }
 
