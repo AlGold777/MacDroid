@@ -4,6 +4,14 @@ import CryptoKit
 /// Единый координатор сессии Mac ↔ Android, управляющий жизненным циклом соединения,
 /// каналами SFTP, бюджетами ресурсов и сопоставлением путей.
 public final class SessionCoordinator: @unchecked Sendable {
+    public static func controlSocketPath(home: URL, identifier: UUID = UUID()) -> String {
+        let compactIdentifier = identifier.uuidString.replacingOccurrences(of: "-", with: "").lowercased()
+        return home
+            .appendingPathComponent("Library/Caches/MCD", isDirectory: true)
+            .appendingPathComponent("c_\(compactIdentifier)", isDirectory: false)
+            .path
+    }
+
     public static let shared = SessionCoordinator()
     
     private let lock = NSRecursiveLock()
@@ -228,7 +236,7 @@ public final class SessionCoordinator: @unchecked Sendable {
             "-o", "Compression=no",
             "-o", "IPQoS=throughput",
             "-o", "StrictHostKeyChecking=yes",
-            "-o", "UserKnownHostsFile=\(knownHostsURL.path)",
+            "-o", "UserKnownHostsFile=\(HostKeyStore.openSSHConfigValue(knownHostsURL.path))",
             "-p", String(targetPort)
         ])
         if let keyAlias {
@@ -243,10 +251,10 @@ public final class SessionCoordinator: @unchecked Sendable {
         let sshDestination = "\(sshUser)@\(targetHost)"
         
         // Попытка OpenSSH Multiplexing через ControlMaster
-        let socketDirectory = home.appendingPathComponent("Library/Caches/MacDroidCommander/ControlSockets", isDirectory: true)
+        let socketDirectory = home.appendingPathComponent("Library/Caches/MCD", isDirectory: true)
         try FileManager.default.createDirectory(at: socketDirectory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
         try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: socketDirectory.path)
-        let sockPath = socketDirectory.appendingPathComponent("mcd_\(UUID().uuidString).sock").path
+        let sockPath = Self.controlSocketPath(home: home)
         
         var interactiveChan: SFTPChannel?
         var bulkChan: SFTPChannel?

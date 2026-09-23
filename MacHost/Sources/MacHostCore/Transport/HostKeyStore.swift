@@ -13,8 +13,17 @@ public final class HostKeyStore: @unchecked Sendable {
     private let storageURL: URL
 
     public static func safeHostKeyAlias(_ value: String) -> String {
-        let safe = String(value.map { $0.isLetter || $0.isNumber || $0 == "-" || $0 == "_" ? $0 : "_" })
+        let safe = String(value.map { $0.isLetter || $0.isNumber || $0 == "-" || $0 == "_" ? $0 : "_" }).lowercased()
         return safe.isEmpty ? "device" : safe
+    }
+
+    /// Quotes a value embedded in an OpenSSH `-o Name=value` argument.
+    /// OpenSSH tokenizes list-valued options such as UserKnownHostsFile on spaces.
+    public static func openSSHConfigValue(_ value: String) -> String {
+        let escaped = value
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
+        return "\"\(escaped)\""
     }
     
     private init() {
@@ -75,8 +84,11 @@ public final class HostKeyStore: @unchecked Sendable {
         guard observedFields.count >= 3 else {
             throw NSError(domain: "HostKeyStore", code: 1, userInfo: [NSLocalizedDescriptionKey: "Некорректная строка ключа SSH."])
         }
-        let alias = hostKeyAlias ?? "mcd-" + String(observation.fingerprint.filter { $0.isLetter || $0.isNumber }.suffix(24))
-        let knownHostsHost = "[\(alias)]:\(port)"
+        let alias = Self.safeHostKeyAlias(hostKeyAlias ?? "mcd-" + String(observation.fingerprint.filter { $0.isLetter || $0.isNumber }.suffix(24)))
+        // HostKeyAlias replaces the hostname OpenSSH uses for known_hosts lookup;
+        // unlike a literal non-standard-port host, it is stored without [host]:port.
+        let knownHostsHost = alias
+        let legacyKnownHostsHost = "[\(alias)]:\(port)"
         let knownHostsLine = ([knownHostsHost] + observedFields.dropFirst().map(String.init)).joined(separator: " ")
 
         let url = openSSHKnownHostsURL(host: host, port: port, deviceId: deviceId)
@@ -91,7 +103,9 @@ public final class HostKeyStore: @unchecked Sendable {
             .map(String.init) ?? []
         let preservedLines = existingLines.filter { line in
             guard let lineHost = line.split(whereSeparator: \.isWhitespace).first else { return false }
-            return lineHost != knownHostsHost
+            let normalizedHost = lineHost.lowercased()
+            return normalizedHost != knownHostsHost.lowercased()
+                && normalizedHost != legacyKnownHostsHost.lowercased()
         }
         let updatedContents = (preservedLines + [knownHostsLine]).joined(separator: "\n") + "\n"
         try Data(updatedContents.utf8).write(to: url, options: .atomic)
@@ -157,18 +171,19 @@ public final class HostKeyStore: @unchecked Sendable {
 
         let url = openSSHKnownHostsURL(host: "", port: UInt16(clamping: port))
         guard let contents = try? String(contentsOf: url, encoding: .utf8) else { return }
-        let entry = "[\(alias)]:\(port)"
+        let entries = Set([alias.lowercased(), "[\(alias)]:\(port)".lowercased()])
         let lines = contents.components(separatedBy: .newlines)
         let retainedLines = lines.filter { line in
             let fields = line.split(whereSeparator: { $0.isWhitespace })
-            return fields.first.map { String($0) } != entry
+            guard let host = fields.first.map({ String($0).lowercased() }) else { return false }
+            return !entries.contains(host)
         }
         let updated = retainedLines.isEmpty ? "" : retainedLines.joined(separator: "\n") + "\n"
         do {
             try Data(updated.utf8).write(to: url, options: .atomic)
             try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
         } catch {
-            NSLog("Unable to remove SSH known_hosts entry %@: %@", entry, error.localizedDescription)
+            NSLog("Unable to remove SSH known_hosts entry %@: %@", alias, error.localizedDescription)
         }
     }
     

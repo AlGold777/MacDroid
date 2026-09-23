@@ -182,6 +182,16 @@ let resetPort = 39871
 let resetFingerprint = "SHA256:KnownHostsResetRegressionFingerprint"
 let preservedFingerprint = "SHA256:KnownHostsPreservationRegressionFingerprint"
 let resetAlias = HostKeyStore.safeHostKeyAlias("dev_\(resetFingerprint.filter { $0.isLetter || $0.isNumber }.suffix(24))")
+assertCondition(resetAlias == resetAlias.lowercased(), "OpenSSH host-key aliases are normalized to lowercase")
+let quotedKnownHostsPath = HostKeyStore.openSSHConfigValue("/Users/test/Library/Application Support/MacDroidCommander/known_hosts")
+assertCondition(quotedKnownHostsPath == "\"/Users/test/Library/Application Support/MacDroidCommander/known_hosts\"", "OpenSSH config values preserve paths containing spaces")
+assertCondition(HostKeyStore.openSSHConfigValue("/tmp/a\\b\"c") == "\"/tmp/a\\\\b\\\"c\"", "OpenSSH config values escape quotes and backslashes")
+let shortControlSocketPath = SessionCoordinator.controlSocketPath(
+    home: URL(fileURLWithPath: "/Users/restart", isDirectory: true),
+    identifier: UUID(uuidString: "00000000-0000-0000-0000-000000000000")!
+)
+assertCondition(shortControlSocketPath.utf8.count <= 84, "OpenSSH ControlMaster socket path leaves room for OpenSSH's temporary suffix")
+let mixedCaseResetAlias = "DEV_\(resetFingerprint.filter { $0.isLetter || $0.isNumber }.suffix(24))"
 let preservedAlias = "knownhosts-preserve-regression"
 keyStore.resetHostKey(host: resetHost, port: resetPort)
 keyStore.resetHostKey(host: preservedHost, port: resetPort)
@@ -192,7 +202,7 @@ do {
         SSHHostKeyObservation(fingerprint: resetFingerprint, knownHostsLine: "phone ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFakeRegressionKey", keyAlgorithm: "ssh-ed25519"),
         host: resetHost,
         port: UInt16(resetPort),
-        hostKeyAlias: resetAlias
+        hostKeyAlias: mixedCaseResetAlias
     )
     try keyStore.installOpenSSHHostKey(
         SSHHostKeyObservation(fingerprint: preservedFingerprint, knownHostsLine: "phone ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFakePreservedKey", keyAlgorithm: "ssh-ed25519"),
@@ -200,10 +210,15 @@ do {
         port: UInt16(resetPort),
         hostKeyAlias: preservedAlias
     )
+    let knownHostsURL = keyStore.openSSHKnownHostsURL(host: resetHost, port: UInt16(resetPort))
+    let beforeLegacyMigration = try String(contentsOf: knownHostsURL, encoding: .utf8)
+    let legacyEntry = "[\(mixedCaseResetAlias)]:\(resetPort) ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILegacyMixedCaseKey\n"
+    try Data((beforeLegacyMigration + legacyEntry).utf8).write(to: knownHostsURL, options: .atomic)
     keyStore.resetHostKey(host: resetHost, port: resetPort)
-    let knownHosts = try String(contentsOf: keyStore.openSSHKnownHostsURL(host: resetHost, port: UInt16(resetPort)), encoding: .utf8)
-    assertCondition(!knownHosts.contains("[\(resetAlias)]:\(resetPort)"), "Host key reset removes the matching OpenSSH known_hosts entry")
-    assertCondition(knownHosts.contains("[\(preservedAlias)]:\(resetPort)"), "Host key reset preserves other devices' known_hosts entries")
+    let knownHosts = try String(contentsOf: knownHostsURL, encoding: .utf8)
+    assertCondition(!knownHosts.contains("\(resetAlias) ssh-ed25519"), "Host key reset removes the matching OpenSSH HostKeyAlias entry")
+    assertCondition(!knownHosts.contains("[\(mixedCaseResetAlias)]:\(resetPort)"), "Host key reset removes a legacy mixed-case [alias]:port entry")
+    assertCondition(knownHosts.contains("\(preservedAlias) ssh-ed25519"), "Host key reset preserves other devices' OpenSSH entries")
 } catch {
     assertCondition(false, "Known hosts reset regression setup failed: \(error.localizedDescription)")
 }

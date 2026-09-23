@@ -362,7 +362,7 @@ public final class ConnectionController: ObservableObject {
                 "-i", legacyKey.path, "-p", String(port), "-F", "/dev/null",
                 "-o", "IdentitiesOnly=yes", "-o", "BatchMode=yes", "-o", "ConnectTimeout=4",
                 "-o", "StrictHostKeyChecking=yes", "-o", "HostKeyAlias=\(hostKeyAlias)",
-                "-o", "UserKnownHostsFile=\(knownHostsURL.path)",
+                "-o", "UserKnownHostsFile=\(HostKeyStore.openSSHConfigValue(knownHostsURL.path))",
                 "\(sshUser)@\(host)", "authorize_key \(pubKey)"
             ]
             let outPipe = Pipe()
