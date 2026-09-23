@@ -17,6 +17,7 @@ public final class SFTPChannel: @unchecked Sendable {
     private var isClosed = false
     private var nextReqId: UInt32 = 1
     private var consecutiveRequestTimeouts = 0
+    private var lastResponseUptime = ProcessInfo.processInfo.systemUptime
     
     private enum PendingEntry {
         case active(continuation: CheckedContinuation<(type: SFTPMessageType, payload: Data), Error>)
@@ -48,6 +49,14 @@ public final class SFTPChannel: @unchecked Sendable {
         defer { lock.unlock() }
         return !isClosed && process.isRunning
     }
+
+    public var idleDuration: TimeInterval {
+        lock.lock()
+        defer { lock.unlock() }
+        return ProcessInfo.processInfo.systemUptime - lastResponseUptime
+    }
+
+    public var sshDiagnosticMessage: String { diagnosticMessage() }
     
     /// Выделение уникального requestId с защитой от wraparound и переиспользования in-flight ID
     public func allocateRequestId() -> UInt32 {
@@ -147,7 +156,7 @@ public final class SFTPChannel: @unchecked Sendable {
                     if entry != nil { self.pendingRequests[requestId] = .cancelled }
                     self.requestTimeoutWorkItems.removeValue(forKey: requestId)
                     self.consecutiveRequestTimeouts += 1
-                    let shouldClose = self.consecutiveRequestTimeouts >= 3
+                    let shouldClose = self.consecutiveRequestTimeouts >= 2
                     self.lock.unlock()
                     if case .active(let cont) = entry {
                         cont.resume(throwing: NSError(
@@ -282,6 +291,7 @@ public final class SFTPChannel: @unchecked Sendable {
                 let entry = pendingRequests.removeValue(forKey: reqId)
                 requestTimeoutWorkItems.removeValue(forKey: reqId)?.cancel()
                 consecutiveRequestTimeouts = 0
+                lastResponseUptime = ProcessInfo.processInfo.systemUptime
                 lock.unlock()
                 
                 switch entry {
@@ -353,6 +363,10 @@ public final class SFTPChannel: @unchecked Sendable {
             }
         }
         timeouts.values.forEach { $0.cancel() }
+
+        let exitStatus = process.isRunning ? "running" : String(process.terminationStatus)
+        let diagnostics = diagnosticMessage()
+        SSHTransportLog.write("SFTP channel teardown channel=\(channelId) exit=\(exitStatus) error=\(error.localizedDescription) stderr=\(diagnostics)")
         
         if process.isRunning {
             process.terminate()

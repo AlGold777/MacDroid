@@ -31,6 +31,7 @@ public final class SessionCoordinator: @unchecked Sendable {
     private var activeConnectTask: Task<Void, Error>?
     private var activeConnectAllowsLegacyFallback: Bool?
     private var activeSessionAllowsLegacyFallback: Bool?
+    private var preferredLegacyFallbackPolicy: Bool?
     private var expectedHostKeyAlgorithm: String?
     private var hostKeyAlias: String?
     private var connectingChannels: [SFTPChannel] = []
@@ -67,6 +68,7 @@ public final class SessionCoordinator: @unchecked Sendable {
         self.deviceId = deviceId
         self.expectedHostKeyAlgorithm = nil
         self.hostKeyAlias = nil
+        self.preferredLegacyFallbackPolicy = nil
         self._interactiveChannel?.close()
         self._interactiveChannel = nil
         self._bulkChannel?.close()
@@ -94,15 +96,31 @@ public final class SessionCoordinator: @unchecked Sendable {
     }
     
     /// Гарантирует активное подключение к Android
-    public func ensureConnected(allowLegacyFallback: Bool = false) async throws {
+    public func ensureConnected(allowLegacyFallback: Bool? = nil) async throws {
         lock.lock()
+        let resolvedLegacyFallback = allowLegacyFallback ?? preferredLegacyFallbackPolicy ?? activeSessionAllowsLegacyFallback ?? false
+        if let allowLegacyFallback {
+            preferredLegacyFallbackPolicy = allowLegacyFallback
+        }
         if let chan = _interactiveChannel, chan.isRunning,
-           activeSessionAllowsLegacyFallback == allowLegacyFallback {
+           activeSessionAllowsLegacyFallback == resolvedLegacyFallback {
+            let shouldProbe = chan.idleDuration >= 20
             lock.unlock()
+            if shouldProbe {
+                do {
+                    let requestId = chan.allocateRequestId()
+                    let packet = packetEngine.createStatPacket(requestId: requestId, path: "/")
+                    _ = try await chan.sendRequest(packet: packet, requestId: requestId, timeoutSeconds: 5)
+                } catch {
+                    SSHTransportLog.write("SFTP health probe failed channel=\(chan.channelId) error=\(error.localizedDescription)")
+                    chan.close()
+                    try await ensureConnected()
+                }
+            }
             return
         }
         if let existing = activeConnectTask {
-            if activeConnectAllowsLegacyFallback == allowLegacyFallback {
+            if activeConnectAllowsLegacyFallback == resolvedLegacyFallback {
                 lock.unlock()
                 try await existing.value
                 return
@@ -115,10 +133,10 @@ public final class SessionCoordinator: @unchecked Sendable {
         let epoch = sessionEpoch
         let task = Task { [weak self] () -> Void in
             guard let self = self else { return }
-            try await self.performConnect(allowLegacyFallback: allowLegacyFallback, epoch: epoch)
+            try await self.performConnect(allowLegacyFallback: resolvedLegacyFallback, epoch: epoch)
         }
         self.activeConnectTask = task
-        self.activeConnectAllowsLegacyFallback = allowLegacyFallback
+        self.activeConnectAllowsLegacyFallback = resolvedLegacyFallback
         lock.unlock()
         
         defer {
@@ -204,8 +222,9 @@ public final class SessionCoordinator: @unchecked Sendable {
             "-o", "IdentitiesOnly=yes",
             "-o", "BatchMode=yes",
             "-o", "ConnectTimeout=5",
-            "-o", "ServerAliveInterval=15",
-            "-o", "ServerAliveCountMax=2",
+            "-o", "ServerAliveInterval=10",
+            "-o", "ServerAliveCountMax=6",
+            "-o", "LogLevel=VERBOSE",
             "-o", "Compression=no",
             "-o", "IPQoS=throughput",
             "-o", "StrictHostKeyChecking=yes",
@@ -246,7 +265,14 @@ public final class SessionCoordinator: @unchecked Sendable {
             masterProc.arguments = masterArgs
             masterProc.standardInput = FileHandle.nullDevice
             masterProc.standardOutput = FileHandle.nullDevice
-            masterProc.standardError = FileHandle.nullDevice
+            let masterErrorPipe = Pipe()
+            masterProc.standardError = masterErrorPipe
+            let masterDiagnostics = SSHDiagnostics(pipe: masterErrorPipe)
+            masterProc.terminationHandler = { process in
+                DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 0.1) {
+                    SSHTransportLog.write("ControlMaster exited status=\(process.terminationStatus) reason=\(process.terminationReason) stderr=\(masterDiagnostics.message)")
+                }
+            }
             
             try masterProc.run()
             self.lock.lock()
@@ -261,7 +287,7 @@ public final class SessionCoordinator: @unchecked Sendable {
             
             // Ждем появления сокета: Wi-Fi host-key handshake может занимать несколько секунд.
             var sockReady = false
-            for _ in 0..<60 {
+            for _ in 0..<80 {
                 if FileManager.default.fileExists(atPath: sockPath) {
                     sockReady = true
                     break
@@ -271,6 +297,7 @@ public final class SessionCoordinator: @unchecked Sendable {
             }
             
             if sockReady {
+                try checkControlMaster(sockPath: sockPath, port: targetPort, destination: sshDestination)
                 // Создаем два SFTP канала через slave ssh процессы
                 let chan1 = try spawnSlaveChannel(
                     sockPath: sockPath,
@@ -301,9 +328,14 @@ public final class SessionCoordinator: @unchecked Sendable {
                     // Инициализируем и второй канал
                     interactiveChan = chan1
                     let initPkt2 = packetEngine.createInitPacket()
-                    if let secondInit = try? await chan2.sendInitPacket(packet: initPkt2), secondInit.type == .version {
+                    do {
+                        let secondInit = try await chan2.sendInitPacket(packet: initPkt2)
+                        guard secondInit.type == .version else {
+                            throw NSError(domain: "SessionCoordinator", code: 12, userInfo: [NSLocalizedDescriptionKey: "Unexpected SFTP init response: \(secondInit.type)"])
+                        }
                         bulkChan = chan2
-                    } else {
+                    } catch {
+                        SSHTransportLog.write("Bulk SFTP channel init failed channel=\(chan2.channelId) error=\(error.localizedDescription) stderr=\(chan2.sshDiagnosticMessage)")
                         // Один рабочий канал лучше двух, один из которых
                         // фактически не прошёл SFTP handshake.
                         chan2.close()
@@ -345,6 +377,11 @@ public final class SessionCoordinator: @unchecked Sendable {
             let errorPipe = Pipe()
             singleProc.standardError = errorPipe
             let diagnostics = SSHDiagnostics(pipe: errorPipe)
+            singleProc.terminationHandler = { process in
+                DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 0.1) {
+                    SSHTransportLog.write("SSH SFTP process exited channel=single_\(currentEpoch) status=\(process.terminationStatus) reason=\(process.terminationReason) stderr=\(diagnostics.message)")
+                }
+            }
             
             try singleProc.run()
             
@@ -425,6 +462,30 @@ public final class SessionCoordinator: @unchecked Sendable {
         }
         connectingChannels.append(channel)
     }
+
+    private func checkControlMaster(sockPath: String, port: UInt16, destination: String) throws {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/ssh")
+        process.arguments = ["-F", "/dev/null", "-S", sockPath, "-p", String(port), "-O", "check", destination]
+        process.standardInput = FileHandle.nullDevice
+        process.standardOutput = FileHandle.nullDevice
+        let errorPipe = Pipe()
+        process.standardError = errorPipe
+        let diagnostics = SSHDiagnostics(pipe: errorPipe)
+        let finished = DispatchSemaphore(value: 0)
+        process.terminationHandler = { _ in finished.signal() }
+        try process.run()
+        if finished.wait(timeout: .now() + 3) == .timedOut {
+            process.terminate()
+            SSHTransportLog.write("ControlMaster check timed out socket=\(sockPath)")
+            throw NSError(domain: "SessionCoordinator", code: 13, userInfo: [NSLocalizedDescriptionKey: "ControlMaster check timed out"])
+        }
+        guard process.terminationStatus == 0 else {
+            let message = diagnostics.message
+            SSHTransportLog.write("ControlMaster check failed status=\(process.terminationStatus) stderr=\(message)")
+            throw NSError(domain: "SessionCoordinator", code: 14, userInfo: [NSLocalizedDescriptionKey: "ControlMaster unavailable: \(message)"])
+        }
+    }
     
     private func spawnSlaveChannel(sockPath: String, baseArgs: [String], destination: String, channelId: String, isInteractive: Bool) throws -> SFTPChannel {
         let proc = Process()
@@ -437,6 +498,11 @@ public final class SessionCoordinator: @unchecked Sendable {
         let errorPipe = Pipe()
         proc.standardError = errorPipe
         let diagnostics = SSHDiagnostics(pipe: errorPipe)
+        proc.terminationHandler = { process in
+            DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 0.1) {
+                SSHTransportLog.write("SSH SFTP process exited channel=\(channelId) status=\(process.terminationStatus) reason=\(process.terminationReason) stderr=\(diagnostics.message)")
+            }
+        }
         try proc.run()
         
         return SFTPChannel(

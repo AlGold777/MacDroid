@@ -22,7 +22,7 @@ public final class RemoteSFTPDriver: FileSystemDriver, @unchecked Sendable {
         coordinator.updateEndpoint(host: host, port: port, deviceId: deviceId)
     }
     
-    public func ensureConnected(allowLegacyFallback: Bool = false) async throws {
+    public func ensureConnected(allowLegacyFallback: Bool? = nil) async throws {
         try await coordinator.ensureConnected(allowLegacyFallback: allowLegacyFallback)
     }
     

@@ -14,8 +14,9 @@ struct ChannelTests {
         try await tests.testInitTimeoutClosesStalledChannel()
         try await tests.testCancelledRequestCompletesWithoutPeerReply()
         try await tests.testRequestTimeoutCompletesWithoutReply()
+        try await tests.testSecondConsecutiveTimeoutClosesChannel()
         try await tests.testSuccessfulVersionResponse()
-        print("PASS: handshake timeout, request cancellation, request timeout, VERSION response")
+        print("PASS: handshake timeout, request cancellation, consecutive request timeouts, VERSION response")
     }
 
     func testSuccessfulVersionResponse() async throws {
@@ -77,5 +78,17 @@ struct ChannelTests {
             _ = try await channel.sendRequest(packet: Data([0]), requestId: channel.allocateRequestId(), timeoutSeconds: 0.05)
             XCTFail("Silent peer must time out")
         } catch { XCTAssertEqual((error as NSError).code, 11) }
+    }
+
+    func testSecondConsecutiveTimeoutClosesChannel() async throws {
+        let channel = try stalledChannel()
+        defer { channel.close() }
+        for _ in 0..<2 {
+            do {
+                _ = try await channel.sendRequest(packet: Data([0]), requestId: channel.allocateRequestId(), timeoutSeconds: 0.05)
+                XCTFail("Silent peer must time out")
+            } catch { XCTAssertEqual((error as NSError).code, 11) }
+        }
+        XCTAssertTrue(!channel.isRunning)
     }
 }
