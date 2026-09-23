@@ -175,6 +175,40 @@ if case .mismatchWarning = status3 {
     assertCondition(false, "Attacker key mismatch was not detected!")
 }
 
+// Сброс ключа удаляет связанную SSH known_hosts запись, сохраняя записи других устройств.
+let resetHost = "203.0.113.251"
+let preservedHost = "203.0.113.252"
+let resetPort = 39871
+let resetFingerprint = "SHA256:KnownHostsResetRegressionFingerprint"
+let preservedFingerprint = "SHA256:KnownHostsPreservationRegressionFingerprint"
+let resetAlias = HostKeyStore.safeHostKeyAlias("dev_\(resetFingerprint.filter { $0.isLetter || $0.isNumber }.suffix(24))")
+let preservedAlias = "knownhosts-preserve-regression"
+keyStore.resetHostKey(host: resetHost, port: resetPort)
+keyStore.resetHostKey(host: preservedHost, port: resetPort)
+_ = keyStore.verifyOrPin(host: resetHost, port: resetPort, fingerprint: resetFingerprint)
+_ = keyStore.verifyOrPin(host: preservedHost, port: resetPort, fingerprint: preservedFingerprint)
+do {
+    try keyStore.installOpenSSHHostKey(
+        SSHHostKeyObservation(fingerprint: resetFingerprint, knownHostsLine: "phone ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFakeRegressionKey", keyAlgorithm: "ssh-ed25519"),
+        host: resetHost,
+        port: UInt16(resetPort),
+        hostKeyAlias: resetAlias
+    )
+    try keyStore.installOpenSSHHostKey(
+        SSHHostKeyObservation(fingerprint: preservedFingerprint, knownHostsLine: "phone ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFakePreservedKey", keyAlgorithm: "ssh-ed25519"),
+        host: preservedHost,
+        port: UInt16(resetPort),
+        hostKeyAlias: preservedAlias
+    )
+    keyStore.resetHostKey(host: resetHost, port: resetPort)
+    let knownHosts = try String(contentsOf: keyStore.openSSHKnownHostsURL(host: resetHost, port: UInt16(resetPort)), encoding: .utf8)
+    assertCondition(!knownHosts.contains("[\(resetAlias)]:\(resetPort)"), "Host key reset removes the matching OpenSSH known_hosts entry")
+    assertCondition(knownHosts.contains("[\(preservedAlias)]:\(resetPort)"), "Host key reset preserves other devices' known_hosts entries")
+} catch {
+    assertCondition(false, "Known hosts reset regression setup failed: \(error.localizedDescription)")
+}
+keyStore.resetHostKey(host: preservedHost, port: resetPort)
+
 // 5b. Тест автомиграции устаревших фиктивных отпечатков из ранних версий
 let legacyHost = "192.168.1.199"
 let legacyMockFp = "SHA256:Ed25519_Xiaomi14Ultra_DaemonFingerprint"

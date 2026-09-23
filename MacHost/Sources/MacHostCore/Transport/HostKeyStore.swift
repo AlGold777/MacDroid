@@ -119,7 +119,57 @@ public final class HostKeyStore: @unchecked Sendable {
     }
     
     public func resetHostKey(host: String, port: Int, deviceId: String? = nil) {
+        let effectiveDeviceId = deviceId ?? PhoneConnectionManager.shared.getConnectedDeviceId()
+        let storageKey: String
+        if (host == "127.0.0.1" || host == "localhost"), let effectiveDeviceId, !effectiveDeviceId.isEmpty {
+            storageKey = "usb_\(effectiveDeviceId)"
+        } else {
+            storageKey = "\(host):\(port)"
+        }
+
+        lock.lock()
+        let previousFingerprint = pinnedKeys[storageKey]
+        lock.unlock()
+
+        let registeredDevice = previousFingerprint.flatMap { DeviceRegistry.shared.device(matchingFingerprint: $0) }
+            ?? DeviceRegistry.shared.device(matchingHost: host)
+        let alias: String?
+        if let deviceId, !deviceId.isEmpty {
+            alias = Self.safeHostKeyAlias(deviceId)
+        } else if let registeredDevice {
+            alias = Self.safeHostKeyAlias(registeredDevice.id)
+        } else if let previousFingerprint {
+            let suffix = previousFingerprint.filter { $0.isLetter || $0.isNumber }.suffix(24)
+            alias = Self.safeHostKeyAlias("dev_\(suffix)")
+        } else {
+            alias = nil
+        }
+
+        if let alias {
+            removeOpenSSHHostKey(alias: alias, port: port)
+        }
         unpin(host: host, port: port, deviceId: deviceId)
+    }
+
+    private func removeOpenSSHHostKey(alias: String, port: Int) {
+        lock.lock()
+        defer { lock.unlock() }
+
+        let url = openSSHKnownHostsURL(host: "", port: UInt16(clamping: port))
+        guard let contents = try? String(contentsOf: url, encoding: .utf8) else { return }
+        let entry = "[\(alias)]:\(port)"
+        let lines = contents.components(separatedBy: .newlines)
+        let retainedLines = lines.filter { line in
+            let fields = line.split(whereSeparator: { $0.isWhitespace })
+            return fields.first.map { String($0) } != entry
+        }
+        let updated = retainedLines.isEmpty ? "" : retainedLines.joined(separator: "\n") + "\n"
+        do {
+            try Data(updated.utf8).write(to: url, options: .atomic)
+            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+        } catch {
+            NSLog("Unable to remove SSH known_hosts entry %@: %@", entry, error.localizedDescription)
+        }
     }
     
     public func isHostPinned(host: String, port: Int, deviceId: String? = nil) -> Bool {

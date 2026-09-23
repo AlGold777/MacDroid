@@ -9,6 +9,7 @@ public final class SFTPChannel: @unchecked Sendable {
     private let inHandle: FileHandle
     private let outHandle: FileHandle
     private let diagnosticMessage: @Sendable () -> String
+    private let waitForDiagnostics: @Sendable (TimeInterval) -> String
     
     private let writerQueue: DispatchQueue
     private let readerQueue: DispatchQueue
@@ -31,8 +32,17 @@ public final class SFTPChannel: @unchecked Sendable {
     
     public static let maxPacketLength: Int = 4 * 1024 * 1024 // 4 MiB жесткий потолок
     
-    public init(channelId: String, isInteractive: Bool, process: Process, inHandle: FileHandle, outHandle: FileHandle, diagnosticMessage: @escaping @Sendable () -> String = { "" }) {
+    public init(
+        channelId: String,
+        isInteractive: Bool,
+        process: Process,
+        inHandle: FileHandle,
+        outHandle: FileHandle,
+        diagnosticMessage: @escaping @Sendable () -> String = { "" },
+        waitForDiagnostics: @escaping @Sendable (TimeInterval) -> String = { _ in "" }
+    ) {
         self.diagnosticMessage = diagnosticMessage
+        self.waitForDiagnostics = waitForDiagnostics
         self.channelId = channelId
         self.isInteractive = isInteractive
         self.process = process
@@ -325,8 +335,15 @@ public final class SFTPChannel: @unchecked Sendable {
             
             let needed = count - accumulated.count
             guard let chunk = try outHandle.read(upToCount: needed), !chunk.isEmpty else {
+                let deadline = ProcessInfo.processInfo.systemUptime + 1
+                _ = waitForDiagnostics(1)
+                while process.isRunning && ProcessInfo.processInfo.systemUptime < deadline {
+                    Thread.sleep(forTimeInterval: 0.01)
+                }
                 let details = diagnosticMessage()
-                throw NSError(domain: "SFTPChannel", code: 3, userInfo: [NSLocalizedDescriptionKey: details.isEmpty ? "SFTP connection closed prematurely" : "SSH: \(details)"])
+                let status = process.isRunning ? "процесс SSH ещё работает" : "код завершения SSH \(process.terminationStatus)"
+                let reason = details.isEmpty ? status : "\(status); SSH: \(details)"
+                throw NSError(domain: "SFTPChannel", code: 3, userInfo: [NSLocalizedDescriptionKey: "SFTP connection closed prematurely (\(reason))"])
             }
             accumulated.append(chunk)
         }

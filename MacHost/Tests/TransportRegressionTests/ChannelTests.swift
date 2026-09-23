@@ -1,6 +1,23 @@
 import Foundation
 import MacHostCore
 
+private final class StderrBuffer: @unchecked Sendable {
+    private let lock = NSLock()
+    private var data = Data()
+
+    func append(_ chunk: Data) {
+        lock.lock()
+        data.append(chunk)
+        lock.unlock()
+    }
+
+    var message: String {
+        lock.lock()
+        defer { lock.unlock() }
+        return String(decoding: data, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+}
+
 func XCTFail(_ message: String) { fatalError(message) }
 func XCTAssertTrue(_ value: Bool) { precondition(value) }
 func XCTAssertEqual(_ a: Int, _ b: Int) { precondition(a == b) }
@@ -15,8 +32,9 @@ struct ChannelTests {
         try await tests.testCancelledRequestCompletesWithoutPeerReply()
         try await tests.testRequestTimeoutCompletesWithoutReply()
         try await tests.testSecondConsecutiveTimeoutClosesChannel()
+        try await tests.testPrematureEOFIncludesSSHStderrAndExitCode()
         try await tests.testSuccessfulVersionResponse()
-        print("PASS: handshake timeout, request cancellation, consecutive request timeouts, VERSION response")
+        print("PASS: handshake timeout, request cancellation, consecutive timeouts, SSH EOF diagnostics, VERSION response")
     }
 
     func testSuccessfulVersionResponse() async throws {
@@ -90,5 +108,48 @@ struct ChannelTests {
             } catch { XCTAssertEqual((error as NSError).code, 11) }
         }
         XCTAssertTrue(!channel.isRunning)
+    }
+
+    func testPrematureEOFIncludesSSHStderrAndExitCode() async throws {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/sh")
+        process.arguments = ["-c", "printf 'Permission denied (publickey).\\n' >&2; exit 255"]
+        let input = Pipe(), output = Pipe(), errorOutput = Pipe()
+        process.standardInput = input
+        process.standardOutput = output
+        process.standardError = errorOutput
+
+        let drained = DispatchGroup()
+        drained.enter()
+        let buffer = StderrBuffer()
+        DispatchQueue.global(qos: .utility).async {
+            defer { drained.leave() }
+            while let chunk = try? errorOutput.fileHandleForReading.read(upToCount: 1024), !chunk.isEmpty {
+                buffer.append(chunk)
+            }
+        }
+        try process.run()
+
+        let channel = SFTPChannel(
+            channelId: "ssh-eof-diagnostics",
+            isInteractive: true,
+            process: process,
+            inHandle: input.fileHandleForWriting,
+            outHandle: output.fileHandleForReading,
+            diagnosticMessage: { buffer.message },
+            waitForDiagnostics: { timeout in
+                _ = drained.wait(timeout: .now() + timeout)
+                return buffer.message
+            }
+        )
+        defer { channel.close() }
+
+        do {
+            _ = try await channel.sendInitPacket(packet: SFTPPacketEngine().createInitPacket(), timeoutSeconds: 1)
+            XCTFail("A process that exits before VERSION must fail initialization")
+        } catch {
+            let message = error.localizedDescription
+            XCTAssertTrue(message.contains("255") && message.contains("Permission denied"))
+        }
     }
 }

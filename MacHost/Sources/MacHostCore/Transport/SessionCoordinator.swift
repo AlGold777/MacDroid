@@ -303,6 +303,7 @@ public final class SessionCoordinator: @unchecked Sendable {
                     sockPath: sockPath,
                     baseArgs: baseArgs,
                     destination: sshDestination,
+                    masterDiagnostics: masterDiagnostics,
                     channelId: "interactive_\(currentEpoch)",
                     isInteractive: true
                 )
@@ -311,6 +312,7 @@ public final class SessionCoordinator: @unchecked Sendable {
                     sockPath: sockPath,
                     baseArgs: baseArgs,
                     destination: sshDestination,
+                    masterDiagnostics: masterDiagnostics,
                     channelId: "bulk_\(currentEpoch)",
                     isInteractive: false
                 )
@@ -391,7 +393,8 @@ public final class SessionCoordinator: @unchecked Sendable {
                 process: singleProc,
                 inHandle: inPipe.fileHandleForWriting,
                 outHandle: outPipe.fileHandleForReading,
-                diagnosticMessage: { diagnostics.message }
+                diagnosticMessage: { diagnostics.message },
+                waitForDiagnostics: { timeout in diagnostics.messageAfterDraining(timeout: timeout) }
             )
             try trackConnectingChannel(chan, epoch: epoch)
             
@@ -487,7 +490,14 @@ public final class SessionCoordinator: @unchecked Sendable {
         }
     }
     
-    private func spawnSlaveChannel(sockPath: String, baseArgs: [String], destination: String, channelId: String, isInteractive: Bool) throws -> SFTPChannel {
+    private func spawnSlaveChannel(
+        sockPath: String,
+        baseArgs: [String],
+        destination: String,
+        masterDiagnostics: SSHDiagnostics,
+        channelId: String,
+        isInteractive: Bool
+    ) throws -> SFTPChannel {
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: "/usr/bin/ssh")
         proc.arguments = baseArgs + ["-S", sockPath, destination, "-s", "sftp"]
@@ -511,7 +521,15 @@ public final class SessionCoordinator: @unchecked Sendable {
             process: proc,
             inHandle: inPipe.fileHandleForWriting,
             outHandle: outPipe.fileHandleForReading,
-            diagnosticMessage: { diagnostics.message }
+            diagnosticMessage: {
+                [diagnostics.message, masterDiagnostics.message].filter { !$0.isEmpty }.joined(separator: "\n")
+            },
+            waitForDiagnostics: { timeout in
+                let deadline = ProcessInfo.processInfo.systemUptime + timeout
+                let channelMessage = diagnostics.messageAfterDraining(timeout: max(0, deadline - ProcessInfo.processInfo.systemUptime))
+                let masterMessage = masterDiagnostics.messageAfterDraining(timeout: max(0, deadline - ProcessInfo.processInfo.systemUptime))
+                return [channelMessage, masterMessage].filter { !$0.isEmpty }.joined(separator: "\n")
+            }
         )
     }
     
