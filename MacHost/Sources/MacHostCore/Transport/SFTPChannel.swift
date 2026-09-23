@@ -16,6 +16,7 @@ public final class SFTPChannel: @unchecked Sendable {
     private let lock = NSLock()
     private var isClosed = false
     private var nextReqId: UInt32 = 1
+    private var consecutiveRequestTimeouts = 0
     
     private enum PendingEntry {
         case active(continuation: CheckedContinuation<(type: SFTPMessageType, payload: Data), Error>)
@@ -145,6 +146,8 @@ public final class SFTPChannel: @unchecked Sendable {
                     let entry = self.pendingRequests[requestId]
                     if entry != nil { self.pendingRequests[requestId] = .cancelled }
                     self.requestTimeoutWorkItems.removeValue(forKey: requestId)
+                    self.consecutiveRequestTimeouts += 1
+                    let shouldClose = self.consecutiveRequestTimeouts >= 3
                     self.lock.unlock()
                     if case .active(let cont) = entry {
                         cont.resume(throwing: NSError(
@@ -153,6 +156,7 @@ public final class SFTPChannel: @unchecked Sendable {
                             userInfo: [NSLocalizedDescriptionKey: "Таймаут ответа SFTP-запроса (\(Int(timeoutSeconds)) сек.)"]
                         ))
                     }
+                    if shouldClose { self.close() }
                 }
                 requestTimeoutWorkItems[requestId] = timeout
                 lock.unlock()
@@ -226,6 +230,7 @@ public final class SFTPChannel: @unchecked Sendable {
     }
     
     private func runReadLoop() {
+        defer { try? outHandle.close() }
         while true {
             do {
                 // 1. Читаем длину пакета (4 байта)
@@ -276,6 +281,7 @@ public final class SFTPChannel: @unchecked Sendable {
                 lock.lock()
                 let entry = pendingRequests.removeValue(forKey: reqId)
                 requestTimeoutWorkItems.removeValue(forKey: reqId)?.cancel()
+                consecutiveRequestTimeouts = 0
                 lock.unlock()
                 
                 switch entry {
@@ -351,7 +357,7 @@ public final class SFTPChannel: @unchecked Sendable {
         if process.isRunning {
             process.terminate()
         }
-        try? inHandle.close()
-        try? outHandle.close()
+        // The child process closes its pipe on exit; only the reader owns stdout.
+        writerQueue.async { [inHandle] in try? inHandle.close() }
     }
 }

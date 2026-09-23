@@ -1,6 +1,7 @@
 import SwiftUI
 import AppKit
 import MacHostCore
+import Darwin
 
 extension KeyEquivalent {
     static let f2Key = KeyEquivalent(Character(Unicode.Scalar(Int(NSF2FunctionKey))!))
@@ -16,6 +17,7 @@ struct MacFileManagerApp: App {
     @StateObject private var viewModel = DualPaneViewModel()
 
     init() {
+        signal(SIGPIPE, SIG_IGN)
         KeyCommandMonitor.installGlobalMonitor()
     }
 
@@ -120,12 +122,12 @@ struct MacFileManagerApp: App {
                 .keyboardShortcut(.tab, modifiers: [])
 
                 Button("Просмотр (Пробел)") {
-                    viewModel.triggerQuickLook()
+                    viewModel.triggerQuickLook(preferNativeQuickLook: true)
                 }
                 .keyboardShortcut(.space, modifiers: [])
 
                 Button("Просмотр (F3)") {
-                    viewModel.triggerQuickLook()
+                    viewModel.triggerQuickLook(preferNativeQuickLook: true)
                 }
                 .keyboardShortcut(.f3Key, modifiers: [])
 

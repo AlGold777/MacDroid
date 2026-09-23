@@ -69,7 +69,9 @@ public final class RemoteSFTPDriver: FileSystemDriver, @unchecked Sendable {
             var (openRespType, openPayload) = try await channel.sendRequest(packet: openDirPacket, requestId: openDirReqId)
             
             // Если каталог не найден, проверяем альтернативное сопоставление корня (/emulated/0 <-> /)
-            if openRespType != .handle {
+            if openRespType == .status,
+               let (_, openCode, _) = try? packetEngine.parseStatusResponse(data: openPayload),
+               openCode == .noSuchFile {
                 let altPath: String
                 if currentSftpPath.hasPrefix("/emulated/0") {
                     let sub = String(currentSftpPath.dropFirst("/emulated/0".count))
@@ -94,6 +96,11 @@ public final class RemoteSFTPDriver: FileSystemDriver, @unchecked Sendable {
                 )
             }
             let (_, dirHandle) = try packetEngine.parseHandleResponse(data: openPayload)
+            defer {
+                let closeReqId = channel.allocateRequestId()
+                let closePacket = packetEngine.createClosePacket(requestId: closeReqId, handle: dirHandle)
+                channel.writeStreamingPacket(packet: closePacket, requestId: closeReqId) { _ in }
+            }
             
             var allEntries: [FileItem] = []
             
@@ -166,126 +173,34 @@ public final class RemoteSFTPDriver: FileSystemDriver, @unchecked Sendable {
                 }
             }
             
-            // 3. Закрываем дескриптор каталога
-            let closeReqId = channel.allocateRequestId()
-            let closePacket = packetEngine.createClosePacket(requestId: closeReqId, handle: dirHandle)
-            _ = try? await channel.sendRequest(packet: closePacket, requestId: closeReqId)
-            
             DirectoryCache.shared.set(path: nfcPath, items: allEntries)
             return allEntries
             
         } catch {
-            if let adbItems = PhoneConnectionManager.shared.listDirectoryAdb(path: nfcPath) {
-                DirectoryCache.shared.set(path: nfcPath, items: adbItems)
-                Task {
-                    _ = await PhoneConnectionManager.shared.establishConnection()
-                }
-                return adbItems
-            }
-            
-            throw NSError(
-                domain: "RemoteSFTPDriver",
-                code: 1009,
-                userInfo: [NSLocalizedDescriptionKey: "Телефон не подключен. Подключите смартфон по USB или выполните сопряжение по Wi-Fi."]
-            )
-        }
-    }
-    
-    /// Быстрый запрос метаданных медиа-каталога через системную медиатеку MediaStore Android
-    public func queryMediaStore(folderPath: String) async -> [FileItem]? {
-        let nfcPath = folderPath.precomposedStringWithCanonicalMapping
-        
-        let home = FileManager.default.homeDirectoryForCurrentUser
-        let keyURL = home.appendingPathComponent(".ssh/id_ed25519")
-        guard FileManager.default.fileExists(atPath: keyURL.path) else { return nil }
-        
-        let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-        let appDir = appSupport.appendingPathComponent("MacDroidCommander")
-        let knownHostsURL = appDir.appendingPathComponent("known_hosts")
-        
-        let sshUser = UserDefaults.standard.string(forKey: "sshUser") ?? NSUserName()
-        let proc = Process()
-        proc.executableURL = URL(fileURLWithPath: "/usr/bin/ssh")
-        proc.arguments = [
-            "-i", keyURL.path,
-            "-o", "StrictHostKeyChecking=accept-new",
-            "-o", "UserKnownHostsFile=\(knownHostsURL.path)",
-            "-o", "ConnectTimeout=2",
-            "-p", String(coordinator.port),
-            "\(sshUser)@\(coordinator.host)",
-            "mediastore_query \(nfcPath)"
-        ]
-        
-        let pipe = Pipe()
-        proc.standardOutput = pipe
-        proc.standardError = FileHandle.nullDevice
-        do {
-            try proc.run()
-            proc.waitUntilExit()
-            guard proc.terminationStatus == 0 else { return nil }
-            let data = pipe.fileHandleForReading.readDataToEndOfFile()
-            guard let text = String(data: data, encoding: .utf8), !text.isEmpty, !text.hasPrefix("ERROR") else { return nil }
-            
-            var items: [FileItem] = []
-            let lines = text.components(separatedBy: "\n")
-            for line in lines {
-                let parts = line.components(separatedBy: "\t")
-                if parts.count >= 4 {
-                    let name = parts[0]
-                    let size = UInt64(parts[1]) ?? 0
-                    let mtime = Double(parts[2]) ?? 0
-                    let filePath = parts.count >= 5 ? parts[4] : (nfcPath as NSString).appendingPathComponent(name)
-                    let cleanPath = filePath.precomposedStringWithCanonicalMapping
-                    items.append(FileItem(
-                        id: cleanPath,
-                        name: name,
-                        path: cleanPath,
-                        size: size,
-                        mtime: mtime,
-                        isDirectory: false,
-                        source: .remotePhone
-                    ))
-                }
-            }
-            return items.isEmpty ? nil : items
-        } catch {
-            return nil
+            throw error
         }
     }
     
     public func createDirectory(at path: String) async throws {
         defer { DirectoryCache.shared.invalidate(path: path) }
         let sftpPath = toSftpPath(path)
-        do {
-            try await ensureConnected()
-            guard let channel = coordinator.interactiveChannel else {
-                throw NSError(domain: "RemoteSFTPDriver", code: 1, userInfo: [NSLocalizedDescriptionKey: "No active SFTP channel"])
+        try await ensureConnected()
+        guard let channel = coordinator.interactiveChannel else {
+            throw NSError(domain: "RemoteSFTPDriver", code: 1, userInfo: [NSLocalizedDescriptionKey: "No active SFTP channel"])
+        }
+        let reqId = channel.allocateRequestId()
+        let packet = packetEngine.createMkdirPacket(requestId: reqId, path: sftpPath)
+        let (respType, payload) = try await channel.sendRequest(packet: packet, requestId: reqId)
+        if respType == .status {
+            let (_, code, msg) = try packetEngine.parseStatusResponse(data: payload)
+            if code != .ok {
+                throw NSError(domain: "RemoteSFTPDriver", code: Int(code.rawValue), userInfo: [NSLocalizedDescriptionKey: "MKDIR failed: \(msg)"])
             }
-            let reqId = channel.allocateRequestId()
-            let packet = packetEngine.createMkdirPacket(requestId: reqId, path: sftpPath)
-            let (respType, payload) = try await channel.sendRequest(packet: packet, requestId: reqId)
-            if respType == .status {
-                let (_, code, msg) = try packetEngine.parseStatusResponse(data: payload)
-                if code != .ok {
-                    throw NSError(domain: "RemoteSFTPDriver", code: Int(code.rawValue), userInfo: [NSLocalizedDescriptionKey: "MKDIR failed: \(msg)"])
-                }
-            }
-        } catch {
-            let escaped = PhoneConnectionManager.shellEscape(path)
-            let (status, adbErr) = PhoneConnectionManager.shared.executeAdbShell(command: "mkdir -p -- \(escaped)")
-            if status == 0 {
-                return
-            }
-            throw NSError(domain: "RemoteSFTPDriver", code: 30, userInfo: [NSLocalizedDescriptionKey: "Не удалось создать каталог «\(path)»: \(error.localizedDescription) (ADB: \(adbErr))"])
         }
     }
     
     public func deleteItem(at path: String, moveToTrash: Bool) async throws {
         defer { DirectoryCache.shared.invalidate(path: path) }
-        if PhoneConnectionManager.shared.fastDeleteAdb(remotePath: path) {
-            return
-        }
-        
         let sftpPath = toSftpPath(path)
         try await ensureConnected()
         guard let channel = coordinator.interactiveChannel else {
@@ -321,9 +236,8 @@ public final class RemoteSFTPDriver: FileSystemDriver, @unchecked Sendable {
     public func deleteEmptyDirectory(at path: String) async throws -> Bool {
         defer { DirectoryCache.shared.invalidate(path: path) }
         let sftpPath = toSftpPath(path)
-        do {
-            try await ensureConnected()
-            guard let channel = coordinator.interactiveChannel else { return false }
+        try await ensureConnected()
+        guard let channel = coordinator.interactiveChannel else { return false }
             
             let rmdirReqId = channel.allocateRequestId()
             let rmdirPacket = packetEngine.createRmdirPacket(requestId: rmdirReqId, path: sftpPath)
@@ -334,41 +248,39 @@ public final class RemoteSFTPDriver: FileSystemDriver, @unchecked Sendable {
                     return true
                 }
             }
-        } catch {
-            // SFTP fallback
-        }
-        
-        let escaped = PhoneConnectionManager.shellEscape(path)
-        let (status, _) = PhoneConnectionManager.shared.executeAdbShell(command: "rmdir -- \(escaped) 2>/dev/null || rm -d -- \(escaped) 2>/dev/null")
-        return status == 0
+        return false
     }
     
     private func deleteDirectoryRecursive(at path: String) async throws {
-        let entries = try await listDirectory(at: path)
+        let entries = try await listDirectory(at: path, forceRefresh: true)
         for entry in entries {
             if entry.isDirectory {
                 try await deleteDirectoryRecursive(at: entry.path)
             } else {
                 let sftpChildPath = toSftpPath(entry.path)
-                if let channel = coordinator.interactiveChannel {
-                    let reqId = channel.allocateRequestId()
-                    let removePacket = packetEngine.createRemovePacket(requestId: reqId, path: sftpChildPath)
-                    _ = try? await channel.sendRequest(packet: removePacket, requestId: reqId)
-                }
+                guard let channel = coordinator.interactiveChannel else { throw CancellationError() }
+                let reqId = channel.allocateRequestId()
+                let removePacket = packetEngine.createRemovePacket(requestId: reqId, path: sftpChildPath)
+                let (response, payload) = try await channel.sendRequest(packet: removePacket, requestId: reqId)
+                guard response == .status else { throw NSError(domain: "RemoteSFTPDriver", code: 32, userInfo: [NSLocalizedDescriptionKey: "Unexpected response while deleting \(entry.path)"]) }
+                let (_, code, msg) = try packetEngine.parseStatusResponse(data: payload)
+                guard code == .ok || code == .noSuchFile else { throw NSError(domain: "RemoteSFTPDriver", code: Int(code.rawValue), userInfo: [NSLocalizedDescriptionKey: msg]) }
             }
         }
         
         let sftpPath = toSftpPath(path)
-        if let channel = coordinator.interactiveChannel {
-            let rmdirReqId = channel.allocateRequestId()
-            let rmdirPacket = packetEngine.createRmdirPacket(requestId: rmdirReqId, path: sftpPath)
-            let (rmdirResp, rmdirPayload) = try await channel.sendRequest(packet: rmdirPacket, requestId: rmdirReqId)
-            if rmdirResp == .status {
-                let (_, rmdirCode, rmdirMsg) = try packetEngine.parseStatusResponse(data: rmdirPayload)
-                if rmdirCode != .ok {
-                    throw NSError(domain: "RemoteSFTPDriver", code: Int(rmdirCode.rawValue), userInfo: [NSLocalizedDescriptionKey: "Delete dir failed: \(rmdirMsg)"])
-                }
-            }
+        guard let channel = coordinator.interactiveChannel else {
+            throw NSError(domain: "RemoteSFTPDriver", code: 1, userInfo: [NSLocalizedDescriptionKey: "SFTP channel closed while deleting \(path)"])
+        }
+        let rmdirReqId = channel.allocateRequestId()
+        let rmdirPacket = packetEngine.createRmdirPacket(requestId: rmdirReqId, path: sftpPath)
+        let (rmdirResp, rmdirPayload) = try await channel.sendRequest(packet: rmdirPacket, requestId: rmdirReqId)
+        guard rmdirResp == .status else {
+            throw NSError(domain: "RemoteSFTPDriver", code: 33, userInfo: [NSLocalizedDescriptionKey: "Unexpected response while removing directory \(path)"])
+        }
+        let (_, rmdirCode, rmdirMsg) = try packetEngine.parseStatusResponse(data: rmdirPayload)
+        if rmdirCode != .ok {
+            throw NSError(domain: "RemoteSFTPDriver", code: Int(rmdirCode.rawValue), userInfo: [NSLocalizedDescriptionKey: "Delete dir failed: \(rmdirMsg)"])
         }
     }
     
@@ -379,22 +291,13 @@ public final class RemoteSFTPDriver: FileSystemDriver, @unchecked Sendable {
         }
         let sftpSrc = toSftpPath(sourcePath)
         let sftpDst = toSftpPath(destinationPath)
-        do {
-            try await ensureConnected()
-            guard let channel = coordinator.interactiveChannel else {
-                throw NSError(domain: "RemoteSFTPDriver", code: 1, userInfo: [NSLocalizedDescriptionKey: "No active SFTP channel"])
-            }
+        try await ensureConnected()
+        guard let channel = coordinator.interactiveChannel else {
+            throw NSError(domain: "RemoteSFTPDriver", code: 1, userInfo: [NSLocalizedDescriptionKey: "No active SFTP channel"])
+        }
             
-            // Если сервер поддерживает posix-rename@openssh.com:
-            if coordinator.serverExtensions["posix-rename@openssh.com"] != nil {
-                let reqId = channel.allocateRequestId()
-                let posixPacket = packetEngine.createPosixRenamePacket(requestId: reqId, oldPath: sftpSrc, newPath: sftpDst)
-                if let (pType, pPayload) = try? await channel.sendRequest(packet: posixPacket, requestId: reqId), pType == .status {
-                    let (_, code, _) = try packetEngine.parseStatusResponse(data: pPayload)
-                    if code == .ok { return }
-                }
-            }
-            
+            // The OpenSSH POSIX rename extension replaces an existing destination;
+            // regular SFTP rename preserves the server's no-overwrite behavior.
             let reqId = channel.allocateRequestId()
             let packet = packetEngine.createRenamePacket(requestId: reqId, oldPath: sftpSrc, newPath: sftpDst)
             let (respType, payload) = try await channel.sendRequest(packet: packet, requestId: reqId)
@@ -404,15 +307,6 @@ public final class RemoteSFTPDriver: FileSystemDriver, @unchecked Sendable {
                     throw NSError(domain: "RemoteSFTPDriver", code: Int(code.rawValue), userInfo: [NSLocalizedDescriptionKey: "Rename failed: \(msg)"])
                 }
             }
-        } catch {
-            let escapedSrc = PhoneConnectionManager.shellEscape(sourcePath)
-            let escapedDst = PhoneConnectionManager.shellEscape(destinationPath)
-            let (status, adbErr) = PhoneConnectionManager.shared.executeAdbShell(command: "mv -- \(escapedSrc) \(escapedDst)")
-            if status == 0 {
-                return
-            }
-            throw NSError(domain: "RemoteSFTPDriver", code: 31, userInfo: [NSLocalizedDescriptionKey: "Не удалось переименовать «\(sourcePath)»: \(error.localizedDescription) (ADB: \(adbErr))"])
-        }
     }
     
     public func checkFreeSpace(at path: String) async throws -> (free: UInt64, total: UInt64) {
@@ -431,15 +325,8 @@ public final class RemoteSFTPDriver: FileSystemDriver, @unchecked Sendable {
             }
         }
         
-        // 2. Попытка получить через ADB df
-        if let adbSpace = PhoneConnectionManager.shared.getStorageSpaceAdb() {
-            return adbSpace
-        }
-        
-        // 3. Отсутствие измерения: возвращаем (0, 0) как неизвестное (unknown), либо mock в тестах
-        if ProcessInfo.processInfo.processName == "MacHostTests" {
-            return (free: 280_000_000_000, total: 512_000_000_000)
-        }
+        // ADB cannot be used here: the selected SFTP session may be Wi-Fi while a
+        // different phone is attached over USB.
         return (free: 0, total: 0)
     }
 }

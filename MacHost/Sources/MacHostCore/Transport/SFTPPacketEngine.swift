@@ -198,7 +198,10 @@ public final class SFTPPacketReader {
         } else {
             let start = data.startIndex + offset
             let slice = data[start..<(start + len)]
-            str = String(data: slice, encoding: .utf8) ?? ""
+            guard let decoded = String(data: slice, encoding: .utf8) else {
+                throw NSError(domain: "SFTPPacketReader", code: 2, userInfo: [NSLocalizedDescriptionKey: "Invalid UTF-8 string in SFTP response"])
+            }
+            str = decoded
         }
         offset += len
         return str

@@ -21,6 +21,68 @@ public final class ArchiveService: Sendable {
     
     public init() {}
     
+    /// Проверяет, является ли файл поддерживаемым архивом по расширению
+    public static func isArchive(fileName: String) -> Bool {
+        let lower = fileName.lowercased()
+        let archiveExtensions = [
+            ".zip", ".tar.gz", ".tgz", ".tar.bz2", ".tbz2", ".tbz",
+            ".tar.xz", ".txz", ".tar", ".gz", ".bz2", ".xz",
+            ".7z", ".rar", ".apk", ".jar", ".ipa"
+        ]
+        return archiveExtensions.contains { lower.hasSuffix($0) }
+    }
+    
+    /// Распаковывает архив в указанную директорию назначения
+    public func extractArchive(
+        archivePath: String,
+        destinationPath: String
+    ) async throws {
+        guard FileManager.default.fileExists(atPath: archivePath) else {
+            throw NSError(domain: "ArchiveService", code: 2, userInfo: [NSLocalizedDescriptionKey: "Архив не найден: \(archivePath)"])
+        }
+        
+        let destURL = URL(fileURLWithPath: destinationPath)
+        try FileManager.default.createDirectory(at: destURL, withIntermediateDirectories: true)
+        
+        let lowerName = URL(fileURLWithPath: archivePath).lastPathComponent.lowercased()
+        
+        return try await withCheckedThrowingContinuation { continuation in
+            DispatchQueue.global(qos: .userInitiated).async {
+                let process = Process()
+                let errPipe = Pipe()
+                process.standardError = errPipe
+                
+                if lowerName.hasSuffix(".zip") || lowerName.hasSuffix(".apk") || lowerName.hasSuffix(".jar") || lowerName.hasSuffix(".ipa") {
+                    process.executableURL = URL(fileURLWithPath: "/usr/bin/ditto")
+                    process.arguments = ["-x", "-k", archivePath, destinationPath]
+                } else {
+                    // tar, tar.gz, tgz, tar.bz2, tbz, tar.xz, txz
+                    process.executableURL = URL(fileURLWithPath: "/usr/bin/tar")
+                    process.arguments = ["-xf", archivePath, "-C", destinationPath]
+                }
+                
+                do {
+                    try process.run()
+                    process.waitUntilExit()
+                    
+                    if process.terminationStatus == 0 {
+                        continuation.resume()
+                    } else {
+                        let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
+                        let errMsg = String(data: errData, encoding: .utf8) ?? "Неизвестная ошибка распаковки"
+                        continuation.resume(throwing: NSError(
+                            domain: "ArchiveService",
+                            code: Int(process.terminationStatus),
+                            userInfo: [NSLocalizedDescriptionKey: "Ошибка распаковки архива: \(errMsg)"]
+                        ))
+                    }
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
+    }
+    
     /// Создает архив из указанных путей (файлы и/или папки)
     public func createArchive(
         sources: [String],
@@ -52,8 +114,13 @@ public final class ArchiveService: Sendable {
                 case .zip:
                     // Если один файл/каталог: используем Apple ditto (нативный формат архивов macOS с сохранением метаданных)
                     if sources.count == 1 {
+                        let isDir = (try? FileManager.default.attributesOfItem(atPath: sources[0])[.type] as? FileAttributeType) == .typeDirectory
                         process.executableURL = URL(fileURLWithPath: "/usr/bin/ditto")
-                        process.arguments = ["-c", "-k", "--sequesterRsrc", "--keepParent", sources[0], destinationPath]
+                        if isDir {
+                            process.arguments = ["-c", "-k", "--sequesterRsrc", "--keepParent", sources[0], destinationPath]
+                        } else {
+                            process.arguments = ["-c", "-k", "--sequesterRsrc", sources[0], destinationPath]
+                        }
                     } else {
                         // Для нескольких источников: используем /usr/bin/zip
                         process.executableURL = URL(fileURLWithPath: "/usr/bin/zip")

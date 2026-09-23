@@ -42,6 +42,9 @@ public final class DiscoveryService: ObservableObject {
     private var browser: NWBrowser?
     private var searchTimer: Task<Void, Never>?
     private var resolvingConnections: [NWConnection] = []
+    private var pendingServiceIds: Set<String> = []
+    private var resolvedServiceIds: Set<String> = []
+    private var activeServiceIds: Set<String> = []
     
     public init() {}
     
@@ -74,11 +77,7 @@ public final class DiscoveryService: ObservableObject {
         newBrowser.browseResultsChangedHandler = { [weak self] results, changes in
             Task { @MainActor [weak self] in
                 guard let self = self else { return }
-                for result in results {
-                    if case .service(let name, let type, let domain, _) = result.endpoint {
-                        self.resolveServiceEndpoint(result.endpoint, name: name, type: type, domain: domain)
-                    }
-                }
+                self.updateBrowseResults(results)
             }
         }
         
@@ -92,6 +91,11 @@ public final class DiscoveryService: ObservableObject {
         // Перезапуск браузера для принудительного mDNS запроса в локальную сеть
         browser?.cancel()
         browser = nil
+        resolvingConnections.forEach { $0.cancel() }
+        resolvingConnections.removeAll()
+        pendingServiceIds.removeAll()
+        resolvedServiceIds.removeAll()
+        activeServiceIds.removeAll()
         
         let params = NWParameters()
         params.includePeerToPeer = true
@@ -113,11 +117,7 @@ public final class DiscoveryService: ObservableObject {
         newBrowser.browseResultsChangedHandler = { [weak self] results, changes in
             Task { @MainActor [weak self] in
                 guard let self = self else { return }
-                for result in results {
-                    if case .service(let name, let type, let domain, _) = result.endpoint {
-                        self.resolveServiceEndpoint(result.endpoint, name: name, type: type, domain: domain)
-                    }
-                }
+                self.updateBrowseResults(results)
             }
         }
         
@@ -132,8 +132,27 @@ public final class DiscoveryService: ObservableObject {
         }
     }
     
+    private func updateBrowseResults(_ results: Set<NWBrowser.Result>) {
+        let services = results.compactMap { result -> (NWEndpoint, String, String, String, String)? in
+            guard case .service(let name, let type, let domain, _) = result.endpoint else { return nil }
+            let serviceId = "\(name).\(type)\(domain)"
+            return (result.endpoint, name, type, domain, serviceId)
+        }
+        let currentIds = Set(services.map { $0.4 })
+        activeServiceIds = currentIds
+        pendingServiceIds.formIntersection(currentIds)
+        resolvedServiceIds.formIntersection(currentIds)
+        discoveredDevices.removeAll { !$0.isManual && !currentIds.contains($0.id) }
+
+        for (endpoint, name, type, domain, serviceId) in services
+        where !pendingServiceIds.contains(serviceId) && !resolvedServiceIds.contains(serviceId) {
+            pendingServiceIds.insert(serviceId)
+            resolveServiceEndpoint(endpoint, name: name, type: type, domain: domain, serviceId: serviceId)
+        }
+    }
+
     /// Настоящий Bonjour/mDNS резолвинг IP-адреса устройства из сетевого пакета
-    private func resolveServiceEndpoint(_ endpoint: NWEndpoint, name: String, type: String, domain: String) {
+    private func resolveServiceEndpoint(_ endpoint: NWEndpoint, name: String, type: String, domain: String, serviceId: String) {
         // Разрешаем dual-stack (IPv4 и IPv6) без принудительного ограничения
         let params = NWParameters.tcp
         let conn = NWConnection(to: endpoint, using: params)
@@ -170,7 +189,7 @@ public final class DiscoveryService: ObservableObject {
                 
                 if !resolvedIp.isEmpty {
                     let dev = DiscoveredDevice(
-                        id: "\(name).\(type)\(domain)",
+                        id: serviceId,
                         name: name,
                         host: resolvedIp,
                         port: resolvedPort
@@ -179,6 +198,9 @@ public final class DiscoveryService: ObservableObject {
                     Task { @MainActor [weak self] in
                         guard let self = self else { return }
                         self.resolvingConnections.removeAll { $0 === conn }
+                        self.pendingServiceIds.remove(serviceId)
+                        guard self.activeServiceIds.contains(serviceId) else { return }
+                        self.resolvedServiceIds.insert(serviceId)
                         if let idx = self.discoveredDevices.firstIndex(where: { $0.id == dev.id || $0.name == dev.name }) {
                             self.discoveredDevices[idx] = dev
                         } else {
@@ -191,6 +213,7 @@ public final class DiscoveryService: ObservableObject {
             case .failed, .cancelled:
                 conn.cancel()
                 Task { @MainActor [weak self] in
+                    self?.pendingServiceIds.remove(serviceId)
                     self?.resolvingConnections.removeAll { $0 === conn }
                 }
                 

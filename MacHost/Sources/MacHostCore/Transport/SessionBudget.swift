@@ -17,7 +17,13 @@ public final class SessionBudget: @unchecked Sendable {
     private var inFlightWriteBuffers: Int = 0
     private var openHandles: Int = 0
     
-    private var waiters: [(neededPayload: Int, isInteractive: Bool, continuation: CheckedContinuation<Void, Never>)] = []
+    private struct PayloadWaiter {
+        let id: UUID
+        let neededPayload: Int
+        let isInteractive: Bool
+        let continuation: CheckedContinuation<Bool, Never>
+    }
+    private var waiters: [PayloadWaiter] = []
     
     public init(
         maxNetworkPayload: Int = defaultMaxNetworkPayload,
@@ -59,23 +65,39 @@ public final class SessionBudget: @unchecked Sendable {
     }
     
     /// Резервирование байтового бюджета для запроса
-    public func acquirePayload(bytes: Int, isInteractive: Bool) async {
-        guard bytes > 0 else { return }
-        
-        while true {
-            lock.lock()
-            let availableLimit = isInteractive ? maxNetworkPayload : (maxNetworkPayload - interactiveReserve)
-            if inFlightNetworkPayload + bytes <= availableLimit {
-                inFlightNetworkPayload += bytes
-                lock.unlock()
-                return
+    public func acquirePayload(bytes: Int, isInteractive: Bool) async -> Bool {
+        guard bytes > 0 else { return true }
+        let id = UUID()
+        let acquired = await withTaskCancellationHandler {
+                await withCheckedContinuation { (continuation: CheckedContinuation<Bool, Never>) in
+                    lock.lock()
+                    if Task.isCancelled {
+                        lock.unlock()
+                        continuation.resume(returning: false)
+                        return
+                    }
+                    let availableLimit = isInteractive ? maxNetworkPayload : (maxNetworkPayload - interactiveReserve)
+                    if inFlightNetworkPayload + bytes <= availableLimit {
+                        inFlightNetworkPayload += bytes
+                        lock.unlock()
+                        continuation.resume(returning: true)
+                        return
+                    }
+                    waiters.append(PayloadWaiter(id: id, neededPayload: bytes, isInteractive: isInteractive, continuation: continuation))
+                    lock.unlock()
+                }
+            } onCancel: {
+                self.lock.lock()
+                let index = self.waiters.firstIndex(where: { $0.id == id })
+                let waiter = index.map { self.waiters.remove(at: $0) }
+                self.lock.unlock()
+                waiter?.continuation.resume(returning: false)
             }
-            
-            await withCheckedContinuation { continuation in
-                waiters.append((neededPayload: bytes, isInteractive: isInteractive, continuation: continuation))
-                lock.unlock()
-            }
+        if acquired && Task.isCancelled {
+            releasePayload(bytes: bytes)
+            return false
         }
+        return acquired
     }
     
     /// Освобождение байтового бюджета после завершения или отмены запроса
@@ -85,23 +107,18 @@ public final class SessionBudget: @unchecked Sendable {
         inFlightNetworkPayload = max(0, inFlightNetworkPayload - bytes)
         
         // Проверяем ждущих
-        var toResume: [CheckedContinuation<Void, Never>] = []
-        var remainingWaiters: [(neededPayload: Int, isInteractive: Bool, continuation: CheckedContinuation<Void, Never>)] = []
-        
-        for w in waiters {
-            let limit = w.isInteractive ? maxNetworkPayload : (maxNetworkPayload - interactiveReserve)
-            if inFlightNetworkPayload + w.neededPayload <= limit {
-                inFlightNetworkPayload += w.neededPayload
-                toResume.append(w.continuation)
-            } else {
-                remainingWaiters.append(w)
-            }
+        var toResume: [CheckedContinuation<Bool, Never>] = []
+        while let first = waiters.first {
+            let limit = first.isInteractive ? maxNetworkPayload : (maxNetworkPayload - interactiveReserve)
+            guard inFlightNetworkPayload + first.neededPayload <= limit else { break }
+            waiters.removeFirst()
+            inFlightNetworkPayload += first.neededPayload
+            toResume.append(first.continuation)
         }
-        waiters = remainingWaiters
         lock.unlock()
         
         for c in toResume {
-            c.resume()
+            c.resume(returning: true)
         }
     }
     
@@ -116,7 +133,7 @@ public final class SessionBudget: @unchecked Sendable {
         lock.unlock()
         
         for c in toResume {
-            c.resume()
+            c.resume(returning: false)
         }
     }
 }

@@ -1,10 +1,23 @@
 import Foundation
+import Darwin
 
 public enum ConnectionResult: Sendable {
     case usbSuccess(deviceId: String, host: String, port: UInt16, log: String)
     case wifiSuccess(host: String, port: UInt16, name: String)
     case unauthorized(deviceId: String, log: String)
     case failure(reason: String, log: String)
+}
+
+public struct SSHHostKeyObservation: Sendable {
+    public let fingerprint: String
+    public let knownHostsLine: String
+    public let keyAlgorithm: String
+
+    public init(fingerprint: String, knownHostsLine: String, keyAlgorithm: String) {
+        self.fingerprint = fingerprint
+        self.knownHostsLine = knownHostsLine
+        self.keyAlgorithm = keyAlgorithm
+    }
 }
 
 public final class PhoneConnectionManager: @unchecked Sendable {
@@ -121,7 +134,11 @@ public final class PhoneConnectionManager: @unchecked Sendable {
     }
     
     @discardableResult
-    public func runCommand(executable: String, arguments: [String]) -> (status: Int32, output: String) {
+    public func runCommand(
+        executable: String,
+        arguments: [String],
+        timeoutSeconds: TimeInterval = 15
+    ) -> (status: Int32, output: String) {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: executable)
         process.arguments = arguments
@@ -130,14 +147,45 @@ public final class PhoneConnectionManager: @unchecked Sendable {
         process.standardError = pipe
         do {
             try process.run()
+            let timeoutLock = NSLock()
+            var timedOut = false
+            let timeout = DispatchWorkItem {
+                timeoutLock.lock()
+                timedOut = true
+                timeoutLock.unlock()
+                guard process.isRunning else { return }
+                process.terminate()
+                let pid = process.processIdentifier
+                DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 1) {
+                    if process.isRunning { _ = Darwin.kill(pid, SIGKILL) }
+                }
+            }
+            DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + timeoutSeconds, execute: timeout)
             // Читаем stdout до waitUntilExit, чтобы избежать взаимной блокировки (deadlock)
             // при заполнении 64 КБ буфера системного pipe дочерним процессом (adb ls -la)
             let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            timeout.cancel()
             process.waitUntilExit()
             let out = String(data: data, encoding: .utf8) ?? ""
-            return (process.terminationStatus, out.trimmingCharacters(in: .whitespacesAndNewlines))
+            timeoutLock.lock()
+            let didTimeout = timedOut
+            timeoutLock.unlock()
+            let timeoutNote = didTimeout ? "\nCommand timed out after \(Int(timeoutSeconds)) seconds." : ""
+            return (didTimeout ? -2 : process.terminationStatus, (out + timeoutNote).trimmingCharacters(in: .whitespacesAndNewlines))
         } catch {
             return (-1, error.localizedDescription)
+        }
+    }
+
+    /// Авторизованные serial-номера из текущего ADB server snapshot.
+    public func authorizedAdbDeviceIds() -> [String] {
+        guard let adb = findAdbBinary() else { return [] }
+        let (status, output) = runCommand(executable: adb, arguments: ["devices"], timeoutSeconds: 8)
+        guard status == 0 else { return [] }
+        return output.split(separator: "\n").compactMap { line in
+            let fields = line.split(separator: "\t")
+            guard fields.count >= 2, fields[1] == "device" else { return nil }
+            return String(fields[0])
         }
     }
     
@@ -168,7 +216,7 @@ public final class PhoneConnectionManager: @unchecked Sendable {
     
     /// Триггер обновления Android MediaStore для списка файлов
     public func notifyMediaScanner(paths: [String], deviceId: String? = nil) {
-        guard !paths.isEmpty else { return }
+        guard !paths.isEmpty, let deviceId, !deviceId.isEmpty else { return }
         // Оптимизация: сканируем пачками по 50 файлов в одном adb shell вызове
         // вместо порождения сотен отдельных процессов adb
         let batchSize = 50
@@ -399,7 +447,7 @@ public final class PhoneConnectionManager: @unchecked Sendable {
         return results
     }
     
-    public func establishConnection() async -> ConnectionResult {
+    public func establishConnection(preferredDeviceId: String? = nil) async -> ConnectionResult {
         var logs: [String] = []
         logs.append("==================================================")
         logs.append("  MacDroid Commander - Установка связи с телефоном")
@@ -407,13 +455,16 @@ public final class PhoneConnectionManager: @unchecked Sendable {
         
         // Шаг 1: Проверка наличия ADB
         if let adb = findAdbBinary() {
-            let (_, versionOut) = runCommand(executable: adb, arguments: ["version"])
+            let (_, versionOut) = runCommand(executable: adb, arguments: ["version"], timeoutSeconds: 8)
             let firstLine = versionOut.components(separatedBy: "\n").first ?? versionOut
             logs.append("Используется ADB: \(firstLine)")
             
             // Шаг 2: Поиск подключенных Android-устройств
-            let (_, devicesOut) = runCommand(executable: adb, arguments: ["devices"])
+            let (devicesStatus, devicesOut) = runCommand(executable: adb, arguments: ["devices"], timeoutSeconds: 8)
             logs.append("Поиск подключенных Android-устройств через ADB...")
+            guard devicesStatus == 0 else {
+                return .failure(reason: "ADB не ответил при поиске устройств.", log: logs.joined(separator: "\n") + "\n" + devicesOut)
+            }
         
         let lines = devicesOut.components(separatedBy: "\n")
         var authorizedDevices: [String] = []
@@ -438,7 +489,13 @@ public final class PhoneConnectionManager: @unchecked Sendable {
         
         // Шаг 3: Проверка неподтвержденных устройств
         if authorizedDevices.isEmpty && !unauthorizedDevices.isEmpty {
-            let dev = unauthorizedDevices[0]
+            let unauthorizedTarget = preferredDeviceId.flatMap { preferred in
+                unauthorizedDevices.first(where: { $0 == preferred })
+            }
+            if preferredDeviceId != nil && unauthorizedTarget == nil {
+                return .failure(reason: "Выбранное ADB-устройство \(preferredDeviceId!) больше не подключено.", log: logs.joined(separator: "\n"))
+            }
+            let dev = unauthorizedTarget ?? unauthorizedDevices[0]
             logs.append("⚠️ Устройство '\(dev)' подключено, но не авторизовано.")
             logs.append("   Пожалуйста, подтвердите RSA-ключ на экране смартфона.")
             return .unauthorized(
@@ -448,7 +505,13 @@ public final class PhoneConnectionManager: @unchecked Sendable {
         }
         
         // Шаг 4: Найдено авторизованное устройство по USB / ADB
-        if let dev = authorizedDevices.first {
+        if preferredDeviceId != nil && !authorizedDevices.contains(preferredDeviceId!) {
+            return .failure(reason: "Выбранное ADB-устройство \(preferredDeviceId!) не найдено или не авторизовано.", log: logs.joined(separator: "\n"))
+        }
+        if let dev = preferredDeviceId ?? authorizedDevices.first {
+            guard authorizedDevices.contains(dev) else {
+                return .failure(reason: "ADB-устройство \(dev) сейчас недоступно.", log: logs.joined(separator: "\n"))
+            }
             setLastConnectedDevice(dev)
             logs.append("✓ Найдено устройство: \(dev)")
             
@@ -462,7 +525,8 @@ public final class PhoneConnectionManager: @unchecked Sendable {
                     logs.append("   Установка из: \(apkPath)")
                     let (instStatus, instOut) = runCommand(
                         executable: adb,
-                        arguments: ["-s", dev, "install", "-r", "-d", "-g", apkPath]
+                        arguments: ["-s", dev, "install", "-r", "-d", "-g", apkPath],
+                        timeoutSeconds: 120
                     )
                     if instStatus == 0 && instOut.contains("Success") {
                         logs.append("✓ [OK] Компаньон успешно установлен на смартфон")
@@ -491,22 +555,24 @@ public final class PhoneConnectionManager: @unchecked Sendable {
             // 4.3 Проброс портов (с поддержкой динамического порта при конфликтах)
             logs.append("Настройка проброса портов (Host 127.0.0.1 <-> Phone:2222)...")
             var localUsbPort: UInt16 = 2222
-            var (fwdStatus, fwdOut) = runCommand(executable: adb, arguments: ["-s", dev, "forward", "tcp:2222", "tcp:2222"])
+            var (fwdStatus, fwdOut) = runCommand(executable: adb, arguments: ["-s", dev, "forward", "--no-rebind", "tcp:2222", "tcp:2222"])
             if fwdStatus != 0 {
                 // Если стандартный порт 2222 занят другим процессом, выделяем свободный динамический порт
-                let (dynStatus, dynOut) = runCommand(executable: adb, arguments: ["-s", dev, "forward", "tcp:0", "tcp:2222"])
+                let (dynStatus, dynOut) = runCommand(executable: adb, arguments: ["-s", dev, "forward", "--no-rebind", "tcp:0", "tcp:2222"])
                 if dynStatus == 0, let p = UInt16(dynOut.trimmingCharacters(in: .whitespacesAndNewlines)) {
                     localUsbPort = p
                     fwdStatus = 0
                     logs.append("✓ [OK] Выделен свободный динамический порт \(localUsbPort) (forward)")
                 } else {
                     logs.append("⚠️ Ошибка 'adb forward': \(fwdOut)")
+                    return .failure(
+                        reason: "Не удалось назначить USB-forward для устройства \(dev). Подключение остановлено, чтобы не использовать порт другого устройства.",
+                        log: logs.joined(separator: "\n") + "\n" + dynOut
+                    )
                 }
             } else {
                 logs.append("✓ [OK] Порт \(localUsbPort) (forward) успешно перенаправлен")
             }
-            
-            _ = runCommand(executable: adb, arguments: ["-s", dev, "reverse", "tcp:2222", "tcp:2222"])
             
             // Получаем реальное имя модели смартфона через ADB
             let (_, modelOut) = runCommand(executable: adb, arguments: ["-s", dev, "shell", "getprop", "ro.product.model"])
@@ -574,7 +640,7 @@ public final class PhoneConnectionManager: @unchecked Sendable {
         )
     }
     
-    /// Автоматическое обнаружение IP-адреса телефона в локальной сети (mDNS -> Last IP -> History -> ARP)
+    /// Поиск по последним и подтвержденным адресам; новые устройства обнаруживаются через Bonjour.
     public func discoverPhoneIpOnLan() -> String? {
         lock.lock()
         var priorities = self.discoveredIps
@@ -599,26 +665,11 @@ public final class PhoneConnectionManager: @unchecked Sendable {
             }
         }
         
-        // Сканируем устройства из локальной ARP-таблицы macOS
-        let (status, arpOut) = runCommand(executable: "/usr/sbin/arp", arguments: ["-an"])
-        if status == 0 {
-            let lines = arpOut.components(separatedBy: "\n")
-            for line in lines {
-                guard line.contains("(") && line.contains(")") else { continue }
-                guard let start = line.firstIndex(of: "("),
-                      let end = line.firstIndex(of: ")"),
-                      start < end else { continue }
-                let ip = String(line[line.index(after: start)..<end]).trimmingCharacters(in: .whitespacesAndNewlines)
-                if !priorities.contains(ip) && isHostPortReachable(host: ip, port: 2222, timeoutSeconds: 1) {
-                    return ip
-                }
-            }
-        }
         return nil
     }
     
-    /// Получение реального SHA-256 отпечатка открытого хост-ключа сервера через ssh-keyscan с защитой от зависания
-    public func fetchHostFingerprint(host: String, port: UInt16) -> String? {
+    /// Получает ключ через ssh-keyscan и возвращает строку known_hosts для строгой проверки самой SSH-сессии.
+    public func fetchHostKeyObservation(host: String, port: UInt16) -> SSHHostKeyObservation? {
         guard isHostPortReachable(host: host, port: port, timeoutSeconds: 1) else { return nil }
         
         let keyscanProc = Process()
@@ -643,32 +694,37 @@ public final class PhoneConnectionManager: @unchecked Sendable {
             keyscanProc.waitUntilExit()
             timer.cancel()
             
-            guard !scanData.isEmpty else { return nil }
-            
-            let keygenProc = Process()
-            keygenProc.executableURL = URL(fileURLWithPath: "/usr/bin/ssh-keygen")
-            keygenProc.arguments = ["-lf", "-"]
-            let inPipe = Pipe()
-            let outPipe = Pipe()
-            keygenProc.standardInput = inPipe
-            keygenProc.standardOutput = outPipe
-            keygenProc.standardError = FileHandle.nullDevice
-            
-            try keygenProc.run()
-            inPipe.fileHandleForWriting.write(scanData)
-            inPipe.fileHandleForWriting.closeFile()
-            
-            let genData = outPipe.fileHandleForReading.readDataToEndOfFile()
-            keygenProc.waitUntilExit()
-            
-            guard let out = String(data: genData, encoding: .utf8), !out.isEmpty else { return nil }
-            for line in out.components(separatedBy: .newlines) {
-                let parts = line.split(separator: " ")
-                for part in parts {
-                    if part.hasPrefix("SHA256:") {
-                        return String(part)
-                    }
+            guard let scanText = String(data: scanData, encoding: .utf8) else { return nil }
+            for scannedLine in scanText.components(separatedBy: .newlines) {
+                let trimmedLine = scannedLine.trimmingCharacters(in: .whitespacesAndNewlines)
+                let fields = trimmedLine.split(whereSeparator: \.isWhitespace)
+                guard fields.count >= 3, !trimmedLine.hasPrefix("#") else { continue }
+
+                let keygenProc = Process()
+                keygenProc.executableURL = URL(fileURLWithPath: "/usr/bin/ssh-keygen")
+                keygenProc.arguments = ["-lf", "-"]
+                let inPipe = Pipe()
+                let outPipe = Pipe()
+                keygenProc.standardInput = inPipe
+                keygenProc.standardOutput = outPipe
+                keygenProc.standardError = FileHandle.nullDevice
+
+                try keygenProc.run()
+                inPipe.fileHandleForWriting.write(Data((trimmedLine + "\n").utf8))
+                inPipe.fileHandleForWriting.closeFile()
+                let genData = outPipe.fileHandleForReading.readDataToEndOfFile()
+                keygenProc.waitUntilExit()
+                guard keygenProc.terminationStatus == 0,
+                      let output = String(data: genData, encoding: .utf8),
+                      let fingerprint = output.split(whereSeparator: \.isWhitespace).first(where: { $0.hasPrefix("SHA256:") }) else {
+                    continue
                 }
+
+                return SSHHostKeyObservation(
+                    fingerprint: String(fingerprint),
+                    knownHostsLine: trimmedLine,
+                    keyAlgorithm: String(fields[1])
+                )
             }
         } catch {
             timer.cancel()
@@ -676,12 +732,17 @@ public final class PhoneConnectionManager: @unchecked Sendable {
         }
         return nil
     }
+
+    public func fetchHostFingerprint(host: String, port: UInt16) -> String? {
+        fetchHostKeyObservation(host: host, port: port)?.fingerprint
+    }
     
     /// Быстрая проверка доступности сетевого порта хоста (для проверки Wi-Fi связи)
     public func isHostPortReachable(host: String, port: UInt16, timeoutSeconds: Int = 1) -> Bool {
         let (status, _) = runCommand(
             executable: "/usr/bin/nc",
-            arguments: ["-zv", "-G", String(timeoutSeconds), host, String(port)]
+            arguments: ["-zv", "-G", String(timeoutSeconds), host, String(port)],
+            timeoutSeconds: TimeInterval(timeoutSeconds + 2)
         )
         return status == 0
     }

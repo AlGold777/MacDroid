@@ -205,6 +205,40 @@ public struct PairingModalView: View {
                 Text(pairingStatus)
                     .font(.caption)
                     .foregroundColor(pairingStatus.hasPrefix("✓") ? .green : pairingStatus.hasPrefix("⚠️") ? .red : .blue)
+
+                if !ConnectionController.shared.lastConnectionDiagnostics.isEmpty {
+                    DisclosureGroup("Подробности диагностики") {
+                        ScrollView {
+                            Text(ConnectionController.shared.lastConnectionDiagnostics)
+                                .font(.system(.caption2, design: .monospaced))
+                                .textSelection(.enabled)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                        .frame(maxHeight: 110)
+                    }
+                    .font(.caption)
+                }
+                
+                if pairingStatus.contains("Host Key") || pairingStatus.contains("не совпадает") {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("Если на телефоне был сгенерирован новый ключ или переустановлен демон, можно обновить сохранённый ключ:")
+                            .font(.caption2)
+                            .foregroundColor(.secondary)
+                        Button(action: {
+                            let portInt = Int(inputPort) ?? 2222
+                            HostKeyStore.shared.resetHostKey(host: inputHost, port: portInt)
+                            HostKeyStore.shared.resetHostKey(host: "127.0.0.1", port: portInt)
+                            pairingStatus = "Старый ключ сброшен. Повторное подключение..."
+                            startConnection()
+                        }) {
+                            Label("Сбросить старый ключ и доверять текущему", systemImage: "arrow.triangle.2.circlepath")
+                                .foregroundColor(.orange)
+                                .font(.caption)
+                        }
+                        .buttonStyle(.bordered)
+                    }
+                    .padding(.top, 2)
+                }
             }
             .padding(.horizontal)
             
@@ -223,48 +257,7 @@ public struct PairingModalView: View {
                 }
                 
                 Button("Подключиться и сохранить ключ (TOFU)") {
-                    guard !inputHost.isEmpty else {
-                        pairingStatus = "⚠️ Введите IP-адрес телефона"
-                        return
-                    }
-                    let portInt = Int(inputPort) ?? 2222
-                    isConnecting = true
-                    pairingStatus = "Проверка доступности и авторизация SFTP..."
-                    
-                    Task { @MainActor in
-                        defer { isConnecting = false }
-                        
-                        let success = await ConnectionController.shared.connect(
-                            customHost: inputHost,
-                            customPort: UInt16(portInt),
-                            isExplicitUserAction: true,
-                            viewModel: vm
-                        )
-                        
-                        if success {
-                            UserDefaults.standard.set(inputHost, forKey: "lastConnectedHost")
-                            UserDefaults.standard.set(inputPort, forKey: "lastConnectedPort")
-                            saveToHistory(host: inputHost, port: portInt)
-                            
-                            pairingStatus = "✓ Подключение успешно установлено"
-                            if vm.rightSource != .remotePhone && vm.leftSource != .remotePhone {
-                                vm.changeSource(to: .remotePhone, side: .right)
-                            } else {
-                                if vm.leftSource == .remotePhone { vm.refreshPane(side: .left) }
-                                if vm.rightSource == .remotePhone { vm.refreshPane(side: .right) }
-                            }
-                            vm.refreshDetectedVolumes()
-                            
-                            try? await Task.sleep(nanoseconds: 600_000_000)
-                            dismiss()
-                        } else {
-                            if case .authFailed(let reason) = ConnectionController.shared.phase {
-                                pairingStatus = "⚠️ Ошибка авторизации: \(reason)"
-                            } else {
-                                pairingStatus = "⚠️ Не удалось подключиться к \(inputHost):\(portInt)"
-                            }
-                        }
-                    }
+                    startConnection()
                 }
                 .buttonStyle(.borderedProminent)
                 .keyboardShortcut(.defaultAction)
@@ -310,6 +303,13 @@ public struct PairingModalView: View {
                 inputHost = ""
                 inputPort = "2222"
             }
+            updateFingerprintDisplay()
+        }
+        .onChange(of: inputHost) { _ in
+            updateFingerprintDisplay()
+        }
+        .onChange(of: inputPort) { _ in
+            updateFingerprintDisplay()
         }
         .onReceive(vm.discoveryService.$discoveredDevices) { devices in
             guard let live = devices.first else { return }
@@ -321,6 +321,74 @@ public struct PairingModalView: View {
             } else if inputHost != live.host && !PhoneConnectionManager.shared.isHostPortReachable(host: inputHost, port: UInt16(inputPort) ?? 2222, timeoutSeconds: 1) {
                 inputHost = live.host
                 inputPort = String(live.port)
+            }
+            updateFingerprintDisplay()
+        }
+    }
+    
+    private func startConnection() {
+        guard !inputHost.isEmpty else {
+            pairingStatus = "⚠️ Введите IP-адрес телефона"
+            return
+        }
+        let portInt = Int(inputPort) ?? 2222
+        isConnecting = true
+        pairingStatus = "Проверка доступности и авторизация SFTP..."
+        
+        Task { @MainActor in
+            defer { isConnecting = false }
+            
+            let success = await ConnectionController.shared.connect(
+                customHost: inputHost,
+                customPort: UInt16(portInt),
+                isExplicitUserAction: true,
+                viewModel: vm
+            )
+            
+            if success {
+                UserDefaults.standard.set(inputHost, forKey: "lastConnectedHost")
+                UserDefaults.standard.set(inputPort, forKey: "lastConnectedPort")
+                saveToHistory(host: inputHost, port: portInt)
+                
+                pairingStatus = "✓ Подключение успешно установлено"
+                if vm.rightSource != .remotePhone && vm.leftSource != .remotePhone {
+                    vm.changeSource(to: .remotePhone, side: .right)
+                } else {
+                    if vm.leftSource == .remotePhone { vm.refreshPane(side: .left) }
+                    if vm.rightSource == .remotePhone { vm.refreshPane(side: .right) }
+                }
+                vm.refreshDetectedVolumes()
+                
+                try? await Task.sleep(nanoseconds: 600_000_000)
+                dismiss()
+            } else {
+                if case .authFailed(let reason) = ConnectionController.shared.phase {
+                    pairingStatus = "⚠️ Ошибка авторизации: \(reason)"
+                } else {
+                    pairingStatus = "⚠️ Не удалось подключиться к \(inputHost):\(portInt)"
+                }
+            }
+        }
+    }
+    
+    private func updateFingerprintDisplay() {
+        guard !inputHost.isEmpty else {
+            currentFingerprint = "— Введите IP-адрес телефона —"
+            return
+        }
+        let host = inputHost
+        let port = UInt16(inputPort) ?? 2222
+        currentFingerprint = "Опрос отпечатка узла..."
+        Task.detached(priority: .userInitiated) {
+            let fp = PhoneConnectionManager.shared.fetchHostFingerprint(host: host, port: port)
+            await MainActor.run {
+                if let fp = fp {
+                    self.currentFingerprint = fp
+                } else if let dev = DeviceRegistry.shared.device(matchingHost: host), !dev.pinnedFingerprint.isEmpty {
+                    self.currentFingerprint = "\(dev.pinnedFingerprint) (сохраненный)"
+                } else {
+                    self.currentFingerprint = "— Узел недоступен или порт закрыт —"
+                }
             }
         }
     }
@@ -348,6 +416,7 @@ public struct PairingModalView: View {
             inputHost = host
             inputPort = String(port)
         }
+        updateFingerprintDisplay()
     }
     
     private func saveToHistory(host: String, port: Int) {

@@ -1,5 +1,4 @@
 import Foundation
-import CryptoKit
 
 public struct RemoteStat: Sendable {
     public let size: UInt64
@@ -25,8 +24,8 @@ public final class TransportMultiplexer: @unchecked Sendable {
         }
     }
     
-    public func updateEndpoint(host: String, port: UInt16) {
-        coordinator.updateEndpoint(host: host, port: port)
+    public func updateEndpoint(host: String, port: UInt16, deviceId: String? = nil) {
+        coordinator.updateEndpoint(host: host, port: port, deviceId: deviceId)
     }
     
     public func invalidateSession() {
@@ -106,7 +105,9 @@ public final class TransportMultiplexer: @unchecked Sendable {
         let openPacket = packetEngine.createOpenPacket(requestId: openReqId, path: sftpPath, pflags: 0x00000001) // SSH_FXF_READ
         var (openRespType, openPayload) = try await channel.sendRequest(packet: openPacket, requestId: openReqId)
         
-        if openRespType != .handle {
+        if openRespType == .status,
+           let (_, openCode, _) = try? packetEngine.parseStatusResponse(data: openPayload),
+           openCode == .noSuchFile {
             let altPath: String
             if sftpPath.hasPrefix("/emulated/0") {
                 let sub = String(sftpPath.dropFirst("/emulated/0".count))
@@ -200,7 +201,9 @@ public final class TransportMultiplexer: @unchecked Sendable {
         let openPacket = packetEngine.createOpenPacket(requestId: openReqId, path: currentSftpPath, pflags: 0x00000001)
         var (openRespType, openPayload) = try await channel.sendRequest(packet: openPacket, requestId: openReqId)
         
-        if openRespType != .handle {
+        if openRespType == .status,
+           let (_, openCode, _) = try? packetEngine.parseStatusResponse(data: openPayload),
+           openCode == .noSuchFile {
             let altPath: String
             if currentSftpPath.hasPrefix("/emulated/0") {
                 let sub = String(currentSftpPath.dropFirst("/emulated/0".count))
@@ -223,10 +226,16 @@ public final class TransportMultiplexer: @unchecked Sendable {
         let (_, remoteHandle) = try packetEngine.parseHandleResponse(data: openPayload)
         
         // 2. Конвейерное чтение с учетом SessionBudget (окно до 16 запросов по 256 КиБ = 4 МиБ)
-        let effectiveChunkSize: UInt32 = min(UInt32(256 * 1024), UInt32(coordinator.serverLimits?.maxReadLen ?? UInt64(256 * 1024)))
+        let advertisedReadLimit = coordinator.serverLimits?.maxReadLen ?? UInt64(256 * 1024)
+        guard advertisedReadLimit > 0 else {
+            throw NSError(domain: "TransportMultiplexer", code: 21, userInfo: [NSLocalizedDescriptionKey: "SFTP server advertised a zero read limit"])
+        }
+        let effectiveChunkSize = UInt32(min(UInt64(256 * 1024), advertisedReadLimit))
         let windowCapacity = 16
         var requestOffset = startOffset
         var confirmedBytes = startOffset
+        var confirmedRanges = rangeTracker ?? ConfirmedRangeTracker()
+        if rangeTracker == nil && startOffset > 0 { confirmedRanges.addRange(0..<startOffset) }
         var activeInflight = 0
         
         do {
@@ -236,25 +245,11 @@ public final class TransportMultiplexer: @unchecked Sendable {
                     let readOffset = requestOffset
                     requestOffset += UInt64(toRead)
                     
-                    await budget.acquirePayload(bytes: Int(toRead), isInteractive: false)
-                    let readReqId = channel.allocateRequestId()
-                    let readPkt = packetEngine.createReadPacket(requestId: readReqId, handle: remoteHandle, offset: readOffset, length: toRead)
-                    
+                    guard await budget.acquirePayload(bytes: Int(toRead), isInteractive: false) else { throw CancellationError() }
                     group.addTask {
                         defer { budget.releasePayload(bytes: Int(toRead)) }
-                        let (rType, rPayload) = try await channel.sendRequest(packet: readPkt, requestId: readReqId)
-                        if rType == .data {
-                            let (_, data) = try self.packetEngine.parseDataResponse(data: rPayload)
-                            return (readOffset..<(readOffset + UInt64(data.count)), data)
-                        } else if rType == .status {
-                            let (_, code, msg) = try self.packetEngine.parseStatusResponse(data: rPayload)
-                            if code == .eof {
-                                return (readOffset..<readOffset, Data())
-                            }
-                            throw NSError(domain: "TransportMultiplexer", code: Int(code.rawValue), userInfo: [NSLocalizedDescriptionKey: "SFTP read error: \(msg)"])
-                        } else {
-                            throw NSError(domain: "TransportMultiplexer", code: -1, userInfo: [NSLocalizedDescriptionKey: "Unexpected response type \(rType)"])
-                        }
+                        let data = try await self.readExactRemoteChunk(channel: channel, handle: remoteHandle, offset: readOffset, length: toRead)
+                        return (readOffset..<(readOffset + UInt64(data.count)), data)
                     }
                     activeInflight += 1
                 }
@@ -266,8 +261,9 @@ public final class TransportMultiplexer: @unchecked Sendable {
                     
                     if !data.isEmpty {
                         try handle.seek(toOffset: range.lowerBound)
-                        handle.write(data)
-                        confirmedBytes = max(confirmedBytes, range.upperBound)
+                        try handle.write(contentsOf: data)
+                        confirmedRanges.addRange(range)
+                        confirmedBytes = confirmedRanges.contiguousFrontier
                         onRangeConfirmed?(range)
                         onProgress(confirmedBytes)
                     }
@@ -277,25 +273,11 @@ public final class TransportMultiplexer: @unchecked Sendable {
                         let readOffset = requestOffset
                         requestOffset += UInt64(toRead)
                         
-                        await budget.acquirePayload(bytes: Int(toRead), isInteractive: false)
-                        let readReqId = channel.allocateRequestId()
-                        let readPkt = packetEngine.createReadPacket(requestId: readReqId, handle: remoteHandle, offset: readOffset, length: toRead)
-                        
+                        guard await budget.acquirePayload(bytes: Int(toRead), isInteractive: false) else { throw CancellationError() }
                         group.addTask {
                             defer { budget.releasePayload(bytes: Int(toRead)) }
-                            let (rType, rPayload) = try await channel.sendRequest(packet: readPkt, requestId: readReqId)
-                            if rType == .data {
-                                let (_, data) = try self.packetEngine.parseDataResponse(data: rPayload)
-                                return (readOffset..<(readOffset + UInt64(data.count)), data)
-                            } else if rType == .status {
-                                let (_, code, msg) = try self.packetEngine.parseStatusResponse(data: rPayload)
-                                if code == .eof {
-                                    return (readOffset..<readOffset, Data())
-                                }
-                                throw NSError(domain: "TransportMultiplexer", code: Int(code.rawValue), userInfo: [NSLocalizedDescriptionKey: "SFTP read error: \(msg)"])
-                            } else {
-                                throw NSError(domain: "TransportMultiplexer", code: -1, userInfo: [NSLocalizedDescriptionKey: "Unexpected response type \(rType)"])
-                            }
+                            let data = try await self.readExactRemoteChunk(channel: channel, handle: remoteHandle, offset: readOffset, length: toRead)
+                            return (readOffset..<(readOffset + UInt64(data.count)), data)
                         }
                         activeInflight += 1
                     }
@@ -315,13 +297,42 @@ public final class TransportMultiplexer: @unchecked Sendable {
         }
         
         try handle.synchronize()
-        guard confirmedBytes == totalSize else {
+        guard confirmedRanges.isFullyCovered(expectedSize: totalSize) else {
             throw NSError(
                 domain: "TransportMultiplexer",
                 code: 416,
                 userInfo: [NSLocalizedDescriptionKey: "Incomplete download: received \(confirmedBytes) of \(totalSize) bytes"]
             )
         }
+    }
+
+    private func readExactRemoteChunk(channel: SFTPChannel, handle: Data, offset: UInt64, length: UInt32) async throws -> Data {
+        guard length > 0 else {
+            throw NSError(domain: "TransportMultiplexer", code: 21, userInfo: [NSLocalizedDescriptionKey: "Cannot issue an empty SFTP read"])
+        }
+        var result = Data()
+        result.reserveCapacity(Int(length))
+        while result.count < Int(length) {
+            try Task.checkCancellation()
+            let cursor = offset + UInt64(result.count)
+            let remaining = UInt32(Int(length) - result.count)
+            let requestId = channel.allocateRequestId()
+            let packet = packetEngine.createReadPacket(requestId: requestId, handle: handle, offset: cursor, length: remaining)
+            let (response, payload) = try await channel.sendRequest(packet: packet, requestId: requestId)
+            if response == .data {
+                let (_, bytes) = try packetEngine.parseDataResponse(data: payload)
+                guard !bytes.isEmpty, bytes.count <= Int(remaining) else {
+                    throw NSError(domain: "TransportMultiplexer", code: 22, userInfo: [NSLocalizedDescriptionKey: "Invalid or empty SFTP READ data response"])
+                }
+                result.append(bytes)
+            } else if response == .status {
+                let (_, code, message) = try packetEngine.parseStatusResponse(data: payload)
+                throw NSError(domain: "TransportMultiplexer", code: Int(code.rawValue), userInfo: [NSLocalizedDescriptionKey: "SFTP READ ended before the requested range was complete: \(message)"])
+            } else {
+                throw NSError(domain: "TransportMultiplexer", code: 23, userInfo: [NSLocalizedDescriptionKey: "Unexpected SFTP READ response \(response)"])
+            }
+        }
+        return result
     }
     
     /// Потоковая выгрузка (Upload) с учетом SessionBudget и подтверждением диапазонов
@@ -374,7 +385,11 @@ public final class TransportMultiplexer: @unchecked Sendable {
         }
         let (_, remoteHandle) = try packetEngine.parseHandleResponse(data: openPayload)
         
-        let effectiveChunkSize = min(256 * 1024, Int(coordinator.serverLimits?.maxWriteLen ?? UInt64(256 * 1024)))
+        let advertisedWriteLimit = coordinator.serverLimits?.maxWriteLen ?? UInt64(256 * 1024)
+        guard advertisedWriteLimit > 0 else {
+            throw NSError(domain: "TransportMultiplexer", code: 21, userInfo: [NSLocalizedDescriptionKey: "SFTP server advertised a zero write limit"])
+        }
+        let effectiveChunkSize = min(256 * 1024, Int(advertisedWriteLimit))
         let windowCapacity = 16
         var offset: UInt64 = startOffset
         var confirmedBytes = startOffset
@@ -391,7 +406,7 @@ public final class TransportMultiplexer: @unchecked Sendable {
                     let writeOffset = offset
                     offset += UInt64(chunk.count)
                     
-                    await budget.acquirePayload(bytes: chunk.count, isInteractive: false)
+                    guard await budget.acquirePayload(bytes: chunk.count, isInteractive: false) else { throw CancellationError() }
                     let writeReqId = channel.allocateRequestId()
                     let writePkt = packetEngine.createWritePacket(requestId: writeReqId, handle: remoteHandle, offset: writeOffset, data: chunk)
                     
@@ -426,7 +441,7 @@ public final class TransportMultiplexer: @unchecked Sendable {
                             let writeOffset = offset
                             offset += UInt64(chunk.count)
                             
-                            await budget.acquirePayload(bytes: chunk.count, isInteractive: false)
+                            guard await budget.acquirePayload(bytes: chunk.count, isInteractive: false) else { throw CancellationError() }
                             let writeReqId = channel.allocateRequestId()
                             let writePkt = packetEngine.createWritePacket(requestId: writeReqId, handle: remoteHandle, offset: writeOffset, data: chunk)
                             
@@ -548,24 +563,6 @@ public final class TransportMultiplexer: @unchecked Sendable {
         let free = vfs.bavail * vfs.frsize
         let total = vfs.blocks * vfs.frsize
         return (free: free, total: total)
-    }
-    
-    public func getRemoteFileDigest(actionId: String, path: String) async throws -> String {
-        let escaped = PhoneConnectionManager.shellEscape(path)
-        let (status, out) = PhoneConnectionManager.shared.executeAdbShell(command: "sha256sum -- \(escaped)")
-        if status == 0, !out.isEmpty {
-            let parts = out.split(whereSeparator: { $0.isWhitespace })
-            if let first = parts.first, first.count == 64 {
-                return String(first)
-            }
-        }
-        
-        try await ensureConnected()
-        let stat = try await prepareRead(actionId: actionId, path: path)
-        let readLen = min(stat.size, 1024 * 1024)
-        let chunk = try await readChunk(remotePath: path, offset: 0, length: UInt32(readLen))
-        let hash = SHA256.hash(data: chunk)
-        return hash.compactMap { String(format: "%02x", $0) }.joined()
     }
     
     public func disconnect() {

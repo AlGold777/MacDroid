@@ -35,14 +35,9 @@ public struct MainContentView: View {
         .sheet(isPresented: $vm.showQueueDialog) {
             TransferQueueModalView()
         }
-        .sheet(isPresented: $vm.showBatchRenameDialog) {
-            let activeSide = vm.activePane
-            let selectedIds = (activeSide == .left) ? vm.leftSelection : vm.rightSelection
-            let allItems = (activeSide == .left) ? vm.leftItems : vm.rightItems
-            let selectedItems = allItems.filter { selectedIds.contains($0.id) || selectedIds.contains($0.path) }
-            let targetItems = selectedItems.isEmpty ? allItems : selectedItems
-            BatchRenameModalView(items: targetItems) { mappings in
-                vm.applyBatchRename(mappings: mappings)
+        .sheet(item: $vm.batchRenameSession) { session in
+            BatchRenameModalView(items: session.items, side: session.side) { mappings in
+                vm.applyBatchRename(mappings: mappings, side: session.side)
             }
             .environmentObject(vm)
         }

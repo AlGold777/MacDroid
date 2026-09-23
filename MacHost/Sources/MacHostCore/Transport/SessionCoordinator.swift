@@ -29,6 +29,10 @@ public final class SessionCoordinator: @unchecked Sendable {
     private var muxSocketPath: String?
     
     private var activeConnectTask: Task<Void, Error>?
+    private var activeConnectAllowsLegacyFallback: Bool?
+    private var activeSessionAllowsLegacyFallback: Bool?
+    private var expectedHostKeyAlgorithm: String?
+    private var hostKeyAlias: String?
     private var connectingChannels: [SFTPChannel] = []
     
     public init() {}
@@ -48,19 +52,21 @@ public final class SessionCoordinator: @unchecked Sendable {
     public var bulkChannel: SFTPChannel? {
         lock.lock()
         defer { lock.unlock() }
-        return _bulkChannel ?? _interactiveChannel
+        return _bulkChannel?.isRunning == true ? _bulkChannel : _interactiveChannel
     }
     
     public func updateEndpoint(host: String, port: UInt16, deviceId: String? = nil) {
         lock.lock()
         defer { lock.unlock() }
-        if self.host == host && self.port == port && self.deviceId == deviceId && isConnected {
+        if self.host == host && self.port == port && self.deviceId == deviceId {
             return
         }
         disconnect()
         self.host = host
         self.port = port
         self.deviceId = deviceId
+        self.expectedHostKeyAlgorithm = nil
+        self.hostKeyAlias = nil
         self._interactiveChannel?.close()
         self._interactiveChannel = nil
         self._bulkChannel?.close()
@@ -74,33 +80,52 @@ public final class SessionCoordinator: @unchecked Sendable {
         self.hostKeyFingerprint = fingerprint
         self.isMigratedToDedicatedKey = isMigrated
     }
+
+    public func setExpectedHostKeyAlgorithm(_ algorithm: String?) {
+        lock.lock()
+        defer { lock.unlock() }
+        expectedHostKeyAlgorithm = algorithm
+    }
+
+    public func setHostKeyAlias(_ alias: String?) {
+        lock.lock()
+        defer { lock.unlock() }
+        hostKeyAlias = alias.map(HostKeyStore.safeHostKeyAlias)
+    }
     
     /// Гарантирует активное подключение к Android
     public func ensureConnected(allowLegacyFallback: Bool = false) async throws {
         lock.lock()
-        if let chan = _interactiveChannel, chan.isRunning {
+        if let chan = _interactiveChannel, chan.isRunning,
+           activeSessionAllowsLegacyFallback == allowLegacyFallback {
             lock.unlock()
             return
         }
         if let existing = activeConnectTask {
-            lock.unlock()
-            try await existing.value
-            return
+            if activeConnectAllowsLegacyFallback == allowLegacyFallback {
+                lock.unlock()
+                try await existing.value
+                return
+            }
+            disconnect()
+        } else if _interactiveChannel?.isRunning == true {
+            disconnect()
         }
-        
-        disconnect()
+
         let epoch = sessionEpoch
         let task = Task { [weak self] () -> Void in
             guard let self = self else { return }
             try await self.performConnect(allowLegacyFallback: allowLegacyFallback, epoch: epoch)
         }
         self.activeConnectTask = task
+        self.activeConnectAllowsLegacyFallback = allowLegacyFallback
         lock.unlock()
         
         defer {
             lock.lock()
             if self.activeConnectTask == task {
                 self.activeConnectTask = nil
+                self.activeConnectAllowsLegacyFallback = nil
             }
             lock.unlock()
         }
@@ -118,6 +143,8 @@ public final class SessionCoordinator: @unchecked Sendable {
         let targetHost = self.host
         let targetPort = self.port
         let devId = self.deviceId
+        let expectedKeyAlgorithm = self.expectedHostKeyAlgorithm
+        let keyAlias = self.hostKeyAlias
         lock.unlock()
         defer {
             lock.lock()
@@ -154,15 +181,9 @@ public final class SessionCoordinator: @unchecked Sendable {
             try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: keyURL.path)
         }
         
-        let isLoopback = (targetHost == "127.0.0.1" || targetHost == "localhost")
-        let knownHostsURL: URL
-        if isLoopback {
-            let devTag = devId ?? PhoneConnectionManager.shared.getConnectedDeviceId() ?? "usb_default"
-            knownHostsURL = sshDir.appendingPathComponent("macdroid_known_hosts_\(devTag)")
-        } else {
-            knownHostsURL = sshDir.appendingPathComponent("macdroid_known_hosts")
-        }
+        let knownHostsURL = HostKeyStore.shared.openSSHKnownHostsURL(host: targetHost, port: targetPort, deviceId: devId)
         if !FileManager.default.fileExists(atPath: knownHostsURL.path) {
+            try? FileManager.default.createDirectory(at: knownHostsURL.deletingLastPathComponent(), withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
             FileManager.default.createFile(atPath: knownHostsURL.path, contents: Data())
         }
         
@@ -187,15 +208,26 @@ public final class SessionCoordinator: @unchecked Sendable {
             "-o", "ServerAliveCountMax=2",
             "-o", "Compression=no",
             "-o", "IPQoS=throughput",
-            "-o", "StrictHostKeyChecking=accept-new",
+            "-o", "StrictHostKeyChecking=yes",
             "-o", "UserKnownHostsFile=\(knownHostsURL.path)",
             "-p", String(targetPort)
         ])
+        if let keyAlias {
+            baseArgs.append(contentsOf: ["-o", "HostKeyAlias=\(keyAlias)"])
+        }
+        if let expectedKeyAlgorithm {
+            let allowedAlgorithms = expectedKeyAlgorithm == "ssh-rsa"
+                ? "rsa-sha2-512,rsa-sha2-256,ssh-rsa"
+                : expectedKeyAlgorithm
+            baseArgs.append(contentsOf: ["-o", "HostKeyAlgorithms=\(allowedAlgorithms)"])
+        }
         let sshDestination = "\(sshUser)@\(targetHost)"
         
         // Попытка OpenSSH Multiplexing через ControlMaster
-        let socketId = UUID().uuidString.prefix(8)
-        let sockPath = "/tmp/mcd_\(socketId).sock"
+        let socketDirectory = home.appendingPathComponent("Library/Caches/MacDroidCommander/ControlSockets", isDirectory: true)
+        try FileManager.default.createDirectory(at: socketDirectory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: socketDirectory.path)
+        let sockPath = socketDirectory.appendingPathComponent("mcd_\(UUID().uuidString).sock").path
         
         var interactiveChan: SFTPChannel?
         var bulkChan: SFTPChannel?
@@ -227,9 +259,9 @@ public final class SessionCoordinator: @unchecked Sendable {
             self.muxSocketPath = sockPath
             self.lock.unlock()
             
-            // Ждем появления сокета (до 2 сек)
+            // Ждем появления сокета: Wi-Fi host-key handshake может занимать несколько секунд.
             var sockReady = false
-            for _ in 0..<20 {
+            for _ in 0..<60 {
                 if FileManager.default.fileExists(atPath: sockPath) {
                     sockReady = true
                     break
@@ -242,6 +274,7 @@ public final class SessionCoordinator: @unchecked Sendable {
                 // Создаем два SFTP канала через slave ssh процессы
                 let chan1 = try spawnSlaveChannel(
                     sockPath: sockPath,
+                    baseArgs: baseArgs,
                     destination: sshDestination,
                     channelId: "interactive_\(currentEpoch)",
                     isInteractive: true
@@ -249,6 +282,7 @@ public final class SessionCoordinator: @unchecked Sendable {
                 try trackConnectingChannel(chan1, epoch: epoch)
                 let chan2 = try spawnSlaveChannel(
                     sockPath: sockPath,
+                    baseArgs: baseArgs,
                     destination: sshDestination,
                     channelId: "bulk_\(currentEpoch)",
                     isInteractive: false
@@ -358,9 +392,14 @@ public final class SessionCoordinator: @unchecked Sendable {
         // Автоопределение корня (/emulated/0 <-> /)
         let statReqId = activeInteractive.allocateRequestId()
         let statPacket = packetEngine.createStatPacket(requestId: statReqId, path: "/emulated/0")
-        if let (statResp, _) = try? await activeInteractive.sendRequest(packet: statPacket, requestId: statReqId) {
+        if let (statResp, statPayload) = try? await activeInteractive.sendRequest(packet: statPacket, requestId: statReqId) {
             self.lock.lock()
-            self.rootIsEmulatedZero = (statResp != .attrs)
+            if statResp == .status,
+               let (_, code, _) = try? packetEngine.parseStatusResponse(data: statPayload) {
+                self.rootIsEmulatedZero = code == .noSuchFile
+            } else {
+                self.rootIsEmulatedZero = false
+            }
             self.lock.unlock()
         }
         
@@ -373,6 +412,7 @@ public final class SessionCoordinator: @unchecked Sendable {
         }
         self._interactiveChannel = activeInteractive
         self._bulkChannel = bulkChan
+        self.activeSessionAllowsLegacyFallback = allowLegacyFallback
         self.lock.unlock()
     }
 
@@ -386,16 +426,10 @@ public final class SessionCoordinator: @unchecked Sendable {
         connectingChannels.append(channel)
     }
     
-    private func spawnSlaveChannel(sockPath: String, destination: String, channelId: String, isInteractive: Bool) throws -> SFTPChannel {
+    private func spawnSlaveChannel(sockPath: String, baseArgs: [String], destination: String, channelId: String, isInteractive: Bool) throws -> SFTPChannel {
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: "/usr/bin/ssh")
-        proc.arguments = [
-            "-S", sockPath,
-            "-F", "/dev/null",
-            "-o", "BatchMode=yes",
-            destination,
-            "-s", "sftp"
-        ]
+        proc.arguments = baseArgs + ["-S", sockPath, destination, "-s", "sftp"]
         let inPipe = Pipe()
         let outPipe = Pipe()
         proc.standardInput = inPipe
@@ -433,6 +467,8 @@ public final class SessionCoordinator: @unchecked Sendable {
         sessionEpoch &+= 1
         activeConnectTask?.cancel()
         activeConnectTask = nil
+        activeConnectAllowsLegacyFallback = nil
+        activeSessionAllowsLegacyFallback = nil
         connectingChannels.forEach { $0.close() }
         connectingChannels.removeAll()
         _interactiveChannel?.close()

@@ -20,6 +20,22 @@ public enum PaneViewMode: String, CaseIterable, Sendable {
     case grid = "grid"
 }
 
+public struct BatchRenameSession: Identifiable, Equatable, Sendable {
+    public let id: UUID
+    public let side: PaneSide
+    public let items: [FileItem]
+    
+    public init(id: UUID = UUID(), side: PaneSide, items: [FileItem]) {
+        self.id = id
+        self.side = side
+        self.items = items
+    }
+    
+    public static func == (lhs: BatchRenameSession, rhs: BatchRenameSession) -> Bool {
+        lhs.id == rhs.id
+    }
+}
+
 @MainActor
 public final class DualPaneViewModel: ObservableObject {
     @Published public var activePane: PaneSide = .left {
@@ -34,6 +50,7 @@ public final class DualPaneViewModel: ObservableObject {
                     TableDoubleClickHandler.HandlerView.leftTableView?.deselectAll(nil)
                 }
                 TableDoubleClickHandler.HandlerView.setActiveSide(activePane)
+                updateQuickLookIfVisible()
             }
         }
     }
@@ -75,7 +92,9 @@ public final class DualPaneViewModel: ObservableObject {
     @Published public var leftItems: [FileItem] = [] {
         didSet { leftItemsVersion &+= 1 }
     }
-    @Published public var leftSelection: Set<String> = []
+    @Published public var leftSelection: Set<String> = [] {
+        didSet { onSelectionChanged(for: .left) }
+    }
     @Published public var leftFilter: String = ""
     @Published public var leftSortField: SortField = .name {
         didSet { UserDefaults.standard.set(leftSortField.rawValue, forKey: SessionKey.leftSortField) }
@@ -96,7 +115,9 @@ public final class DualPaneViewModel: ObservableObject {
     @Published public var rightItems: [FileItem] = [] {
         didSet { rightItemsVersion &+= 1 }
     }
-    @Published public var rightSelection: Set<String> = []
+    @Published public var rightSelection: Set<String> = [] {
+        didSet { onSelectionChanged(for: .right) }
+    }
     @Published public var rightFilter: String = ""
     @Published public var rightSortField: SortField = .name {
         didSet { UserDefaults.standard.set(rightSortField.rawValue, forKey: SessionKey.rightSortField) }
@@ -134,8 +155,18 @@ public final class DualPaneViewModel: ObservableObject {
     @Published public var showDeleteConfirmDialog: Bool = false
     @Published public var showTransferProgress: Bool = false
     @Published public var showQueueDialog: Bool = false
-    @Published public var showBatchRenameDialog: Bool = false
+    @Published public var batchRenameSession: BatchRenameSession? = nil
+    @Published public var showBatchRenameDialog: Bool = false {
+        didSet {
+            if !showBatchRenameDialog {
+                batchRenameSession = nil
+            }
+        }
+    }
+    @Published public var batchRenameItems: [FileItem] = []
+    @Published public var batchRenameSide: PaneSide = .left
     @Published public var lastBatchRenameHistory: [(oldPath: String, newPath: String)] = []
+    @Published public var lastBatchRenameSide: PaneSide = .left
     @Published public var canUndoBatchRename: Bool = false
     @Published public var showSearchDialog: Bool = false
     @Published public var showPairingDialog: Bool = false
@@ -267,6 +298,10 @@ public final class DualPaneViewModel: ObservableObject {
     @Published public var isPathPrefixHidingEnabled: Bool = true
     @Published public var showPathDisplaySettings: Bool = false
     
+    public var isRunningTests: Bool {
+        ProcessInfo.processInfo.processName == "MacHostTests"
+    }
+    
     // MARK: - Session Restore Keys
     private enum SessionKey {
         static let leftPath = "session.leftPath"
@@ -300,10 +335,13 @@ public final class DualPaneViewModel: ObservableObject {
         // Восстановление сохранённого адреса телефона
         let savedHost = UserDefaults.standard.string(forKey: "lastConnectedHost") ?? ""
         let savedPort = UInt16(UserDefaults.standard.integer(forKey: "lastConnectedPort"))
+        let savedDeviceId = savedHost == "127.0.0.1"
+            ? UserDefaults.standard.string(forKey: "lastConnectedDeviceId")
+            : nil
         let port = savedPort > 0 ? savedPort : 2222
         if !savedHost.isEmpty {
-            remoteDriver.updateEndpoint(host: savedHost, port: port)
-            transport.updateEndpoint(host: savedHost, port: port)
+            remoteDriver.updateEndpoint(host: savedHost, port: port, deviceId: savedDeviceId)
+            transport.updateEndpoint(host: savedHost, port: port, deviceId: savedDeviceId)
         }
         
         // Восстановление состояния из предыдущей сессии
@@ -329,12 +367,28 @@ public final class DualPaneViewModel: ObservableObject {
             rightActiveTabId = defaultRightTab.id
         }
         
-        refreshPane(side: .left)
-        refreshPane(side: .right)
+        if leftSource != .remotePhone || remoteDriver.isConnected {
+            refreshPane(side: .left)
+        }
+        if rightSource != .remotePhone || remoteDriver.isConnected {
+            refreshPane(side: .right)
+        }
         discoveryService.startDiscovery()
         
-        // Автоматическое обнаружение и подключение смартфона при старте (только если включено пользователем в настройках)
-        if UserDefaults.standard.bool(forKey: "autoConnectEnabled") {
+        QuickLookBridge.shared.onNavigateNext = { [weak self] in
+            self?.selectNext()
+        }
+        QuickLookBridge.shared.onNavigatePrevious = { [weak self] in
+            self?.selectPrevious()
+        }
+        
+        // Автоматическое обнаружение и подключение смартфона при старте
+        let isRunningTests = ProcessInfo.processInfo.processName == "MacHostTests"
+        if !isRunningTests && (leftSource == .remotePhone || rightSource == .remotePhone) {
+            leftIsStale = false
+            rightIsStale = false
+            connectPhone(preferredDeviceId: savedDeviceId, forceActivate: false, isExplicit: false)
+        } else if UserDefaults.standard.bool(forKey: "autoConnectEnabled") {
             autoConnectPhoneIfAvailable()
         }
         
@@ -854,13 +908,27 @@ public final class DualPaneViewModel: ObservableObject {
             leftActiveTabId = id
             leftPath = tab.path
             leftSource = tab.source
-            refreshPane(side: .left)
+            if tab.source == .remotePhone && !remoteDriver.isConnected {
+                leftIsStale = false
+                if !isRunningTests {
+                    connectPhone(forceActivate: false, isExplicit: true)
+                }
+            } else {
+                refreshPane(side: .left)
+            }
             saveSession()
         } else if side == .right, let tab = rightTabs.first(where: { $0.id == id }) {
             rightActiveTabId = id
             rightPath = tab.path
             rightSource = tab.source
-            refreshPane(side: .right)
+            if tab.source == .remotePhone && !remoteDriver.isConnected {
+                rightIsStale = false
+                if !isRunningTests {
+                    connectPhone(forceActivate: false, isExplicit: true)
+                }
+            } else {
+                refreshPane(side: .right)
+            }
             saveSession()
         }
     }
@@ -1184,6 +1252,7 @@ public final class DualPaneViewModel: ObservableObject {
     
     /// Безопасная смена источника панели с автоматической коррекцией пути под платформу
     public func changeSource(to newSource: FileSource, side: PaneSide) {
+        if activePane != side { activePane = side }
         if side == .left {
             leftSource = newSource
             if newSource == .localMac {
@@ -1195,12 +1264,21 @@ public final class DualPaneViewModel: ObservableObject {
                 if !leftPath.hasPrefix("/storage") {
                     leftPath = "/storage/emulated/0"
                 }
+                leftIsStale = false
             }
             leftSelection.removeAll()
             updateActiveTab(side: .left)
-            refreshPane(side: .left)
             if newSource == .remotePhone {
-                autoConnectPhoneIfAvailable()
+                if !remoteDriver.isConnected {
+                    leftIsStale = false
+                    if !isRunningTests {
+                        connectPhone(forceActivate: false, isExplicit: true)
+                    }
+                } else {
+                    refreshPane(side: .left)
+                }
+            } else {
+                refreshPane(side: .left)
             }
         } else {
             rightSource = newSource
@@ -1213,20 +1291,29 @@ public final class DualPaneViewModel: ObservableObject {
                 if !rightPath.hasPrefix("/storage") {
                     rightPath = "/storage/emulated/0"
                 }
+                rightIsStale = false
             }
             rightSelection.removeAll()
             updateActiveTab(side: .right)
-            refreshPane(side: .right)
             if newSource == .remotePhone {
-                autoConnectPhoneIfAvailable()
+                if !remoteDriver.isConnected {
+                    rightIsStale = false
+                    if !isRunningTests {
+                        connectPhone(forceActivate: false, isExplicit: true)
+                    }
+                } else {
+                    refreshPane(side: .right)
+                }
+            } else {
+                refreshPane(side: .right)
             }
         }
     }
     
     /// Обновление сетевого адреса телефона для SFTP и передачи файлов
-    public func updateRemoteEndpoint(host: String, port: UInt16) {
-        remoteDriver.updateEndpoint(host: host, port: port)
-        transport.updateEndpoint(host: host, port: port)
+    public func updateRemoteEndpoint(host: String, port: UInt16, deviceId: String? = nil) {
+        remoteDriver.updateEndpoint(host: host, port: port, deviceId: deviceId)
+        transport.updateEndpoint(host: host, port: port, deviceId: deviceId)
     }
     
     /// Подключение к телефону: единое управление через ConnectionController (Слой 3)
@@ -1234,12 +1321,17 @@ public final class DualPaneViewModel: ObservableObject {
         targetPath: CandidatePath? = nil,
         customHost: String? = nil,
         customPort: UInt16? = nil,
+        preferredDeviceId: String? = nil,
         forceActivate: Bool = true,
         isExplicit: Bool = true
     ) {
         guard !isConnectingPhone else { return }
         isConnectingPhone = true
-        statusMessage = "Поиск и подключение телефона..."
+        if leftSource == .remotePhone { leftIsStale = false }
+        if rightSource == .remotePhone { rightIsStale = false }
+        if isExplicit {
+            statusMessage = "Поиск и подключение телефона..."
+        }
         
         Task { @MainActor in
             defer { self.isConnectingPhone = false }
@@ -1247,10 +1339,13 @@ public final class DualPaneViewModel: ObservableObject {
                 targetCandidate: targetPath,
                 customHost: customHost,
                 customPort: customPort,
+                preferredDeviceId: preferredDeviceId,
                 isExplicitUserAction: isExplicit,
                 viewModel: self
             )
             if success {
+                self.leftIsStale = false
+                self.rightIsStale = false
                 if forceActivate && self.rightSource != .remotePhone && self.leftSource != .remotePhone {
                     self.changeSource(to: .remotePhone, side: .right)
                 } else {
@@ -1259,6 +1354,8 @@ public final class DualPaneViewModel: ObservableObject {
                 }
                 self.refreshDetectedVolumes()
             } else {
+                if self.leftSource == .remotePhone { self.leftIsStale = true }
+                if self.rightSource == .remotePhone { self.rightIsStale = true }
                 self.refreshUsbDrives()
             }
         }
@@ -1289,18 +1386,16 @@ public final class DualPaneViewModel: ObservableObject {
             guard let self = self else { return }
             // 1. Проверяем наличие USB-устройства через ADB и его политику autoConnect
             var chosenCandidate: CandidatePath? = nil
-            if let adb = PhoneConnectionManager.shared.findAdbBinary() {
-                let (status, out) = PhoneConnectionManager.shared.runCommand(executable: adb, arguments: ["devices"])
-                if status == 0 && out.contains("\tdevice") {
-                    let devId = PhoneConnectionManager.shared.getConnectedDeviceId()
-                    if let id = devId, let dev = DeviceRegistry.shared.device(withId: id), dev.autoConnect {
-                        chosenCandidate = .usb(deviceId: id, localPort: 2222)
-                    }
+            var chosenUsbDeviceId: String? = nil
+            for id in PhoneConnectionManager.shared.authorizedAdbDeviceIds() {
+                if let dev = DeviceRegistry.shared.device(withId: id), dev.autoConnect {
+                    chosenUsbDeviceId = id
+                    break
                 }
             }
             
             // 2. Если по USB не обнаружен, сканируем Wi-Fi для доверенных устройств с autoConnect == true
-            if chosenCandidate == nil {
+            if chosenUsbDeviceId == nil {
                 if let foundIp = PhoneConnectionManager.shared.discoverPhoneIpOnLan() {
                     let dev = DeviceRegistry.shared.device(matchingHost: foundIp)
                     if dev?.autoConnect == true {
@@ -1309,14 +1404,20 @@ public final class DualPaneViewModel: ObservableObject {
                     }
                 }
             }
-            
+
             let candidateToConnect = chosenCandidate
+            let usbDeviceToConnect = chosenUsbDeviceId
             await MainActor.run {
                 self.isAutoConnecting = false
                 // Важно: повторная проверка подавления прямо перед коннектом
                 guard !ConnectionController.shared.isManualDisconnectSuppressed else { return }
-                if let candidate = candidateToConnect, !self.isConnectingPhone && !self.remoteDriver.isConnected {
-                    self.connectPhone(targetPath: candidate, forceActivate: false, isExplicit: false)
+                if (candidateToConnect != nil || usbDeviceToConnect != nil), !self.isConnectingPhone && !self.remoteDriver.isConnected {
+                    self.connectPhone(
+                        targetPath: candidateToConnect,
+                        preferredDeviceId: usbDeviceToConnect,
+                        forceActivate: false,
+                        isExplicit: false
+                    )
                 }
             }
         }
@@ -1396,46 +1497,20 @@ public final class DualPaneViewModel: ObservableObject {
         }
         connectionProbeRunning = true
         let probeEpoch = remoteDriver.coordinator.sessionEpoch
-
-        // Проверяем именно текущий endpoint. Ранее монитор после автоматического
-        // подключения мог перейти к устаревшему UserDefaults/ARP-адресу и
-        // принять краткий сетевой джиттер за отключение телефона.
         let monitoredPath = ConnectionController.shared.currentPath
-        let monitoredWifiEndpoint: (host: String, port: UInt16)? = {
-            guard let path = monitoredPath else { return nil }
-            if case .lan(let host, let port, _) = path {
-                return (host, port)
-            }
-            return nil
-        }()
+        let activeSSHChannel = remoteDriver.coordinator.interactiveChannel
         
         Task.detached(priority: .utility) { [weak self] in
             guard let self = self else { return }
-            var isAdbConnected = false
-            if let adb = PhoneConnectionManager.shared.findAdbBinary() {
-                let (status, out) = PhoneConnectionManager.shared.runCommand(executable: adb, arguments: ["devices"])
-                if status == 0 && out.contains("\tdevice") {
-                    isAdbConnected = true
-                }
-            }
-            
-            // Проверяем реальный отклик порта SFTP (USB 127.0.0.1:2222 или сохраненный Wi-Fi)
-            var isSocketActive = false
-            if let endpoint = monitoredWifiEndpoint {
-                isSocketActive = PhoneConnectionManager.shared.isHostPortReachable(host: endpoint.host, port: endpoint.port, timeoutSeconds: 1)
-                isAdbConnected = false
-            } else if isAdbConnected {
-                isSocketActive = PhoneConnectionManager.shared.isHostPortReachable(host: "127.0.0.1", port: monitoredPath?.port ?? 2222, timeoutSeconds: 1)
-            } else {
-                let hostToCheck = UserDefaults.standard.string(forKey: "lastConnectedHost") ?? ""
-                let portToCheck: UInt16 = UInt16(UserDefaults.standard.string(forKey: "lastConnectedPort") ?? "2222") ?? 2222
-                if !hostToCheck.isEmpty && hostToCheck != "127.0.0.1" {
-                    isSocketActive = PhoneConnectionManager.shared.isHostPortReachable(host: hostToCheck, port: portToCheck, timeoutSeconds: 1)
-                }
-            }
+            let adbDeviceIds = PhoneConnectionManager.shared.authorizedAdbDeviceIds()
+            let monitoredUsbDeviceId: String? = {
+                guard let path = monitoredPath, case .usb(let deviceId, _) = path else { return nil }
+                return deviceId
+            }()
+            let isAdbConnected = monitoredUsbDeviceId.map(adbDeviceIds.contains) ?? false
             
             let adbDetected = isAdbConnected
-            let socketDetected = isSocketActive
+            let sshProcessAlive = activeSSHChannel?.isRunning == true
             
             await MainActor.run {
                 self.connectionProbeRunning = false
@@ -1443,15 +1518,10 @@ public final class DualPaneViewModel: ObservableObject {
                       self.remoteDriver.coordinator.sessionEpoch == probeEpoch,
                       ConnectionController.shared.currentPath == monitoredPath else { return }
                 if self.remoteDriver.isConnected {
-                    // Если связь была активна, но сокет пропал (отключили кабель или Wi-Fi)
-                    if !socketDetected && !adbDetected {
-                        if monitoredWifiEndpoint != nil {
-                            // Wi‑Fi может пропустить один-два probe во время
-                            // роуминга между точками доступа. Не рвём SFTP
-                            // сессию, пока пропадание не подтверждено.
-                            self.wifiReachabilityMisses += 1
-                            guard self.wifiReachabilityMisses >= self.wifiReachabilityMissLimit else { return }
-                        }
+                    // Check the authenticated SSH process itself. An ADB forward or
+                    // an unrelated listener on port 2222 does not prove SFTP is alive.
+                    let sessionTransportAlive = sshProcessAlive && (monitoredUsbDeviceId == nil || adbDetected)
+                    if !sessionTransportAlive {
                         self.wifiReachabilityMisses = 0
                         self.isPhoneConnected = false
                         self.remoteDriver.disconnect()
@@ -1476,7 +1546,7 @@ public final class DualPaneViewModel: ObservableObject {
                     
                     // Приоритетное автоподключение:
                     // Если обнаружено физическое устройство по USB или доступен телефон по Wi-Fi:
-                    if (adbDetected || socketDetected) && !self.isConnectingPhone && !self.isAutoConnecting {
+                    if (adbDetected || monitoredPath != nil) && !self.isConnectingPhone && !self.isAutoConnecting {
                         self.autoConnectPhoneIfAvailable()
                     }
                 }
@@ -1485,6 +1555,7 @@ public final class DualPaneViewModel: ObservableObject {
     }
     
     public func switchToVolume(_ volume: PhoneConnectionManager.StorageVolume, side: PaneSide) {
+        if activePane != side { activePane = side }
         if side == .left {
             if leftSource != .remotePhone {
                 leftSource = .remotePhone
@@ -1492,7 +1563,14 @@ public final class DualPaneViewModel: ObservableObject {
             leftPath = volume.path
             leftSelection.removeAll()
             updateActiveTab(side: .left)
-            refreshPane(side: .left)
+            if !remoteDriver.isConnected {
+                leftIsStale = false
+                if !isRunningTests {
+                    connectPhone(forceActivate: false, isExplicit: true)
+                }
+            } else {
+                refreshPane(side: .left)
+            }
         } else {
             if rightSource != .remotePhone {
                 rightSource = .remotePhone
@@ -1500,13 +1578,21 @@ public final class DualPaneViewModel: ObservableObject {
             rightPath = volume.path
             rightSelection.removeAll()
             updateActiveTab(side: .right)
-            refreshPane(side: .right)
+            if !remoteDriver.isConnected {
+                rightIsStale = false
+                if !isRunningTests {
+                    connectPhone(forceActivate: false, isExplicit: true)
+                }
+            } else {
+                refreshPane(side: .right)
+            }
         }
         statusMessage = "Переход к хранилищу: \(volume.name)"
     }
     
     /// Переключение на внешний USB накопитель
     public func switchToUsbDrive(_ drive: UsbDriveInfo, side: PaneSide) {
+        if activePane != side { activePane = side }
         if drive.isMac {
             if (side == .left ? leftSource : rightSource) != .localMac {
                 changeSource(to: .localMac, side: side)
@@ -1591,6 +1677,7 @@ public final class DualPaneViewModel: ObservableObject {
     
     public func navigateBack(side: PaneSide) {
         guard canNavigateBack(side: side) else { return }
+        if activePane != side { activePane = side }
         if side == .left {
             leftHistoryIndex -= 1
             leftPath = leftHistory[leftHistoryIndex]
@@ -1608,6 +1695,7 @@ public final class DualPaneViewModel: ObservableObject {
     
     public func navigateForward(side: PaneSide) {
         guard canNavigateForward(side: side) else { return }
+        if activePane != side { activePane = side }
         if side == .left {
             leftHistoryIndex += 1
             leftPath = leftHistory[leftHistoryIndex]
@@ -1681,6 +1769,9 @@ public final class DualPaneViewModel: ObservableObject {
             }
         }
         recordHistory(path: targetPath, side: side)
+        if activePane != side {
+            activePane = side
+        }
         if side == .left {
             leftPath = targetPath
             leftSelection.removeAll()
@@ -1694,7 +1785,7 @@ public final class DualPaneViewModel: ObservableObject {
         }
     }
     
-    public func refreshPane(side: PaneSide) {
+    public func refreshPane(side: PaneSide, selectPath: String? = nil) {
         var path = (side == .left) ? leftPath : rightPath
         let source = (side == .left) ? leftSource : rightSource
         
@@ -1736,13 +1827,33 @@ public final class DualPaneViewModel: ObservableObject {
                 
                 if side == .left {
                     self.leftItems = items
-                    self.leftIsStale = isRemoteOffline
+                    self.leftIsStale = isRemoteOffline && !self.isConnectingPhone
+                    if let selectPath = selectPath {
+                        let normSelectPath = selectPath.precomposedStringWithCanonicalMapping
+                        let selectName = URL(fileURLWithPath: selectPath).lastPathComponent.precomposedStringWithCanonicalMapping
+                        if let target = items.first(where: { $0.path == normSelectPath || $0.name == selectName }) {
+                            self.activePane = .left
+                            self.leftSelection = [target.id]
+                            TableDoubleClickHandler.HandlerView.focusAndScrollToItem(id: target.id, side: .left)
+                        }
+                    }
                 } else {
                     self.rightItems = items
-                    self.rightIsStale = isRemoteOffline
+                    self.rightIsStale = isRemoteOffline && !self.isConnectingPhone
+                    if let selectPath = selectPath {
+                        let normSelectPath = selectPath.precomposedStringWithCanonicalMapping
+                        let selectName = URL(fileURLWithPath: selectPath).lastPathComponent.precomposedStringWithCanonicalMapping
+                        if let target = items.first(where: { $0.path == normSelectPath || $0.name == selectName }) {
+                            self.activePane = .right
+                            self.rightSelection = [target.id]
+                            TableDoubleClickHandler.HandlerView.focusAndScrollToItem(id: target.id, side: .right)
+                        }
+                    }
                 }
                 if isRemoteOffline {
-                    self.statusMessage = "Телефон не подключен (Offline)"
+                    if !self.isConnectingPhone {
+                        self.statusMessage = "Телефон не подключен (Offline)"
+                    }
                 } else if source == .remotePhone {
                     self.statusMessage = "Телефон: \(path)"
                 } else if source == .localMac {
@@ -1764,13 +1875,15 @@ public final class DualPaneViewModel: ObservableObject {
                 guard !Task.isCancelled else { return }
                 if side == .left {
                     self.leftItems = []
-                    self.leftIsStale = (source == .remotePhone)
+                    self.leftIsStale = (source == .remotePhone) && !self.isConnectingPhone
                 } else {
                     self.rightItems = []
-                    self.rightIsStale = (source == .remotePhone)
+                    self.rightIsStale = (source == .remotePhone) && !self.isConnectingPhone
                 }
                 if source == .remotePhone {
-                    self.statusMessage = "Телефон не подключен (Offline)"
+                    if !self.isConnectingPhone {
+                        self.statusMessage = "Телефон не подключен (Offline)"
+                    }
                     self.isPhoneConnected = false
                     self.refreshUsbDrives()
                 } else {
@@ -1800,6 +1913,8 @@ public final class DualPaneViewModel: ObservableObject {
         print("DUAL_PANE: openItem '\(item.name)', isDirectory: \(item.isDirectory)")
         if item.isDirectory {
             navigateInto(item: item, side: side)
+        } else if isArchive(item: item) {
+            unarchive(item: item, side: side)
         } else {
             openFile(item: item)
         }
@@ -1874,6 +1989,9 @@ public final class DualPaneViewModel: ObservableObject {
         // Отслеживание недавних папок
         BookmarksManager.shared.addRecentPath(path: item.path, source: item.source)
         recordHistory(path: item.path, side: side)
+        if activePane != side {
+            activePane = side
+        }
         if side == .left {
             leftPath = item.path
             leftSelection.removeAll()
@@ -1889,6 +2007,7 @@ public final class DualPaneViewModel: ObservableObject {
     
     public func navigateUp(side targetSide: PaneSide? = nil) {
         let side = targetSide ?? activePane
+        if activePane != side { activePane = side }
         let currentSource = (side == .left) ? leftSource : rightSource
         let currentPath = (side == .left) ? leftPath : rightPath
         
@@ -2403,20 +2522,81 @@ public final class DualPaneViewModel: ObservableObject {
         }
     }
     
-    public func triggerBatchRename() {
-        let side = activePane
-        let selected = (side == .left) ? leftSelection : rightSelection
-        let items = (side == .left) ? leftItems : rightItems
-        if selected.isEmpty && items.isEmpty {
-            statusMessage = "В текущей панели нет файлов для переименования"
+    public func triggerBatchRename(item: FileItem? = nil, side: PaneSide? = nil) {
+        let targetSide: PaneSide
+        if let explicitSide = side {
+            targetSide = explicitSide
+        } else {
+            // 1. Проверяем, какой NSTableView сейчас в фокусе (firstResponder)
+            let leftTv = TableDoubleClickHandler.HandlerView.leftTableView
+            let rightTv = TableDoubleClickHandler.HandlerView.rightTableView
+            
+            let isLeftFocused: Bool
+            let isRightFocused: Bool
+            if let window = leftTv?.window ?? rightTv?.window, let firstResponder = window.firstResponder {
+                isLeftFocused = (leftTv != nil && (firstResponder === leftTv || (firstResponder as? NSView)?.isDescendant(of: leftTv!) == true))
+                isRightFocused = (rightTv != nil && (firstResponder === rightTv || (firstResponder as? NSView)?.isDescendant(of: rightTv!) == true))
+            } else {
+                isLeftFocused = false
+                isRightFocused = false
+            }
+            
+            if isRightFocused && !isLeftFocused {
+                targetSide = .right
+            } else if isLeftFocused && !isRightFocused {
+                targetSide = .left
+            } else {
+                // Если шорткат вызван глобально или нажата кнопка тулбара,
+                // целевой стороной ВСЕГДА является текущая активная панель (activePane)
+                targetSide = activePane
+            }
+        }
+        
+        if activePane != targetSide {
+            activePane = targetSide
+        }
+        
+        let allItems = (targetSide == .left) ? leftItems : rightItems
+        let displayList = displayItems(for: targetSide)
+        let sourceList = (displayList.isEmpty ? allItems : displayList).filter { $0.name != ".." }
+        let selection = (targetSide == .left) ? leftSelection : rightSelection
+        let targetTv = (targetSide == .left) ? TableDoubleClickHandler.HandlerView.leftTableView : TableDoubleClickHandler.HandlerView.rightTableView
+        
+        var targets: [FileItem] = []
+        if let item = item {
+            if selection.contains(item.id) || selection.contains(item.path) {
+                targets = sourceList.filter { selection.contains($0.id) || selection.contains($0.path) }
+            } else {
+                targets = [item]
+            }
+        } else if !selection.isEmpty {
+            targets = sourceList.filter { selection.contains($0.id) || selection.contains($0.path) }
+        } else if let tv = targetTv, tv.selectedRowIndexes.count > 0 {
+            let rowIndexes = tv.selectedRowIndexes
+            targets = rowIndexes.compactMap { idx in
+                (idx >= 0 && idx < sourceList.count) ? sourceList[idx] : nil
+            }
+        } else {
+            // В стиле Total Commander: если ничего не выделено, переименовываются ВСЕ файлы активной панели
+            targets = sourceList
+        }
+        
+        self.batchRenameSide = targetSide
+        
+        guard !targets.isEmpty else {
+            statusMessage = "В выбранной панели нет файлов для переименования"
             return
         }
-        showBatchRenameDialog = true
+        
+        let session = BatchRenameSession(side: targetSide, items: targets)
+        self.batchRenameItems = targets
+        self.batchRenameSession = session
+        self.showBatchRenameDialog = true
     }
     
-    public func applyBatchRename(mappings: [(oldItem: FileItem, newName: String)]) {
-        let side = activePane
-        let source = (side == .left) ? leftSource : rightSource
+    public func applyBatchRename(mappings: [(oldItem: FileItem, newName: String)], side: PaneSide? = nil) {
+        let targetSide = side ?? batchRenameSide
+        let source = (targetSide == .left) ? leftSource : rightSource
         let driver: FileSystemDriver = (source == .localMac) ? localDriver : remoteDriver
         
         Task {
@@ -2437,16 +2617,17 @@ public final class DualPaneViewModel: ObservableObject {
             }
             if !history.isEmpty {
                 self.lastBatchRenameHistory = history
+                self.lastBatchRenameSide = targetSide
                 self.canUndoBatchRename = true
             }
-            self.refreshPane(side: side)
+            self.refreshPane(side: targetSide)
             self.statusMessage = "Успешно переименовано объектов: \(renamedCount)"
         }
     }
     
     public func undoBatchRename() {
         guard !lastBatchRenameHistory.isEmpty else { return }
-        let side = activePane
+        let side = lastBatchRenameSide
         let source = (side == .left) ? leftSource : rightSource
         let driver: FileSystemDriver = (source == .localMac) ? localDriver : remoteDriver
         
@@ -2498,15 +2679,54 @@ public final class DualPaneViewModel: ObservableObject {
         self.archiveFormat = .zip
         self.archiveDestinationPath = currentPath
         
+        let base: String
         if targets.count == 1 {
-            let base = URL(fileURLWithPath: targets[0].path).deletingPathExtension().lastPathComponent
-            self.archiveName = "\(base).zip"
+            base = URL(fileURLWithPath: targets[0].path).deletingPathExtension().lastPathComponent
         } else {
             let dirName = URL(fileURLWithPath: currentPath).lastPathComponent
-            self.archiveName = "\(dirName.isEmpty ? "Archive" : dirName).zip"
+            base = dirName.isEmpty ? "Archive" : dirName
         }
         
+        self.archiveName = generateUniqueArchiveName(baseName: base, extension: "zip", destinationPath: currentPath)
+        
         self.showCreateArchiveDialog = true
+    }
+    
+    /// Генерирует уникальное имя для архива, добавляя счетчик (1), (2)... при наличии файла с таким же именем
+    public func generateUniqueArchiveName(baseName: String, extension ext: String, destinationPath: String) -> String {
+        let cleanExt = ext.hasPrefix(".") ? String(ext.dropFirst()) : ext
+        let side = (destinationPath == leftPath) ? PaneSide.left : (destinationPath == rightPath ? PaneSide.right : activePane)
+        let items = (side == .left) ? leftItems : rightItems
+        
+        // Очищаем базовое имя от предыдущего счетчика " (1)", если он был добавлен ранее
+        var cleanBase = baseName
+        if let regex = try? NSRegularExpression(pattern: #"^(.*?)\s*\(\d+\)$"#, options: []),
+           let match = regex.firstMatch(in: baseName, range: NSRange(baseName.startIndex..., in: baseName)),
+           let baseRange = Range(match.range(at: 1), in: baseName) {
+            cleanBase = String(baseName[baseRange])
+        }
+        
+        let fileExists: (String) -> Bool = { filename in
+            if items.contains(where: { $0.name.lowercased() == filename.lowercased() }) {
+                return true
+            }
+            let fullPath = URL(fileURLWithPath: destinationPath).appendingPathComponent(filename).path
+            return FileManager.default.fileExists(atPath: fullPath)
+        }
+        
+        let initial = "\(cleanBase).\(cleanExt)"
+        guard fileExists(initial) else {
+            return initial
+        }
+        
+        var counter = 1
+        while true {
+            let candidate = "\(cleanBase) (\(counter)).\(cleanExt)"
+            if !fileExists(candidate) {
+                return candidate
+            }
+            counter += 1
+        }
     }
     
     public func confirmCreateArchive() {
@@ -2595,7 +2815,161 @@ public final class DualPaneViewModel: ObservableObject {
         }
     }
     
+    // MARK: - Разархивирование (Unarchive / Extract)
+    
+    public func isArchive(item: FileItem) -> Bool {
+        return ArchiveService.isArchive(fileName: item.name)
+    }
+    
+    public func unarchive(item: FileItem? = nil, side: PaneSide? = nil, to destinationDir: String? = nil) {
+        let currentSide = side ?? activePane
+        let items = (currentSide == .left) ? leftItems : rightItems
+        let selection = (currentSide == .left) ? leftSelection : rightSelection
+        let currentPath = (currentSide == .left) ? leftPath : rightPath
+        let source = (currentSide == .left) ? leftSource : rightSource
+        
+        let targetItem: FileItem?
+        if let item = item {
+            targetItem = item
+        } else if let first = selection.first, let found = items.first(where: { $0.id == first || $0.path == first }) {
+            targetItem = found
+        } else {
+            targetItem = items.first(where: { ArchiveService.isArchive(fileName: $0.name) })
+        }
+        
+        guard let archiveItem = targetItem else {
+            statusMessage = "Нет выбранного архива для распаковки"
+            return
+        }
+        
+        let targetDir = destinationDir ?? currentPath
+        let isDestRemote = (targetDir.hasPrefix("/sdcard") || targetDir.hasPrefix("/storage"))
+        
+        var archiveBaseName = URL(fileURLWithPath: archiveItem.name).deletingPathExtension().lastPathComponent
+        if archiveBaseName.hasSuffix(".tar") {
+            archiveBaseName = String(archiveBaseName.dropLast(4))
+        }
+        let extractFolder = archiveBaseName.isEmpty ? "Extracted" : archiveBaseName
+        let destinationPath = URL(fileURLWithPath: targetDir).appendingPathComponent(extractFolder).path
+        
+        isArchiving = true
+        statusMessage = "Разархивирование: \(archiveItem.name)..."
+        
+        Task { @MainActor [weak self] in
+            guard let self = self else { return }
+            do {
+                if source == .localMac && !isDestRemote {
+                    // Полностью локальная распаковка на Mac
+                    try await ArchiveService.shared.extractArchive(
+                        archivePath: archiveItem.path,
+                        destinationPath: destinationPath
+                    )
+                } else if source == .localMac && isDestRemote {
+                    // Локальный архив на Mac -> распаковка во временную папку -> заливка на телефон
+                    let tempDir = FileManager.default.temporaryDirectory
+                        .appendingPathComponent("MacDroidExtract_\(UUID().uuidString)")
+                    try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+                    
+                    let tempExtractDir = tempDir.appendingPathComponent(extractFolder)
+                    try await ArchiveService.shared.extractArchive(
+                        archivePath: archiveItem.path,
+                        destinationPath: tempExtractDir.path
+                    )
+                    
+                    let extractedFiles = (try? FileManager.default.contentsOfDirectory(atPath: tempExtractDir.path)) ?? []
+                    for name in extractedFiles {
+                        let localFilePath = tempExtractDir.appendingPathComponent(name).path
+                        let isDir = (try? FileManager.default.attributesOfItem(atPath: localFilePath)[.type] as? FileAttributeType) == .typeDirectory
+                        let size = (try? FileManager.default.attributesOfItem(atPath: localFilePath)[.size] as? UInt64) ?? 0
+                        let queueItem = FileItem(
+                            id: localFilePath,
+                            name: name,
+                            path: localFilePath,
+                            size: size,
+                            mtime: Date().timeIntervalSince1970,
+                            isDirectory: isDir
+                        )
+                        self.queueManager.enqueue(source: queueItem, targetDir: destinationPath, isMove: true)
+                    }
+                    try? FileManager.default.removeItem(at: tempDir)
+                } else {
+                    // Удаленный архив на телефоне
+                    let tempDir = FileManager.default.temporaryDirectory
+                        .appendingPathComponent("MacDroidExtract_\(UUID().uuidString)")
+                    try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+                    
+                    let localArchiveURL = tempDir.appendingPathComponent(archiveItem.name)
+                    let stat = try await self.transport.prepareRead(actionId: UUID().uuidString, path: archiveItem.path)
+                    try await self.transport.downloadFileStreaming(
+                        actionId: UUID().uuidString,
+                        remotePath: archiveItem.path,
+                        targetURL: localArchiveURL,
+                        totalSize: stat.size
+                    ) { _ in }
+                    
+                    if !isDestRemote {
+                        // Распаковываем на Mac в destinationPath
+                        try await ArchiveService.shared.extractArchive(
+                            archivePath: localArchiveURL.path,
+                            destinationPath: destinationPath
+                        )
+                    } else {
+                        // Распаковываем локально и заливаем на телефон
+                        let tempExtractDir = tempDir.appendingPathComponent(extractFolder)
+                        try await ArchiveService.shared.extractArchive(
+                            archivePath: localArchiveURL.path,
+                            destinationPath: tempExtractDir.path
+                        )
+                        
+                        let extractedFiles = (try? FileManager.default.contentsOfDirectory(atPath: tempExtractDir.path)) ?? []
+                        for name in extractedFiles {
+                            let localFilePath = tempExtractDir.appendingPathComponent(name).path
+                            let isDir = (try? FileManager.default.attributesOfItem(atPath: localFilePath)[.type] as? FileAttributeType) == .typeDirectory
+                            let size = (try? FileManager.default.attributesOfItem(atPath: localFilePath)[.size] as? UInt64) ?? 0
+                            let queueItem = FileItem(
+                                id: localFilePath,
+                                name: name,
+                                path: localFilePath,
+                                size: size,
+                                mtime: Date().timeIntervalSince1970,
+                                isDirectory: isDir
+                            )
+                            self.queueManager.enqueue(source: queueItem, targetDir: destinationPath, isMove: true)
+                        }
+                    }
+                    
+                    try? FileManager.default.removeItem(at: tempDir)
+                }
+                
+                self.isArchiving = false
+                let destSide: PaneSide
+                if let dest = destinationDir {
+                    destSide = (dest == self.leftPath) ? .left : ((dest == self.rightPath) ? .right : currentSide)
+                } else {
+                    destSide = currentSide
+                }
+                let otherSide: PaneSide = (destSide == .left) ? .right : .left
+                self.refreshPane(side: otherSide)
+                self.refreshPane(side: destSide, selectPath: destinationPath)
+                self.statusMessage = "Архив успешно разархивирован: \(archiveItem.name)"
+            } catch {
+                self.isArchiving = false
+                self.statusMessage = "Ошибка разархивирования: \(error.localizedDescription)"
+                self.errorMessage = error.localizedDescription
+                self.showErrorAlert = true
+            }
+        }
+    }
+    
+    // MARK: - Быстрый просмотр (Quick Look)
+    
     public func triggerQuickLook(preferNativeQuickLook: Bool = false) {
+        // Если окно Quick Look уже открыто — закрываем его (toggle по Пробелу, как в Finder)
+        if QuickLookBridge.shared.isVisible {
+            QuickLookBridge.shared.close()
+            return
+        }
+        
         let side = activePane
         let selected = (side == .left) ? leftSelection : rightSelection
         let source = (side == .left) ? leftSource : rightSource
@@ -2630,8 +3004,8 @@ public final class DualPaneViewModel: ObservableObject {
         let photoExtensions: Set<String> = ["jpg", "jpeg", "png", "heic", "dng", "webp", "gif", "bmp", "tiff"]
         let ext = URL(fileURLWithPath: item.name).pathExtension.lowercased()
         
-        // Встроенный просмотрщик для фотографий (локальных и удалённых)
-        if photoExtensions.contains(ext) && !preferNativeQuickLook {
+        // Встроенный просмотрщик для фотографий (только для удалённых файлов телефона, если явно не запрошен нативный Quick Look и панель Quick Look ещё не открыта)
+        if photoExtensions.contains(ext) && !preferNativeQuickLook && source == .remotePhone && !QuickLookBridge.shared.isVisible {
             let photoItems = currentItems.filter {
                 let e = URL(fileURLWithPath: $0.name).pathExtension.lowercased()
                 return photoExtensions.contains(e)
@@ -2680,6 +3054,125 @@ public final class DualPaneViewModel: ObservableObject {
             } catch {
                 self.statusMessage = "Ошибка загрузки: \(error.localizedDescription)"
             }
+        }
+    }
+    
+    // MARK: - Quick Look Dynamic Selection Synchronization (Finder-like)
+    
+    private func onSelectionChanged(for side: PaneSide) {
+        if side == activePane {
+            updateQuickLookIfVisible()
+        }
+    }
+    
+    public func updateQuickLookIfVisible() {
+        guard QuickLookBridge.shared.isVisible else { return }
+        
+        let side = activePane
+        let selected = (side == .left) ? leftSelection : rightSelection
+        let source = (side == .left) ? leftSource : rightSource
+        let currentItems = (side == .left) ? leftItems : rightItems
+        
+        guard let first = selected.first,
+              let item = currentItems.first(where: { $0.id == first || $0.path == first }) ?? currentItems.first(where: { selected.contains($0.id) || selected.contains($0.path) }) else {
+            return
+        }
+        
+        if item.isDirectory {
+            if source == .localMac {
+                let localURL = URL(fileURLWithPath: item.path)
+                self.statusMessage = "Просмотр папки: \(item.name)"
+                QuickLookBridge.shared.updatePreview(url: localURL)
+            } else {
+                self.statusMessage = "Папка: \(item.name)"
+            }
+            return
+        }
+        
+        if source == .localMac {
+            let localURL = URL(fileURLWithPath: item.path)
+            self.statusMessage = "Просмотр: \(item.name)"
+            QuickLookBridge.shared.updatePreview(url: localURL)
+            return
+        }
+        
+        // Удаленный файл (Android)
+        if let cachedURL = QuickLookCacheManager.shared.isCached(for: item) {
+            self.statusMessage = "Просмотр: \(item.name)"
+            QuickLookBridge.shared.updatePreview(url: cachedURL)
+            return
+        }
+        
+        currentPreviewTask?.cancel()
+        statusMessage = "Загрузка для просмотра: \(item.name) (0%)..."
+        
+        currentPreviewTask = Task { @MainActor [weak self] in
+            guard let self = self else { return }
+            do {
+                let targetURL = try await QuickLookCacheManager.shared.fetchFile(item: item, transport: self.transport) { [weak self] (progress: Double) in
+                    Task { @MainActor in
+                        guard let self = self else { return }
+                        let percent = Int(progress * 100)
+                        self.statusMessage = "Загрузка для просмотра: \(item.name) (\(percent)%)..."
+                    }
+                }
+                guard !Task.isCancelled else { return }
+                guard QuickLookBridge.shared.isVisible else { return }
+                let currentSide = self.activePane
+                let currSel = (currentSide == .left) ? self.leftSelection : self.rightSelection
+                guard currSel.contains(item.id) || currSel.contains(item.path) else { return }
+                
+                self.statusMessage = "Просмотр: \(item.name)"
+                QuickLookBridge.shared.updatePreview(url: targetURL)
+            } catch is CancellationError {
+                // Ignore fast navigation
+            } catch {
+                self.statusMessage = "Ошибка загрузки: \(error.localizedDescription)"
+            }
+        }
+    }
+    
+    public func selectNext() {
+        let side = activePane
+        let items = (side == .left) ? leftItems : rightItems
+        guard !items.isEmpty else { return }
+        let selected = (side == .left) ? leftSelection : rightSelection
+        
+        let currentIndex: Int
+        if let first = selected.first, let idx = items.firstIndex(where: { $0.id == first || $0.path == first }) {
+            currentIndex = idx
+        } else {
+            currentIndex = -1
+        }
+        
+        let nextIndex = min(currentIndex + 1, items.count - 1)
+        let nextItem = items[nextIndex]
+        if side == .left {
+            leftSelection = [nextItem.id]
+        } else {
+            rightSelection = [nextItem.id]
+        }
+    }
+    
+    public func selectPrevious() {
+        let side = activePane
+        let items = (side == .left) ? leftItems : rightItems
+        guard !items.isEmpty else { return }
+        let selected = (side == .left) ? leftSelection : rightSelection
+        
+        let currentIndex: Int
+        if let first = selected.first, let idx = items.firstIndex(where: { $0.id == first || $0.path == first }) {
+            currentIndex = idx
+        } else {
+            currentIndex = items.count
+        }
+        
+        let prevIndex = max(currentIndex - 1, 0)
+        let prevItem = items[prevIndex]
+        if side == .left {
+            leftSelection = [prevItem.id]
+        } else {
+            rightSelection = [prevItem.id]
         }
     }
     
@@ -3399,8 +3892,6 @@ public final class DualPaneViewModel: ObservableObject {
                         if !deleted {
                             // Безопасная очистка: удаляем ТОЛЬКО временные артефакты передачи (.DS_Store, .mcdpart),
                             // НИ В КОЕМ СЛУЧАЕ не удаляя произвольные скрытые пользовательские файлы (.*)
-                            let escaped = PhoneConnectionManager.shellEscape(folder)
-                            _ = PhoneConnectionManager.shared.executeAdbShell(command: "find \(escaped) -maxdepth 1 \\( -name '.DS_Store' -o -name '*.mcdpart' -o -name '.*.mcdpart' \\) -type f -delete 2>/dev/null")
                             deleted = (try? await self.remoteDriver.deleteEmptyDirectory(at: folder)) ?? false
                         }
                     }
@@ -3409,7 +3900,7 @@ public final class DualPaneViewModel: ObservableObject {
             
             // Обновление медиатеки Android (MediaScanner)
             if !transferredMediaPaths.isEmpty {
-                PhoneConnectionManager.shared.notifyMediaScanner(paths: transferredMediaPaths)
+                PhoneConnectionManager.shared.notifyMediaScanner(paths: transferredMediaPaths, deviceId: self.remoteDriver.coordinator.deviceId)
             }
             
             if Task.isCancelled {
@@ -3582,10 +4073,7 @@ public final class DualPaneViewModel: ObservableObject {
                     scanLocal(dirURL: URL(fileURLWithPath: path), currentTargetDir: folderTargetBase)
                 } else {
                     func scanRemote(remoteDir: String, currentTargetDir: String) async {
-                        var contents: [FileItem]? = try? await remoteDriver.listDirectory(at: remoteDir)
-                        if contents == nil {
-                            contents = PhoneConnectionManager.shared.listDirectoryAdb(path: remoteDir)
-                        }
+                        let contents = try? await remoteDriver.listDirectory(at: remoteDir)
                         guard let validContents = contents else {
                             if remoteDir != path {
                                 print("scanRemote: failed to list directory at \(remoteDir)")

@@ -47,6 +47,7 @@ class MainActivity : Activity() {
     private lateinit var tvPairingStatus: TextView
     private lateinit var tvPairingDesc: TextView
     private lateinit var btnResetPairing: Button
+    private lateinit var btnEnablePairing: Button
 
     private lateinit var tvBatteryStatus: TextView
     private lateinit var tvBatteryLevel: TextView
@@ -77,9 +78,6 @@ class MainActivity : Activity() {
 
     override fun onResume() {
         super.onResume()
-
-        // При активном открытом экране разрешаем сопряжение с Mac по Wi-Fi
-        com.macandroid.filemanager.server.EmbeddedServer.isPairingModeActive = true
 
         // При возврате на экран (например, после выдачи разрешений) проверяем запуск службы и обновляем данные
         if (hasStoragePermission() && !isServerRunning()) {
@@ -190,7 +188,7 @@ class MainActivity : Activity() {
                 if (success) {
                     Toast.makeText(
                         this@MainActivity,
-                        "Сопряжение сброшено. Ожидание первого подключения (TOFU).",
+                        "Сопряжение сброшено. Нажмите кнопку, чтобы открыть окно сопряжения на 60 секунд.",
                         Toast.LENGTH_LONG
                     ).show()
                 } else {
@@ -204,6 +202,20 @@ class MainActivity : Activity() {
             }
         }
         cardPairing.addView(btnResetPairing)
+
+        btnEnablePairing = createButton("Разрешить сопряжение на 60 секунд", 0xFF1565C0.toInt()).apply {
+            setOnClickListener {
+                EmbeddedServer.openPairingWindow()
+                Toast.makeText(
+                    this@MainActivity,
+                    "Первое SSH-сопряжение по USB и Wi-Fi разрешено на 60 секунд.",
+                    Toast.LENGTH_LONG
+                ).show()
+                refreshDisplay()
+                postDelayed({ refreshDisplay() }, 60_100L)
+            }
+        }
+        cardPairing.addView(btnEnablePairing)
         rootLayout.addView(cardPairing)
 
         // Карточка 3: Оптимизация батареи (HyperOS / MIUI / Doze)
@@ -339,11 +351,17 @@ class MainActivity : Activity() {
             tvPairingStatus.setTextColor(0xFF81C784.toInt())
             tvPairingDesc.text = "Клиент авторизован. Открытый ключ сохранен в authorized_keys."
             btnResetPairing.visibility = View.VISIBLE
+            btnEnablePairing.visibility = View.GONE
         } else {
-            tvPairingStatus.text = "Ожидание первого подключения (TOFU)"
+            tvPairingStatus.text = if (EmbeddedServer.isPairingModeActive) "Окно сопряжения открыто" else "Сопряжение отключено"
             tvPairingStatus.setTextColor(0xFFFFB74D.toInt()) // Оранжевый
-            tvPairingDesc.text = "Ключ еще не сохранен. Первое входящее подключение с Mac будет доверенным (Trust On First Use)."
+            tvPairingDesc.text = if (EmbeddedServer.isPairingModeActive) {
+                "Первый SSH-ключ может быть принят в течение 60 секунд. Подключайте только доверенный Mac."
+            } else {
+                "Для первого подключения по USB или Wi-Fi нажмите кнопку ниже. Окно закроется после регистрации первого ключа или через 60 секунд."
+            }
             btnResetPairing.visibility = View.VISIBLE
+            btnEnablePairing.visibility = View.VISIBLE
         }
 
         // 4. Проверка оптимизации батареи (HyperOS / MIUI / Doze)

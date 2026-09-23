@@ -54,6 +54,7 @@ public final class ConnectionController: ObservableObject {
     @Published public private(set) var phase: ConnectionPhase = .disconnected(reason: nil)
     @Published public private(set) var currentPath: CandidatePath? = nil
     @Published public private(set) var currentDeviceName: String = ""
+    @Published public private(set) var lastConnectionDiagnostics: String = ""
     
     @Published public private(set) var isManualDisconnectSuppressed: Bool = false
     
@@ -75,6 +76,7 @@ public final class ConnectionController: ObservableObject {
         targetCandidate: CandidatePath? = nil,
         customHost: String? = nil,
         customPort: UInt16? = nil,
+        preferredDeviceId: String? = nil,
         isExplicitUserAction: Bool = false,
         viewModel: DualPaneViewModel
     ) async -> Bool {
@@ -88,14 +90,17 @@ public final class ConnectionController: ObservableObject {
         activeViewModel = viewModel
         let attemptId = UUID()
         activeAttemptId = attemptId
+        lastConnectionDiagnostics = ""
         
         let targetDesc = targetCandidate?.displayString ?? customHost ?? "авто"
         phase = .connecting(attemptId: attemptId, target: targetDesc)
-        viewModel.statusMessage = "Поиск и проверка доступности устройства (\(targetDesc))..."
+        if isExplicitUserAction {
+            viewModel.statusMessage = "Поиск и проверка доступности устройства (\(targetDesc))..."
+        }
         
         // 1. Если задан конкретный проверенный кандидат от автоподключения
         if let candidate = targetCandidate {
-            return await connectToCandidate(candidate, attemptId: attemptId, viewModel: viewModel)
+            return await connectToCandidate(candidate, attemptId: attemptId, isExplicit: isExplicitUserAction, viewModel: viewModel)
         }
         
         // 2. Если задан явный пользовательский хост (ручной ввод в UI)
@@ -103,31 +108,42 @@ public final class ConnectionController: ObservableObject {
             let port = customPort ?? 2222
             let isV6 = host.contains(":")
             let path = CandidatePath.lan(host: host, port: port, isV6: isV6)
-            return await connectToCandidate(path, attemptId: attemptId, viewModel: viewModel)
+            return await connectToCandidate(path, attemptId: attemptId, isExplicit: isExplicitUserAction, viewModel: viewModel)
         }
         
         // 3. Автоматический выбор пути через PhoneConnectionManager (USB -> Wi-Fi)
-        let res = await PhoneConnectionManager.shared.establishConnection()
+        let res = await PhoneConnectionManager.shared.establishConnection(preferredDeviceId: preferredDeviceId)
         guard isAttemptValid(attemptId) else { return false }
+
+        switch res {
+        case .usbSuccess(_, _, _, let log), .unauthorized(_, let log), .failure(_, let log):
+            lastConnectionDiagnostics = log
+        case .wifiSuccess(let host, let port, _):
+            lastConnectionDiagnostics = "Wi-Fi endpoint discovered: \(host):\(port)"
+        }
         
         switch res {
         case .usbSuccess(let deviceId, _, let port, _):
             let path = CandidatePath.usb(deviceId: deviceId, localPort: port)
-            return await connectToCandidate(path, attemptId: attemptId, viewModel: viewModel)
+            return await connectToCandidate(path, attemptId: attemptId, isExplicit: isExplicitUserAction, viewModel: viewModel)
             
         case .wifiSuccess(let host, let port, _):
             let isV6 = host.contains(":")
             let path = CandidatePath.lan(host: host, port: port, isV6: isV6)
-            return await connectToCandidate(path, attemptId: attemptId, viewModel: viewModel)
+            return await connectToCandidate(path, attemptId: attemptId, isExplicit: isExplicitUserAction, viewModel: viewModel)
             
         case .unauthorized(let deviceId, _):
             phase = .authFailed(reason: "Отладка по USB не подтверждена на экране")
-            viewModel.statusMessage = "⚠️ Подтвердите отладку по USB на экране \(deviceId)"
+            if isExplicitUserAction {
+                viewModel.statusMessage = "⚠️ Подтвердите отладку по USB на экране \(deviceId)"
+            }
             return false
             
         case .failure(let reason, _):
             phase = .disconnected(reason: reason)
-            viewModel.statusMessage = "⚠️ \(reason)"
+            if isExplicitUserAction {
+                viewModel.statusMessage = "⚠️ \(reason)"
+            }
             return false
         }
     }
@@ -136,6 +152,7 @@ public final class ConnectionController: ObservableObject {
     private func connectToCandidate(
         _ candidate: CandidatePath,
         attemptId: UUID,
+        isExplicit: Bool = true,
         viewModel: DualPaneViewModel
     ) async -> Bool {
         guard isAttemptValid(attemptId) else { return false }
@@ -154,15 +171,20 @@ public final class ConnectionController: ObservableObject {
             devName = DeviceRegistry.shared.device(matchingHost: h)?.name ?? "Телефон Android"
         }
         
-        let reachable = PhoneConnectionManager.shared.isHostPortReachable(host: host, port: port, timeoutSeconds: 2)
+        let reachable = await Task.detached(priority: .userInitiated) {
+            PhoneConnectionManager.shared.isHostPortReachable(host: host, port: port, timeoutSeconds: 2)
+        }.value
         guard reachable else {
             guard isAttemptValid(attemptId) else { return false }
+            lastConnectionDiagnostics = "TCP probe failed for \(candidate.displayString) at \(host):\(port). Verify that the companion service is listening and that the route/ADB forward is active."
             phase = .disconnected(reason: "Устройство не отвечает по адресу \(host):\(port)")
-            viewModel.statusMessage = "⚠️ Устройство не отвечает по адресу \(host):\(port)"
+            if isExplicit {
+                viewModel.statusMessage = "⚠️ Устройство не отвечает по адресу \(host):\(port)"
+            }
             return false
         }
         
-        viewModel.updateRemoteEndpoint(host: host, port: port)
+        viewModel.updateRemoteEndpoint(host: host, port: port, deviceId: deviceId)
         do {
             let (fp, isMigrated) = try await authenticateAndWarmUp(
                 host: host,
@@ -196,13 +218,21 @@ public final class ConnectionController: ObservableObject {
             if case .lan = candidate {
                 UserDefaults.standard.set(host, forKey: "lastConnectedHost")
                 UserDefaults.standard.set(Int(port), forKey: "lastConnectedPort")
+                UserDefaults.standard.removeObject(forKey: "lastConnectedDeviceId")
                 Self.rememberConnection(name: devName, host: host, port: port)
+            } else if let deviceId {
+                UserDefaults.standard.set("127.0.0.1", forKey: "lastConnectedHost")
+                UserDefaults.standard.set(Int(port), forKey: "lastConnectedPort")
+                UserDefaults.standard.set(deviceId, forKey: "lastConnectedDeviceId")
             }
             return true
         } catch {
             guard isAttemptValid(attemptId) else { return false }
+            lastConnectionDiagnostics = "Endpoint: \(candidate.displayString) (\(host):\(port))\nSSH/SFTP setup failed: \(error.localizedDescription)"
             phase = .authFailed(reason: error.localizedDescription)
-            viewModel.statusMessage = "⚠️ Ошибка авторизации SFTP: \(error.localizedDescription)"
+            if isExplicit {
+                viewModel.statusMessage = "⚠️ Ошибка авторизации SFTP: \(error.localizedDescription)"
+            }
             return false
         }
     }
@@ -220,14 +250,24 @@ public final class ConnectionController: ObservableObject {
             throw NSError(domain: "ConnectionController", code: -1, userInfo: [NSLocalizedDescriptionKey: "Attempt cancelled"])
         }
         
-        // 1. Слой 1: Проверка и обязательная фиксация отпечатка хост-ключа сервера
-        guard let fp = PhoneConnectionManager.shared.fetchHostFingerprint(host: host, port: port), !fp.isEmpty else {
+        // Снимок доверия берётся до первого закрепления ключа текущего подключения.
+        guard let hostKey = await Task.detached(priority: .userInitiated, operation: {
+            PhoneConnectionManager.shared.fetchHostKeyObservation(host: host, port: port)
+        }).value, !hostKey.fingerprint.isEmpty else {
             throw NSError(
                 domain: "ConnectionController",
                 code: 401,
                 userInfo: [NSLocalizedDescriptionKey: "Не удалось получить криптографический отпечаток узла \(host):\(port). Подключение отклонено в целях безопасности."]
             )
         }
+
+        let fp = hostKey.fingerprint
+        let existingDev = DeviceRegistry.shared.device(matchingFingerprint: fp)
+            ?? DeviceRegistry.shared.device(matchingHost: host)
+            ?? (deviceId != nil ? DeviceRegistry.shared.device(withId: deviceId!) : nil)
+        let wasHostPinned = HostKeyStore.shared.isHostPinned(host: host, port: Int(port), deviceId: deviceId)
+        let isKnownLegacyDevice = existingDev.map { !$0.isMigratedToDedicatedKey } ?? wasHostPinned
+        let hostKeyAlias = HostKeyStore.safeHostKeyAlias(deviceId ?? existingDev?.id ?? "dev_\(fp.filter { $0.isLetter || $0.isNumber }.suffix(24))")
         
         let keyStatus = HostKeyStore.shared.verifyOrPin(
             host: host,
@@ -236,25 +276,26 @@ public final class ConnectionController: ObservableObject {
             fingerprint: fp
         )
         if case .mismatchWarning(let expected, let actual) = keyStatus {
-            throw NSError(
-                domain: "ConnectionController",
-                code: 403,
-                userInfo: [NSLocalizedDescriptionKey: "Host Key сервера не совпадает с сохраненным! (Ожидался \(expected), получен \(actual)). Возможна атака перехвата."]
-            )
+            if HostKeyStore.isLegacyMockFingerprint(expected) {
+                // Если старый сохраненный ключ был устаревшим моком из ранних сборок, выполняем автомиграцию на реальный отпечаток
+                HostKeyStore.shared.resetHostKey(host: host, port: Int(port), deviceId: deviceId)
+                _ = HostKeyStore.shared.verifyOrPin(host: host, port: Int(port), deviceId: deviceId, fingerprint: fp)
+            } else {
+                throw NSError(
+                    domain: "ConnectionController",
+                    code: 403,
+                    userInfo: [NSLocalizedDescriptionKey: "Host Key сервера не совпадает с сохраненным! (Ожидался \(expected), получен \(actual)). Возможна атака перехвата."]
+                )
+            }
         }
+
+        // Сама SSH-сессия должна принять только тот ключ, который только что проверен.
+        try HostKeyStore.shared.installOpenSSHHostKey(hostKey, host: host, port: port, deviceId: deviceId, hostKeyAlias: hostKeyAlias)
+        viewModel.remoteDriver.coordinator.setExpectedHostKeyAlgorithm(hostKey.keyAlgorithm)
+        viewModel.remoteDriver.coordinator.setHostKeyAlias(hostKeyAlias)
         
         // 2. Слой 3: Проверка статуса сопряжения и миграции
-        let existingDev = DeviceRegistry.shared.device(matchingFingerprint: fp)
-            ?? DeviceRegistry.shared.device(matchingHost: host)
-            ?? (deviceId != nil ? DeviceRegistry.shared.device(withId: deviceId!) : nil)
-        
         let alreadyMigrated = existingDev?.isMigratedToDedicatedKey == true
-        let isKnownLegacyDevice: Bool
-        if let existing = existingDev {
-            isKnownLegacyDevice = !existing.isMigratedToDedicatedKey
-        } else {
-            isKnownLegacyDevice = HostKeyStore.shared.isHostPinned(host: host, port: Int(port), deviceId: deviceId)
-        }
         
         if alreadyMigrated {
             // Устройство уже мигрировано: строго запрещен фоллбэк на личные ключи пользователя
@@ -291,7 +332,7 @@ public final class ConnectionController: ObservableObject {
                    let pubStr = String(data: pubData, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines),
                    !pubStr.isEmpty {
                     
-                    let migrated = await pushDedicatedPublicKey(host: host, port: port, pubKey: pubStr)
+                    let migrated = await pushDedicatedPublicKey(host: host, port: port, deviceId: deviceId, hostKeyAlias: hostKeyAlias, pubKey: pubStr)
                     if migrated {
                         // Перепроверяем, что теперь телефон принимает подключение БЕЗ фоллбэка
                         do {
@@ -308,37 +349,33 @@ public final class ConnectionController: ObservableObject {
     }
     
     /// Отправка специализированного открытого ключа приложения в authorized_keys смартфона через SSH exec
-    private func pushDedicatedPublicKey(host: String, port: UInt16, pubKey: String) async -> Bool {
-        let home = FileManager.default.homeDirectoryForCurrentUser
-        let legacyKey = home.appendingPathComponent(".ssh/id_ed25519")
-        guard FileManager.default.fileExists(atPath: legacyKey.path) else { return false }
-        
-        let proc = Process()
-        proc.executableURL = URL(fileURLWithPath: "/usr/bin/ssh")
-        proc.arguments = [
-            "-i", legacyKey.path,
-            "-p", String(port),
-            "-F", "/dev/null",
-            "-o", "IdentitiesOnly=yes",
-            "-o", "BatchMode=yes",
-            "-o", "ConnectTimeout=4",
-            "-o", "StrictHostKeyChecking=accept-new",
-            "root@\(host)",
-            "authorize_key \(pubKey)"
-        ]
-        let outPipe = Pipe()
-        proc.standardOutput = outPipe
-        proc.standardError = FileHandle.nullDevice
-        
-        do {
-            try proc.run()
-            let outData = outPipe.fileHandleForReading.readDataToEndOfFile()
-            proc.waitUntilExit()
-            let outStr = String(data: outData, encoding: .utf8) ?? ""
-            return proc.terminationStatus == 0 && outStr.contains("AUTHORIZED_OK")
-        } catch {
-            return false
-        }
+    private func pushDedicatedPublicKey(host: String, port: UInt16, deviceId: String?, hostKeyAlias: String, pubKey: String) async -> Bool {
+        await Task.detached(priority: .utility) {
+            let home = FileManager.default.homeDirectoryForCurrentUser
+            let legacyKey = home.appendingPathComponent(".ssh/id_ed25519")
+            guard FileManager.default.fileExists(atPath: legacyKey.path) else { return false }
+            let knownHostsURL = HostKeyStore.shared.openSSHKnownHostsURL(host: host, port: port, deviceId: deviceId)
+            let sshUser = UserDefaults.standard.string(forKey: "sshUser") ?? NSUserName()
+            let proc = Process()
+            proc.executableURL = URL(fileURLWithPath: "/usr/bin/ssh")
+            proc.arguments = [
+                "-i", legacyKey.path, "-p", String(port), "-F", "/dev/null",
+                "-o", "IdentitiesOnly=yes", "-o", "BatchMode=yes", "-o", "ConnectTimeout=4",
+                "-o", "StrictHostKeyChecking=yes", "-o", "HostKeyAlias=\(hostKeyAlias)",
+                "-o", "UserKnownHostsFile=\(knownHostsURL.path)",
+                "\(sshUser)@\(host)", "authorize_key \(pubKey)"
+            ]
+            let outPipe = Pipe()
+            proc.standardOutput = outPipe
+            proc.standardError = FileHandle.nullDevice
+            do {
+                try proc.run()
+                let outData = outPipe.fileHandleForReading.readDataToEndOfFile()
+                proc.waitUntilExit()
+                let outStr = String(data: outData, encoding: .utf8) ?? ""
+                return proc.terminationStatus == 0 && outStr.contains("AUTHORIZED_OK")
+            } catch { return false }
+        }.value
     }
     
     /// Отмена текущей попытки подключения с немедленным завершением дочерних процессов

@@ -175,6 +175,33 @@ if case .mismatchWarning = status3 {
     assertCondition(false, "Attacker key mismatch was not detected!")
 }
 
+// 5b. Тест автомиграции устаревших фиктивных отпечатков из ранних версий
+let legacyHost = "192.168.1.199"
+let legacyMockFp = "SHA256:Ed25519_Xiaomi14Ultra_DaemonFingerprint"
+let realFp = "SHA256:RealDeviceHostFingerprint12345"
+assertCondition(HostKeyStore.isLegacyMockFingerprint(legacyMockFp), "HostKeyStore recognizes legacy mock fingerprint")
+assertCondition(!HostKeyStore.isLegacyMockFingerprint(realFp), "HostKeyStore does not flag real fingerprint as mock")
+
+// Симулируем наличие старого мока
+keyStore.unpin(host: legacyHost, port: testPort)
+_ = keyStore.verifyOrPin(host: legacyHost, port: testPort, fingerprint: legacyMockFp)
+let autoMigratedStatus = keyStore.verifyOrPin(host: legacyHost, port: testPort, fingerprint: realFp)
+if case .pinnedNew = autoMigratedStatus {
+    assertCondition(true, "Legacy mock fingerprint automatically migrated to real fingerprint")
+} else {
+    assertCondition(false, "Failed to auto-migrate legacy mock fingerprint")
+}
+let trustedStatus = keyStore.verifyOrPin(host: legacyHost, port: testPort, fingerprint: realFp)
+if case .trusted = trustedStatus {
+    assertCondition(true, "Migrated real fingerprint is now trusted")
+} else {
+    assertCondition(false, "Migrated key was not trusted")
+}
+
+// Очистка тестовых записей
+keyStore.unpin(host: testHost, port: testPort)
+keyStore.unpin(host: legacyHost, port: testPort)
+
 // 6. Directory Comparison Tests
 print("\n[TEST 6] Directory Comparison:")
 let comparator = DirectoryComparator()
@@ -1271,9 +1298,7 @@ Task { @MainActor in
             // 4. Remote storage space calculation
             let remoteDriver = RemoteSFTPDriver(host: "127.0.0.1", port: 2222)
             let space = try await remoteDriver.checkFreeSpace(at: "/storage/emulated/0")
-            assertCondition(space.total > 0, "Remote total space > 0 (\(space.total) bytes)")
-            assertCondition(space.free > 0, "Remote free space > 0 (\(space.free) bytes)")
-            assertCondition(space.free <= space.total, "Remote free space <= total space")
+            assertCondition(space.total == 0 && space.free == 0, "Unavailable remote capacity is reported as unknown without an active phone session")
             
             // 5. Recursive Directory Transfer Planning & Execution
             let testDir = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("mcd_test_recursive_\(UUID().uuidString)")
@@ -1705,7 +1730,7 @@ Task { @MainActor in
         // ============================================================
         // TEST 31: Phone Directory Listing Integrity & ADB Fallback (Bug Fix Verification)
         // ============================================================
-        print("\n[TEST 31] Phone Directory Listing Integrity & ADB Fallback (Bug Fix Verification):")
+        print("\n[TEST 31] Phone Directory Listing Integrity & SFTP Error Preservation:")
         
         // 1. ADB ls -la parsing verification
         let sampleAdbLsLong = """
@@ -1758,7 +1783,7 @@ Task { @MainActor in
             _ = try await sftpDriver31.listDirectory(at: "/storage/emulated/0")
         } catch {
             threwOfflineError = true
-            assertCondition(error.localizedDescription.contains("Телефон не подключен"), "Error explains phone is not connected: \(error.localizedDescription)")
+            assertCondition(error.localizedDescription.contains("недоступен"), "Original endpoint error is preserved: \(error.localizedDescription)")
         }
         assertCondition(threwOfflineError, "Disconnected SFTP driver throws error instead of returning ghost mock folders")
         
@@ -2494,7 +2519,7 @@ Task { @MainActor in
         }
         // 6. Phone Connection Status & Indicator Invariants
         let indicatorConnecting = PhoneConnectionIndicatorView(isConnected: false, isConnecting: true)
-        assertCondition(indicatorConnecting.isConnecting == true, "Phone indicator handles isConnecting == true (pulsing green)")
+        assertCondition(indicatorConnecting.isConnecting == true, "Phone indicator handles isConnecting == true (pulsing orange)")
         let indicatorConnected = PhoneConnectionIndicatorView(isConnected: true, isConnecting: false)
         assertCondition(indicatorConnected.isConnected == true, "Phone indicator handles isConnected == true (solid lime green)")
         let indicatorDisconnected = PhoneConnectionIndicatorView(isConnected: false, isConnecting: false)
@@ -2860,13 +2885,39 @@ Task { @MainActor in
         assertCondition(testBudget.currentSnapshot.handles == 0, "All 32 handles released back to budget")
         
         // Network payload allocation and release
-        await testBudget.acquirePayload(bytes: 1024 * 1024, isInteractive: true)
+        assertCondition(await testBudget.acquirePayload(bytes: 1024 * 1024, isInteractive: true), "Payload budget acquired")
         assertCondition(testBudget.currentSnapshot.networkBytes == 1024 * 1024, "Payload acquired: 1 MiB")
         testBudget.releasePayload(bytes: 1024 * 1024)
         assertCondition(testBudget.currentSnapshot.networkBytes == 0, "Payload budget fully restored after release")
+
+        // A waiter is granted its reservation exactly once when another request releases capacity.
+        let queuedBudget = SessionBudget(maxNetworkPayload: 10, maxWriteBuffers: 10, maxHandles: 1, interactiveReserve: 0)
+        assertCondition(await queuedBudget.acquirePayload(bytes: 8, isInteractive: false), "Initial constrained payload acquired")
+        let queuedAcquire = Task { await queuedBudget.acquirePayload(bytes: 3, isInteractive: false) }
+        try? await Task.sleep(nanoseconds: 20_000_000)
+        queuedBudget.releasePayload(bytes: 8)
+        assertCondition(await queuedAcquire.value, "Queued payload wakes after capacity is released")
+        assertCondition(queuedBudget.currentSnapshot.networkBytes == 3, "Woken payload is reserved once")
+        queuedBudget.releasePayload(bytes: 3)
+
+        let cancelledBudget = SessionBudget(maxNetworkPayload: 10, maxWriteBuffers: 10, maxHandles: 1, interactiveReserve: 0)
+        assertCondition(await cancelledBudget.acquirePayload(bytes: 8, isInteractive: false), "Cancellation test fills payload budget")
+        let cancelledAcquire = Task { await cancelledBudget.acquirePayload(bytes: 3, isInteractive: false) }
+        try? await Task.sleep(nanoseconds: 20_000_000)
+        cancelledAcquire.cancel()
+        assertCondition(await cancelledAcquire.value == false, "Cancelled payload waiter exits")
+        assertCondition(cancelledBudget.currentSnapshot.networkBytes == 8, "Cancelled waiter does not leak a reservation")
+        cancelledBudget.releasePayload(bytes: 8)
         
         // 45.3 SFTPPacketEngine Extended Packets
         let pe = SFTPPacketEngine()
+        do {
+            let malformedString = Data([0, 0, 0, 1, 0xFF])
+            let reader = SFTPPacketReader(data: malformedString)
+            var rejectedInvalidUtf8 = false
+            do { _ = try reader.readString() } catch { rejectedInvalidUtf8 = true }
+            assertCondition(rejectedInvalidUtf8, "Invalid UTF-8 in an SFTP filename is rejected")
+        }
         let statvfsPkt = pe.createStatVfsPacket(requestId: 888, path: "/storage/emulated/0")
         assertCondition(statvfsPkt.count > 10, "statvfs packet generated")
         // Header: uint32 len, uint8 type=200
@@ -3063,8 +3114,105 @@ Task { @MainActor in
         let resetSnap = metrics.snapshot()
         assertCondition(resetSnap.totalBytesDownloaded == 0 && resetSnap.reconnectCount == 0, "Metrics reset cleared all values")
         
+        // 10. [TEST 49] Quick Look Dynamic Navigation & Context Menu Archive / Unarchive
+        print("\n--- [TEST 49] Quick Look Dynamic Navigation & Archive / Unarchive ---")
+        
+        // 1) Archive format detection
+        assertCondition(ArchiveService.isArchive(fileName: "archive.zip") == true, "archive.zip is detected as archive")
+        assertCondition(ArchiveService.isArchive(fileName: "package.tar.gz") == true, "package.tar.gz is detected as archive")
+        assertCondition(ArchiveService.isArchive(fileName: "backup.tar") == true, "backup.tar is detected as archive")
+        assertCondition(ArchiveService.isArchive(fileName: "app.apk") == true, "app.apk is detected as archive")
+        assertCondition(ArchiveService.isArchive(fileName: "library.jar") == true, "library.jar is detected as archive")
+        assertCondition(ArchiveService.isArchive(fileName: "photo.jpg") == false, "photo.jpg is not an archive")
+        assertCondition(ArchiveService.isArchive(fileName: "document.pdf") == false, "document.pdf is not an archive")
+        
+        // 2) Real Archive creation and extraction with ArchiveService
+        let archiveTestDir = FileManager.default.temporaryDirectory.appendingPathComponent("MacDroidTestArchive_\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: archiveTestDir, withIntermediateDirectories: true)
+        let archiveSampleFile = archiveTestDir.appendingPathComponent("sample.txt")
+        let sampleContent = "Hello MacDroidCommander Archive Test"
+        try sampleContent.write(to: archiveSampleFile, atomically: true, encoding: .utf8)
+        
+        let targetZipPath = archiveTestDir.appendingPathComponent("test.zip").path
+        try await ArchiveService.shared.createArchive(sources: [archiveSampleFile.path], destinationPath: targetZipPath, format: .zip)
+        assertCondition(FileManager.default.fileExists(atPath: targetZipPath), "ZIP archive created on filesystem")
+        
+        let extractDir = archiveTestDir.appendingPathComponent("Extracted")
+        try await ArchiveService.shared.extractArchive(archivePath: targetZipPath, destinationPath: extractDir.path)
+        assertCondition(FileManager.default.fileExists(atPath: extractDir.path), "Extraction directory created")
+        
+        let extractedSample = extractDir.appendingPathComponent("sample.txt")
+        assertCondition(FileManager.default.fileExists(atPath: extractedSample.path), "Extracted file exists")
+        let readBack = try? String(contentsOf: extractedSample, encoding: .utf8)
+        assertCondition(readBack == sampleContent, "Extracted content matches original file content")
+        
+        // 3) ViewModel unarchive and Quick Look navigation
+        await MainActor.run {
+            let vm49 = DualPaneViewModel()
+            let zipItem = FileItem(
+                id: targetZipPath,
+                name: "test.zip",
+                path: targetZipPath,
+                size: 1024,
+                mtime: Date().timeIntervalSince1970,
+                isDirectory: false
+            )
+            assertCondition(vm49.isArchive(item: zipItem), "vm.isArchive returns true for zip item")
+            
+            let item1 = FileItem(id: "1", name: "file1.txt", path: "/tmp/file1.txt", size: 100, mtime: 0, isDirectory: false)
+            let item2 = FileItem(id: "2", name: "file2.txt", path: "/tmp/file2.txt", size: 200, mtime: 0, isDirectory: false)
+            let item3 = FileItem(id: "3", name: "file3.txt", path: "/tmp/file3.txt", size: 300, mtime: 0, isDirectory: false)
+            vm49.leftItems = [item1, item2, item3]
+            vm49.leftSelection = [item1.id]
+            vm49.activePane = .left
+            
+            // Test selectNext
+            vm49.selectNext()
+            assertCondition(vm49.leftSelection == [item2.id], "selectNext advances selection to file2")
+            vm49.selectNext()
+            assertCondition(vm49.leftSelection == [item3.id], "selectNext advances selection to file3")
+            vm49.selectNext()
+            assertCondition(vm49.leftSelection == [item3.id], "selectNext clamps at end of list")
+            
+            // Test selectPrevious
+            vm49.selectPrevious()
+            assertCondition(vm49.leftSelection == [item2.id], "selectPrevious moves selection back to file2")
+            vm49.selectPrevious()
+            assertCondition(vm49.leftSelection == [item1.id], "selectPrevious moves selection back to file1")
+            vm49.selectPrevious()
+            assertCondition(vm49.leftSelection == [item1.id], "selectPrevious clamps at start of list")
+            
+            // Test unarchive execution
+            vm49.leftPath = archiveTestDir.path
+            vm49.leftSource = .localMac
+            vm49.unarchive(item: zipItem, side: .left)
+            assertCondition(vm49.isArchiving == true, "vm.unarchive sets isArchiving = true")
+            
+            // 4) Unique Archive Name with counter tests
+            let uniqueName1 = vm49.generateUniqueArchiveName(baseName: "test", extension: "zip", destinationPath: archiveTestDir.path)
+            assertCondition(uniqueName1 == "test (1).zip", "Existing archive triggers (1) counter: got \(uniqueName1)")
+            
+            let test1ZipPath = archiveTestDir.appendingPathComponent("test (1).zip").path
+            try? "".write(toFile: test1ZipPath, atomically: true, encoding: .utf8)
+            let uniqueName2 = vm49.generateUniqueArchiveName(baseName: "test", extension: "zip", destinationPath: archiveTestDir.path)
+            assertCondition(uniqueName2 == "test (2).zip", "Existing test.zip and test (1).zip triggers (2) counter: got \(uniqueName2)")
+            
+            let uniqueName3 = vm49.generateUniqueArchiveName(baseName: "test (1)", extension: "zip", destinationPath: archiveTestDir.path)
+            assertCondition(uniqueName3 == "test (2).zip", "Base name with (1) cleans up to increment to (2): got \(uniqueName3)")
+            
+            let uniqueNameNew = vm49.generateUniqueArchiveName(baseName: "brand_new", extension: "zip", destinationPath: archiveTestDir.path)
+            assertCondition(uniqueNameNew == "brand_new.zip", "Non-existing base name gets plain .zip without counter: got \(uniqueNameNew)")
+            
+            // 5) Test openItem on archive triggers unarchive directly in app
+            vm49.isArchiving = false
+            vm49.openItem(item: zipItem, side: .left)
+            assertCondition(vm49.isArchiving == true, "openItem on archive triggers in-app unarchive (isArchiving == true)")
+        }
+        
+        try? FileManager.default.removeItem(at: archiveTestDir)
+        
         print("\n🎉 ==================================================")
-        print("🎉   ALL 48 PRODUCTION TEST SUITES PASSED!          ")
+        print("🎉   ALL 49 PRODUCTION TEST SUITES PASSED!          ")
         print("🎉 ==================================================")
         exit(0)
     } catch {

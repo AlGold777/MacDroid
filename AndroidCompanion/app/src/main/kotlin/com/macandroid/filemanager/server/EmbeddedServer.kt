@@ -19,6 +19,7 @@ class EmbeddedServer(
 ) {
     private var sshd: SshServer? = null
     private val authorizedKeysFile = File(context.filesDir, "authorized_keys")
+    private val pairingLock = Any()
 
     fun start() {
         if (sshd != null) return
@@ -38,45 +39,42 @@ class EmbeddedServer(
             // Применяем строгую проверку открытого ключа (Public Key Auth)
             passwordAuthenticator = null
 
-            publickeyAuthenticator = PublickeyAuthenticator { _, key: PublicKey, session ->
-                val encodedKey = Base64.getEncoder().encodeToString(key.encoded)
-                if (!authorizedKeysFile.exists() || authorizedKeysFile.length() == 0L) {
-                    // SEC-03 FIX: Проверка источника подключения для защиты от несанкционированного TOFU.
-                    // Через USB (ADB loopback 127.0.0.1) подключение локально доверенное.
-                    // По Wi-Fi сопряжение разрешено только при активном экране/режиме сопряжения.
-                    val clientAddress = session.clientAddress
-                    val isLoopback = (clientAddress as? java.net.InetSocketAddress)?.address?.isLoopbackAddress == true
-                    if (isLoopback || isPairingModeActive) {
-                        authorizedKeysFile.writeText(encodedKey + "\n")
-                        true
-                    } else {
-                        false
-                    }
-                } else {
-                    // Последующие подключения сверяются со списком сохраненных доверенных ключей (по одному на строку)
-                    val authorizedKeys = authorizedKeysFile.readLines()
-                        .map { it.trim() }
-                        .filter { it.isNotEmpty() }
-                    
-                    if (encodedKey in authorizedKeys) {
-                        return@PublickeyAuthenticator true
-                    }
-                    
-                    // Поддержка строк в формате OpenSSH (ssh-ed25519 AAAAC3... или ssh-rsa ...)
-                    val matchesOpenSsh = authorizedKeys.any { line ->
-                        if (line.startsWith("ssh-")) {
-                            try {
-                                val entry = org.apache.sshd.common.config.keys.AuthorizedKeyEntry.parseAuthorizedKeyEntry(line)
-                                val resolved = entry?.resolvePublicKey(null, null, null)
-                                resolved != null && org.apache.sshd.common.config.keys.KeyUtils.compareKeys(key, resolved)
-                            } catch (_: Throwable) {
-                                false
-                            }
+            publickeyAuthenticator = PublickeyAuthenticator { _, key: PublicKey, _ ->
+                synchronized(pairingLock) {
+                    val encodedKey = Base64.getEncoder().encodeToString(key.encoded)
+                    if (!authorizedKeysFile.exists() || authorizedKeysFile.length() == 0L) {
+                        // Every first key requires an explicit, time-limited pairing window.
+                        if (isPairingModeActive) {
+                            authorizedKeysFile.writeText(encodedKey + "\n")
+                            closePairingWindow()
+                            true
                         } else {
                             false
                         }
+                    } else {
+                        // Subsequent connections must match an already enrolled public key.
+                        val authorizedKeys = authorizedKeysFile.readLines()
+                            .map { it.trim() }
+                            .filter { it.isNotEmpty() }
+
+                        if (encodedKey in authorizedKeys) {
+                            true
+                        } else {
+                            authorizedKeys.any { line ->
+                                if (line.startsWith("ssh-")) {
+                                    try {
+                                        val entry = org.apache.sshd.common.config.keys.AuthorizedKeyEntry.parseAuthorizedKeyEntry(line)
+                                        val resolved = entry?.resolvePublicKey(null, null, null)
+                                        resolved != null && org.apache.sshd.common.config.keys.KeyUtils.compareKeys(key, resolved)
+                                    } catch (_: Throwable) {
+                                        false
+                                    }
+                                } else {
+                                    false
+                                }
+                            }
+                        }
                     }
-                    return@PublickeyAuthenticator matchesOpenSsh
                 }
             }
 
@@ -179,10 +177,12 @@ class EmbeddedServer(
             serverProps["io-buffer-size"] = (320 * 1024).toString()
             serverProps["window-size"] = (8L * 1024 * 1024).toString()
             serverProps["max-packet-length"] = (320 * 1024).toString()
-            serverProps["sftp-max-open-handles"] = "32"
-            serverProps["sftp-read-buffer-size"] = (256 * 1024).toString()
-            serverProps["sftp-write-buffer-size"] = (256 * 1024).toString()
-            serverProps["sftp-auto-fsync-on-close"] = "true"
+            // Property names verified against Apache MINA SSHD 2.12.0 SftpModuleProperties.
+            serverProps["max-open-handles-per-session"] = "32"
+            serverProps["sftp-fs-read-buffer-size"] = (256 * 1024).toString()
+            serverProps["sftp-fs-write-buffer-size"] = (256 * 1024).toString()
+            serverProps["sftp-max-readdata-packet-length"] = (256 * 1024).toString()
+            serverProps["sftp-max-writedata-packet-length"] = (256 * 1024).toString()
         }
 
         sshd?.start()
@@ -199,6 +199,7 @@ class EmbeddedServer(
      * @return true, если файл был успешно удален или не существовал
      */
     fun resetPairing(): Boolean {
+        closePairingWindow()
         return if (authorizedKeysFile.exists()) {
             authorizedKeysFile.delete()
         } else {
@@ -214,7 +215,20 @@ class EmbeddedServer(
     }
 
     companion object {
+        private const val PAIRING_WINDOW_MILLIS = 60_000L
+
         @Volatile
-        var isPairingModeActive: Boolean = true
+        private var pairingWindowEndsAt: Long = 0L
+
+        val isPairingModeActive: Boolean
+            get() = android.os.SystemClock.elapsedRealtime() < pairingWindowEndsAt
+
+        fun openPairingWindow() {
+            pairingWindowEndsAt = android.os.SystemClock.elapsedRealtime() + PAIRING_WINDOW_MILLIS
+        }
+
+        fun closePairingWindow() {
+            pairingWindowEndsAt = 0L
+        }
     }
 }

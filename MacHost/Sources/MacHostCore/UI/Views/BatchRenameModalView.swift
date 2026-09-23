@@ -12,6 +12,7 @@ public enum BatchRenameCaseMode: String, CaseIterable, Identifiable {
 
 public struct BatchRenameModalView: View {
     public let items: [FileItem]
+    public let side: PaneSide?
     public let onApplyRename: ([(oldItem: FileItem, newName: String)]) -> Void
     
     @Environment(\.dismiss) private var dismiss
@@ -35,8 +36,9 @@ public struct BatchRenameModalView: View {
     @State private var counterStep: Int = 1
     @State private var counterDigits: Int = 2
     
-    public init(items: [FileItem], onApplyRename: @escaping ([(oldItem: FileItem, newName: String)]) -> Void) {
+    public init(items: [FileItem], side: PaneSide? = nil, onApplyRename: @escaping ([(oldItem: FileItem, newName: String)]) -> Void) {
         self.items = items
+        self.side = side
         self.onApplyRename = onApplyRename
     }
     
@@ -212,9 +214,14 @@ public struct BatchRenameModalView: View {
                 VStack(alignment: .leading, spacing: 2) {
                     Text("Групповое переименование (Total Commander)")
                         .font(.headline)
-                    Text("\(items.count) объектов в очереди • \(changedCount) к изменению")
+                    let activeSide = side ?? vm.batchRenameSide
+                    let paneLabel = activeSide == .left ? "Левая панель" : "Правая панель"
+                    let panePath = activeSide == .left ? vm.leftPath : vm.rightPath
+                    Text("\(items.count) объектов в очереди • \(changedCount) к изменению • \(paneLabel): \(panePath)")
                         .font(.caption)
                         .foregroundColor(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
                 }
                 Spacer()
                 

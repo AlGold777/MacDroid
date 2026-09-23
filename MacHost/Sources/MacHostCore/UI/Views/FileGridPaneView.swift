@@ -301,7 +301,7 @@ public struct FileGridPaneView: View {
         }
         .onKeyPress(.space, phases: .down) { press in
             if press.modifiers.isEmpty {
-                vm.triggerQuickLook()
+                vm.triggerQuickLook(preferNativeQuickLook: true)
                 return .handled
             }
             return .ignored
@@ -333,6 +333,11 @@ public struct FileGridPaneView: View {
             navigateSelectionRow(direction: 1)
             return .handled
         }
+        .simultaneousGesture(TapGesture().onEnded {
+            if vm.activePane != side {
+                vm.activePane = side
+            }
+        })
     }
     
     private func clearSelection() {
@@ -396,6 +401,7 @@ public struct FileGridPaneView: View {
     }
     
     private func selectSingle(item: FileItem) {
+        if vm.activePane != side { vm.activePane = side }
         if side == .left {
             vm.leftSelection = [item.id]
             vm.rightSelection.removeAll()
@@ -719,7 +725,7 @@ public struct FileGridCell: View {
     @ViewBuilder
     private func gridContextMenu(for item: FileItem) -> some View {
         Button("Открыть") { vm.openItem(item: item, side: side) }
-        Button("Просмотр (F3 / Пробел)") { vm.triggerQuickLook() }
+        Button("Просмотр (F3 / Пробел)") { vm.triggerQuickLook(preferNativeQuickLook: true) }
         Divider()
         
         Button("Копировать (Cmd+C)") { vm.copyToClipboard(items: [item], side: side) }
@@ -729,10 +735,21 @@ public struct FileGridCell: View {
         
         Button("Копировать в другую панель (F5)") { vm.triggerCopy() }
         Button("Переместить (F6)") { vm.triggerMove() }
+        Divider()
+        
+        // Архивация и разархивирование
+        if vm.isArchive(item: item) {
+            Button("Разархивировать") { vm.unarchive(item: item, side: side) }
+            Button("Разархивировать в другую панель") {
+                let otherPath = (side == .left) ? vm.rightPath : vm.leftPath
+                vm.unarchive(item: item, side: side, to: otherPath)
+            }
+        }
         Button("Сжать в архив... (Alt+F5)") { vm.triggerCreateArchive(item: item, side: side) }
         Divider()
         
         Button("Переименовать (F2)") { vm.triggerRename(item: item, side: side) }
+        Button("Групповое переименование (Ctrl+M)...") { vm.triggerBatchRename(item: item, side: side) }
         Button("Удалить (F8 / Delete)") { vm.triggerDelete() }
         Divider()
         

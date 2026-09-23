@@ -17,7 +17,7 @@ public struct CreateArchiveModalView: View {
         if base.hasSuffix(".tar") {
             base = String(base.dropLast(4))
         }
-        vm.archiveName = "\(base).\(format.fileExtension)"
+        vm.archiveName = vm.generateUniqueArchiveName(baseName: base, extension: format.fileExtension, destinationPath: vm.archiveDestinationPath)
     }
     
     public var body: some View {
@@ -79,6 +79,13 @@ public struct CreateArchiveModalView: View {
                     Button("В противоположную панель") {
                         let oppositePath = (vm.activePane == .left) ? vm.rightPath : vm.leftPath
                         vm.archiveDestinationPath = oppositePath
+                        let current = vm.archiveName
+                        let url = URL(fileURLWithPath: current)
+                        var base = url.deletingPathExtension().lastPathComponent
+                        if base.hasSuffix(".tar") {
+                            base = String(base.dropLast(4))
+                        }
+                        vm.archiveName = vm.generateUniqueArchiveName(baseName: base, extension: vm.archiveFormat.fileExtension, destinationPath: oppositePath)
                     }
                     .buttonStyle(.borderless)
                     .font(.caption2)

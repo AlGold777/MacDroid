@@ -10,6 +10,10 @@ public struct PaneView: View {
     @State private var editingTabId: UUID? = nil
     @State private var editingTabTitle: String = ""
     @FocusState private var isTabTitleFocused: Bool
+    @State private var isConnectHovered: Bool = false
+    @State private var isPhoneHovered: Bool = false
+    @State private var lastTabClickTime: Date = .distantPast
+    @State private var lastClickedTabId: UUID? = nil
     
     public init(side: PaneSide) {
         self.side = side
@@ -38,7 +42,7 @@ public struct PaneView: View {
     private var isStale: Bool {
         let isRemote = (side == .left ? vm.leftSource : vm.rightSource) == .remotePhone
         let staleFlag = (side == .left ? vm.leftIsStale : vm.rightIsStale)
-        return isRemote && staleFlag
+        return isRemote && staleFlag && !vm.isConnectingPhone
     }
     
     private var freeSpace: (free: UInt64, total: UInt64) {
@@ -93,20 +97,27 @@ public struct PaneView: View {
             get: { side == .left ? vm.leftSelection : vm.rightSelection },
             set: { newSelection in
                 if side == .left {
+                    if !newSelection.isEmpty && vm.activePane != .left {
+                        vm.activePane = .left
+                    }
                     vm.leftSelection = newSelection
-                    if !newSelection.isEmpty && !vm.rightSelection.isEmpty {
-                        vm.rightSelection.removeAll()
-                        TableDoubleClickHandler.HandlerView.rightTableView?.deselectAll(nil)
+                    if !newSelection.isEmpty {
+                        if !vm.rightSelection.isEmpty {
+                            vm.rightSelection.removeAll()
+                            TableDoubleClickHandler.HandlerView.rightTableView?.deselectAll(nil)
+                        }
                     }
                 } else {
-                    vm.rightSelection = newSelection
-                    if !newSelection.isEmpty && !vm.leftSelection.isEmpty {
-                        vm.leftSelection.removeAll()
-                        TableDoubleClickHandler.HandlerView.leftTableView?.deselectAll(nil)
+                    if !newSelection.isEmpty && vm.activePane != .right {
+                        vm.activePane = .right
                     }
-                }
-                if vm.activePane != side {
-                    vm.activePane = side
+                    vm.rightSelection = newSelection
+                    if !newSelection.isEmpty {
+                        if !vm.leftSelection.isEmpty {
+                            vm.leftSelection.removeAll()
+                            TableDoubleClickHandler.HandlerView.leftTableView?.deselectAll(nil)
+                        }
+                    }
                 }
             }
         )
@@ -123,43 +134,35 @@ public struct PaneView: View {
                         : NSColor(red: 28/255.0, green: 26/255.0, blue: 26/255.0, alpha: 0.7)
                 })
                 
-                Button(action: {
+                NavArrowButton(
+                    systemImage: "chevron.up",
+                    tooltip: "На уровень выше (Cmd+Up)",
+                    isEnabled: true,
+                    color: navArrowColor
+                ) {
                     if vm.activePane != side { vm.activePane = side }
                     vm.navigateUp(side: side)
-                }) {
-                    Image(systemName: "chevron.up")
-                        .font(.system(size: 11, weight: .semibold))
-                        .foregroundColor(navArrowColor)
-                        .frame(width: 22, height: 22)
                 }
-                .buttonStyle(.plain)
-                .help("На уровень выше (Cmd+Up)")
                 
-                Button(action: {
+                NavArrowButton(
+                    systemImage: "chevron.left",
+                    tooltip: "Назад (Cmd+[)",
+                    isEnabled: vm.canNavigateBack(side: side),
+                    color: navArrowColor
+                ) {
                     if vm.activePane != side { vm.activePane = side }
                     vm.navigateBack(side: side)
-                }) {
-                    Image(systemName: "chevron.left")
-                        .font(.system(size: 11, weight: .semibold))
-                        .foregroundColor(vm.canNavigateBack(side: side) ? navArrowColor : navArrowColor.opacity(0.3))
-                        .frame(width: 22, height: 22)
                 }
-                .buttonStyle(.plain)
-                .disabled(!vm.canNavigateBack(side: side))
-                .help("Назад (Cmd+[)")
                 
-                Button(action: {
+                NavArrowButton(
+                    systemImage: "chevron.right",
+                    tooltip: "Вперёд (Cmd+])",
+                    isEnabled: vm.canNavigateForward(side: side),
+                    color: navArrowColor
+                ) {
                     if vm.activePane != side { vm.activePane = side }
                     vm.navigateForward(side: side)
-                }) {
-                    Image(systemName: "chevron.right")
-                        .font(.system(size: 11, weight: .semibold))
-                        .foregroundColor(vm.canNavigateForward(side: side) ? navArrowColor : navArrowColor.opacity(0.3))
-                        .frame(width: 22, height: 22)
                 }
-                .buttonStyle(.plain)
-                .disabled(!vm.canNavigateForward(side: side))
-                .help("Вперёд (Cmd+])")
                 
                 ForEach(tabs) { tab in
                     HStack(spacing: 4) {
@@ -210,18 +213,21 @@ public struct PaneView: View {
                     .cornerRadius(4)
                     .contentShape(Rectangle())
                     .onTapGesture {
-                        if editingTabId != tab.id {
+                        let now = Date()
+                        let isDoubleClick = (lastClickedTabId == tab.id && now.timeIntervalSince(lastTabClickTime) < 0.35)
+                        lastTabClickTime = now
+                        lastClickedTabId = tab.id
+                        
+                        if isDoubleClick {
+                            startTabRename(tab: tab)
+                        } else if editingTabId != tab.id {
                             if vm.activePane != side {
                                 vm.activePane = side
                             }
-                            vm.switchTab(id: tab.id, side: side)
+                            if tab.id != activeTabId {
+                                vm.switchTab(id: tab.id, side: side)
+                            }
                         }
-                    }
-                    .simultaneousGesture(TapGesture(count: 2).onEnded {
-                        startTabRename(tab: tab)
-                    })
-                    .onLongPressGesture(minimumDuration: 0.5) {
-                        startTabRename(tab: tab)
                     }
                     .onDrag {
                         vm.draggedTabInfo = (side: side, id: tab.id)
@@ -229,6 +235,26 @@ public struct PaneView: View {
                     }
                     .onDrop(of: [UTType.text.identifier, UTType.plainText.identifier], delegate: TabReorderDropDelegate(targetTab: tab, side: side, vm: vm))
                     .contextMenu {
+                        if tab.source == .remotePhone {
+                            if vm.isPhoneConnected && vm.remoteDriver.isConnected {
+                                Button(action: {
+                                    vm.disconnectPhone()
+                                }) {
+                                    Label("Disconnect", systemImage: "link.badge.slash")
+                                }
+                            } else {
+                                Button(action: {
+                                    if vm.activePane != side { vm.activePane = side }
+                                    vm.switchTab(id: tab.id, side: side)
+                                    vm.connectPhone(forceActivate: false, isExplicit: true)
+                                }) {
+                                    Label("Connect", systemImage: "link")
+                                }
+                                .disabled(vm.isConnectingPhone)
+                            }
+                            
+                            Divider()
+                        }
                         Button(action: { startTabRename(tab: tab) }) {
                             Label("Переименовать вкладку...", systemImage: "pencil")
                         }
@@ -286,6 +312,9 @@ public struct PaneView: View {
                     let currentSrc = (side == .left ? vm.leftSource : vm.rightSource)
                     let currentP = (side == .left ? vm.leftPath : vm.rightPath)
                     let activeUsb = vm.detectedUsbDrives.first(where: { currentP.hasPrefix($0.path) })
+                    let isMacActive = (currentSrc == .localMac && activeUsb == nil)
+                    let isPhoneActive = (currentSrc == .remotePhone && activeUsb == nil)
+                    let isUsbActive = (activeUsb != nil)
                     
                     // Кнопка Mac
                     Button(action: {
@@ -295,12 +324,19 @@ public struct PaneView: View {
                             Image(systemName: "laptopcomputer")
                                 .font(.system(size: 10))
                             Text("Mac")
-                                .font(.system(size: 11, weight: (currentSrc == .localMac && activeUsb == nil) ? .semibold : .regular))
+                                .font(.system(size: 11, weight: isMacActive ? .semibold : .regular))
                         }
                         .padding(.horizontal, 6)
                         .padding(.vertical, 3)
-                        .background((currentSrc == .localMac && activeUsb == nil) ? Color(nsColor: .selectedControlColor) : Color(nsColor: .controlBackgroundColor).opacity(0.6))
-                        .foregroundColor((currentSrc == .localMac && activeUsb == nil) ? Color(nsColor: .selectedControlTextColor) : .primary)
+                        .background(Color.clear)
+                        .foregroundColor(isMacActive ? .primary : .secondary)
+                        .overlay(alignment: .top) {
+                            if isMacActive {
+                                RoundedRectangle(cornerRadius: 1.5)
+                                    .fill(Color.blue)
+                                    .frame(height: 3)
+                            }
+                        }
                         .cornerRadius(4)
                     }
                     .buttonStyle(.plain)
@@ -316,16 +352,53 @@ public struct PaneView: View {
                                 isConnecting: vm.isConnectingPhone
                             )
                             Text("Phone")
-                                .font(.system(size: 11, weight: (currentSrc == .remotePhone && activeUsb == nil) ? .semibold : .regular))
+                                .font(.system(size: 11, weight: isPhoneActive ? .semibold : .regular))
                         }
                         .padding(.horizontal, 6)
                         .padding(.vertical, 3)
-                        .background((currentSrc == .remotePhone && activeUsb == nil) ? Color(nsColor: .selectedControlColor) : Color(nsColor: .controlBackgroundColor).opacity(0.6))
-                        .foregroundColor((currentSrc == .remotePhone && activeUsb == nil) ? Color(nsColor: .selectedControlTextColor) : .primary)
+                        .background(isPhoneHovered ? Color(nsColor: .controlColor).opacity(0.35) : Color.clear)
+                        .foregroundColor(isPhoneActive ? .primary : .secondary)
+                        .overlay(alignment: .top) {
+                            if isPhoneActive {
+                                RoundedRectangle(cornerRadius: 1.5)
+                                    .fill(Color.blue)
+                                    .frame(height: 3)
+                            }
+                        }
                         .cornerRadius(4)
                     }
                     .buttonStyle(.plain)
-                    .help(vm.isConnectingPhone ? "Подключение к телефону..." : ((vm.isPhoneConnected && vm.remoteDriver.isConnected) ? "Телефон подключен" : "Телефон не подключен (нажмите для подключения)"))
+                    .onHover { hovering in
+                        isPhoneHovered = hovering
+                    }
+                    .help(vm.isConnectingPhone ? "Подключение к телефону..." : ((vm.isPhoneConnected && vm.remoteDriver.isConnected) ? "Телефон подключен (правый клик: контекстное меню)" : "Телефон не подключен (нажмите для перехода или правый клик: Connect)"))
+                    .contextMenu {
+                        if vm.isPhoneConnected && vm.remoteDriver.isConnected {
+                            Button(action: {
+                                vm.disconnectPhone()
+                            }) {
+                                Label("Disconnect", systemImage: "link.badge.slash")
+                            }
+                        } else {
+                            Button(action: {
+                                if currentSrc != .remotePhone {
+                                    vm.changeSource(to: .remotePhone, side: side)
+                                }
+                                vm.connectPhone(forceActivate: false, isExplicit: true)
+                            }) {
+                                Label("Connect", systemImage: "link")
+                            }
+                            .disabled(vm.isConnectingPhone)
+                        }
+                        
+                        Divider()
+                        
+                        Button(action: {
+                            vm.showPairingDialog = true
+                        }) {
+                            Label("Настройки подключения (SFTP)...", systemImage: "gearshape")
+                        }
+                    }
                     
                     // Автоматическая кнопка USB при подключении внешнего накопителя
                     if !vm.detectedUsbDrives.isEmpty {
@@ -337,12 +410,19 @@ public struct PaneView: View {
                                     Image(systemName: "externaldrive.fill")
                                         .font(.system(size: 10))
                                     Text("USB")
-                                        .font(.system(size: 11, weight: activeUsb != nil ? .semibold : .regular))
+                                        .font(.system(size: 11, weight: isUsbActive ? .semibold : .regular))
                                 }
                                 .padding(.horizontal, 6)
                                 .padding(.vertical, 3)
-                                .background(activeUsb != nil ? Color(nsColor: .selectedControlColor) : Color(nsColor: .controlBackgroundColor).opacity(0.6))
-                                .foregroundColor(activeUsb != nil ? Color(nsColor: .selectedControlTextColor) : .primary)
+                                .background(Color.clear)
+                                .foregroundColor(isUsbActive ? .primary : .secondary)
+                                .overlay(alignment: .top) {
+                                    if isUsbActive {
+                                        RoundedRectangle(cornerRadius: 1.5)
+                                            .fill(Color.blue)
+                                            .frame(height: 3)
+                                    }
+                                }
                                 .cornerRadius(4)
                             }
                             .buttonStyle(.plain)
@@ -366,14 +446,21 @@ public struct PaneView: View {
                                     Image(systemName: "externaldrive.fill")
                                         .font(.system(size: 10))
                                     Text("USB")
-                                        .font(.system(size: 11, weight: activeUsb != nil ? .semibold : .regular))
+                                        .font(.system(size: 11, weight: isUsbActive ? .semibold : .regular))
                                     Image(systemName: "chevron.down")
                                         .font(.system(size: 8))
                                 }
                                 .padding(.horizontal, 6)
                                 .padding(.vertical, 3)
-                                .background(activeUsb != nil ? Color(nsColor: .selectedControlColor) : Color(nsColor: .controlBackgroundColor).opacity(0.6))
-                                .foregroundColor(activeUsb != nil ? Color(nsColor: .selectedControlTextColor) : .primary)
+                                .background(Color.clear)
+                                .foregroundColor(isUsbActive ? .primary : .secondary)
+                                .overlay(alignment: .top) {
+                                    if isUsbActive {
+                                        RoundedRectangle(cornerRadius: 1.5)
+                                            .fill(Color.blue)
+                                            .frame(height: 3)
+                                    }
+                                }
                                 .cornerRadius(4)
                             }
                             .menuStyle(.borderlessButton)
@@ -473,6 +560,69 @@ public struct PaneView: View {
                     .help("Двойной клик для ручного ввода пути (Cmd+L)")
                 }
                 
+                // Кнопка быстрого соединения (слева от поля фильтра, без текста)
+                Button(action: {
+                    if vm.isPhoneConnected && vm.remoteDriver.isConnected {
+                        vm.disconnectPhone()
+                    } else {
+                        let currentSrc = (side == .left ? vm.leftSource : vm.rightSource)
+                        let otherSrc = (side == .left ? vm.rightSource : vm.leftSource)
+                        if currentSrc != .remotePhone && otherSrc != .remotePhone {
+                            vm.changeSource(to: .remotePhone, side: side)
+                        }
+                        vm.connectPhone(forceActivate: false, isExplicit: true)
+                    }
+                }) {
+                    Group {
+                        if vm.isConnectingPhone {
+                            ProgressView()
+                                .controlSize(.mini)
+                                .scaleEffect(0.65)
+                                .frame(width: 18, height: 18)
+                        } else {
+                            Image(systemName: "link")
+                                .font(.system(size: 12, weight: .medium))
+                                .foregroundColor(isConnectHovered ? Color(nsColor: .controlTextColor) : Color(nsColor: .systemGray))
+                                .frame(width: 18, height: 18)
+                        }
+                    }
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .disabled(vm.isConnectingPhone)
+                .onHover { hovering in
+                    isConnectHovered = hovering
+                }
+                .help(vm.isConnectingPhone ? "Подключение к телефону..." : ((vm.isPhoneConnected && vm.remoteDriver.isConnected) ? "Телефон подключен (клик: отключить, правый клик: меню)" : "Подключить телефон (Connect)"))
+                .contextMenu {
+                    if vm.isPhoneConnected && vm.remoteDriver.isConnected {
+                        Button(action: {
+                            vm.disconnectPhone()
+                        }) {
+                            Label("Disconnect", systemImage: "link.badge.slash")
+                        }
+                    } else {
+                        Button(action: {
+                            let currentSrc = (side == .left ? vm.leftSource : vm.rightSource)
+                            if currentSrc != .remotePhone {
+                                vm.changeSource(to: .remotePhone, side: side)
+                            }
+                            vm.connectPhone(forceActivate: false, isExplicit: true)
+                        }) {
+                            Label("Connect", systemImage: "link")
+                        }
+                        .disabled(vm.isConnectingPhone)
+                    }
+                    
+                    Divider()
+                    
+                    Button(action: {
+                        vm.showPairingDialog = true
+                    }) {
+                        Label("Настройки подключения (SFTP)...", systemImage: "gearshape")
+                    }
+                }
+                
                 // 3. Поле фильтра (с иконкой, кнопкой очистки и очисткой по Esc)
                 HStack(spacing: 3) {
                     Image(systemName: "line.3.horizontal.decrease.circle")
@@ -525,28 +675,19 @@ public struct PaneView: View {
             
             if isStale {
                 HStack(spacing: 8) {
-                    Image(systemName: vm.isConnectingPhone ? "arrow.triangle.2.circlepath" : "exclamationmark.triangle.fill")
-                        .foregroundColor(vm.isConnectingPhone ? .accentColor : .orange)
-                    Text(vm.isConnectingPhone ? "Подключение к смартфону..." : "Телефон не подключен (Offline)")
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .foregroundColor(.orange)
+                    Text("Телефон не подключен (Offline)")
                         .font(.caption)
                         .foregroundColor(.secondary)
                     Spacer()
                     Button(action: {
                         vm.connectPhone()
                     }) {
-                        if vm.isConnectingPhone {
-                            HStack(spacing: 4) {
-                                ProgressView()
-                                    .controlSize(.mini)
-                                Text("Поиск...")
-                            }
-                        } else {
-                            Label("Connect", systemImage: "arrow.triangle.2.circlepath")
-                        }
+                        Label("Connect", systemImage: "arrow.triangle.2.circlepath")
                     }
                     .buttonStyle(.borderedProminent)
                     .controlSize(.mini)
-                    .disabled(vm.isConnectingPhone)
                     
                     Button(action: {
                         vm.showPairingDialog = true
@@ -802,7 +943,7 @@ public struct PaneView: View {
                 }
                 .onKeyPress(.space, phases: .down) { press in
                     if press.modifiers.isEmpty {
-                        vm.triggerQuickLook()
+                        vm.triggerQuickLook(preferNativeQuickLook: true)
                         return .handled
                     }
                     return .ignored
@@ -857,6 +998,12 @@ public struct PaneView: View {
             .padding(.vertical, 4)
             .background(Color(nsColor: .windowBackgroundColor))
         }
+        .contentShape(Rectangle())
+        .simultaneousGesture(TapGesture().onEnded {
+            if vm.activePane != side {
+                vm.activePane = side
+            }
+        })
     }
     
     @ViewBuilder
@@ -951,7 +1098,7 @@ public struct PaneView: View {
             }
         }
         
-        Button("Просмотр (F3)") { vm.triggerQuickLook() }
+        Button("Просмотр (F3)") { vm.triggerQuickLook(preferNativeQuickLook: true) }
         Divider()
         
         // Copy & Paste
@@ -964,12 +1111,22 @@ public struct PaneView: View {
         
         Button("Копировать в другую панель (F5)") { vm.triggerCopy() }
         Button("Переместить (F6)") { vm.triggerMove() }
+        Divider()
+        
+        // Архивация и разархивирование
+        if vm.isArchive(item: item) {
+            Button("Разархивировать") { vm.unarchive(item: item, side: side) }
+            Button("Разархивировать в другую панель") {
+                let otherPath = (side == .left) ? vm.rightPath : vm.leftPath
+                vm.unarchive(item: item, side: side, to: otherPath)
+            }
+        }
         Button("Сжать в архив... (Alt+F5)") { vm.triggerCreateArchive(item: item, side: side) }
         Divider()
         
         // Rename
         Button("Переименовать (F2)") { vm.triggerRename(item: item, side: side) }
-        Button("Групповое переименование (Ctrl+M)...") { vm.triggerBatchRename() }
+        Button("Групповое переименование (Ctrl+M)...") { vm.triggerBatchRename(item: item, side: side) }
         
         // Delete
         Button("Удалить (F8)", role: .destructive) { vm.triggerDelete() }
@@ -1373,6 +1530,17 @@ public struct TableDoubleClickHandler: NSViewRepresentable {
             rightTableView?.needsDisplay = true
         }
         
+        public static func focusAndScrollToItem(id: String, side: PaneSide) {
+            DispatchQueue.main.async {
+                let tv = (side == .left) ? leftTableView : rightTableView
+                let items = (side == .left) ? (leftVM?.leftItems ?? []) : (rightVM?.rightItems ?? [])
+                guard let index = items.firstIndex(where: { $0.id == id || $0.path == id }) else { return }
+                tv?.selectRowIndexes(IndexSet(integer: index), byExtendingSelection: false)
+                tv?.scrollRowToVisible(index)
+                tv?.window?.makeFirstResponder(tv)
+            }
+        }
+        
         var side: PaneSide = .left
         var vm: DualPaneViewModel?
         var items: [FileItem] = []
@@ -1446,7 +1614,36 @@ public struct TableDoubleClickHandler: NSViewRepresentable {
             tv.allowsMultipleSelection = true
             tv.allowsEmptySelection = true
             tv.intercellSpacing = NSSize(width: 0, height: tv.intercellSpacing.height)
+            NotificationCenter.default.removeObserver(self, name: NSTableView.selectionDidChangeNotification, object: nil)
+            NotificationCenter.default.addObserver(
+                self,
+                selector: #selector(onTableSelectionDidChange(_:)),
+                name: NSTableView.selectionDidChangeNotification,
+                object: tv
+            )
             setupEventMonitor()
+        }
+        
+        @objc private func onTableSelectionDidChange(_ notification: Notification) {
+            guard let tv = notification.object as? NSTableView, tv === hookedTableView else { return }
+            let selectedRow = tv.selectedRow
+            guard selectedRow >= 0 && selectedRow < items.count else { return }
+            let item = items[selectedRow]
+            DispatchQueue.main.async { [weak self] in
+                guard let self = self, let vm = self.vm else { return }
+                if vm.activePane != self.side {
+                    vm.activePane = self.side
+                }
+                if self.side == .left {
+                    if vm.leftSelection != [item.id] {
+                        vm.leftSelection = [item.id]
+                    }
+                } else {
+                    if vm.rightSelection != [item.id] {
+                        vm.rightSelection = [item.id]
+                    }
+                }
+            }
         }
         
         private func setupEventMonitor() {
@@ -1495,7 +1692,7 @@ public struct TableDoubleClickHandler: NSViewRepresentable {
                         // Space (KeyCode 49) without Command/Shift/Alt -> QuickLook / Calculate Folder Size
                         if event.keyCode == 49 && event.modifierFlags.intersection([.command, .option, .control, .shift]).isEmpty {
                             print("DUAL_PANE: KeyDown Space on side \(self.side)")
-                            self.vm?.triggerQuickLook()
+                            self.vm?.triggerQuickLook(preferNativeQuickLook: true)
                             return nil
                         }
                     }
@@ -1519,6 +1716,21 @@ public struct TableDoubleClickHandler: NSViewRepresentable {
                 }
                 
                 let locationInTable = tv.convert(event.locationInWindow, from: nil)
+                let isClickInPaneArea: Bool
+                if let scroll = tv.enclosingScrollView {
+                    let locInScroll = scroll.convert(event.locationInWindow, from: nil)
+                    isClickInPaneArea = scroll.bounds.contains(locInScroll)
+                } else {
+                    isClickInPaneArea = tv.bounds.contains(locationInTable)
+                }
+                
+                if (event.type == .leftMouseDown || event.type == .rightMouseDown) && isClickInPaneArea {
+                    HandlerView.setActiveSide(self.side)
+                    if let vm = self.vm, vm.activePane != self.side {
+                        vm.activePane = self.side
+                    }
+                }
+                
                 guard tv.bounds.contains(locationInTable) else {
                     return event
                 }
@@ -1935,7 +2147,7 @@ public struct TabReorderDropDelegate: DropDelegate {
     }
 }
 
-/// Индикатор состояния подключения телефона (Серый = отключен, Мигающий зеленый = подключение, Салатовый = подключен)
+/// Индикатор состояния подключения телефона (Серый = отключен, Мигающий оранжевый = подключение, Салатовый = подключен)
 public struct PhoneConnectionIndicatorView: View {
     public let isConnected: Bool
     public let isConnecting: Bool
@@ -1961,7 +2173,7 @@ private struct PulsingIndicatorCircle: View {
     
     var body: some View {
         Circle()
-            .fill(Color(red: 0.35, green: 0.88, blue: 0.35))
+            .fill(Color.orange)
             .frame(width: 7, height: 7)
             .opacity(isDimmed ? 0.2 : 1.0)
             .onAppear {
@@ -1971,5 +2183,34 @@ private struct PulsingIndicatorCircle: View {
             }
     }
 }
+
+private struct NavArrowButton: View {
+    let systemImage: String
+    let tooltip: String
+    let isEnabled: Bool
+    let color: Color
+    let action: () -> Void
+    
+    @State private var isHovered: Bool = false
+    
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: systemImage)
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundColor(isEnabled ? (isHovered ? Color.primary : color) : color.opacity(0.3))
+                .frame(width: 26, height: 24)
+                .background(isHovered && isEnabled ? Color(nsColor: .controlColor).opacity(0.35) : Color.clear)
+                .cornerRadius(4)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .disabled(!isEnabled)
+        .onHover { hovering in
+            isHovered = hovering
+        }
+        .help(tooltip)
+    }
+}
+
 
 
