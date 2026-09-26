@@ -219,6 +219,8 @@ public final class ConnectionController: ObservableObject {
                 UserDefaults.standard.set(host, forKey: "lastConnectedHost")
                 UserDefaults.standard.set(Int(port), forKey: "lastConnectedPort")
                 UserDefaults.standard.removeObject(forKey: "lastConnectedDeviceId")
+                UserDefaults.standard.set(ConnectionHostAddress.normalized(host), forKey: "lastSuccessfulPhoneHost")
+                UserDefaults.standard.set(Int(port), forKey: "lastSuccessfulPhonePort")
                 Self.rememberConnection(name: devName, host: host, port: port)
             } else if let deviceId {
                 UserDefaults.standard.set("127.0.0.1", forKey: "lastConnectedHost")
@@ -403,14 +405,21 @@ public final class ConnectionController: ObservableObject {
     }
 
     private static func rememberConnection(name: String, host: String, port: UInt16) {
-        let newConnection = SavedConnection(name: name, host: host, port: Int(port))
+        let normalizedHost = ConnectionHostAddress.normalized(host)
+        let newConnection = SavedConnection(name: name, host: normalizedHost, port: Int(port))
         var history = (try? JSONDecoder().decode(
             [SavedConnection].self,
             from: UserDefaults.standard.data(forKey: "phoneConnectionHistory") ?? Data()
         )) ?? []
-        history.removeAll { $0.host == host && $0.port == Int(port) }
+        var seen = Set<String>()
+        history = history.compactMap { item in
+            let host = ConnectionHostAddress.normalized(item.host)
+            let key = "\(host):\(item.port)"
+            guard seen.insert(key).inserted, key != "\(normalizedHost):\(port)" else { return nil }
+            return SavedConnection(name: item.name, host: host, port: item.port, date: item.date)
+        }
         history.insert(newConnection, at: 0)
-        UserDefaults.standard.set(try? JSONEncoder().encode(Array(history.prefix(8))), forKey: "phoneConnectionHistory")
+        UserDefaults.standard.set(try? JSONEncoder().encode(Array(history.prefix(4))), forKey: "phoneConnectionHistory")
     }
 }
 

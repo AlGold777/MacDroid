@@ -17,6 +17,16 @@ public struct DiscoveredDevice: Identifiable, Hashable, Sendable {
     }
 }
 
+public enum ConnectionHostAddress {
+    /// Removes malformed repeated IPv6 scope suffixes while preserving a single interface zone.
+    public static func normalized(_ host: String) -> String {
+        let trimmed = host.trimmingCharacters(in: .whitespacesAndNewlines)
+        let parts = trimmed.split(separator: "%", omittingEmptySubsequences: true)
+        guard parts.count > 1 else { return trimmed }
+        return "\(parts[0])%\(parts[1])"
+    }
+}
+
 public struct SavedConnection: Codable, Identifiable, Hashable, Sendable {
     public var id: String { "\(host):\(port)" }
     public let name: String
@@ -172,10 +182,11 @@ public final class DiscoveryService: ObservableObject {
                         resolvedIp = "\(ip4)"
                     case .ipv6(let ip6):
                         // Для IPv6 link-local интерфейс (%en0) обязателен для BSD сокетов и OpenSSH
-                        if let iface = ip6.interface?.name, !resolvedIp.contains("%") {
-                            resolvedIp = "\(ip6)%\(iface)"
+                        let address = String("\(ip6)".split(separator: "%", maxSplits: 1).first ?? "\(ip6)")
+                        if let iface = ip6.interface?.name {
+                            resolvedIp = "\(address)%\(iface)"
                         } else {
-                            resolvedIp = "\(ip6)"
+                            resolvedIp = ConnectionHostAddress.normalized("\(ip6)")
                         }
                     case .name(let hostName, _):
                         resolvedIp = hostName

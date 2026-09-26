@@ -643,20 +643,33 @@ public final class PhoneConnectionManager: @unchecked Sendable {
     /// Поиск по последним и подтвержденным адресам; новые устройства обнаруживаются через Bonjour.
     public func discoverPhoneIpOnLan() -> String? {
         lock.lock()
-        var priorities = self.discoveredIps
+        let discovered = self.discoveredIps
         lock.unlock()
-        
-        if let saved = UserDefaults.standard.string(forKey: "lastConnectedHost"), !saved.isEmpty, !priorities.contains(saved) {
-            priorities.append(saved)
+
+        var priorities: [String] = []
+
+        if let lastSuccessful = UserDefaults.standard.string(forKey: "lastSuccessfulPhoneHost"), !lastSuccessful.isEmpty {
+            priorities.append(ConnectionHostAddress.normalized(lastSuccessful))
+        }
+
+        if let saved = UserDefaults.standard.string(forKey: "lastConnectedHost"),
+           !saved.isEmpty, saved != "127.0.0.1" {
+            let normalized = ConnectionHostAddress.normalized(saved)
+            if !priorities.contains(normalized) { priorities.append(normalized) }
         }
         
         if let data = UserDefaults.standard.data(forKey: "phoneConnectionHistory"),
            let savedList = try? JSONDecoder().decode([SavedConnection].self, from: data) {
             for item in savedList {
-                if !priorities.contains(item.host) {
-                    priorities.append(item.host)
+                let host = ConnectionHostAddress.normalized(item.host)
+                if !priorities.contains(host) {
+                    priorities.append(host)
                 }
             }
+        }
+
+        for host in discovered where !priorities.contains(ConnectionHostAddress.normalized(host)) {
+            priorities.append(ConnectionHostAddress.normalized(host))
         }
         
         for ip in priorities {

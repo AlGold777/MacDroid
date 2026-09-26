@@ -270,13 +270,24 @@ public struct PairingModalView: View {
             loadHistory()
             vm.discoveryService.startDiscovery()
             
-            // Умный приоритет автоподстановки IP:
-            // 1. Прямо сейчас обнаруженное через mDNS живое устройство
-            if let firstDiscovered = vm.discoveryService.discoveredDevices.first {
+            // Сначала подставляем последний успешно использованный IP телефона.
+            let lastSuccessfulHost = UserDefaults.standard.string(forKey: "lastSuccessfulPhoneHost")
+            let previousHost = UserDefaults.standard.string(forKey: "lastConnectedHost")
+            if let host = lastSuccessfulHost, !host.isEmpty {
+                inputHost = ConnectionHostAddress.normalized(host)
+                inputPort = String(UserDefaults.standard.integer(forKey: "lastSuccessfulPhonePort") == 0
+                    ? 2222
+                    : UserDefaults.standard.integer(forKey: "lastSuccessfulPhonePort"))
+            } else if let host = previousHost, !host.isEmpty, host != "127.0.0.1" {
+                inputHost = ConnectionHostAddress.normalized(host)
+                inputPort = UserDefaults.standard.string(forKey: "lastConnectedPort") ?? "2222"
+            }
+            // Если успешный IP ещё не сохранён, используем актуальное обнаружение.
+            else if let firstDiscovered = vm.discoveryService.discoveredDevices.first {
                 inputHost = firstDiscovered.host
                 inputPort = String(firstDiscovered.port)
             }
-            // 2. Сканирование живого IP (mDNS кэш -> последний успешный IP -> история -> ARP)
+            // 2. Сканирование последнего успешного IP, истории и обнаруженных адресов.
             else if let liveIp = PhoneConnectionManager.shared.discoverPhoneIpOnLan() {
                 inputHost = liveIp
                 if let savedPort = UserDefaults.standard.string(forKey: "lastConnectedPort"), !savedPort.isEmpty {
@@ -313,12 +324,8 @@ public struct PairingModalView: View {
         }
         .onReceive(vm.discoveryService.$discoveredDevices) { devices in
             guard let live = devices.first else { return }
-            // Если поле было пустым, либо текущий введенный адрес недоступен,
-            // автоматически переключаем на свежеобнаруженный живой IP устройства
+            // Автозаполнение только пустого поля сохраняет выбранный последний успешный IP.
             if inputHost.isEmpty {
-                inputHost = live.host
-                inputPort = String(live.port)
-            } else if inputHost != live.host && !PhoneConnectionManager.shared.isHostPortReachable(host: inputHost, port: UInt16(inputPort) ?? 2222, timeoutSeconds: 1) {
                 inputHost = live.host
                 inputPort = String(live.port)
             }
@@ -331,6 +338,8 @@ public struct PairingModalView: View {
             pairingStatus = "⚠️ Введите IP-адрес телефона"
             return
         }
+        let host = ConnectionHostAddress.normalized(inputHost)
+        inputHost = host
         let portInt = Int(inputPort) ?? 2222
         isConnecting = true
         pairingStatus = "Проверка доступности и авторизация SFTP..."
@@ -339,16 +348,18 @@ public struct PairingModalView: View {
             defer { isConnecting = false }
             
             let success = await ConnectionController.shared.connect(
-                customHost: inputHost,
+                customHost: host,
                 customPort: UInt16(portInt),
                 isExplicitUserAction: true,
                 viewModel: vm
             )
             
             if success {
-                UserDefaults.standard.set(inputHost, forKey: "lastConnectedHost")
+                UserDefaults.standard.set(host, forKey: "lastConnectedHost")
                 UserDefaults.standard.set(inputPort, forKey: "lastConnectedPort")
-                saveToHistory(host: inputHost, port: portInt)
+                UserDefaults.standard.set(host, forKey: "lastSuccessfulPhoneHost")
+                UserDefaults.standard.set(portInt, forKey: "lastSuccessfulPhonePort")
+                saveToHistory(host: host, port: portInt)
                 
                 pairingStatus = "✓ Подключение успешно установлено"
                 if vm.rightSource != .remotePhone && vm.leftSource != .remotePhone {
@@ -413,21 +424,20 @@ public struct PairingModalView: View {
             inputHost = liveDev.host
             inputPort = String(liveDev.port)
         } else {
-            inputHost = host
+            inputHost = ConnectionHostAddress.normalized(host)
             inputPort = String(port)
         }
         updateFingerprintDisplay()
     }
     
     private func saveToHistory(host: String, port: Int) {
-        var updated = history.filter { !($0.host == host && $0.port == port) }
-        let name = vm.discoveryService.discoveredDevices.first(where: { $0.host == host && $0.port == port })?.name
-            ?? PhoneConnectionManager.shared.deviceNameForHost(host)
+        let normalizedHost = ConnectionHostAddress.normalized(host)
+        var updated = history.filter { !(ConnectionHostAddress.normalized($0.host) == normalizedHost && $0.port == port) }
+        let name = vm.discoveryService.discoveredDevices.first(where: { ConnectionHostAddress.normalized($0.host) == normalizedHost && $0.port == port })?.name
+            ?? PhoneConnectionManager.shared.deviceNameForHost(normalizedHost)
             ?? "Телефон Android"
-        updated.insert(SavedConnection(name: name, host: host, port: port, date: Date()), at: 0)
-        if updated.count > 25 {
-            updated = Array(updated.prefix(25))
-        }
+        updated.insert(SavedConnection(name: name, host: normalizedHost, port: port, date: Date()), at: 0)
+        updated = Array(updated.prefix(4))
         history = updated
         if let data = try? JSONEncoder().encode(updated) {
             UserDefaults.standard.set(data, forKey: "phoneConnectionHistory")
@@ -437,7 +447,16 @@ public struct PairingModalView: View {
     private func loadHistory() {
         if let data = UserDefaults.standard.data(forKey: "phoneConnectionHistory"),
            let saved = try? JSONDecoder().decode([SavedConnection].self, from: data) {
-            history = saved
+            var seen = Set<String>()
+            history = saved.compactMap { item in
+                let host = ConnectionHostAddress.normalized(item.host)
+                let key = "\(host):\(item.port)"
+                guard seen.insert(key).inserted else { return nil }
+                return SavedConnection(name: item.name, host: host, port: item.port, date: item.date)
+            }.prefix(4).map { $0 }
+            if let normalized = try? JSONEncoder().encode(history) {
+                UserDefaults.standard.set(normalized, forKey: "phoneConnectionHistory")
+            }
         } else if let savedHost = UserDefaults.standard.string(forKey: "lastConnectedHost"), !savedHost.isEmpty {
             let savedPort = Int(UserDefaults.standard.string(forKey: "lastConnectedPort") ?? "2222") ?? 2222
             let devName = PhoneConnectionManager.shared.deviceNameForHost(savedHost) ?? "Телефон Android"
