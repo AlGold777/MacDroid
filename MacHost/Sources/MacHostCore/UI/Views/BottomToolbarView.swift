@@ -10,7 +10,7 @@ public struct BottomToolbarView: View {
             HStack(spacing: 4) {
                 ToolButton(systemImage: "doc.on.doc", tooltip: "Копировать (F5)") { vm.triggerCopy() }
                 ToolButton(systemImage: "arrow.right.doc.on.clipboard", tooltip: "Переместить (F6)") { vm.triggerMove() }
-                ToolButton(systemImage: "folder.badge.plus", tooltip: "Новая папка (F7)") { vm.showNewFolderDialog = true }
+                ToolButton(systemImage: "folder.badge.plus", tooltip: "Новая папка (F7)") { vm.prepareNewFolder() }
                 ToolButton(systemImage: "trash", tooltip: "Удалить (F8)") { vm.triggerDelete() }
                 ToolButton(systemImage: "textformat.abc", tooltip: "Групповое переименование (Ctrl+M)") { vm.triggerBatchRename() }
                 ToolButton(systemImage: "rectangle.2.swap", tooltip: "Сравнить папки", isActive: vm.isComparing) { vm.comparePanes() }

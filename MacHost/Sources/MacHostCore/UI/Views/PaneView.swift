@@ -1077,9 +1077,12 @@ public struct PaneView: View {
     
     @ViewBuilder
     private func rowContextMenu(for item: FileItem) -> some View {
-        Button("Открыть") { vm.openItem(item: item, side: side) }
-        
-        // Open with...
+        let contextItems = vm.contextMenuItems(for: item, side: side)
+        Button("Новая папка с выбранными объектами (\(contextItems.count))") {
+            vm.prepareNewFolderWithSelection(item: item, side: side)
+        }
+        Button("Новая папка") { vm.prepareNewFolder(side: side) }
+
         Menu("Открыть с помощью...") {
             let apps = vm.getApplicationsForFile(item: item)
             if apps.isEmpty {
@@ -1097,59 +1100,26 @@ public struct PaneView: View {
                 vm.chooseCustomApplicationAndOpen(item: item)
             }
         }
-        
-        Button("Просмотр (F3)") { vm.triggerQuickLook(preferNativeQuickLook: true) }
-        Divider()
-        
-        // Copy & Paste
-        Button("Копировать (Cmd+C)") { vm.copyToClipboard(items: [item], side: side) }
+
+        Button("Удалить (F8)", role: .destructive) {
+            vm.selectContextMenuItems(for: item, side: side)
+            vm.triggerDelete()
+        }
+        Button("Копировать (Cmd+C)") { vm.copyToClipboard(items: contextItems, side: side) }
         Button("Вставить (Cmd+V)") { vm.pasteFromClipboard(targetSide: side) }
             .disabled(!vm.canPaste)
-        
-        // Duplicate
         Button("Дублировать (Cmd+Shift+D)") { vm.duplicateItem(item: item, side: side) }
-        
-        Button("Копировать в другую панель (F5)") { vm.triggerCopy() }
-        Button("Переместить (F6)") { vm.triggerMove() }
-        Divider()
-        
-        // Архивация и разархивирование
-        if vm.isArchive(item: item) {
-            Button("Разархивировать") { vm.unarchive(item: item, side: side) }
-            Button("Разархивировать в другую панель") {
-                let otherPath = (side == .left) ? vm.rightPath : vm.leftPath
-                vm.unarchive(item: item, side: side, to: otherPath)
-            }
-        }
+
         Button("Сжать в архив... (Alt+F5)") { vm.triggerCreateArchive(item: item, side: side) }
-        Divider()
-        
-        // Rename
         Button("Переименовать (F2)") { vm.triggerRename(item: item, side: side) }
-        Button("Групповое переименование (Ctrl+M)...") { vm.triggerBatchRename(item: item, side: side) }
-        
-        // Delete
-        Button("Удалить (F8)", role: .destructive) { vm.triggerDelete() }
-        Divider()
-        
         Button("Свойства (Cmd+I)") { vm.triggerProperties(item: item, side: side) }
-        Divider()
-        Button("Копировать имя") {
-            NSPasteboard.general.clearContents()
-            NSPasteboard.general.setString(item.name, forType: .string)
-        }
-        Button("Копировать путь") {
-            NSPasteboard.general.clearContents()
-            NSPasteboard.general.setString(item.path, forType: .string)
-        }
-        if sourceBinding.wrappedValue == .localMac {
-            Button("Показать в Finder") { NSWorkspace.shared.selectFile(item.path, inFileViewerRootedAtPath: "") }
-        }
-        Divider()
-        let showHidden = (side == .left) ? vm.leftShowHidden : vm.rightShowHidden
-        Button(action: { vm.toggleShowHidden(side: side) }) {
-            Label(showHidden ? "Скрыть скрытые файлы" : "Показывать скрытые файлы", systemImage: showHidden ? "eye.slash" : "eye")
-        }
+        Toggle("Показывать скрытые файлы", isOn: Binding(
+            get: { side == .left ? vm.leftShowHidden : vm.rightShowHidden },
+            set: { newValue in
+                let showHidden = side == .left ? vm.leftShowHidden : vm.rightShowHidden
+                if newValue != showHidden { vm.toggleShowHidden(side: side) }
+            }
+        ))
     }
     
     private func startTabRename(tab: PanelTab) {
@@ -2211,6 +2181,4 @@ private struct NavArrowButton: View {
         .help(tooltip)
     }
 }
-
-
 

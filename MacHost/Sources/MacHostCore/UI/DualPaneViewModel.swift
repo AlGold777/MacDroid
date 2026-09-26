@@ -177,6 +177,7 @@ public final class DualPaneViewModel: ObservableObject {
     @Published public var transferETA: String = ""
     @Published public var statusMessage: String = "Готов к работе"
     @Published public var newFolderName: String = ""
+    @Published public var newFolderSelectedItems: [FileItem] = []
     @Published public var showOperationReport: Bool = false
     
     // Drag & Drop Visual Feedback
@@ -2259,18 +2260,110 @@ public final class DualPaneViewModel: ObservableObject {
         }
     }
     
+    public func contextMenuItems(for item: FileItem, side: PaneSide) -> [FileItem] {
+        let items = side == .left ? leftItems : rightItems
+        let selection = side == .left ? leftSelection : rightSelection
+        let itemIsSelected = selection.contains(item.id) || selection.contains(item.path)
+        guard itemIsSelected else { return [item] }
+
+        let selectedItems = items.filter { selection.contains($0.id) || selection.contains($0.path) }
+        return selectedItems.isEmpty ? [item] : selectedItems
+    }
+
+    public func prepareNewFolder(side: PaneSide? = nil) {
+        if let side, activePane != side { activePane = side }
+        newFolderName = ""
+        newFolderSelectedItems = []
+        showNewFolderDialog = true
+    }
+
+    public func prepareNewFolderWithSelection(item: FileItem, side: PaneSide) {
+        let selectedItems = contextMenuItems(for: item, side: side)
+        if activePane != side { activePane = side }
+        newFolderName = ""
+        newFolderSelectedItems = selectedItems
+        showNewFolderDialog = true
+    }
+
+    public func selectContextMenuItems(for item: FileItem, side: PaneSide) {
+        let selectedItems = contextMenuItems(for: item, side: side)
+        if activePane != side { activePane = side }
+        let selectedIDs = Set(selectedItems.map(\.id))
+        if side == .left {
+            leftSelection = selectedIDs
+        } else {
+            rightSelection = selectedIDs
+        }
+    }
+
+    public func cancelNewFolderCreation() {
+        newFolderName = ""
+        newFolderSelectedItems = []
+    }
+
     public func createFolder() {
-        guard !newFolderName.isEmpty else { return }
-        let currentPath = (activePane == .left) ? leftPath : rightPath
-        let source = (activePane == .left) ? leftSource : rightSource
-        let driver: FileSystemDriver = (source == .localMac) ? localDriver : remoteDriver
-        let targetPath = URL(fileURLWithPath: currentPath).appendingPathComponent(newFolderName).path
-        
+        let folderName = newFolderName.trimmingCharacters(in: .whitespacesAndNewlines).precomposedStringWithCanonicalMapping
+        guard !folderName.isEmpty, folderName != ".", folderName != "..", !folderName.contains("/") else {
+            errorMessage = "Введите корректное имя папки без символа '/'."
+            showErrorAlert = true
+            return
+        }
+
+        let side = activePane
+        let currentPath = side == .left ? leftPath : rightPath
+        let source = side == .left ? leftSource : rightSource
+        let driver: FileSystemDriver = source == .localMac ? localDriver : remoteDriver
+        let targetPath = URL(fileURLWithPath: currentPath).appendingPathComponent(folderName).path
+        let selectedItems = newFolderSelectedItems
+
         Task {
-            try? await driver.createDirectory(at: targetPath)
-            self.newFolderName = ""
-            self.refreshPane(side: self.activePane)
-            self.statusMessage = "Папка создана: \(targetPath)"
+            var movedItems: [(source: String, destination: String)] = []
+            var folderCreated = false
+
+            do {
+                let siblings = try await driver.listDirectory(at: currentPath)
+                guard !siblings.contains(where: { $0.name == folderName }) else {
+                    throw NSError(domain: "DualPaneViewModel", code: 1, userInfo: [NSLocalizedDescriptionKey: "Папка «\(folderName)» уже существует."])
+                }
+
+                try await driver.createDirectory(at: targetPath)
+                folderCreated = true
+
+                for item in selectedItems {
+                    let destination = URL(fileURLWithPath: targetPath).appendingPathComponent(item.name).path
+                    try await driver.renameItem(from: item.path, to: destination)
+                    movedItems.append((source: item.path, destination: destination))
+                }
+
+                self.newFolderName = ""
+                self.newFolderSelectedItems = []
+                if !selectedItems.isEmpty {
+                    if side == .left { self.leftSelection.removeAll() } else { self.rightSelection.removeAll() }
+                }
+                self.refreshPane(side: side)
+                self.statusMessage = selectedItems.isEmpty
+                    ? "Папка создана: \(targetPath)"
+                    : "Создана папка «\(folderName)», перемещено объектов: \(selectedItems.count)"
+            } catch {
+                var rollbackSucceeded = true
+                for movedItem in movedItems.reversed() {
+                    do {
+                        try await driver.renameItem(from: movedItem.destination, to: movedItem.source)
+                    } catch {
+                        rollbackSucceeded = false
+                    }
+                }
+                if folderCreated && rollbackSucceeded {
+                    try? await driver.deleteItem(at: targetPath, moveToTrash: false)
+                }
+
+                self.newFolderSelectedItems = []
+                self.errorMessage = rollbackSucceeded
+                    ? error.localizedDescription
+                    : "\(error.localizedDescription) Не все объекты удалось вернуть на исходные места; папка «\(folderName)» сохранена."
+                self.showErrorAlert = true
+                self.refreshPane(side: side)
+            }
         }
     }
     

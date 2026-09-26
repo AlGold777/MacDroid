@@ -8,7 +8,9 @@ public struct NewFolderModalView: View {
     
     public var body: some View {
         VStack(spacing: 16) {
-            Text("Создание новой папки")
+            Text(vm.newFolderSelectedItems.isEmpty
+                 ? "Создание новой папки"
+                 : "Новая папка с выбранными объектами (\(vm.newFolderSelectedItems.count))")
                 .font(.headline)
             
             TextField("Имя каталога", text: $vm.newFolderName)
@@ -17,6 +19,7 @@ public struct NewFolderModalView: View {
             
             HStack(spacing: 12) {
                 Button("Отмена") {
+                    vm.cancelNewFolderCreation()
                     dismiss()
                 }
                 .keyboardShortcut(.cancelAction)

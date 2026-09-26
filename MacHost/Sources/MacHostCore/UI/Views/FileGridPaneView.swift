@@ -724,36 +724,50 @@ public struct FileGridCell: View {
     
     @ViewBuilder
     private func gridContextMenu(for item: FileItem) -> some View {
-        Button("Открыть") { vm.openItem(item: item, side: side) }
-        Button("Просмотр (F3 / Пробел)") { vm.triggerQuickLook(preferNativeQuickLook: true) }
-        Divider()
-        
-        Button("Копировать (Cmd+C)") { vm.copyToClipboard(items: [item], side: side) }
+        let contextItems = vm.contextMenuItems(for: item, side: side)
+        Button("Новая папка с выбранными объектами (\(contextItems.count))") {
+            vm.prepareNewFolderWithSelection(item: item, side: side)
+        }
+        Button("Новая папка") { vm.prepareNewFolder(side: side) }
+
+        Menu("Открыть с помощью...") {
+            let apps = vm.getApplicationsForFile(item: item)
+            if apps.isEmpty {
+                Text("Нет ассоциированных программ")
+            } else {
+                ForEach(apps, id: \.self) { appURL in
+                    Button(action: { vm.openFile(item: item, withApplicationURL: appURL) }) {
+                        let appName = FileManager.default.displayName(atPath: appURL.path).replacingOccurrences(of: ".app", with: "")
+                        Label(appName, systemImage: "app")
+                    }
+                }
+            }
+            Divider()
+            Button("Выбрать программу...") {
+                vm.chooseCustomApplicationAndOpen(item: item)
+            }
+        }
+
+        Button("Удалить (F8)", role: .destructive) {
+            vm.selectContextMenuItems(for: item, side: side)
+            vm.triggerDelete()
+        }
+        Button("Копировать (Cmd+C)") { vm.copyToClipboard(items: contextItems, side: side) }
         Button("Вставить (Cmd+V)") { vm.pasteFromClipboard(targetSide: side) }
             .disabled(!vm.canPaste)
         Button("Дублировать (Cmd+Shift+D)") { vm.duplicateItem(item: item, side: side) }
-        
-        Button("Копировать в другую панель (F5)") { vm.triggerCopy() }
-        Button("Переместить (F6)") { vm.triggerMove() }
-        Divider()
-        
-        // Архивация и разархивирование
-        if vm.isArchive(item: item) {
-            Button("Разархивировать") { vm.unarchive(item: item, side: side) }
-            Button("Разархивировать в другую панель") {
-                let otherPath = (side == .left) ? vm.rightPath : vm.leftPath
-                vm.unarchive(item: item, side: side, to: otherPath)
-            }
-        }
+
         Button("Сжать в архив... (Alt+F5)") { vm.triggerCreateArchive(item: item, side: side) }
-        Divider()
-        
         Button("Переименовать (F2)") { vm.triggerRename(item: item, side: side) }
-        Button("Групповое переименование (Ctrl+M)...") { vm.triggerBatchRename(item: item, side: side) }
-        Button("Удалить (F8 / Delete)") { vm.triggerDelete() }
-        Divider()
-        
-        Button("Свойства (Alt+Enter)") { vm.triggerProperties(item: item) }
+        Button("Свойства (Cmd+I)") { vm.triggerProperties(item: item, side: side) }
+
+        Toggle("Показывать скрытые файлы", isOn: Binding(
+            get: { side == .left ? vm.leftShowHidden : vm.rightShowHidden },
+            set: { newValue in
+                let showHidden = side == .left ? vm.leftShowHidden : vm.rightShowHidden
+                if newValue != showHidden { vm.toggleShowHidden(side: side) }
+            }
+        ))
     }
 }
 

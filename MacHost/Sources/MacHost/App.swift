@@ -152,7 +152,7 @@ struct MacFileManagerApp: App {
                 .keyboardShortcut(.f2Key, modifiers: [])
 
                 Button("Новая папка (F7)") {
-                    viewModel.showNewFolderDialog = true
+                    viewModel.prepareNewFolder()
                 }
                 .keyboardShortcut(.f7Key, modifiers: [])
 
