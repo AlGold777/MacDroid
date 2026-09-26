@@ -510,11 +510,6 @@ public struct PaneView: View {
                     .contextMenu { pathContextMenu }
                 } else {
                     VStack(spacing: 0) {
-                        Color.clear
-                            .frame(height: 7)
-                            .contentShape(Rectangle())
-                            .onTapGesture { beginPathEditing() }
-
                         ScrollView(.horizontal, showsIndicators: false) {
                             HStack(spacing: 3) {
                                 let source = (side == .left ? vm.leftSource : vm.rightSource)
@@ -539,8 +534,19 @@ public struct PaneView: View {
                             .padding(.horizontal, 2)
                             .padding(.vertical, 3)
                         }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .contentShape(Rectangle())
+                        .onTapGesture(count: 2) { beginPathEditing() }
+                        .padding(.top, 5)
+                        .offset(y: -2.5)
                     }
                     .frame(maxWidth: .infinity, alignment: .leading)
+                    .overlay(alignment: .top) {
+                        Color.clear
+                            .frame(height: 5)
+                            .contentShape(Rectangle())
+                            .onTapGesture { beginPathEditing() }
+                    }
                     .contextMenu { pathContextMenu }
                     .help("Нажмите над крошками, чтобы ввести путь; нажмите на папку, чтобы перейти")
                 }
