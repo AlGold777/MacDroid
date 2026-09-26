@@ -14,6 +14,7 @@ public struct PaneView: View {
     @State private var isPhoneHovered: Bool = false
     @State private var lastTabClickTime: Date = .distantPast
     @State private var lastClickedTabId: UUID? = nil
+    @FocusState private var isPathInputFocused: Bool
     
     public init(side: PaneSide) {
         self.side = side
@@ -481,6 +482,12 @@ public struct PaneView: View {
                         .textFieldStyle(.plain)
                         .font(.system(size: 13, design: .monospaced))
                         .padding(.horizontal, 4)
+                        .focused($isPathInputFocused)
+                        .onAppear {
+                            DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+                                isPathInputFocused = true
+                            }
+                        }
                         
                         Button(action: { vm.commitManualPath(side: side) }) {
                             Image(systemName: "checkmark.circle.fill")
@@ -500,64 +507,42 @@ public struct PaneView: View {
                     .padding(.vertical, 3)
                     .background(Color(nsColor: .controlBackgroundColor))
                     .cornerRadius(4)
+                    .contextMenu { pathContextMenu }
                 } else {
-                    ScrollView(.horizontal, showsIndicators: false) {
-                        HStack(spacing: 3) {
-                            let source = (side == .left ? vm.leftSource : vm.rightSource)
-                            let crumbs = vm.breadcrumbs(for: currentPath, source: source)
-                            ForEach(Array(crumbs.enumerated()), id: \.element.id) { index, crumb in
-                                if crumb.isRoot {
+                    VStack(spacing: 0) {
+                        Color.clear
+                            .frame(height: 7)
+                            .contentShape(Rectangle())
+                            .onTapGesture { beginPathEditing() }
+
+                        ScrollView(.horizontal, showsIndicators: false) {
+                            HStack(spacing: 3) {
+                                let source = (side == .left ? vm.leftSource : vm.rightSource)
+                                let crumbs = vm.breadcrumbs(for: currentPath, source: source)
+                                ForEach(Array(crumbs.enumerated()), id: \.element.id) { index, crumb in
                                     Button(action: {
                                         vm.navigateTo(path: crumb.fullPath, side: side)
                                     }) {
+                                        Text(crumb.isRoot ? "›" : crumb.title)
+                                            .font(.system(size: 13, weight: crumb.isRoot ? .regular : .medium))
+                                            .foregroundColor(.secondary)
+                                    }
+                                    .buttonStyle(.plain)
+
+                                    if index < crumbs.count - 1 {
                                         Text("›")
-                                            .font(.system(size: 13, weight: .semibold))
+                                            .font(.system(size: 13, weight: .regular))
                                             .foregroundColor(.secondary)
                                     }
-                                    .buttonStyle(.plain)
-                                    .contextMenu {
-                                        let bms = vm.quickBookmarks(for: side)
-                                        ForEach(bms) { bm in
-                                            Button(action: {
-                                                vm.navigateTo(path: bm.path, side: side)
-                                            }) {
-                                                Label(bm.name, systemImage: bm.icon)
-                                            }
-                                        }
-                                        Divider()
-                                        Button(action: {
-                                            vm.showPathDisplaySettings = true
-                                        }) {
-                                            Label("Настройки пути...", systemImage: "folder.badge.gearshape")
-                                        }
-                                    }
-                                    .help("Корневой каталог (клик для перехода, правый клик для закладок и настроек пути)")
-                                } else {
-                                    Button(action: {
-                                        vm.navigateTo(path: crumb.fullPath, side: side)
-                                    }) {
-                                        Text(crumb.title)
-                                            .font(.system(size: 13, weight: .medium))
-                                            .foregroundColor(.secondary)
-                                    }
-                                    .buttonStyle(.plain)
-                                }
-                                
-                                if index < crumbs.count - 1 {
-                                    Text("›")
-                                        .font(.system(size: 13, weight: .regular))
-                                        .foregroundColor(.secondary)
                                 }
                             }
+                            .padding(.horizontal, 2)
+                            .padding(.vertical, 3)
                         }
-                        .padding(.horizontal, 2)
-                        .padding(.vertical, 3)
                     }
                     .frame(maxWidth: .infinity, alignment: .leading)
-                    .onTapGesture(count: 2) {
-                        vm.startEditingPath(side: side)
-                    }
-                    .help("Двойной клик для ручного ввода пути (Cmd+L)")
+                    .contextMenu { pathContextMenu }
+                    .help("Нажмите над крошками, чтобы ввести путь; нажмите на папку, чтобы перейти")
                 }
                 
                 // Кнопка быстрого соединения (слева от поля фильтра, без текста)
@@ -1121,6 +1106,24 @@ public struct PaneView: View {
             }
         ))
     }
+
+    @ViewBuilder
+    private var pathContextMenu: some View {
+        Button("Скопировать путь") {
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(currentPath, forType: .string)
+        }
+        Button("Вставить") {
+            guard let pastedPath = NSPasteboard.general.string(forType: .string), !pastedPath.isEmpty else { return }
+            vm.startEditingPath(side: side)
+            vm.manualPathInput = pastedPath
+        }
+        .disabled(NSPasteboard.general.string(forType: .string)?.isEmpty != false)
+    }
+
+    private func beginPathEditing() {
+        vm.startEditingPath(side: side)
+    }
     
     private func startTabRename(tab: PanelTab) {
         editingTabTitle = tab.title
@@ -1175,19 +1178,10 @@ public struct PaneView: View {
 // MARK: - In-place Inline Renaming Text Field
 public final class CustomRenameNSTextField: NSTextField {
     public override func performKeyEquivalent(with event: NSEvent) -> Bool {
-        let isControl = event.modifierFlags.contains(.control) && !event.modifierFlags.contains(.command)
-        let chars = event.charactersIgnoringModifiers?.lowercased()
-        let isV = (chars == "v" || event.keyCode == 9)
-        
-        if isControl && isV {
-            if let editor = self.currentEditor() as? NSTextView, editor.isEditable {
-                if let str = NSPasteboard.general.string(forType: .string) {
-                    editor.insertText(str, replacementRange: editor.selectedRange())
-                } else {
-                    editor.paste(nil)
-                }
-                return true
-            }
+        if event.modifierFlags.contains(.control),
+           !event.modifierFlags.contains(.command),
+           KeyCommandMonitor.performTextShortcut(keyCode: Int(event.keyCode), targetResponder: self) {
+            return true
         }
         return super.performKeyEquivalent(with: event)
     }
@@ -2181,4 +2175,3 @@ private struct NavArrowButton: View {
         .help(tooltip)
     }
 }
-

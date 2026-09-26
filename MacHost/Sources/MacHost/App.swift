@@ -187,7 +187,9 @@ struct MacFileManagerApp: App {
                 .keyboardShortcut("a", modifiers: [.command])
                 
                 Button("Выделить всё (Ctrl+A)") {
-                    viewModel.selectAll()
+                    if !KeyCommandMonitor.performTextShortcut(keyCode: 0) {
+                        viewModel.selectAll()
+                    }
                 }
                 .keyboardShortcut("a", modifiers: [.control])
                 
@@ -202,7 +204,9 @@ struct MacFileManagerApp: App {
                 .keyboardShortcut("v", modifiers: [.command])
                 
                 Button("Вставить из буфера (Ctrl+V)") {
-                    viewModel.pasteFromClipboard()
+                    if !KeyCommandMonitor.performTextShortcut(keyCode: 9) {
+                        viewModel.pasteFromClipboard()
+                    }
                 }
                 .keyboardShortcut("v", modifiers: [.control])
                 
