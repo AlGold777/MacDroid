@@ -325,7 +325,7 @@ public struct PaneView: View {
                             Image(systemName: "laptopcomputer")
                                 .font(.system(size: 10))
                             Text("Mac")
-                                .font(.system(size: 11, weight: isMacActive ? .semibold : .regular))
+                                .font(.system(size: 13, weight: isMacActive ? .semibold : .medium))
                         }
                         .padding(.horizontal, 6)
                         .padding(.vertical, 3)
@@ -353,7 +353,7 @@ public struct PaneView: View {
                                 isConnecting: vm.isConnectingPhone
                             )
                             Text("Phone")
-                                .font(.system(size: 11, weight: isPhoneActive ? .semibold : .regular))
+                                .font(.system(size: 13, weight: isPhoneActive ? .semibold : .medium))
                         }
                         .padding(.horizontal, 6)
                         .padding(.vertical, 3)
@@ -411,7 +411,7 @@ public struct PaneView: View {
                                     Image(systemName: "externaldrive.fill")
                                         .font(.system(size: 10))
                                     Text("USB")
-                                        .font(.system(size: 11, weight: isUsbActive ? .semibold : .regular))
+                                        .font(.system(size: 13, weight: isUsbActive ? .semibold : .medium))
                                 }
                                 .padding(.horizontal, 6)
                                 .padding(.vertical, 3)
@@ -447,7 +447,7 @@ public struct PaneView: View {
                                     Image(systemName: "externaldrive.fill")
                                         .font(.system(size: 10))
                                     Text("USB")
-                                        .font(.system(size: 11, weight: isUsbActive ? .semibold : .regular))
+                                        .font(.system(size: 13, weight: isUsbActive ? .semibold : .medium))
                                     Image(systemName: "chevron.down")
                                         .font(.system(size: 8))
                                 }
