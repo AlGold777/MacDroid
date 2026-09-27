@@ -666,12 +666,12 @@ public struct PaneView: View {
             
             if isStale {
                 HStack(spacing: 8) {
+                    Spacer()
                     Text("Phone Offline")
-                        .font(.system(size: 13))
+                        .font(.system(size: 12))
                         .foregroundColor(.secondary)
                     Image(systemName: "exclamationmark.triangle.fill")
                         .foregroundColor(.orange)
-                    Spacer()
                     Button(action: {
                         vm.showPairingDialog = true
                     }) {
