@@ -144,6 +144,9 @@ public struct PaneView: View {
                     if vm.activePane != side { vm.activePane = side }
                     vm.navigateUp(side: side)
                 }
+                Rectangle()
+                    .fill(Color.secondary.opacity(0.35))
+                    .frame(width: 1, height: 14)
                 
                 NavArrowButton(
                     systemImage: "chevron.left",
@@ -154,6 +157,9 @@ public struct PaneView: View {
                     if vm.activePane != side { vm.activePane = side }
                     vm.navigateBack(side: side)
                 }
+                Rectangle()
+                    .fill(Color.secondary.opacity(0.35))
+                    .frame(width: 1, height: 14)
                 
                 NavArrowButton(
                     systemImage: "chevron.right",
@@ -164,6 +170,9 @@ public struct PaneView: View {
                     if vm.activePane != side { vm.activePane = side }
                     vm.navigateForward(side: side)
                 }
+                Rectangle()
+                    .fill(Color.secondary.opacity(0.35))
+                    .frame(width: 1, height: 14)
                 
                 ForEach(tabs) { tab in
                     HStack(spacing: 4) {
@@ -291,7 +300,7 @@ public struct PaneView: View {
                     vm.toggleViewMode(for: side)
                 }) {
                     Image(systemName: currentMode == .table ? "square.grid.2x2" : "line.3.horizontal")
-                        .font(.system(size: 12, weight: .medium))
+                        .font(.system(size: 14.76, weight: .medium))
                         .foregroundColor(currentMode == .grid ? .accentColor : .secondary)
                         .padding(4)
                         .contentShape(Rectangle())
