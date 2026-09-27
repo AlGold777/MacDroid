@@ -34,7 +34,7 @@ public struct PairingModalView: View {
             VStack(alignment: .leading, spacing: 6) {
                 HStack {
                     Text("История подключений и устройства в сети:")
-                        .font(.caption)
+                        .font(.system(size: 14))
                         .fontWeight(.bold)
                     
                     Spacer()
@@ -166,17 +166,6 @@ public struct PairingModalView: View {
                     TextField("2222", text: $inputPort)
                         .textFieldStyle(.roundedBorder)
                         .frame(width: 80)
-                }
-                
-                VStack(alignment: .leading, spacing: 4) {
-                    Text("Отпечаток хост-ключа телефона:")
-                        .font(.caption)
-                        .fontWeight(.bold)
-                    Text(currentFingerprint)
-                        .font(.system(size: 11, design: .monospaced))
-                        .padding(6)
-                        .background(Color(nsColor: .controlBackgroundColor))
-                        .cornerRadius(4)
                 }
                 
                 Toggle("Автоматически подключаться к этому устройству при запуске", isOn: Binding(
