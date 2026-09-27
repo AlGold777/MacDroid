@@ -1,5 +1,7 @@
 import Foundation
 import Network
+import dnssd
+import Darwin
 
 public struct DiscoveredDevice: Identifiable, Hashable, Sendable {
     public let id: String
@@ -24,6 +26,17 @@ public enum ConnectionHostAddress {
         let parts = trimmed.split(separator: "%", omittingEmptySubsequences: true)
         guard parts.count > 1 else { return trimmed }
         return "\(parts[0])%\(parts[1])"
+    }
+
+    public static func isIPv4(_ host: String) -> Bool {
+        let octets = host.split(separator: ".", omittingEmptySubsequences: false)
+        guard octets.count == 4 else { return false }
+        return octets.allSatisfy { octet in
+            guard !octet.isEmpty,
+                  octet.unicodeScalars.allSatisfy({ (48...57).contains($0.value) }),
+                  let value = Int(octet) else { return false }
+            return (0...255).contains(value)
+        }
     }
 }
 
@@ -55,6 +68,12 @@ public final class DiscoveryService: ObservableObject {
     private var pendingServiceIds: Set<String> = []
     private var resolvedServiceIds: Set<String> = []
     private var activeServiceIds: Set<String> = []
+
+    private final class BonjourResolveContext: @unchecked Sendable {
+        let semaphore = DispatchSemaphore(value: 0)
+        var hostName: String?
+        var port: Int?
+    }
     
     public init() {}
     
@@ -163,7 +182,6 @@ public final class DiscoveryService: ObservableObject {
 
     /// Настоящий Bonjour/mDNS резолвинг IP-адреса устройства из сетевого пакета
     private func resolveServiceEndpoint(_ endpoint: NWEndpoint, name: String, type: String, domain: String, serviceId: String) {
-        // Разрешаем dual-stack (IPv4 и IPv6) без принудительного ограничения
         let params = NWParameters.tcp
         let conn = NWConnection(to: endpoint, using: params)
         resolvingConnections.append(conn)
@@ -180,15 +198,10 @@ public final class DiscoveryService: ObservableObject {
                     switch host {
                     case .ipv4(let ip4):
                         resolvedIp = "\(ip4)"
-                    case .ipv6(let ip6):
-                        // Для IPv6 link-local интерфейс (%en0) обязателен для BSD сокетов и OpenSSH
-                        let address = String("\(ip6)".split(separator: "%", maxSplits: 1).first ?? "\(ip6)")
-                        if let iface = ip6.interface?.name {
-                            resolvedIp = "\(address)%\(iface)"
-                        } else {
-                            resolvedIp = ConnectionHostAddress.normalized("\(ip6)")
-                        }
+                    case .ipv6:
+                        break
                     case .name(let hostName, _):
+                        // Не используем имя узла в списке mDNS, где показывается только IPv4.
                         resolvedIp = hostName
                     @unknown default:
                         break
@@ -197,27 +210,46 @@ public final class DiscoveryService: ObservableObject {
                 }
                 
                 conn.cancel()
-                
-                if !resolvedIp.isEmpty {
-                    let dev = DiscoveredDevice(
-                        id: serviceId,
-                        name: name,
-                        host: resolvedIp,
-                        port: resolvedPort
-                    )
-                    PhoneConnectionManager.shared.registerDevice(host: resolvedIp, name: name)
+
+                if ConnectionHostAddress.isIPv4(resolvedIp) {
                     Task { @MainActor [weak self] in
-                        guard let self = self else { return }
-                        self.resolvingConnections.removeAll { $0 === conn }
-                        self.pendingServiceIds.remove(serviceId)
-                        guard self.activeServiceIds.contains(serviceId) else { return }
-                        self.resolvedServiceIds.insert(serviceId)
-                        if let idx = self.discoveredDevices.firstIndex(where: { $0.id == dev.id || $0.name == dev.name }) {
-                            self.discoveredDevices[idx] = dev
-                        } else {
-                            self.discoveredDevices.append(dev)
+                        self?.finishServiceResolution(
+                            serviceId: serviceId,
+                            name: name,
+                            host: resolvedIp,
+                            port: resolvedPort,
+                            connection: conn
+                        )
+                    }
+                } else if case .service(let serviceName, let serviceType, let serviceDomain, let interface) = endpoint {
+                    let interfaceIndex = UInt32(interface?.index ?? 0)
+                    let fallbackPort = resolvedPort
+                    DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                        let address = Self.resolveBonjourIPv4(
+                            serviceName: serviceName,
+                            serviceType: serviceType,
+                            serviceDomain: serviceDomain,
+                            interfaceIndex: interfaceIndex
+                        )
+                        Task { @MainActor [weak self] in
+                            self?.finishServiceResolution(
+                                serviceId: serviceId,
+                                name: name,
+                                host: address?.host,
+                                port: address?.port ?? fallbackPort,
+                                connection: conn
+                            )
                         }
-                        self.isSearching = false
+                    }
+                } else {
+                    Task { @MainActor [weak self] in
+                        self?.finishServiceResolution(
+                            serviceId: serviceId,
+                            name: name,
+                            host: nil,
+                            port: resolvedPort,
+                            connection: conn
+                        )
                     }
                 }
                 
@@ -241,6 +273,78 @@ public final class DiscoveryService: ObservableObject {
         }
         
         conn.start(queue: DispatchQueue.global(qos: .userInitiated))
+    }
+
+    private func finishServiceResolution(serviceId: String, name: String, host: String?, port: Int, connection: NWConnection) {
+        resolvingConnections.removeAll { $0 === connection }
+        pendingServiceIds.remove(serviceId)
+        guard activeServiceIds.contains(serviceId),
+              let host,
+              ConnectionHostAddress.isIPv4(host) else { return }
+
+        let device = DiscoveredDevice(id: serviceId, name: name, host: host, port: port)
+        PhoneConnectionManager.shared.registerDevice(host: host, name: name)
+        resolvedServiceIds.insert(serviceId)
+        if let index = discoveredDevices.firstIndex(where: { $0.id == device.id || $0.name == device.name }) {
+            discoveredDevices[index] = device
+        } else {
+            discoveredDevices.append(device)
+        }
+        isSearching = false
+    }
+
+    nonisolated private static func resolveBonjourIPv4(
+        serviceName: String,
+        serviceType: String,
+        serviceDomain: String,
+        interfaceIndex: UInt32
+    ) -> (host: String, port: Int)? {
+        let context = BonjourResolveContext()
+        var serviceRef: DNSServiceRef?
+        let status = DNSServiceResolve(
+            &serviceRef,
+            0,
+            interfaceIndex,
+            serviceName,
+            serviceType,
+            serviceDomain,
+            { _, _, _, errorCode, _, hostTarget, networkPort, _, _, rawContext in
+                guard let rawContext else { return }
+                let context = Unmanaged<BonjourResolveContext>.fromOpaque(rawContext).takeUnretainedValue()
+                if errorCode == kDNSServiceErr_NoError {
+                    if let hostTarget { context.hostName = String(cString: hostTarget) }
+                    context.port = Int(UInt16(bigEndian: networkPort))
+                }
+                context.semaphore.signal()
+            },
+            Unmanaged.passUnretained(context).toOpaque()
+        )
+        guard status == kDNSServiceErr_NoError, let serviceRef else { return nil }
+        defer { DNSServiceRefDeallocate(serviceRef) }
+
+        let queue = DispatchQueue.global(qos: .userInitiated)
+        guard DNSServiceSetDispatchQueue(serviceRef, queue) == kDNSServiceErr_NoError,
+              context.semaphore.wait(timeout: .now() + 2.5) == .success,
+              let hostName = context.hostName,
+              let port = context.port else { return nil }
+
+        var hints = addrinfo()
+        hints.ai_family = AF_INET
+        hints.ai_socktype = SOCK_STREAM
+        var result: UnsafeMutablePointer<addrinfo>?
+        guard getaddrinfo(hostName, nil, &hints, &result) == 0,
+              let result else { return nil }
+        defer { freeaddrinfo(result) }
+
+        guard let socketAddress = result.pointee.ai_addr else { return nil }
+        var ipv4Address = socketAddress.withMemoryRebound(to: sockaddr_in.self, capacity: 1) {
+            $0.pointee.sin_addr
+        }
+        var addressBuffer = [CChar](repeating: 0, count: Int(INET_ADDRSTRLEN))
+        guard inet_ntop(AF_INET, &ipv4Address, &addressBuffer, socklen_t(addressBuffer.count)) != nil else {
+            return nil
+        }
+        return (String(cString: addressBuffer), port)
     }
     
     public func addManualDevice(name: String, host: String, port: Int) {

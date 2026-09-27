@@ -61,32 +61,16 @@ public struct PairingModalView: View {
                 }
                 
                 Menu {
-                    // 1. Обнаруженные устройства через mDNS
-                    let discovered = vm.discoveryService.discoveredDevices
-                    if !discovered.isEmpty {
-                        Section("Обнаруженные в сети (mDNS)") {
-                            ForEach(discovered) { dev in
-                                Button(action: {
-                                    selectConnection(name: dev.name, host: dev.host, port: dev.port)
-                                }) {
-                                    HStack {
-                                        Label("\(dev.name) — \(dev.host):\(dev.port) (в сети)", systemImage: "wifi")
-                                        if inputHost == dev.host && inputPort == String(dev.port) {
-                                            Image(systemName: "checkmark")
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    
-                    // 2. История предыдущих подключений
+                    let liveIPv4Devices = vm.discoveryService.discoveredDevices
+                        .filter { ConnectionHostAddress.isIPv4($0.host) }
+                    let discovered = Array(liveIPv4Devices.prefix(10))
+
+                    // 1. История предыдущих подключений
                     if !history.isEmpty {
-                        if !discovered.isEmpty { Divider() }
                         Section("История подключений") {
                             ForEach(history) { item in
-                                let isLive = discovered.contains(where: { $0.host == item.host })
-                                let matchingLive = discovered.first(where: { $0.name == item.name && $0.host != item.host })
+                                let isLive = liveIPv4Devices.contains(where: { $0.host == item.host })
+                                let matchingLive = liveIPv4Devices.first(where: { $0.name == item.name && $0.host != item.host })
                                 Button(action: {
                                     selectConnection(name: item.name, host: item.host, port: item.port)
                                 }) {
@@ -107,6 +91,25 @@ public struct PairingModalView: View {
                             Divider()
                             Button("Очистить историю подключений", role: .destructive) {
                                 clearHistory()
+                            }
+                        }
+                    }
+
+                    // 2. Обнаруженные устройства через mDNS: показываем только IPv4 и не более 10.
+                    if !discovered.isEmpty {
+                        if !history.isEmpty { Divider() }
+                        Section("Обнаруженные в сети (mDNS).") {
+                            ForEach(discovered) { dev in
+                                Button(action: {
+                                    selectConnection(name: dev.name, host: dev.host, port: dev.port)
+                                }) {
+                                    HStack {
+                                        Label("\(dev.name) — \(dev.host):\(dev.port) (в сети)", systemImage: "wifi")
+                                        if inputHost == dev.host && inputPort == String(dev.port) {
+                                            Image(systemName: "checkmark")
+                                        }
+                                    }
+                                }
                             }
                         }
                     }

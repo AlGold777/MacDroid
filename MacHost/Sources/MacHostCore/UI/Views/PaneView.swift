@@ -666,24 +666,17 @@ public struct PaneView: View {
             
             if isStale {
                 HStack(spacing: 8) {
+                    Text("Phone Offline")
+                        .font(.system(size: 13))
+                        .foregroundColor(.secondary)
                     Image(systemName: "exclamationmark.triangle.fill")
                         .foregroundColor(.orange)
-                    Text("Телефон не подключен (Offline)")
-                        .font(.caption)
-                        .foregroundColor(.secondary)
                     Spacer()
-                    Button(action: {
-                        vm.connectPhone()
-                    }) {
-                        Label("Connect", systemImage: "arrow.triangle.2.circlepath")
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .controlSize(.mini)
-                    
                     Button(action: {
                         vm.showPairingDialog = true
                     }) {
-                        Label("SFTP", systemImage: "wifi")
+                        Label("Connect", systemImage: "wifi")
+                            .font(.system(size: 12))
                     }
                     .buttonStyle(.bordered)
                     .controlSize(.mini)
