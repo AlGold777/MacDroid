@@ -136,7 +136,7 @@ public struct PaneView: View {
                 })
                 
                 NavArrowButton(
-                    systemImage: "chevron.up",
+                    systemImage: "arrow.up",
                     tooltip: "На уровень выше (Cmd+Up)",
                     isEnabled: true,
                     color: navArrowColor
@@ -146,10 +146,10 @@ public struct PaneView: View {
                 }
                 Rectangle()
                     .fill(Color.secondary.opacity(0.35))
-                    .frame(width: 1, height: 14)
+                    .frame(width: 1.5, height: 14)
                 
                 NavArrowButton(
-                    systemImage: "chevron.left",
+                    systemImage: "arrow.left",
                     tooltip: "Назад (Cmd+[)",
                     isEnabled: vm.canNavigateBack(side: side),
                     color: navArrowColor
@@ -159,10 +159,10 @@ public struct PaneView: View {
                 }
                 Rectangle()
                     .fill(Color.secondary.opacity(0.35))
-                    .frame(width: 1, height: 14)
+                    .frame(width: 1.5, height: 14)
                 
                 NavArrowButton(
-                    systemImage: "chevron.right",
+                    systemImage: "arrow.right",
                     tooltip: "Вперёд (Cmd+])",
                     isEnabled: vm.canNavigateForward(side: side),
                     color: navArrowColor
@@ -172,7 +172,7 @@ public struct PaneView: View {
                 }
                 Rectangle()
                     .fill(Color.secondary.opacity(0.35))
-                    .frame(width: 1, height: 14)
+                    .frame(width: 1.5, height: 14)
                 
                 ForEach(tabs) { tab in
                     HStack(spacing: 4) {
