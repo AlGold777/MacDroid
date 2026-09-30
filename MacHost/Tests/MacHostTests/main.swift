@@ -438,6 +438,49 @@ func runTest52() async {
     print("  ✓ Phone-to-Mac Drag & Drop fast-path handled immediately without deadlock!")
 }
 
+func runTest53() async {
+    print("\n[TEST 53] Fast Browsing Navigation: Cursor Restore & Display-Order Stepping:")
+    await MainActor.run {
+        assertCondition(DualPaneViewModel.immediateChildPath(of: "/storage/emulated/0", toward: "/storage/emulated/0/DCIM/Camera") == "/storage/emulated/0/DCIM", "immediateChildPath returns direct child toward descendant")
+        assertCondition(DualPaneViewModel.immediateChildPath(of: "/storage/emulated/0/", toward: "/storage/emulated/0/DCIM") == "/storage/emulated/0/DCIM", "immediateChildPath tolerates trailing slash")
+        assertCondition(DualPaneViewModel.immediateChildPath(of: "/storage/emulated/0/DCIM", toward: "/storage/emulated/0") == nil, "immediateChildPath is nil when moving forward into a child")
+        assertCondition(DualPaneViewModel.immediateChildPath(of: "/storage/emulated/0/DC", toward: "/storage/emulated/0/DCIM") == nil, "immediateChildPath ignores name-prefix siblings")
+        
+        let vm = DualPaneViewModel()
+        vm.activePane = .left
+        let b = FileItem(id: "/t/b.jpg", name: "b.jpg", path: "/t/b.jpg", size: 10, mtime: 3, isDirectory: false)
+        let a = FileItem(id: "/t/a.jpg", name: "a.jpg", path: "/t/a.jpg", size: 30, mtime: 1, isDirectory: false)
+        let c = FileItem(id: "/t/c.jpg", name: "c.jpg", path: "/t/c.jpg", size: 20, mtime: 2, isDirectory: false)
+        vm.leftItems = [b, a, c]
+        vm.leftSortField = .name
+        vm.leftSortAscending = true
+        vm.leftSelection = [a.id]
+        vm.selectNext()
+        assertCondition(vm.leftSelection == [b.id], "selectNext follows sorted display order (a → b), not raw order")
+        vm.selectNext()
+        vm.selectNext()
+        assertCondition(vm.leftSelection == [c.id], "selectNext clamps at the last displayed item")
+        vm.selectPrevious()
+        assertCondition(vm.leftSelection == [b.id], "selectPrevious steps back in display order")
+        
+        vm.leftSortField = .size
+        vm.leftSortAscending = false
+        vm.leftSelection = [a.id]
+        vm.selectNext()
+        assertCondition(vm.leftSelection == [c.id], "selectNext respects size-descending sort (a:30 → c:20)")
+        
+        vm.leftSelection = []
+        vm.selectPrevious()
+        assertCondition(vm.leftSelection == [b.id], "selectPrevious without selection jumps to last displayed item")
+        
+        vm.leftSortField = .name
+        vm.leftSortAscending = true
+        vm.leftSelection = []
+        assertCondition(vm.quickViewItem?.id == a.id, "quickViewItem falls back to first displayed item")
+    }
+}
+
+
 
 Task { @MainActor in
     do {
@@ -3553,8 +3596,11 @@ Task { @MainActor in
         // 52. Phone-to-Mac Drag & Drop Non-Blocking Transfer
         await runTest52()
         
+        // 53. Fast Browsing Navigation
+        await runTest53()
+        
         print("\n🎉 ==================================================")
-        print("🎉   ALL 52 PRODUCTION TEST SUITES PASSED!          ")
+        print("🎉   ALL 53 PRODUCTION TEST SUITES PASSED!          ")
         print("🎉 ==================================================")
         exit(0)
     } catch {

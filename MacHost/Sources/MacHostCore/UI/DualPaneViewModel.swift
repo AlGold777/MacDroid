@@ -1144,7 +1144,7 @@ public final class DualPaneViewModel: ObservableObject {
     public var quickViewItem: FileItem? {
         let side = activePane
         let selected = (side == .left) ? leftSelection : rightSelection
-        let items = (side == .left) ? leftItems : rightItems
+        let items = displayItems(for: side)
         if let firstSelected = selected.first,
            let item = items.first(where: { $0.id == firstSelected || $0.path == firstSelected || $0.name == firstSelected }) {
             return item
@@ -1684,18 +1684,19 @@ public final class DualPaneViewModel: ObservableObject {
     public func navigateBack(side: PaneSide) {
         guard canNavigateBack(side: side) else { return }
         if activePane != side { activePane = side }
+        let previousPath = (side == .left) ? leftPath : rightPath
         if side == .left {
             leftHistoryIndex -= 1
             leftPath = leftHistory[leftHistoryIndex]
             leftSelection.removeAll()
             updateActiveTab(side: .left)
-            refreshPane(side: .left)
+            refreshPane(side: .left, selectPath: Self.immediateChildPath(of: leftPath, toward: previousPath))
         } else {
             rightHistoryIndex -= 1
             rightPath = rightHistory[rightHistoryIndex]
             rightSelection.removeAll()
             updateActiveTab(side: .right)
-            refreshPane(side: .right)
+            refreshPane(side: .right, selectPath: Self.immediateChildPath(of: rightPath, toward: previousPath))
         }
     }
     
@@ -2047,17 +2048,28 @@ public final class DualPaneViewModel: ObservableObject {
         guard parentPath != currentPath else { return }
         recordHistory(path: parentPath, side: side)
         
+        // Курсор возвращается на папку, из которой вышли (как в Total Commander / Finder)
         if side == .left {
             leftPath = parentPath
             leftSelection.removeAll()
             updateActiveTab(side: .left)
-            refreshPane(side: .left)
+            refreshPane(side: .left, selectPath: currentPath)
         } else {
             rightPath = parentPath
             rightSelection.removeAll()
             updateActiveTab(side: .right)
-            refreshPane(side: .right)
+            refreshPane(side: .right, selectPath: currentPath)
         }
+    }
+    
+    /// Путь непосредственного потомка `ancestor` на пути к `descendant`
+    /// (`/a`, `/a/b/c` → `/a/b`). Nil, если `descendant` не лежит внутри `ancestor`.
+    public static func immediateChildPath(of ancestor: String, toward descendant: String) -> String? {
+        let base = ancestor.hasSuffix("/") ? String(ancestor.dropLast()) : ancestor
+        guard descendant.count > base.count + 1, descendant.hasPrefix(base + "/") else { return nil }
+        let rest = descendant.dropFirst(base.count + 1)
+        guard let component = rest.split(separator: "/").first, !component.isEmpty else { return nil }
+        return base + "/" + component
     }
     
     // MARK: - Single Rename & In-place Inline Rename
@@ -3245,47 +3257,35 @@ public final class DualPaneViewModel: ObservableObject {
     }
     
     public func selectNext() {
-        let side = activePane
-        let items = (side == .left) ? leftItems : rightItems
-        guard !items.isEmpty else { return }
-        let selected = (side == .left) ? leftSelection : rightSelection
-        
-        let currentIndex: Int
-        if let first = selected.first, let idx = items.firstIndex(where: { $0.id == first || $0.path == first }) {
-            currentIndex = idx
-        } else {
-            currentIndex = -1
-        }
-        
-        let nextIndex = min(currentIndex + 1, items.count - 1)
-        let nextItem = items[nextIndex]
-        if side == .left {
-            leftSelection = [nextItem.id]
-        } else {
-            rightSelection = [nextItem.id]
-        }
+        moveSelection(by: 1)
     }
     
     public func selectPrevious() {
+        moveSelection(by: -1)
+    }
+    
+    /// Перемещение курсора в порядке отображения (сортировка/фильтр), как видит пользователь.
+    /// Используется стрелками в окне Quick Look: таблица прокручивается к новому элементу.
+    private func moveSelection(by offset: Int) {
         let side = activePane
-        let items = (side == .left) ? leftItems : rightItems
+        let items = displayItems(for: side)
         guard !items.isEmpty else { return }
         let selected = (side == .left) ? leftSelection : rightSelection
         
-        let currentIndex: Int
+        let targetIndex: Int
         if let first = selected.first, let idx = items.firstIndex(where: { $0.id == first || $0.path == first }) {
-            currentIndex = idx
+            targetIndex = max(0, min(items.count - 1, idx + offset))
         } else {
-            currentIndex = items.count
+            targetIndex = offset >= 0 ? 0 : items.count - 1
         }
         
-        let prevIndex = max(currentIndex - 1, 0)
-        let prevItem = items[prevIndex]
+        let target = items[targetIndex]
         if side == .left {
-            leftSelection = [prevItem.id]
+            leftSelection = [target.id]
         } else {
-            rightSelection = [prevItem.id]
+            rightSelection = [target.id]
         }
+        TableDoubleClickHandler.HandlerView.scrollToItem(id: target.id, side: side)
     }
     
     // MARK: - Folder Size Calculation (Space Key)

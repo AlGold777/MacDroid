@@ -1613,11 +1613,22 @@ public struct TableDoubleClickHandler: NSViewRepresentable {
         public static func focusAndScrollToItem(id: String, side: PaneSide) {
             DispatchQueue.main.async {
                 let tv = (side == .left) ? leftTableView : rightTableView
-                let items = (side == .left) ? (leftVM?.leftItems ?? []) : (rightVM?.rightItems ?? [])
+                // Индекс строки таблицы — в порядке отображения (сортировка/фильтр), а не в сыром списке
+                let items = activeVM(for: side)?.displayItems(for: side) ?? []
                 guard let index = items.firstIndex(where: { $0.id == id || $0.path == id }) else { return }
                 tv?.selectRowIndexes(IndexSet(integer: index), byExtendingSelection: false)
                 tv?.scrollRowToVisible(index)
                 tv?.window?.makeFirstResponder(tv)
+            }
+        }
+        
+        /// Прокрутка к элементу без перехвата фокуса (окно Quick Look остаётся ключевым)
+        public static func scrollToItem(id: String, side: PaneSide) {
+            DispatchQueue.main.async {
+                let tv = (side == .left) ? leftTableView : rightTableView
+                let items = activeVM(for: side)?.displayItems(for: side) ?? []
+                guard let index = items.firstIndex(where: { $0.id == id || $0.path == id }) else { return }
+                tv?.scrollRowToVisible(index)
             }
         }
         
