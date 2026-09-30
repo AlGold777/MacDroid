@@ -292,7 +292,20 @@ public struct FileGridPaneView: View {
         .background(Color(nsColor: .controlBackgroundColor).opacity(0.1))
         .onDrop(of: [DualPaneViewModel.dragUTType, UTType.fileURL.identifier, UTType.utf8PlainText.identifier], delegate: FileGridDropDelegate(side: side, vm: vm, items: items))
         // Клавиатурные команды для сетки
+        .onKeyPress(KeyEquivalent(Character(UnicodeScalar(NSF2FunctionKey)!)), phases: .down) { press in
+            if KeyCommandMonitor.isTextEditingActive(in: vm) {
+                return .ignored
+            }
+            if press.modifiers.isEmpty {
+                vm.triggerRename(side: side)
+                return .handled
+            }
+            return .ignored
+        }
         .onKeyPress(KeyEquivalent("a"), phases: .down) { press in
+            if KeyCommandMonitor.isTextEditingActive(in: vm) {
+                return .ignored
+            }
             if press.modifiers.contains(.control) || press.modifiers.contains(.command) {
                 vm.selectAll(side: side)
                 return .handled
@@ -300,6 +313,9 @@ public struct FileGridPaneView: View {
             return .ignored
         }
         .onKeyPress(.space, phases: .down) { press in
+            if KeyCommandMonitor.isTextEditingActive(in: vm) {
+                return .ignored
+            }
             if press.modifiers.isEmpty {
                 vm.triggerQuickLook(preferNativeQuickLook: true)
                 return .handled
@@ -307,10 +323,16 @@ public struct FileGridPaneView: View {
             return .ignored
         }
         .onKeyPress(.return, phases: .down) { _ in
+            if KeyCommandMonitor.isTextEditingActive(in: vm) {
+                return .ignored
+            }
             vm.openSelected()
             return .handled
         }
         .onKeyPress(.delete, phases: .down) { press in
+            if KeyCommandMonitor.isTextEditingActive(in: vm) {
+                return .ignored
+            }
             if press.modifiers.isEmpty {
                 vm.navigateUp(side: side)
                 return .handled
@@ -318,18 +340,30 @@ public struct FileGridPaneView: View {
             return .ignored
         }
         .onKeyPress(.leftArrow, phases: .down) { _ in
+            if KeyCommandMonitor.isTextEditingActive(in: vm) {
+                return .ignored
+            }
             navigateSelection(offset: -1)
             return .handled
         }
         .onKeyPress(.rightArrow, phases: .down) { _ in
+            if KeyCommandMonitor.isTextEditingActive(in: vm) {
+                return .ignored
+            }
             navigateSelection(offset: 1)
             return .handled
         }
         .onKeyPress(.upArrow, phases: .down) { _ in
+            if KeyCommandMonitor.isTextEditingActive(in: vm) {
+                return .ignored
+            }
             navigateSelectionRow(direction: -1)
             return .handled
         }
         .onKeyPress(.downArrow, phases: .down) { _ in
+            if KeyCommandMonitor.isTextEditingActive(in: vm) {
+                return .ignored
+            }
             navigateSelectionRow(direction: 1)
             return .handled
         }
@@ -661,6 +695,10 @@ public struct FileGridCell: View {
         vm.clearDragHoverState()
         let isMove = NSEvent.modifierFlags.contains(.command)
         let targetDir = item.isDirectory ? item.path : nil
+        SSHTransportLog.write("DND_GRID_FOLDER_DROP side=\(side) folder=\(item.name) hasPayload=\(vm.currentDragPayload != nil)")
+        if vm.currentDragPayload != nil {
+            return vm.handleDroppedProviders([], toSide: side, targetDirPath: targetDir, isMove: isMove)
+        }
         return vm.handleDroppedProviders(providers, toSide: side, targetDirPath: targetDir, isMove: isMove)
     }
     
@@ -748,7 +786,7 @@ public struct FileGridCell: View {
             }
         }
 
-        Button("Удалить (F8)", role: .destructive) {
+        Button("Удалить (F8 / Delete)", role: .destructive) {
             vm.selectContextMenuItems(for: item, side: side)
             vm.triggerDelete()
         }
@@ -816,8 +854,16 @@ public struct FileGridDropDelegate: DropDelegate {
         }
         
         let isMove = NSEvent.modifierFlags.contains(.command)
+        SSHTransportLog.write("DND_GRID_PERFORM_DROP side=\(side) hasPayload=\(vm.currentDragPayload != nil) targetDir=\(targetDirPath ?? "nil")")
+        
+        // 1. Приоритетный путь для внутреннего Drag & Drop между панелями
+        if vm.currentDragPayload != nil {
+            return vm.handleDroppedProviders([], toSide: side, targetDirPath: targetDirPath, isMove: isMove)
+        }
+        
+        let customUTType = UTType(exportedAs: DualPaneViewModel.dragUTType, conformingTo: .data)
         let utTypes: [UTType] = [
-            UTType(DualPaneViewModel.dragUTType) ?? .data,
+            customUTType,
             .fileURL,
             .utf8PlainText,
             .plainText,

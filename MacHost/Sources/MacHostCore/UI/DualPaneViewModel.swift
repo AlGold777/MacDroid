@@ -267,6 +267,11 @@ public final class DualPaneViewModel: ObservableObject {
     public let queueManager = TransferQueueManager.shared
     
     public private(set) var transport = TransportMultiplexer()
+    
+    // Индикаторы процесса обновления панелей
+    @Published public var leftIsRefreshing: Bool = false
+    @Published public var rightIsRefreshing: Bool = false
+    
     private var leftRefreshTask: Task<Void, Never>?
     private var rightRefreshTask: Task<Void, Never>?
     
@@ -1808,12 +1813,26 @@ public final class DualPaneViewModel: ObservableObject {
         let driver: FileSystemDriver = (source == .localMac) ? localDriver : remoteDriver
         
         if side == .left {
+            leftIsRefreshing = true
             leftRefreshTask?.cancel()
         } else {
+            rightIsRefreshing = true
             rightRefreshTask?.cancel()
         }
         
         let task = Task { @MainActor in
+            if side == .left {
+                self.leftIsRefreshing = true
+            } else {
+                self.rightIsRefreshing = true
+            }
+            defer {
+                if side == .left {
+                    self.leftIsRefreshing = false
+                } else {
+                    self.rightIsRefreshing = false
+                }
+            }
             do {
                 let items = try await driver.listDirectory(at: path)
                 guard !Task.isCancelled else { return }
@@ -3413,6 +3432,7 @@ public final class DualPaneViewModel: ObservableObject {
             paths: dragPaths
         )
         self.currentDragPayload = payload
+        SSHTransportLog.write("DND_CREATE_PROVIDER side=\(side) source=\(currentSource) paths=\(dragPaths)")
         
         let provider = NSItemProvider()
         
@@ -3432,36 +3452,38 @@ public final class DualPaneViewModel: ObservableObject {
             }
         } else {
             // Для удаленного файла на Android: предзагружаем в локальный кэш DragOut (только для внешних приложений)
-            provider.registerItem(forTypeIdentifier: UTType.fileURL.identifier) { completionHandler, _, _ in
+            provider.registerItem(forTypeIdentifier: UTType.fileURL.identifier) { [weak self, orchestrator = self.orchestrator] completionHandler, _, _ in
                 let tempDir = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("MacDroidCommander/DragOut", isDirectory: true)
                 try? FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
                 let localTargetURL = tempDir.appendingPathComponent(item.name)
                 
-                Task {
+                Task.detached(priority: .userInitiated) {
                     do {
                         if item.isDirectory {
                             // Рекурсивная выгрузка директории со всем содержимым для внешнего приложения (Finder, Desktop)
                             try FileManager.default.createDirectory(at: localTargetURL, withIntermediateDirectories: true)
-                            let plan = await self.resolveTransferPlan(
+                            let plan = await self?.resolveTransferPlan(
                                 paths: [item.path],
                                 fromSource: .remotePhone,
                                 targetBaseDirPath: tempDir.path
                             )
-                            for dir in plan.directoriesToCreate {
-                                try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
-                            }
-                            for file in plan.filesToTransfer {
-                                let subDirURL = URL(fileURLWithPath: file.targetDirPath)
-                                _ = try? await self.orchestrator.executeCopyPhoneToMac(
-                                    jobId: UUID().uuidString,
-                                    itemId: UUID().uuidString,
-                                    remotePath: file.sourcePath,
-                                    localTargetDir: subDirURL,
-                                    strategy: .overwrite
-                                ) { _ in }
+                            if let plan = plan {
+                                for dir in plan.directoriesToCreate {
+                                    try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+                                }
+                                for file in plan.filesToTransfer {
+                                    let subDirURL = URL(fileURLWithPath: file.targetDirPath)
+                                    _ = try? await orchestrator.executeCopyPhoneToMac(
+                                        jobId: UUID().uuidString,
+                                        itemId: UUID().uuidString,
+                                        remotePath: file.sourcePath,
+                                        localTargetDir: subDirURL,
+                                        strategy: .overwrite
+                                    ) { _ in }
+                                }
                             }
                         } else {
-                            try await self.orchestrator.executeCopyPhoneToMac(
+                            try await orchestrator.executeCopyPhoneToMac(
                                 jobId: UUID().uuidString,
                                 itemId: UUID().uuidString,
                                 remotePath: item.path,
@@ -3494,6 +3516,7 @@ public final class DualPaneViewModel: ObservableObject {
         targetDirPath: String? = nil,
         isMove: Bool = false
     ) -> Bool {
+        SSHTransportLog.write("DND_HANDLE_DROPPED_PROVIDERS toSide=\(toSide) targetDirPath=\(targetDirPath ?? "nil") providersCount=\(providers.count) hasPayload=\(self.currentDragPayload != nil)")
         guard !providers.isEmpty || self.currentDragPayload != nil else { return false }
         
         let destinationDir = targetDirPath ?? ((toSide == .left) ? self.leftPath : self.rightPath)
@@ -3502,6 +3525,7 @@ public final class DualPaneViewModel: ObservableObject {
         if let payload = self.currentDragPayload {
             self.currentDragPayload = nil
             let fromSource: FileSource = (payload.sourceKind == "localMac") ? .localMac : .remotePhone
+            SSHTransportLog.write("DND_EXECUTE_INTERNAL_PAYLOAD paths=\(payload.paths) from=\(fromSource) to=\(toSide) dest=\(destinationDir)")
             
             let sourceDirNorm = (payload.sourceDirPath as NSString).standardizingPath
             let targetDirNorm = (destinationDir as NSString).standardizingPath
@@ -3532,6 +3556,7 @@ public final class DualPaneViewModel: ObservableObject {
                     }
                     DispatchQueue.main.async {
                         let fromSource: FileSource = (payload.sourceKind == "localMac") ? .localMac : .remotePhone
+                        SSHTransportLog.write("DND_EXECUTE_PAYLOAD_FROM_ITEM_PROVIDER paths=\(payload.paths) from=\(fromSource) to=\(toSide) dest=\(destinationDir)")
                         
                         let sourceDirNorm = (payload.sourceDirPath as NSString).standardizingPath
                         let targetDirNorm = (destinationDir as NSString).standardizingPath
@@ -3665,6 +3690,7 @@ public final class DualPaneViewModel: ObservableObject {
         let speedTracker = TransferSpeedTracker()
         
         currentTransferTask = Task {
+            SSHTransportLog.write("UI_TRANSFER_TASK_START paths=\(paths) fromSource=\(fromSource) targetDir=\(targetDirPath)")
             // Включаем защиту от засыпания Mac во время активной очереди
             NotificationManager.shared.beginSleepPrevention()
             ThumbnailCacheManager.shared.isThrottledDueToTransfer = true
@@ -3674,11 +3700,13 @@ public final class DualPaneViewModel: ObservableObject {
             }
             
             self.statusMessage = "Анализ файлов и структуры папок..."
+            SSHTransportLog.write("UI_RESOLVE_PLAN_START")
             let plan = await self.resolveTransferPlan(
                 paths: paths,
                 fromSource: fromSource,
                 targetBaseDirPath: targetDirPath
             )
+            SSHTransportLog.write("UI_RESOLVE_PLAN_DONE files=\(plan.filesToTransfer.count) dirs=\(plan.directoriesToCreate.count)")
             if !plan.skippedFolders.isEmpty {
                 self.statusMessage = "Внимание: пропущено защищенных папок (\(plan.skippedFolders.count))"
             }
@@ -3826,6 +3854,7 @@ public final class DualPaneViewModel: ObservableObject {
                         }
                         
                     case (.remotePhone, .localMac):
+                        SSHTransportLog.write("UI_CALL_ORCH_COPY_PHONE_TO_MAC path=\(path) target=\(targetSubDirURL.path) isMove=\(isMove)")
                         if isMove {
                             result = try await orchestrator.executeMovePhoneToMac(
                                 jobId: jobId,
@@ -3845,6 +3874,7 @@ public final class DualPaneViewModel: ObservableObject {
                                 progress: onProgress
                             )
                         }
+                        SSHTransportLog.write("UI_COPY_PHONE_TO_MAC_RESULT path=\(path) result=\(result)")
                         
                     case (.localMac, .localMac):
                         let localURL = URL(fileURLWithPath: path)
@@ -4089,6 +4119,7 @@ public final class DualPaneViewModel: ObservableObject {
             let cleanPath = path.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
             let normPath = path.precomposedStringWithCanonicalMapping
             
+            var remoteStatSize: UInt64? = nil
             if fromSource == .localMac {
                 var isDirectoryObjC: ObjCBool = false
                 let exists = FileManager.default.fileExists(atPath: path, isDirectory: &isDirectoryObjC)
@@ -4101,8 +4132,10 @@ public final class DualPaneViewModel: ObservableObject {
                     $0.path.trimmingCharacters(in: CharacterSet(charactersIn: "/")) == cleanPath
                 }) {
                     isDir = item.isDirectory
+                    remoteStatSize = item.size
                 } else if let stat = try? await self.transport.prepareRead(actionId: UUID().uuidString, path: path) {
                     isDir = stat.isDirectory
+                    remoteStatSize = stat.size
                 } else if let _ = try? await self.remoteDriver.listDirectory(at: path) {
                     isDir = true
                 }
@@ -4113,12 +4146,7 @@ public final class DualPaneViewModel: ObservableObject {
                 if fromSource == .localMac {
                     size = (try? FileManager.default.attributesOfItem(atPath: path)[.size] as? UInt64) ?? 0
                 } else {
-                    let allSourceItems = leftItems + rightItems
-                    size = allSourceItems.first(where: {
-                        $0.id == path || $0.path == path ||
-                        $0.path.precomposedStringWithCanonicalMapping == normPath ||
-                        $0.path.trimmingCharacters(in: CharacterSet(charactersIn: "/")) == cleanPath
-                    })?.size ?? 0
+                    size = remoteStatSize ?? 0
                 }
                 filesToTransfer.append(TransferPlanItem(
                     sourcePath: path,
@@ -4165,7 +4193,10 @@ public final class DualPaneViewModel: ObservableObject {
                     }
                     scanLocal(dirURL: URL(fileURLWithPath: path), currentTargetDir: folderTargetBase)
                 } else {
-                    func scanRemote(remoteDir: String, currentTargetDir: String) async {
+                    var visitedRemoteDirs = Set<String>()
+                    func scanRemote(remoteDir: String, currentTargetDir: String, depth: Int = 0) async {
+                        guard depth < 30 else { return }
+                        guard visitedRemoteDirs.insert(remoteDir).inserted else { return }
                         let contents = try? await remoteDriver.listDirectory(at: remoteDir)
                         guard let validContents = contents else {
                             if remoteDir != path {
@@ -4181,7 +4212,7 @@ public final class DualPaneViewModel: ObservableObject {
                             if item.isDirectory {
                                 sourceFoldersToDeleteOnMove.append(item.path)
                                 directoriesToCreate.append(subTarget)
-                                await scanRemote(remoteDir: item.path, currentTargetDir: subTarget)
+                                await scanRemote(remoteDir: item.path, currentTargetDir: subTarget, depth: depth + 1)
                             } else {
                                 filesToTransfer.append(TransferPlanItem(
                                     sourcePath: item.path,
@@ -4192,7 +4223,7 @@ public final class DualPaneViewModel: ObservableObject {
                             }
                         }
                     }
-                    await scanRemote(remoteDir: path, currentTargetDir: folderTargetBase)
+                    await scanRemote(remoteDir: path, currentTargetDir: folderTargetBase, depth: 0)
                 }
             }
         }
@@ -4207,6 +4238,7 @@ public final class DualPaneViewModel: ObservableObject {
     private func startTransfer(isMove: Bool) {
         var sourceSide = activePane
         var selected = (sourceSide == .left) ? leftSelection : rightSelection
+        SSHTransportLog.write("UI_START_TRANSFER activePane=\(activePane) leftSel=\(leftSelection.count) rightSel=\(rightSelection.count) isMove=\(isMove)")
         
         // Если в активной панели ничего не выбрано, но в противоположной панели есть выделение
         if selected.isEmpty {
@@ -4215,16 +4247,19 @@ public final class DualPaneViewModel: ObservableObject {
             if !oppositeSelection.isEmpty {
                 sourceSide = oppositeSide
                 selected = oppositeSelection
+                SSHTransportLog.write("UI_START_TRANSFER fallback to oppositeSide=\(oppositeSide) selected=\(selected.count)")
             }
         }
         
         guard !selected.isEmpty else {
             statusMessage = "Выберите файлы для передачи"
+            SSHTransportLog.write("UI_START_TRANSFER empty selection")
             return
         }
         
         let targetSide: PaneSide = (sourceSide == .left) ? .right : .left
         let fromSource = (sourceSide == .left) ? leftSource : rightSource
+        SSHTransportLog.write("UI_START_TRANSFER proceed paths=\(Array(selected)) fromSource=\(fromSource) targetSide=\(targetSide)")
         executeTransfer(paths: Array(selected), fromSource: fromSource, toSide: targetSide, isMove: isMove)
     }
     

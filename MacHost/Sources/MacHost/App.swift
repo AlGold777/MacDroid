@@ -99,10 +99,10 @@ struct MacFileManagerApp: App {
                 
                 Divider()
                 
-                Button("Перейти вверх (Backspace)") {
+                Button("Перейти вверх (Cmd+↑)") {
                     viewModel.navigateUp()
                 }
-                .keyboardShortcut(.delete, modifiers: [])
+                .keyboardShortcut(.upArrow, modifiers: [.command])
                 
                 Button("Ввести путь вручную (Cmd+L)") {
                     viewModel.startEditingPath(side: viewModel.activePane)
@@ -114,19 +114,12 @@ struct MacFileManagerApp: App {
                 Button("Открыть (Return)") {
                     viewModel.openSelected()
                 }
-                .keyboardShortcut(.return, modifiers: [])
 
                 Button("Сменить панель (Tab)") {
                     viewModel.toggleActivePane()
                 }
-                .keyboardShortcut(.tab, modifiers: [])
 
-                Button("Просмотр (Пробел)") {
-                    viewModel.triggerQuickLook(preferNativeQuickLook: true)
-                }
-                .keyboardShortcut(.space, modifiers: [])
-
-                Button("Просмотр (F3)") {
+                Button("Просмотр (F3 / Пробел)") {
                     viewModel.triggerQuickLook(preferNativeQuickLook: true)
                 }
                 .keyboardShortcut(.f3Key, modifiers: [])
@@ -156,10 +149,17 @@ struct MacFileManagerApp: App {
                 }
                 .keyboardShortcut(.f7Key, modifiers: [])
 
-                Button("Удалить (F8)") {
+                Button("Удалить (F8 / Delete)") {
                     viewModel.triggerDelete()
                 }
                 .keyboardShortcut(.f8Key, modifiers: [])
+
+                Button("Удалить в корзину (Cmd+Delete)") {
+                    if !KeyCommandMonitor.isTextEditingActive(in: viewModel) {
+                        viewModel.triggerDelete()
+                    }
+                }
+                .keyboardShortcut(.delete, modifiers: [.command])
                 
                 Button("Свойства (Cmd+I)") {
                     viewModel.triggerProperties()
@@ -182,7 +182,9 @@ struct MacFileManagerApp: App {
                 .keyboardShortcut("a", modifiers: [.command, .shift])
                 
                 Button("Выделить всё (Cmd+A)") {
-                    viewModel.selectAll()
+                    if !KeyCommandMonitor.performTextShortcut(keyCode: 0) {
+                        viewModel.selectAll()
+                    }
                 }
                 .keyboardShortcut("a", modifiers: [.command])
                 
@@ -194,12 +196,23 @@ struct MacFileManagerApp: App {
                 .keyboardShortcut("a", modifiers: [.control])
                 
                 Button("Копировать в буфер (Cmd+C)") {
-                    viewModel.copyToClipboard()
+                    if !KeyCommandMonitor.performTextShortcut(keyCode: 8) {
+                        viewModel.copyToClipboard()
+                    }
                 }
                 .keyboardShortcut("c", modifiers: [.command])
                 
+                Button("Копировать в буфер (Ctrl+C)") {
+                    if !KeyCommandMonitor.performTextShortcut(keyCode: 8) {
+                        viewModel.copyToClipboard()
+                    }
+                }
+                .keyboardShortcut("c", modifiers: [.control])
+                
                 Button("Вставить из буфера (Cmd+V)") {
-                    viewModel.pasteFromClipboard()
+                    if !KeyCommandMonitor.performTextShortcut(keyCode: 9) {
+                        viewModel.pasteFromClipboard()
+                    }
                 }
                 .keyboardShortcut("v", modifiers: [.command])
                 
@@ -209,6 +222,16 @@ struct MacFileManagerApp: App {
                     }
                 }
                 .keyboardShortcut("v", modifiers: [.control])
+
+                Button("Вырезать (Cmd+X)") {
+                    _ = KeyCommandMonitor.performTextShortcut(keyCode: 7)
+                }
+                .keyboardShortcut("x", modifiers: [.command])
+
+                Button("Вырезать (Ctrl+X)") {
+                    _ = KeyCommandMonitor.performTextShortcut(keyCode: 7)
+                }
+                .keyboardShortcut("x", modifiers: [.control])
                 
                 Button("Дублировать (Cmd+Shift+D)") {
                     viewModel.duplicateItem()
@@ -249,11 +272,6 @@ struct MacFileManagerApp: App {
                     viewModel.showQueueDialog = true
                 }
                 .keyboardShortcut("j", modifiers: [.command])
-                
-                Button("Перейти вверх (Backspace)") {
-                    viewModel.navigateUp()
-                }
-                .keyboardShortcut(.delete, modifiers: [])
                 
                 Divider()
                 

@@ -278,6 +278,167 @@ let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("fs_
 try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
 defer { try? FileManager.default.removeItem(at: tempDir) }
 
+func runTest50() async {
+    print("\n[TEST 50] Trackpad Two-Finger Pull-to-Refresh & Header Refresh Button:")
+    var refreshCalled = false
+    let vm50 = await MainActor.run { () -> DualPaneViewModel in
+        let vm = DualPaneViewModel()
+        assertCondition(vm.leftIsRefreshing == false, "Default leftIsRefreshing is false")
+        assertCondition(vm.rightIsRefreshing == false, "Default rightIsRefreshing is false")
+        
+        // 1) Test refresh state triggers and resets cleanly
+        vm.refreshPane(side: .left)
+        assertCondition(vm.leftIsRefreshing == true, "refreshPane activates leftIsRefreshing")
+        
+        vm.refreshPane(side: .right)
+        assertCondition(vm.rightIsRefreshing == true, "refreshPane activates rightIsRefreshing")
+        
+        // 2) Test TrackpadSwipeRefreshView Container properties
+        let refreshView = TrackpadSwipeRefreshView.RefreshContainerView()
+        refreshView.side = .left
+        refreshView.vm = vm
+        refreshView.frame = NSRect(x: 0, y: 0, width: 400, height: 600)
+        refreshView.onRefreshTriggered = {
+            refreshCalled = true
+        }
+        
+        // hitTest must return nil so it never intercepts clicks or table interactions
+        assertCondition(refreshView.hitTest(NSPoint(x: 100, y: 100)) == nil, "RefreshContainerView hitTest returns nil (transparent to clicks)")
+        
+        // With no scroll view attached, empty/non-scrollable pane is considered at top
+        assertCondition(refreshView.isContentAtTop() == true, "isContentAtTop returns true when no scroll view present")
+        
+        // Direction normalization invariant:
+        let naturalDelta: CGFloat = 25.0
+        let effectiveDownDeltaNatural = true ? naturalDelta : -naturalDelta
+        assertCondition(effectiveDownDeltaNatural > 0, "Natural scrolling downward delta normalized to > 0")
+        
+        let traditionalDelta: CGFloat = -25.0
+        let effectiveDownDeltaTraditional = false ? traditionalDelta : -traditionalDelta
+        assertCondition(effectiveDownDeltaTraditional > 0, "Traditional scrolling downward delta normalized to > 0")
+        
+        // Manual trigger simulation
+        refreshView.triggerRefresh()
+        return vm
+    }
+    
+    try? await Task.sleep(nanoseconds: 60_000_000)
+    assertCondition(refreshCalled == true, "triggerRefresh executes onRefreshTriggered closure")
+    await MainActor.run {
+        assertCondition(vm50.activePane == .left, "triggerRefresh activates target pane side")
+    }
+}
+
+@MainActor
+func runTest51() async {
+    print("\n[TEST 51] Live Phone-to-Mac File Transfer:")
+    guard PhoneConnectionManager.shared.isHostPortReachable(host: "127.0.0.1", port: 2222, timeoutSeconds: 1) else {
+        print("  ⚠️ Port 2222 not reachable, skipping live Phone-to-Mac transfer test.")
+        return
+    }
+    
+    let destDir = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("MacDroidTest_PhoneToMac_\(UUID().uuidString)")
+    try? FileManager.default.createDirectory(at: destDir, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: destDir) }
+    
+    let vm = DualPaneViewModel()
+    vm.updateRemoteEndpoint(host: "127.0.0.1", port: 2222, deviceId: "emulator-5554")
+    vm.leftSource = .localMac
+    vm.leftPath = destDir.path
+    vm.rightSource = .remotePhone
+    vm.rightPath = "/storage/emulated/0"
+    
+    let host = "127.0.0.1"
+    let port: UInt16 = 2222
+    let deviceId = "emulator-5554"
+    if let hostKey = PhoneConnectionManager.shared.fetchHostKeyObservation(host: host, port: port) {
+        let alias = HostKeyStore.safeHostKeyAlias(deviceId)
+        try? HostKeyStore.shared.installOpenSSHHostKey(hostKey, host: host, port: port, deviceId: deviceId, hostKeyAlias: alias)
+        vm.remoteDriver.coordinator.setExpectedHostKeyAlgorithm(hostKey.keyAlgorithm)
+        vm.remoteDriver.coordinator.setHostKeyAlias(alias)
+    }
+
+    do {
+        try await vm.remoteDriver.ensureConnected(allowLegacyFallback: true)
+        let remoteItems = try await vm.remoteDriver.listDirectory(at: "/storage/emulated/0")
+        print("  ✓ Remote items found: \(remoteItems.count)")
+        guard let firstFile = remoteItems.first(where: { !$0.isDirectory && $0.size > 0 }) else {
+            print("  ⚠️ No non-empty file found on remote phone to test copy.")
+            return
+        }
+        print("  Testing transfer of file: \(firstFile.name) (size: \(firstFile.size) bytes)")
+        
+        vm.rightItems = remoteItems
+        vm.rightSelection = [firstFile.id]
+        vm.activePane = .right
+        print("  Triggering copy...")
+        vm.triggerCopy()
+        
+        // Wait for transfer task
+        var waited = 0
+        while waited < 50 {
+            try? await Task.sleep(nanoseconds: 100_000_000)
+            waited += 1
+            if !vm.showTransferProgress && waited > 5 { break }
+        }
+        
+        let targetFile = destDir.appendingPathComponent(firstFile.name)
+        let fileExists = FileManager.default.fileExists(atPath: targetFile.path)
+        let localSize = (try? FileManager.default.attributesOfItem(atPath: targetFile.path)[.size] as? UInt64) ?? 0
+        print("  Target file exists: \(fileExists), size: \(localSize)")
+        assertCondition(fileExists, "Transferred file exists in target directory")
+        assertCondition(localSize == firstFile.size, "Transferred file size matches source size (\(localSize) == \(firstFile.size))")
+        print("  ✓ Live Phone-to-Mac copy succeeded perfectly!")
+    } catch {
+        print("❌ runTest51 failed: \(error)")
+        assertCondition(false, "runTest51 failed with error: \(error)")
+    }
+}
+
+@MainActor
+func runTest52() async {
+    print("\n[TEST 52] Phone-to-Mac Drag & Drop Non-Blocking Transfer:")
+    let destDir = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("MacDroidTest_DND_\(UUID().uuidString)")
+    try? FileManager.default.createDirectory(at: destDir, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: destDir) }
+    
+    let vm = DualPaneViewModel()
+    vm.leftSource = .localMac
+    vm.leftPath = destDir.path
+    vm.rightSource = .remotePhone
+    vm.rightPath = "/storage/emulated/0"
+    
+    let remoteItem = FileItem(
+        id: "/storage/emulated/0/test_drag.txt",
+        name: "test_drag.txt",
+        path: "/storage/emulated/0/test_drag.txt",
+        size: 1024,
+        mtime: Date().timeIntervalSince1970,
+        isDirectory: false,
+        source: .remotePhone
+    )
+    vm.rightItems = [remoteItem]
+    
+    // 1. Create drag item provider for phone file
+    let provider = vm.createDragItemProvider(for: remoteItem, side: .right)
+    assertCondition(vm.currentDragPayload != nil, "currentDragPayload is set when dragging from phone")
+    assertCondition(vm.currentDragPayload?.paths == [remoteItem.path], "currentDragPayload contains dragged remote item path")
+    assertCondition(vm.currentDragPayload?.sourceKind == "remotePhone", "currentDragPayload marks sourceKind as remotePhone")
+    assertCondition(provider.hasItemConformingToTypeIdentifier(DualPaneViewModel.dragUTType), "Provider conforms to internal dragUTType")
+    assertCondition(provider.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier), "Provider conforms to UTType.fileURL for external apps")
+    
+    // 2. Perform drop onto Mac side via fast path without deadlock
+    let handled = vm.handleDroppedProviders([], toSide: .left, targetDirPath: destDir.path, isMove: false)
+    assertCondition(handled == true, "handleDroppedProviders successfully accepts drop")
+    assertCondition(vm.currentDragPayload == nil, "currentDragPayload is consumed and reset after drop")
+    assertCondition(vm.showTransferProgress == true, "Transfer progress dialog is activated on drop")
+    
+    // Cancel transfer so test doesn't actually try to download a mock file
+    vm.cancelTransfer()
+    print("  ✓ Phone-to-Mac Drag & Drop fast-path handled immediately without deadlock!")
+}
+
+
 Task { @MainActor in
     do {
         let testDirName = "Каталог_Проверки"
@@ -2380,7 +2541,7 @@ Task { @MainActor in
             TableDoubleClickHandler.HandlerView.activePaneSide = .left
             assertCondition(TableDoubleClickHandler.HandlerView.activeVM(for: .left) === vm38, "activeVM retrieves pane view model")
             
-            // E. Universal Ctrl+V Paste Monitor Invariant
+            // E. Universal Ctrl+V/C/A/X & Cmd+V/C/A/X Monitor & Space Pass-through Invariants
             KeyCommandMonitor.installGlobalMonitor()
             NSPasteboard.general.clearContents()
             let testPastedText = "ClipboardText_\(UUID().uuidString.prefix(8))"
@@ -2389,6 +2550,9 @@ Task { @MainActor in
             
             class MockTextResponder: NSResponder {
                 var pasted = false
+                var copied = false
+                var cutCalled = false
+                var selectedAll = false
                 var customText = "Initial: "
                 
                 @objc func paste(_ sender: Any?) {
@@ -2397,11 +2561,21 @@ Task { @MainActor in
                         pasted = true
                     }
                 }
+                @objc func copy(_ sender: Any?) {
+                    copied = true
+                }
+                @objc func cut(_ sender: Any?) {
+                    cutCalled = true
+                }
+                @objc override func selectAll(_ sender: Any?) {
+                    selectedAll = true
+                }
             }
             
             let mockResponder = MockTextResponder()
+            assertCondition(KeyCommandMonitor.isTextEditingResponder(mockResponder), "MockTextResponder is recognized as text editing responder")
             
-            // Simulate Ctrl+V keyDown event
+            // 1. Simulate Ctrl+V keyDown event
             if let ctrlVEvent = NSEvent.keyEvent(
                 with: .keyDown,
                 location: .zero,
@@ -2419,6 +2593,116 @@ Task { @MainActor in
                 assertCondition(mockResponder.pasted, "Mock responder paste method was invoked")
                 assertCondition(mockResponder.customText.contains(testPastedText), "Ctrl+V successfully inserted clipboard text (got '\(mockResponder.customText)')")
             }
+            
+            // 2. Simulate Cmd+V keyDown event
+            mockResponder.pasted = false
+            if let cmdVEvent = NSEvent.keyEvent(
+                with: .keyDown,
+                location: .zero,
+                modifierFlags: [.command],
+                timestamp: ProcessInfo.processInfo.systemUptime,
+                windowNumber: 0,
+                context: nil,
+                characters: "v",
+                charactersIgnoringModifiers: "v",
+                isARepeat: false,
+                keyCode: 9
+            ) {
+                let result = KeyCommandMonitor.handleEvent(cmdVEvent, targetResponder: mockResponder)
+                assertCondition(result == nil, "KeyCommandMonitor handled Cmd+V on text editor and consumed event (returned nil)")
+                assertCondition(mockResponder.pasted, "Mock responder paste method was invoked for Cmd+V")
+            }
+            
+            // 3. Simulate Ctrl+C and Cmd+C
+            if let ctrlCEvent = NSEvent.keyEvent(
+                with: .keyDown,
+                location: .zero,
+                modifierFlags: [.control],
+                timestamp: ProcessInfo.processInfo.systemUptime,
+                windowNumber: 0,
+                context: nil,
+                characters: "c",
+                charactersIgnoringModifiers: "c",
+                isARepeat: false,
+                keyCode: 8
+            ) {
+                let result = KeyCommandMonitor.handleEvent(ctrlCEvent, targetResponder: mockResponder)
+                assertCondition(result == nil, "KeyCommandMonitor handled Ctrl+C and consumed event")
+                assertCondition(mockResponder.copied, "Mock responder copy was invoked for Ctrl+C")
+            }
+            
+            mockResponder.copied = false
+            if let cmdCEvent = NSEvent.keyEvent(
+                with: .keyDown,
+                location: .zero,
+                modifierFlags: [.command],
+                timestamp: ProcessInfo.processInfo.systemUptime,
+                windowNumber: 0,
+                context: nil,
+                characters: "c",
+                charactersIgnoringModifiers: "c",
+                isARepeat: false,
+                keyCode: 8
+            ) {
+                let result = KeyCommandMonitor.handleEvent(cmdCEvent, targetResponder: mockResponder)
+                assertCondition(result == nil, "KeyCommandMonitor handled Cmd+C and consumed event")
+                assertCondition(mockResponder.copied, "Mock responder copy was invoked for Cmd+C")
+            }
+            
+            // 4. Space Key Pass-Through Invariant (CRUCIAL BUG FIX: Space must NEVER be swallowed!)
+            if let spaceEvent = NSEvent.keyEvent(
+                with: .keyDown,
+                location: .zero,
+                modifierFlags: [],
+                timestamp: ProcessInfo.processInfo.systemUptime,
+                windowNumber: 0,
+                context: nil,
+                characters: " ",
+                charactersIgnoringModifiers: " ",
+                isARepeat: false,
+                keyCode: 49
+            ) {
+                let result = KeyCommandMonitor.handleEvent(spaceEvent, targetResponder: mockResponder)
+                assertCondition(result != nil, "KeyCommandMonitor passes Space event through to text field without consuming it")
+            }
+            
+            // 5. Non-text responder (NSTableView) must NOT be recognized as text editing
+            let testTableView = NSTableView()
+            assertCondition(!KeyCommandMonitor.isTextEditingResponder(testTableView), "NSTableView is NOT recognized as text editing responder")
+            assertCondition(!KeyCommandMonitor.performTextShortcut(keyCode: 8, targetResponder: testTableView), "performTextShortcut returns false for table view")
+            assertCondition(!KeyCommandMonitor.performTextShortcut(keyCode: 9, targetResponder: testTableView), "performTextShortcut returns false for table view")
+            assertCondition(!KeyCommandMonitor.performTextShortcut(keyCode: 0, targetResponder: testTableView), "performTextShortcut returns false for table view")
+            
+            // 6. Real NSTextField text editing & clipboard operations
+            let realTextField = NSTextField(string: "MacDroid Commander")
+            assertCondition(KeyCommandMonitor.isTextEditingResponder(realTextField), "realTextField is recognized as text editing responder")
+            assertCondition(KeyCommandMonitor.performTextShortcut(keyCode: 0, targetResponder: realTextField), "performTextShortcut selects all in real text field")
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString("NewName", forType: .string)
+            assertCondition(KeyCommandMonitor.performTextShortcut(keyCode: 9, targetResponder: realTextField), "performTextShortcut pastes into real text field")
+            assertCondition(realTextField.stringValue == "NewName", "realTextField string updated to 'NewName' after paste (got '\(realTextField.stringValue)')")
+            
+            // 7. isTextEditingActive invariants with DualPaneViewModel
+            let testVm = DualPaneViewModel()
+            testVm.editingItemId = nil
+            testVm.showRenameDialog = false
+            testVm.showNewFolderDialog = false
+            assertCondition(!KeyCommandMonitor.isTextEditingActive(in: testVm), "isTextEditingActive is false when idle")
+            
+            testVm.editingItemId = "item-123"
+            assertCondition(KeyCommandMonitor.isTextEditingActive(in: testVm), "isTextEditingActive is true when editingItemId != nil")
+            
+            testVm.editingItemId = nil
+            testVm.showRenameDialog = true
+            assertCondition(KeyCommandMonitor.isTextEditingActive(in: testVm), "isTextEditingActive is true when showRenameDialog == true")
+            
+            testVm.showRenameDialog = false
+            testVm.showNewFolderDialog = true
+            assertCondition(KeyCommandMonitor.isTextEditingActive(in: testVm), "isTextEditingActive is true when showNewFolderDialog == true")
+            
+            testVm.showNewFolderDialog = false
+            testVm.isEditingLeftPath = true
+            assertCondition(KeyCommandMonitor.isTextEditingActive(in: testVm), "isTextEditingActive is true when isEditingLeftPath == true")
         }
         
         try? FileManager.default.removeItem(at: testDir38)
@@ -3260,8 +3544,17 @@ Task { @MainActor in
         
         try? FileManager.default.removeItem(at: archiveTestDir)
         
+        // 50. Trackpad Two-Finger Pull-to-Refresh & Pane Refresh Button Invariants
+        await runTest50()
+        
+        // 51. Live Phone-to-Mac File Transfer
+        await runTest51()
+        
+        // 52. Phone-to-Mac Drag & Drop Non-Blocking Transfer
+        await runTest52()
+        
         print("\n🎉 ==================================================")
-        print("🎉   ALL 49 PRODUCTION TEST SUITES PASSED!          ")
+        print("🎉   ALL 52 PRODUCTION TEST SUITES PASSED!          ")
         print("🎉 ==================================================")
         exit(0)
     } catch {

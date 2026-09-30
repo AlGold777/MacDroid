@@ -15,6 +15,8 @@ public struct PaneView: View {
     @State private var lastTabClickTime: Date = .distantPast
     @State private var lastClickedTabId: UUID? = nil
     @FocusState private var isPathInputFocused: Bool
+    @State private var pullProgress: CGFloat = 0
+    @State private var showPullIndicator: Bool = false
     
     public init(side: PaneSide) {
         self.side = side
@@ -292,6 +294,13 @@ public struct PaneView: View {
                 .buttonStyle(.plain)
                 
                 Spacer()
+                
+                // Кнопка обновления содержимого панели (слева от иконки плитки)
+                let isRefreshing = (side == .left ? vm.leftIsRefreshing : vm.rightIsRefreshing)
+                PaneRefreshButton(isRefreshing: isRefreshing) {
+                    if vm.activePane != side { vm.activePane = side }
+                    vm.refreshPane(side: side)
+                }
                 
                 // Переключатель режима отображения: Сетка (галерея) / Список (таблица)
                 let currentMode = (side == .left ? vm.leftViewMode : vm.rightViewMode)
@@ -744,14 +753,18 @@ public struct PaneView: View {
             
             Divider()
             
-            if vm.isQuickViewActive && vm.activePane != side {
-                QuickViewPaneView(item: vm.quickViewItem)
-            } else if (side == .left ? vm.leftViewMode : vm.rightViewMode) == .grid {
-                // Режим графического просмотрщика папок (Сетка / Галерея)
-                GridSettingsBarView(side: side)
-                Divider()
-                FileGridPaneView(side: side)
-            } else {
+            ZStack(alignment: .top) {
+                Group {
+                    if vm.isQuickViewActive && vm.activePane != side {
+                        QuickViewPaneView(item: vm.quickViewItem)
+                    } else if (side == .left ? vm.leftViewMode : vm.rightViewMode) == .grid {
+                        // Режим графического просмотрщика папок (Сетка / Галерея)
+                        VStack(spacing: 0) {
+                            GridSettingsBarView(side: side)
+                            Divider()
+                            FileGridPaneView(side: side)
+                        }
+                    } else {
                 // Таблица списка файлов с Drag & Drop и сравнением
                 Table(items, selection: selectionBinding, sortOrder: sortOrderBinding) {
                     TableColumn("Имя", value: \FileItem.name) { item in
@@ -927,7 +940,20 @@ public struct PaneView: View {
                     }
                     .width(min: 120, ideal: 140, max: 160)
                 }
+                .onKeyPress(KeyEquivalent(Character(UnicodeScalar(NSF2FunctionKey)!)), phases: .down) { press in
+                    if KeyCommandMonitor.isTextEditingActive(in: vm) {
+                        return .ignored
+                    }
+                    if press.modifiers.isEmpty {
+                        vm.triggerRename(side: side)
+                        return .handled
+                    }
+                    return .ignored
+                }
                 .onKeyPress(KeyEquivalent("a"), phases: .down) { press in
+                    if KeyCommandMonitor.isTextEditingActive(in: vm) {
+                        return .ignored
+                    }
                     if press.modifiers.contains(.control) || press.modifiers.contains(.command) {
                         vm.selectAll(side: side)
                         return .handled
@@ -935,6 +961,9 @@ public struct PaneView: View {
                     return .ignored
                 }
                 .onKeyPress(.space, phases: .down) { press in
+                    if KeyCommandMonitor.isTextEditingActive(in: vm) {
+                        return .ignored
+                    }
                     if press.modifiers.isEmpty {
                         vm.triggerQuickLook(preferNativeQuickLook: true)
                         return .handled
@@ -942,10 +971,16 @@ public struct PaneView: View {
                     return .ignored
                 }
                 .onKeyPress(.return, phases: .down) { _ in
+                    if KeyCommandMonitor.isTextEditingActive(in: vm) {
+                        return .ignored
+                    }
                     vm.openSelected()
                     return .handled
                 }
                 .onKeyPress(.delete, phases: .down) { press in
+                    if KeyCommandMonitor.isTextEditingActive(in: vm) {
+                        return .ignored
+                    }
                     // Backspace/Delete opens parent directory if no modifiers
                     if press.modifiers.isEmpty {
                         vm.navigateUp()
@@ -963,6 +998,64 @@ public struct PaneView: View {
                 )
                 .onDrop(of: [DualPaneViewModel.dragUTType, UTType.fileURL.identifier, UTType.utf8PlainText.identifier], delegate: PaneTableDropDelegate(side: side, vm: vm, items: items))
             }
+        }
+        
+        // Плавающий индикатор pull-to-refresh
+        let isRefreshing = (side == .left ? vm.leftIsRefreshing : vm.rightIsRefreshing)
+        if pullProgress > 0.15 || showPullIndicator {
+            HStack(spacing: 6) {
+                if isRefreshing {
+                    ProgressView()
+                        .controlSize(.small)
+                        .scaleEffect(0.75)
+                    Text("Обновление...")
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundColor(.secondary)
+                } else {
+                    Image(systemName: pullProgress >= 1.0 ? "arrow.clockwise" : "arrow.down")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundColor(pullProgress >= 1.0 ? .accentColor : .secondary)
+                        .rotationEffect(.degrees(pullProgress >= 1.0 ? 180 : 0))
+                    Text(pullProgress >= 1.0 ? "Отпустите для обновления" : "Потяните для обновления")
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundColor(pullProgress >= 1.0 ? .primary : .secondary)
+                }
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 4)
+            .background(
+                Capsule()
+                    .fill(Color(nsColor: .windowBackgroundColor))
+                    .shadow(color: Color.black.opacity(0.18), radius: 4, x: 0, y: 2)
+            )
+            .padding(.top, 6)
+            .transition(.opacity.combined(with: .scale(scale: 0.9)))
+        }
+    }
+    .background(
+        TrackpadSwipeRefreshView(
+            side: side,
+            vm: vm,
+            onPullProgress: { progress in
+                withAnimation(.easeOut(duration: 0.1)) {
+                    pullProgress = progress
+                }
+            },
+            onRefreshTriggered: {
+                withAnimation(.easeOut(duration: 0.2)) {
+                    showPullIndicator = true
+                }
+            }
+        )
+    )
+    .onChange(of: (side == .left ? vm.leftIsRefreshing : vm.rightIsRefreshing)) { _, refreshing in
+        if !refreshing {
+            withAnimation(.easeOut(duration: 0.3)) {
+                showPullIndicator = false
+                pullProgress = 0
+            }
+        }
+    }
             
             Divider()
             
@@ -1094,7 +1187,7 @@ public struct PaneView: View {
             }
         }
 
-        Button("Удалить (F8)", role: .destructive) {
+        Button("Удалить (F8 / Delete)", role: .destructive) {
             vm.selectContextMenuItems(for: item, side: side)
             vm.triggerDelete()
         }
@@ -1185,10 +1278,39 @@ public struct PaneView: View {
 
 // MARK: - In-place Inline Renaming Text Field
 public final class CustomRenameNSTextField: NSTextField {
+    public var isDirectory: Bool = false
+    
+    public override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        if let window = self.window {
+            DispatchQueue.main.async { [weak self] in
+                guard let self = self, self.window != nil else { return }
+                if self.currentEditor() == nil {
+                    window.makeFirstResponder(self)
+                    self.selectBaseName()
+                }
+            }
+        }
+    }
+    
+    public func selectBaseName() {
+        if let editor = self.currentEditor() {
+            let name = self.stringValue
+            if !self.isDirectory && name.contains(".") && !name.hasPrefix(".") {
+                let nsName = name as NSString
+                let ext = nsName.pathExtension
+                let baseLen = name.count - ext.count - 1
+                if baseLen > 0 {
+                    editor.selectedRange = NSRange(location: 0, length: baseLen)
+                    return
+                }
+            }
+            editor.selectedRange = NSRange(location: 0, length: name.count)
+        }
+    }
+
     public override func performKeyEquivalent(with event: NSEvent) -> Bool {
-        if event.modifierFlags.contains(.control),
-           !event.modifierFlags.contains(.command),
-           KeyCommandMonitor.performTextShortcut(keyCode: Int(event.keyCode), targetResponder: self) {
+        if KeyCommandMonitor.handleEvent(event, targetResponder: self) == nil {
             return true
         }
         return super.performKeyEquivalent(with: event)
@@ -1214,6 +1336,7 @@ public struct InlineRenameTextField: NSViewRepresentable {
     
     public func makeNSView(context: Context) -> CustomRenameNSTextField {
         let textField = CustomRenameNSTextField()
+        textField.isDirectory = isDirectory
         textField.stringValue = text
         textField.isBordered = true
         textField.bezelStyle = .roundedBezel
@@ -1228,21 +1351,9 @@ public struct InlineRenameTextField: NSViewRepresentable {
         
         DispatchQueue.main.async {
             guard let window = textField.window else { return }
-            window.makeFirstResponder(textField)
-            
-            // Выделяем имя файла без расширения, если это обычный файл
-            if let editor = textField.currentEditor() {
-                let name = textField.stringValue
-                if !self.isDirectory && name.contains(".") && !name.hasPrefix(".") {
-                    let nsName = name as NSString
-                    let ext = nsName.pathExtension
-                    let baseLen = name.count - ext.count - 1
-                    if baseLen > 0 {
-                        editor.selectedRange = NSRange(location: 0, length: baseLen)
-                        return
-                    }
-                }
-                editor.selectedRange = NSRange(location: 0, length: name.count)
+            if textField.currentEditor() == nil {
+                window.makeFirstResponder(textField)
+                textField.selectBaseName()
             }
         }
         
@@ -1258,6 +1369,7 @@ public struct InlineRenameTextField: NSViewRepresentable {
     public class Coordinator: NSObject, NSTextFieldDelegate {
         var parent: InlineRenameTextField
         private var isHandled = false
+        private var createdAt = Date()
         
         init(_ parent: InlineRenameTextField) {
             self.parent = parent
@@ -1289,6 +1401,7 @@ public struct InlineRenameTextField: NSViewRepresentable {
         
         public func controlTextDidEndEditing(_ obj: Notification) {
             guard !isHandled else { return }
+            guard Date().timeIntervalSince(createdAt) > 0.3 else { return }
             isHandled = true
             if let tf = obj.object as? NSTextField {
                 parent.text = tf.stringValue
@@ -1487,11 +1600,6 @@ public struct TableDoubleClickHandler: NSViewRepresentable {
         public static func setActiveSide(_ side: PaneSide) {
             guard activePaneSide != side else { return }
             activePaneSide = side
-            if side == .left {
-                rightTableView?.deselectAll(nil)
-            } else {
-                leftTableView?.deselectAll(nil)
-            }
             leftTableView?.enumerateAvailableRowViews { rowView, _ in
                 rowView.needsDisplay = true
             }
@@ -1598,21 +1706,27 @@ public struct TableDoubleClickHandler: NSViewRepresentable {
         
         @objc private func onTableSelectionDidChange(_ notification: Notification) {
             guard let tv = notification.object as? NSTableView, tv === hookedTableView else { return }
-            let selectedRow = tv.selectedRow
-            guard selectedRow >= 0 && selectedRow < items.count else { return }
-            let item = items[selectedRow]
+            let selectedIndexes = tv.selectedRowIndexes
+            guard !selectedIndexes.isEmpty else { return }
+            var selectedIds: Set<String> = []
+            for idx in selectedIndexes {
+                if idx >= 0 && idx < items.count {
+                    selectedIds.insert(items[idx].id)
+                }
+            }
+            guard !selectedIds.isEmpty else { return }
             DispatchQueue.main.async { [weak self] in
                 guard let self = self, let vm = self.vm else { return }
                 if vm.activePane != self.side {
                     vm.activePane = self.side
                 }
                 if self.side == .left {
-                    if vm.leftSelection != [item.id] {
-                        vm.leftSelection = [item.id]
+                    if vm.leftSelection != selectedIds {
+                        vm.leftSelection = selectedIds
                     }
                 } else {
-                    if vm.rightSelection != [item.id] {
-                        vm.rightSelection = [item.id]
+                    if vm.rightSelection != selectedIds {
+                        vm.rightSelection = selectedIds
                     }
                 }
             }
@@ -1630,15 +1744,20 @@ public struct TableDoubleClickHandler: NSViewRepresentable {
                     self.longPressWorkItem?.cancel()
                     self.longPressWorkItem = nil
                     
-                    // Если фокус находится в любом поле ввода текста (поле фильтра, пути, модальном окне),
-                    // обрабатываем Ctrl+V, Ctrl+C, Ctrl+X, Ctrl+A через KeyCommandMonitor
-                    if let firstResponder = tv.window?.firstResponder {
-                        if firstResponder is NSText || firstResponder is NSTextView || firstResponder is NSTextField {
-                            if KeyCommandMonitor.handleEvent(event) == nil {
-                                return nil
-                            }
-                            return event
+                    // Если фокус находится в любом поле ввода текста (поле фильтра, пути, модальном окне, переименовании),
+                    // передаем событие в KeyCommandMonitor (для Ctrl+C/V/X/A и Cmd+C/V/X/A в тексте)
+                    // и ГАРАНТИРУЕМ, что текстовый ввод (пробел, буквы, цифры, backspace, return) не перехватывается шорткатами таблицы!
+                    if let firstResponder = tv.window?.firstResponder, KeyCommandMonitor.isTextEditingResponder(firstResponder) {
+                        if KeyCommandMonitor.handleEvent(event, targetResponder: firstResponder) == nil {
+                            return nil
                         }
+                        return event
+                    }
+                    
+                    // Если пользователь находится в процессе редактирования текста (переименование, модальные окна, фильтр и т.д.),
+                    // не перехватываем пробел, ввод или другие клавиши шорткатами таблицы!
+                    if KeyCommandMonitor.isTextEditingActive(in: self.vm) {
+                        return event
                     }
                     
                     // Обрабатываем шорткаты таблицы только для активной панели
@@ -1646,8 +1765,9 @@ public struct TableDoubleClickHandler: NSViewRepresentable {
                         return event
                     }
                     
-                    // Check if table is first responder or focused in active pane
-                    let isFocused = (tv.window?.firstResponder === tv) || (HandlerView.activePaneSide == self.side)
+                    // Check if table or active pane view is focused
+                    let firstResponder = tv.window?.firstResponder
+                    let isFocused = (firstResponder === tv || ((firstResponder as? NSView)?.isDescendant(of: tv) ?? false) || !KeyCommandMonitor.isTextEditingResponder(firstResponder))
                     if isFocused {
                         // Return / Enter (KeyCodes 36: Return, 76: Enter)
                         if event.keyCode == 36 || event.keyCode == 76 {
@@ -1655,15 +1775,84 @@ public struct TableDoubleClickHandler: NSViewRepresentable {
                             self.vm?.openSelected()
                             return nil
                         }
-                        // Backspace / Delete (KeyCode 51) without Command/Shift/Alt -> Navigate Up
-                        if event.keyCode == 51 && event.modifierFlags.intersection([.command, .option, .control, .shift]).isEmpty {
-                            print("DUAL_PANE: KeyDown Backspace (Navigate Up) on side \(self.side)")
+                        // Delete / Forward Delete / Cmd+Delete (KeyCode 51: Delete on Mac, KeyCode 117: Forward Delete ⌦)
+                        if event.keyCode == 51 || event.keyCode == 117 {
+                            let modifiers = event.modifierFlags.intersection([.command, .option, .control, .shift])
+                            if modifiers.isEmpty || modifiers == .command {
+                                print("DUAL_PANE: KeyDown Delete on side \(self.side)")
+                                if (self.side == .left ? self.vm?.leftSelection.isEmpty : self.vm?.rightSelection.isEmpty) ?? true {
+                                    let selectedRow = tv.selectedRow
+                                    if selectedRow >= 0 && selectedRow < self.items.count {
+                                        let item = self.items[selectedRow]
+                                        if self.side == .left {
+                                            self.vm?.leftSelection = [item.id]
+                                        } else {
+                                            self.vm?.rightSelection = [item.id]
+                                        }
+                                    }
+                                }
+                                self.vm?.triggerDelete()
+                                return nil
+                            }
+                        }
+                        // Cmd+Up Arrow (KeyCode 126 with .command): Navigate Up (Mac standard)
+                        if event.keyCode == 126 && event.modifierFlags.contains(.command) {
                             self.vm?.navigateUp()
                             return nil
                         }
                         // Space (KeyCode 49) without Command/Shift/Alt -> QuickLook / Calculate Folder Size
                         if event.keyCode == 49 && event.modifierFlags.intersection([.command, .option, .control, .shift]).isEmpty {
                             print("DUAL_PANE: KeyDown Space on side \(self.side)")
+                            self.vm?.triggerQuickLook(preferNativeQuickLook: true)
+                            return nil
+                        }
+                        // Tab (KeyCode 48) -> Switch Pane
+                        if event.keyCode == 48 && event.modifierFlags.intersection([.command, .option, .control, .shift]).isEmpty {
+                            self.vm?.toggleActivePane()
+                            return nil
+                        }
+                        // F5 (KeyCode 96): Copy / Alt+F5 Create Archive
+                        if event.keyCode == 96 {
+                            if event.modifierFlags.contains(.option) {
+                                self.vm?.triggerCreateArchive()
+                            } else {
+                                self.vm?.triggerCopy()
+                            }
+                            return nil
+                        }
+                        // F6 (KeyCode 97): Move
+                        if event.keyCode == 97 {
+                            self.vm?.triggerMove()
+                            return nil
+                        }
+                        // F7 (KeyCode 98): New Folder
+                        if event.keyCode == 98 {
+                            self.vm?.prepareNewFolder()
+                            return nil
+                        }
+                        // F8 (KeyCode 100): Delete
+                        if event.keyCode == 100 {
+                            if (self.side == .left ? self.vm?.leftSelection.isEmpty : self.vm?.rightSelection.isEmpty) ?? true {
+                                let selectedRow = tv.selectedRow
+                                if selectedRow >= 0 && selectedRow < self.items.count {
+                                    let item = self.items[selectedRow]
+                                    if self.side == .left {
+                                        self.vm?.leftSelection = [item.id]
+                                    } else {
+                                        self.vm?.rightSelection = [item.id]
+                                    }
+                                }
+                            }
+                            self.vm?.triggerDelete()
+                            return nil
+                        }
+                        // F2 (KeyCode 120): Rename
+                        if event.keyCode == 120 {
+                            self.vm?.triggerRename(side: self.side)
+                            return nil
+                        }
+                        // F3 (KeyCode 99): QuickLook
+                        if event.keyCode == 99 {
                             self.vm?.triggerQuickLook(preferNativeQuickLook: true)
                             return nil
                         }
@@ -1714,6 +1903,17 @@ public struct TableDoubleClickHandler: NSViewRepresentable {
                     self.longPressWorkItem = nil
                     self.mouseDownLocation = event.locationInWindow
                     
+                    // Если пользователь кликает по элементу, имя которого сейчас редактируется:
+                    if let editingId = self.vm?.editingItemId, clickedRow >= 0 && clickedRow < self.items.count, self.items[clickedRow].id == editingId {
+                        // Позволяем клику пройти в текстовое поле редактирования
+                        return event
+                    }
+                    
+                    // Если редактировался другой элемент и пользователь кликнул вне него:
+                    if self.vm?.editingItemId != nil {
+                        self.vm?.commitInlineRename()
+                    }
+                    
                     if tv.window?.firstResponder != tv {
                         tv.window?.makeFirstResponder(tv)
                     }
@@ -1721,17 +1921,6 @@ public struct TableDoubleClickHandler: NSViewRepresentable {
                     if let vm = self.vm {
                         if vm.activePane != self.side {
                             vm.activePane = self.side
-                        }
-                        if self.side == .left {
-                            if !vm.rightSelection.isEmpty {
-                                vm.rightSelection.removeAll()
-                            }
-                            HandlerView.rightTableView?.deselectAll(nil)
-                        } else {
-                            if !vm.leftSelection.isEmpty {
-                                vm.leftSelection.removeAll()
-                            }
-                            HandlerView.leftTableView?.deselectAll(nil)
                         }
                     }
                     
@@ -1938,8 +2127,18 @@ public struct PaneTableDropDelegate: DropDelegate {
         }
         
         let isMove = NSEvent.modifierFlags.contains(.command)
+        SSHTransportLog.write("DND_PERFORM_DROP side=\(side) hasPayload=\(vm.currentDragPayload != nil) targetDir=\(targetDirPath ?? "nil")")
+        
+        // 1. Приоритетный путь для внутреннего Drag & Drop между панелями
+        // Если payload активен, обрабатываем напрямую без запроса провайдеров из AppKit/NSPasteboard,
+        // предотвращая синхронную блокировку главного потока и дедлок.
+        if vm.currentDragPayload != nil {
+            return vm.handleDroppedProviders([], toSide: side, targetDirPath: targetDirPath, isMove: isMove)
+        }
+        
+        let customUTType = UTType(exportedAs: DualPaneViewModel.dragUTType, conformingTo: .data)
         let utTypes: [UTType] = [
-            UTType(DualPaneViewModel.dragUTType) ?? .data,
+            customUTType,
             .fileURL,
             .utf8PlainText,
             .plainText,
@@ -2181,5 +2380,264 @@ private struct NavArrowButton: View {
             isHovered = hovering
         }
         .help(tooltip)
+    }
+}
+
+// MARK: - Кнопка обновления содержимого панели
+
+private struct PaneRefreshButton: View {
+    let isRefreshing: Bool
+    let action: () -> Void
+    
+    @State private var isHovered: Bool = false
+    
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: "arrow.clockwise")
+                .font(.system(size: 13, weight: .medium))
+                .foregroundColor(isRefreshing ? .accentColor : (isHovered ? .primary : .secondary))
+                .rotationEffect(.degrees(isRefreshing ? 360 : 0))
+                .animation(isRefreshing ? Animation.linear(duration: 0.8).repeatForever(autoreverses: false) : .default, value: isRefreshing)
+                .frame(width: 24, height: 24)
+                .background(isHovered ? Color(nsColor: .controlColor).opacity(0.35) : Color.clear)
+                .cornerRadius(4)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .onHover { hovering in
+            isHovered = hovering
+        }
+        .help("Обновить содержимое панели (Cmd+R)")
+    }
+}
+
+// MARK: - Обработчик свайпа двумя пальцами тачпада вниз (Pull-to-refresh)
+
+public struct TrackpadSwipeRefreshView: NSViewRepresentable {
+    public let side: PaneSide
+    public let vm: DualPaneViewModel
+    public let onPullProgress: (CGFloat) -> Void
+    public let onRefreshTriggered: () -> Void
+    
+    public init(
+        side: PaneSide,
+        vm: DualPaneViewModel,
+        onPullProgress: @escaping (CGFloat) -> Void,
+        onRefreshTriggered: @escaping () -> Void
+    ) {
+        self.side = side
+        self.vm = vm
+        self.onPullProgress = onPullProgress
+        self.onRefreshTriggered = onRefreshTriggered
+    }
+    
+    public func makeNSView(context: Context) -> RefreshContainerView {
+        let view = RefreshContainerView()
+        view.side = side
+        view.vm = vm
+        view.onPullProgress = onPullProgress
+        view.onRefreshTriggered = onRefreshTriggered
+        return view
+    }
+    
+    public func updateNSView(_ nsView: RefreshContainerView, context: Context) {
+        nsView.side = side
+        nsView.vm = vm
+        nsView.onPullProgress = onPullProgress
+        nsView.onRefreshTriggered = onRefreshTriggered
+    }
+    
+    public final class RefreshContainerView: NSView {
+        public var side: PaneSide = .left
+        public weak var vm: DualPaneViewModel?
+        public var onPullProgress: ((CGFloat) -> Void)?
+        public var onRefreshTriggered: (() -> Void)?
+        
+        private var eventMonitor: Any?
+        private var isTrackingSwipe: Bool = false
+        private var accumulatedDownDelta: CGFloat = 0
+        private var hasTriggeredInThisGesture: Bool = false
+        private var lastTriggerTime: Date = .distantPast
+        private weak var cachedScrollView: NSScrollView?
+        
+        public var triggerThreshold: CGFloat = 55.0
+        public var endReleaseThreshold: CGFloat = 30.0
+        
+        public override func hitTest(_ point: NSPoint) -> NSView? {
+            // Background must not block clicks/drags
+            return nil
+        }
+        
+        public override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            if window != nil {
+                setupMonitor()
+            } else {
+                removeMonitor()
+            }
+        }
+        
+        public override func viewWillMove(toWindow newWindow: NSWindow?) {
+            super.viewWillMove(toWindow: newWindow)
+            if newWindow == nil {
+                removeMonitor()
+            }
+        }
+        
+        deinit {
+            removeMonitor()
+        }
+        
+        private func removeMonitor() {
+            if let monitor = eventMonitor {
+                NSEvent.removeMonitor(monitor)
+                eventMonitor = nil
+            }
+        }
+        
+        private func setupMonitor() {
+            guard eventMonitor == nil else { return }
+            eventMonitor = NSEvent.addLocalMonitorForEvents(matching: .scrollWheel) { [weak self] event in
+                guard let self = self else { return event }
+                return self.handleScrollWheel(event)
+            }
+        }
+        
+        private func findScrollView(in view: NSView) -> NSScrollView? {
+            if let sv = view as? NSScrollView {
+                return sv
+            }
+            for sub in view.subviews {
+                if let found = findScrollView(in: sub) {
+                    return found
+                }
+            }
+            return nil
+        }
+        
+        private func resolveScrollView() -> NSScrollView? {
+            if let cached = cachedScrollView, cached.window != nil {
+                return cached
+            }
+            var current: NSView? = self.superview
+            while let v = current {
+                if let sv = findScrollView(in: v) {
+                    cachedScrollView = sv
+                    return sv
+                }
+                current = v.superview
+            }
+            return nil
+        }
+        
+        public func isContentAtTop() -> Bool {
+            guard let sv = resolveScrollView() else {
+                return true
+            }
+            let clip = sv.contentView
+            return clip.bounds.origin.y <= 2
+        }
+        
+        public func handleScrollWheel(_ event: NSEvent) -> NSEvent? {
+            guard let window = self.window, event.window === window else {
+                return event
+            }
+            
+            // 1. Verify cursor is within this pane's area
+            let locationInView = self.convert(event.locationInWindow, from: nil)
+            guard self.bounds.contains(locationInView) else {
+                if isTrackingSwipe {
+                    resetTracking()
+                }
+                return event
+            }
+            
+            // 2. Trackpad and touch surfaces have precise scrolling deltas
+            guard event.hasPreciseScrollingDeltas else {
+                return event
+            }
+            
+            // 3. Direction normalization:
+            // Under Natural Scrolling (Apple default): finger moving down -> scrollingDeltaY > 0.
+            // Under Traditional Scrolling: finger moving down -> scrollingDeltaY < 0.
+            let deltaY: CGFloat = event.isDirectionInvertedFromDevice ? event.scrollingDeltaY : -event.scrollingDeltaY
+            
+            let phase = event.phase
+            
+            if phase.contains(.began) {
+                hasTriggeredInThisGesture = false
+                if isContentAtTop() {
+                    isTrackingSwipe = true
+                    accumulatedDownDelta = 0
+                } else {
+                    isTrackingSwipe = false
+                    accumulatedDownDelta = 0
+                }
+            } else if phase.contains(.changed) {
+                if !isTrackingSwipe && isContentAtTop() {
+                    isTrackingSwipe = true
+                    accumulatedDownDelta = 0
+                }
+                
+                if isTrackingSwipe {
+                    if deltaY > 0 {
+                        accumulatedDownDelta += deltaY
+                    } else {
+                        accumulatedDownDelta = max(0, accumulatedDownDelta + deltaY)
+                    }
+                    
+                    let progress = min(1.0, max(0.0, accumulatedDownDelta / triggerThreshold))
+                    DispatchQueue.main.async { [weak self] in
+                        self?.onPullProgress?(progress)
+                    }
+                    
+                    if accumulatedDownDelta >= triggerThreshold && !hasTriggeredInThisGesture {
+                        triggerRefresh()
+                    }
+                }
+            } else if phase.contains(.ended) || phase.contains(.cancelled) {
+                if isTrackingSwipe && !hasTriggeredInThisGesture && accumulatedDownDelta >= endReleaseThreshold {
+                    triggerRefresh()
+                }
+                resetTracking()
+            } else if event.momentumPhase.contains(.began) || event.momentumPhase.contains(.changed) {
+                if isTrackingSwipe {
+                    resetTracking()
+                }
+            }
+            
+            return event
+        }
+        
+        public func triggerRefresh() {
+            guard !hasTriggeredInThisGesture else { return }
+            let now = Date()
+            guard now.timeIntervalSince(lastTriggerTime) > 0.6 else { return }
+            
+            hasTriggeredInThisGesture = true
+            lastTriggerTime = now
+            
+            NSHapticFeedbackManager.defaultPerformer.perform(.alignment, performanceTime: .default)
+            
+            let performAction = { [weak self] in
+                guard let self = self else { return }
+                if let vm = self.vm {
+                    if vm.activePane != self.side {
+                        vm.activePane = self.side
+                    }
+                    vm.refreshPane(side: self.side)
+                }
+                self.onRefreshTriggered?()
+            }
+            performAction()
+        }
+        
+        public func resetTracking() {
+            isTrackingSwipe = false
+            accumulatedDownDelta = 0
+            DispatchQueue.main.async { [weak self] in
+                self?.onPullProgress?(0)
+            }
+        }
     }
 }
