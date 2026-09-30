@@ -231,7 +231,7 @@ public final class SessionCoordinator: @unchecked Sendable {
             "-o", "BatchMode=yes",
             "-o", "ConnectTimeout=5",
             "-o", "ServerAliveInterval=10",
-            "-o", "ServerAliveCountMax=6",
+            "-o", "ServerAliveCountMax=2",
             "-o", "LogLevel=VERBOSE",
             "-o", "Compression=no",
             "-o", "IPQoS=throughput",

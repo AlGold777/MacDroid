@@ -106,14 +106,23 @@ public final class SessionBudget: @unchecked Sendable {
         lock.lock()
         inFlightNetworkPayload = max(0, inFlightNetworkPayload - bytes)
         
-        // Проверяем ждущих
+        // Проверяем ждущих: полный проход по очереди (best-fit scan).
+        // Строгий FIFO с break на первом несоответствии приводил к convoy deadlock:
+        // ожидающие задачи за «застрявшим» крупным waiter блокировались навсегда
+        // даже если бюджет покрывал их запросы. Полный проход устраняет convoy.
         var toResume: [CheckedContinuation<Bool, Never>] = []
-        while let first = waiters.first {
-            let limit = first.isInteractive ? maxNetworkPayload : (maxNetworkPayload - interactiveReserve)
-            guard inFlightNetworkPayload + first.neededPayload <= limit else { break }
-            waiters.removeFirst()
-            inFlightNetworkPayload += first.neededPayload
-            toResume.append(first.continuation)
+        var i = 0
+        while i < waiters.count {
+            let waiter = waiters[i]
+            let limit = waiter.isInteractive ? maxNetworkPayload : (maxNetworkPayload - interactiveReserve)
+            if inFlightNetworkPayload + waiter.neededPayload <= limit {
+                inFlightNetworkPayload += waiter.neededPayload
+                toResume.append(waiter.continuation)
+                waiters.remove(at: i)
+                // не инкрементируем i: следующий элемент сместился на текущую позицию
+            } else {
+                i += 1
+            }
         }
         lock.unlock()
         

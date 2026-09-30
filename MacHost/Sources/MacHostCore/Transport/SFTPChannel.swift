@@ -159,31 +159,59 @@ public final class SFTPChannel: @unchecked Sendable {
                 
                 // Регистрируем ДО отправки
                 pendingRequests[requestId] = .active(continuation: continuation)
-                let timeout = DispatchWorkItem { [weak self] in
-                    guard let self else { return }
-                    self.lock.lock()
-                    let entry = self.pendingRequests[requestId]
-                    if entry != nil { self.pendingRequests[requestId] = .cancelled }
-                    self.requestTimeoutWorkItems.removeValue(forKey: requestId)
-                    self.consecutiveRequestTimeouts += 1
-                    let shouldClose = self.consecutiveRequestTimeouts >= 2
-                    self.lock.unlock()
-                    if case .active(let cont) = entry {
-                        cont.resume(throwing: NSError(
-                            domain: "SFTPChannel",
-                            code: 11,
-                            userInfo: [NSLocalizedDescriptionKey: "Таймаут ответа SFTP-запроса (\(Int(timeoutSeconds)) сек.)"]
-                        ))
+                
+                func scheduleTimeoutWorkItem() {
+                    let timeout = DispatchWorkItem { [weak self] in
+                        guard let self else { return }
+                        self.lock.lock()
+                        // Проверяем: жив ли еще запрос
+                        guard let entry = self.pendingRequests[requestId], case .active = entry else {
+                            self.requestTimeoutWorkItems.removeValue(forKey: requestId)
+                            self.lock.unlock()
+                            return
+                        }
+                        
+                        // Проверяем время последней активности канала (inactivity/idle timeout)
+                        let timeSinceLastActivity = ProcessInfo.processInfo.systemUptime - self.lastResponseUptime
+                        if timeSinceLastActivity < timeoutSeconds {
+                            // Канал активно передает данные (другие запросы конвейера успешно завершаются).
+                            // Продлеваем ожидание на оставшееся время до реального простоя.
+                            let remainingIdle = max(1.0, timeoutSeconds - timeSinceLastActivity)
+                            self.lock.unlock()
+                            DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + remainingIdle) {
+                                scheduleTimeoutWorkItem()
+                            }
+                            return
+                        }
+                        
+                        self.pendingRequests[requestId] = .cancelled
+                        self.requestTimeoutWorkItems.removeValue(forKey: requestId)
+                        self.consecutiveRequestTimeouts += 1
+                        let closeThreshold = 2
+                        let shouldClose = self.consecutiveRequestTimeouts >= closeThreshold
+                        self.lock.unlock()
+                        
+                        if case .active(let cont) = entry {
+                            cont.resume(throwing: NSError(
+                                domain: "SFTPChannel",
+                                code: 11,
+                                userInfo: [NSLocalizedDescriptionKey: "Таймаут ответа SFTP-запроса (\(Int(timeoutSeconds)) сек.)"]
+                            ))
+                        }
+                        if shouldClose { self.close() }
                     }
-                    if shouldClose { self.close() }
+                    
+                    self.lock.lock()
+                    self.requestTimeoutWorkItems[requestId] = timeout
+                    self.lock.unlock()
+                    
+                    DispatchQueue.global(qos: .userInitiated).asyncAfter(
+                        deadline: .now() + timeoutSeconds,
+                        execute: timeout
+                    )
                 }
-                requestTimeoutWorkItems[requestId] = timeout
                 lock.unlock()
-
-                DispatchQueue.global(qos: .userInitiated).asyncAfter(
-                    deadline: .now() + timeoutSeconds,
-                    execute: timeout
-                )
+                scheduleTimeoutWorkItem()
                 
                 // Запись в pipe на выделенной очереди
                 writerQueue.async { [weak self] in

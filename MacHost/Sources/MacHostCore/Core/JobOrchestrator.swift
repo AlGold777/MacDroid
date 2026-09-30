@@ -143,17 +143,21 @@ public final class JobOrchestrator: @unchecked Sendable {
     ) async throws -> TransferExecutionResult {
         let actionId = UUID().uuidString
         let sm = JobUnitStateMachine(initialState: .planned)
+        SSHTransportLog.write("ORCH_TRANSFER_START remotePath=\(remotePath) targetDir=\(localTargetDir.path) isMove=\(isMove)")
         
         // 0. Гарантируем существование целевой директории
         try FileManager.default.createDirectory(at: localTargetDir, withIntermediateDirectories: true)
         
         let stat = try await transport.prepareRead(actionId: actionId, path: remotePath)
+        SSHTransportLog.write("ORCH_PREPARE_READ_OK remotePath=\(remotePath) size=\(stat.size) isDir=\(stat.isDirectory)")
         let reqHash = "\(remotePath):\(stat.size):\(stat.mtime)"
         
         // 1. Pre-flight проверка свободного места (+ 5% запас надежности)
         let space = try await localFS.checkFreeSpace(at: localTargetDir.path)
+        SSHTransportLog.write("ORCH_FREE_SPACE_OK free=\(space.free)")
         let requiredWithMargin = stat.size + (stat.size / 20)
         if space.free > 0 && space.free < requiredWithMargin {
+            SSHTransportLog.write("ORCH_INSUFFICIENT_SPACE required=\(requiredWithMargin) available=\(space.free)")
             throw JobOrchestratorError.insufficientSpace(required: requiredWithMargin, available: space.free)
         }
         
