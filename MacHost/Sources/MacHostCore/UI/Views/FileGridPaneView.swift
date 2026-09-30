@@ -497,6 +497,7 @@ public struct FileGridCell: View {
     @State private var thumbnail: NSImage? = nil
     @State private var isLoading: Bool = false
     @State private var isHovered: Bool = false
+    @State private var thumbnailReloadToken: Int = 0
     
     public init(item: FileItem, side: PaneSide, size: CGFloat, spacing: CGFloat = 10, isSelected: Bool) {
         self.item = item
@@ -618,8 +619,14 @@ public struct FileGridCell: View {
         )) { providers in
             onFolderDrop(providers: providers)
         }
-        .task(id: item.path) {
+        .task(id: "\(ThumbnailCacheManager.thumbnailKey(for: item))#\(thumbnailReloadToken)") {
             await loadThumbnailAsync()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: ThumbnailCacheManager.throttleLiftedNotification)) { _ in
+            // Эскиз пропущен во время трансфера — догружаем после его завершения
+            if thumbnail == nil && !item.isDirectory {
+                thumbnailReloadToken &+= 1
+            }
         }
         .contextMenu {
             gridContextMenu(for: item)
@@ -709,7 +716,8 @@ public struct FileGridCell: View {
         let imageExts: Set<String> = ["jpg", "jpeg", "png", "heic", "heif", "webp", "gif", "bmp", "tiff", "tif", "ico", "avif"]
         guard imageExts.contains(ext) else { return }
         
-        if let cached = ThumbnailCacheManager.shared.getThumbnail(for: item.path) {
+        // Только RAM-кэш в главном потоке; чтение с диска и генерация — в фоне
+        if let cached = ThumbnailCacheManager.shared.memoryThumbnail(for: item) {
             self.thumbnail = cached
             return
         }
@@ -720,10 +728,10 @@ public struct FileGridCell: View {
             targetSize: CGSize(width: size * 2, height: size * 2),
             transport: vm.transport
         )
-        await MainActor.run {
-            self.thumbnail = img
-            self.isLoading = false
-        }
+        // Ячейка ушла с экрана или сменила файл — результат не применяем
+        guard !Task.isCancelled else { return }
+        self.thumbnail = img
+        self.isLoading = false
     }
     
     private func fileIconName(for name: String) -> String {

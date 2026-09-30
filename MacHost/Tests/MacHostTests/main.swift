@@ -5,6 +5,7 @@ import MacHostCore
 import UniformTypeIdentifiers
 import SwiftUI
 import AppKit
+import ImageIO
 
 setbuf(stdout, nil)
 
@@ -436,6 +437,64 @@ func runTest52() async {
     // Cancel transfer so test doesn't actually try to download a mock file
     vm.cancelTransfer()
     print("  ✓ Phone-to-Mac Drag & Drop fast-path handled immediately without deadlock!")
+}
+
+func makeTestJPEG(width: Int, height: Int, embedThumbnail: Bool, orientation: Int? = nil) -> Data {
+    let cs = CGColorSpaceCreateDeviceRGB()
+    let ctx = CGContext(data: nil, width: width, height: height, bitsPerComponent: 8, bytesPerRow: 0, space: cs, bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue)!
+    let buf = ctx.data!.assumingMemoryBound(to: UInt8.self)
+    for i in 0..<(ctx.bytesPerRow * height) { buf[i] = UInt8(truncatingIfNeeded: (i &* 2654435761) >> 13) }
+    let data = NSMutableData()
+    let dest = CGImageDestinationCreateWithData(data, UTType.jpeg.identifier as CFString, 1, nil)!
+    var props: [CFString: Any] = [kCGImageDestinationEmbedThumbnail: embedThumbnail, kCGImageDestinationLossyCompressionQuality: 0.9]
+    if let orientation = orientation { props[kCGImagePropertyOrientation] = orientation }
+    CGImageDestinationAddImage(dest, ctx.makeImage()!, props as CFDictionary)
+    CGImageDestinationFinalize(dest)
+    return data as Data
+}
+
+func runTest54() async {
+    print("\n[TEST 54] Phone Thumbnails: EXIF Prefix Extraction & Cache Keys:")
+    let withThumb = makeTestJPEG(width: 3000, height: 2000, embedThumbnail: true)
+    let noThumb = makeTestJPEG(width: 3000, height: 2000, embedThumbnail: false)
+    assertCondition(withThumb.count > 256 * 1024 && noThumb.count > 256 * 1024, "Test JPEGs are larger than the 128 KB prefix")
+    
+    let prefixWith = withThumb.prefix(128 * 1024)
+    let prefixNo = noThumb.prefix(128 * 1024)
+    let embedded = ThumbnailCacheManager.embeddedThumbnail(from: Data(prefixWith), maxPixelSize: 240)
+    assertCondition(embedded != nil, "Embedded EXIF thumbnail extracted from truncated 128 KB prefix")
+    assertCondition((embedded?.size.width ?? 0) <= 240, "Embedded thumbnail is small (no full-frame decode)")
+    let partial = ThumbnailCacheManager.embeddedThumbnail(from: Data(prefixNo), maxPixelSize: 240)
+    assertCondition(partial == nil, "Prefix without EXIF thumbnail yields nil instead of a gray half-decoded frame")
+    assertCondition(ThumbnailCacheManager.exifThumbnailJPEG(from: Data(prefixWith)) != nil, "EXIF parser finds the embedded JPEG thumbnail")
+    assertCondition(ThumbnailCacheManager.exifThumbnailJPEG(from: Data(prefixNo)) == nil, "EXIF parser reports no thumbnail for a plain JPEG")
+    assertCondition(ThumbnailCacheManager.exifThumbnailJPEG(from: Data(prefixWith.prefix(40))) == nil, "EXIF parser rejects data truncated inside the EXIF block")
+    assertCondition(ThumbnailCacheManager.exifThumbnailJPEG(from: Data(repeating: 0x42, count: 1024)) == nil, "EXIF parser rejects non-JPEG data")
+    
+    let portrait = makeTestJPEG(width: 3000, height: 2000, embedThumbnail: true, orientation: 6)
+    let portraitThumb = ThumbnailCacheManager.embeddedThumbnail(from: Data(portrait.prefix(128 * 1024)), maxPixelSize: 240)
+    assertCondition(portraitThumb != nil && portraitThumb!.size.height > portraitThumb!.size.width, "EXIF orientation is applied to the embedded thumbnail (portrait stays portrait)")
+    
+    let whole = ThumbnailCacheManager.createThumbnail(from: noThumb, maxPixelSize: 240)
+    assertCondition(whole != nil && Int(whole!.size.width) == 240, "Complete file produces a downsampled thumbnail (240 px)")
+    
+    let v1 = FileItem(id: "/storage/emulated/0/DCIM/a.jpg", name: "a.jpg", path: "/storage/emulated/0/DCIM/a.jpg", size: 100, mtime: 1000, isDirectory: false, source: .remotePhone)
+    let v2 = FileItem(id: v1.id, name: v1.name, path: v1.path, size: 100, mtime: 2000, isDirectory: false, source: .remotePhone)
+    assertCondition(ThumbnailCacheManager.thumbnailKey(for: v1) != ThumbnailCacheManager.thumbnailKey(for: v2), "Thumbnail key changes when the phone file is modified (mtime)")
+    
+    let img = NSImage(size: NSSize(width: 8, height: 8))
+    img.lockFocus(); NSColor.red.setFill(); NSRect(x: 0, y: 0, width: 8, height: 8).fill(); img.unlockFocus()
+    ThumbnailCacheManager.shared.storeThumbnail(image: img, for: v1)
+    assertCondition(ThumbnailCacheManager.shared.memoryThumbnail(for: v1) != nil, "memoryThumbnail returns RAM-cached thumbnail")
+    assertCondition(ThumbnailCacheManager.shared.memoryThumbnail(for: v2) == nil, "Modified file does not reuse the stale thumbnail")
+    
+    // Cancelled cells must not queue for phone access
+    let cancelledTask = Task { () -> NSImage? in
+        withUnsafeCurrentTask { $0?.cancel() }
+        return await ThumbnailCacheManager.shared.loadThumbnail(for: FileItem(id: "/storage/emulated/0/x.jpg", name: "x.jpg", path: "/storage/emulated/0/x.jpg", size: 2_000_000, mtime: 5, isDirectory: false, source: .remotePhone), targetSize: CGSize(width: 240, height: 240), transport: TransportMultiplexer())
+    }
+    let cancelledResult = await cancelledTask.value
+    assertCondition(cancelledResult == nil, "Cancelled (off-screen) thumbnail request returns immediately without phone access")
 }
 
 func runTest53() async {
@@ -2429,7 +2488,7 @@ Task { @MainActor in
             targetSize: CGSize(width: 120, height: 120)
         )
         assertCondition(generatedThumb != nil, "Thumbnail successfully generated for local image")
-        let cachedThumb = ThumbnailCacheManager.shared.getThumbnail(for: testImgItem.path)
+        let cachedThumb = ThumbnailCacheManager.shared.getThumbnail(for: testImgItem)
         assertCondition(cachedThumb != nil, "Thumbnail is present in ThumbnailCacheManager cache")
         
         // Test directory returns nil gracefully
@@ -3599,8 +3658,11 @@ Task { @MainActor in
         // 53. Fast Browsing Navigation
         await runTest53()
         
+        // 54. Phone Thumbnails
+        await runTest54()
+        
         print("\n🎉 ==================================================")
-        print("🎉   ALL 53 PRODUCTION TEST SUITES PASSED!          ")
+        print("🎉   ALL 54 PRODUCTION TEST SUITES PASSED!          ")
         print("🎉 ==================================================")
         exit(0)
     } catch {
