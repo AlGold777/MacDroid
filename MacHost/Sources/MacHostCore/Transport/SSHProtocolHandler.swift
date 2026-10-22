@@ -111,7 +111,7 @@ public final class SSHProtocolHandler: @unchecked Sendable {
         writer.appendUInt8(1) // with signature = true
         writer.appendString("ssh-ed25519")
         
-        let pubRaw = ClientKeyManager.shared.publicKey.rawRepresentation
+        let pubRaw = try ClientKeyManager.shared.publicKey.rawRepresentation
         var keyBlob = Data()
         var ktLen = UInt32("ssh-ed25519".utf8.count).bigEndian
         withUnsafeBytes(of: &ktLen) { keyBlob.append(contentsOf: $0) }

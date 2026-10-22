@@ -171,6 +171,8 @@ public final class ConnectionController: ObservableObject {
             devName = DeviceRegistry.shared.device(matchingHost: h)?.name ?? "Телефон Android"
         }
         
+        // W9: отменённая попытка не запускает новые сетевые пробы (nc/ssh-keyscan).
+        guard isAttemptValid(attemptId) else { return false }
         let reachable = await Task.detached(priority: .userInitiated) {
             PhoneConnectionManager.shared.isHostPortReachable(host: host, port: port, timeoutSeconds: 2)
         }.value
@@ -184,9 +186,10 @@ public final class ConnectionController: ObservableObject {
             return false
         }
         
+        guard isAttemptValid(attemptId) else { return false }
         viewModel.updateRemoteEndpoint(host: host, port: port, deviceId: deviceId)
         do {
-            let (fp, isMigrated) = try await authenticateAndWarmUp(
+            let (fp, isMigrated, pinKey) = try await authenticateAndWarmUp(
                 host: host,
                 port: port,
                 deviceId: deviceId,
@@ -195,7 +198,7 @@ public final class ConnectionController: ObservableObject {
                 attemptId: attemptId
             )
             guard isAttemptValid(attemptId) else { return false }
-            
+
             currentPath = candidate
             currentDeviceName = devName
             phase = .connected(path: candidate, deviceName: devName)
@@ -203,9 +206,9 @@ public final class ConnectionController: ObservableObject {
             viewModel.transport.rootIsEmulatedZero = viewModel.remoteDriver.rootIsEmulatedZero
             viewModel.statusMessage = "✓ Подключено: \(devName) (\(candidate.displayString))"
             
-            let effectiveId = !deviceId.orEmpty.isEmpty ? deviceId! : (!fp.isEmpty ? "dev_\(fp.suffix(12))" : "device_\(host)")
+            // Идентичность устройства — ключ закрепления (проверенный отпечаток), а не адрес.
             DeviceRegistry.shared.registerOrUpdate(
-                id: effectiveId,
+                id: pinKey,
                 name: devName,
                 fingerprint: fp,
                 host: host,
@@ -247,68 +250,78 @@ public final class ConnectionController: ObservableObject {
         devName: String,
         viewModel: DualPaneViewModel,
         attemptId: UUID
-    ) async throws -> (fingerprint: String, isMigrated: Bool) {
+    ) async throws -> (fingerprint: String, isMigrated: Bool, pinKey: String) {
         guard isAttemptValid(attemptId) else {
             throw NSError(domain: "ConnectionController", code: -1, userInfo: [NSLocalizedDescriptionKey: "Attempt cancelled"])
         }
-        
-        // Снимок доверия берётся до первого закрепления ключа текущего подключения.
-        guard let hostKey = await Task.detached(priority: .userInitiated, operation: {
-            PhoneConnectionManager.shared.fetchHostKeyObservation(host: host, port: port)
-        }).value, !hostKey.fingerprint.isEmpty else {
+
+        // 1. Ключ узла только наблюдается: без доверия и без закрепления.
+        let hostKey: SSHHostKeyObservation
+        do {
+            hostKey = try await HostKeyStore.shared.fetchHostKeyObservation(host: host, port: port)
+        } catch {
             throw NSError(
                 domain: "ConnectionController",
                 code: 401,
                 userInfo: [NSLocalizedDescriptionKey: "Не удалось получить криптографический отпечаток узла \(host):\(port). Подключение отклонено в целях безопасности."]
             )
         }
-
         let fp = hostKey.fingerprint
-        let existingDev = DeviceRegistry.shared.device(matchingFingerprint: fp)
-            ?? DeviceRegistry.shared.device(matchingHost: host)
-            ?? (deviceId != nil ? DeviceRegistry.shared.device(withId: deviceId!) : nil)
-        let wasHostPinned = HostKeyStore.shared.isHostPinned(host: host, port: Int(port), deviceId: deviceId)
-        let isKnownLegacyDevice = existingDev.map { !$0.isMigratedToDedicatedKey } ?? wasHostPinned
-        let hostKeyAlias = HostKeyStore.safeHostKeyAlias(deviceId ?? existingDev?.id ?? "dev_\(fp.filter { $0.isLetter || $0.isNumber }.suffix(24))")
-        
-        let keyStatus = HostKeyStore.shared.verifyOrPin(
-            host: host,
-            port: Int(port),
-            deviceId: deviceId,
-            fingerprint: fp
-        )
-        if case .mismatchWarning(let expected, let actual) = keyStatus {
-            if HostKeyStore.isLegacyMockFingerprint(expected) {
-                // Если старый сохраненный ключ был устаревшим моком из ранних сборок, выполняем автомиграцию на реальный отпечаток
-                HostKeyStore.shared.resetHostKey(host: host, port: Int(port), deviceId: deviceId)
-                _ = HostKeyStore.shared.verifyOrPin(host: host, port: Int(port), deviceId: deviceId, fingerprint: fp)
-            } else {
-                throw NSError(
-                    domain: "ConnectionController",
-                    code: 403,
-                    userInfo: [NSLocalizedDescriptionKey: "Host Key сервера не совпадает с сохраненным! (Ожидался \(expected), получен \(actual)). Возможна атака перехвата."]
-                )
-            }
+        // W9: попытка могла быть отменена, пока шёл ssh-keyscan — дальше не идём.
+        guard isAttemptValid(attemptId) else {
+            throw NSError(domain: "ConnectionController", code: -1, userInfo: [NSLocalizedDescriptionKey: "Attempt cancelled"])
         }
 
-        // Сама SSH-сессия должна принять только тот ключ, который только что проверен.
-        try HostKeyStore.shared.installOpenSSHHostKey(hostKey, host: host, port: port, deviceId: deviceId, hostKeyAlias: hostKeyAlias)
+        // 2. Устройство определяется по стабильному id или по уже закреплённому ключу, а не по адресу.
+        guard let pinKey = HostKeyStore.shared.resolvePinKey(deviceId: deviceId, host: host, observedFingerprint: fp) else {
+            throw NSError(
+                domain: "ConnectionController",
+                code: 403,
+                userInfo: [NSLocalizedDescriptionKey: HostKeyStoreError.notPaired.localizedDescription]
+            )
+        }
+
+        // 3. Доверие только к закреплённому (подтверждённому пользователем) ключу. Несовпадение = отказ, без записи.
+        switch HostKeyStore.shared.verifyPinned(deviceId: pinKey, fingerprint: fp) {
+        case .trusted:
+            break
+        case .mismatchWarning(let expected, let actual):
+            throw NSError(
+                domain: "ConnectionController",
+                code: 403,
+                userInfo: [NSLocalizedDescriptionKey: HostKeyStoreError.hostKeyMismatch(expected: expected, actual: actual).localizedDescription]
+            )
+        case .pinnedNew, .notPinned:
+            throw NSError(
+                domain: "ConnectionController",
+                code: 403,
+                userInfo: [NSLocalizedDescriptionKey: HostKeyStoreError.notPaired.localizedDescription]
+            )
+        }
+
+        let hostKeyAlias = HostKeyStore.safeHostKeyAlias(pinKey)
+        // Сама SSH-сессия принимает только тот ключ, который только что сверен с закреплённым.
+        try HostKeyStore.shared.installOpenSSHHostKey(hostKey, host: host, port: port, deviceId: pinKey, hostKeyAlias: hostKeyAlias)
         viewModel.remoteDriver.coordinator.setExpectedHostKeyAlgorithm(hostKey.keyAlgorithm)
         viewModel.remoteDriver.coordinator.setHostKeyAlias(hostKeyAlias)
-        
+
+        // Личный ключ (legacy fallback) допускается только для устройства с подтверждённым закреплённым отпечатком.
+        let existingDev = DeviceRegistry.shared.device(withId: pinKey)
+        let isKnownLegacyDevice = existingDev.map { !$0.isMigratedToDedicatedKey } ?? false
+
         // 2. Слой 3: Проверка статуса сопряжения и миграции
         let alreadyMigrated = existingDev?.isMigratedToDedicatedKey == true
         
         if alreadyMigrated {
             // Устройство уже мигрировано: строго запрещен фоллбэк на личные ключи пользователя
             try await viewModel.remoteDriver.warmUpConnection(allowLegacyFallback: false)
-            return (fp, true)
+            return (fp, true, pinKey)
         } else {
             // Устройство ещё не мигрировано: сначала пробуем только изолированный macdroid_id_ed25519
             do {
                 try await viewModel.remoteDriver.warmUpConnection(allowLegacyFallback: false)
                 // Если телефон принял macdroid_id_ed25519 без фоллбэка, фиксируем миграцию
-                return (fp, true)
+                return (fp, true, pinKey)
             } catch {
                 guard isAttemptValid(attemptId) else {
                     throw NSError(domain: "ConnectionController", code: -1, userInfo: [NSLocalizedDescriptionKey: "Attempt cancelled"])
@@ -339,13 +352,13 @@ public final class ConnectionController: ObservableObject {
                         // Перепроверяем, что теперь телефон принимает подключение БЕЗ фоллбэка
                         do {
                             try await viewModel.remoteDriver.warmUpConnection(allowLegacyFallback: false)
-                            return (fp, true)
+                            return (fp, true, pinKey)
                         } catch {
-                            return (fp, false)
+                            return (fp, false, pinKey)
                         }
                     }
                 }
-                return (fp, false)
+                return (fp, false, pinKey)
             }
         }
     }
@@ -358,6 +371,7 @@ public final class ConnectionController: ObservableObject {
             guard FileManager.default.fileExists(atPath: legacyKey.path) else { return false }
             let knownHostsURL = HostKeyStore.shared.openSSHKnownHostsURL(host: host, port: port, deviceId: deviceId)
             let sshUser = UserDefaults.standard.string(forKey: "sshUser") ?? NSUserName()
+            guard SessionCoordinator.isValidSSHUser(sshUser) else { return false }
             let proc = Process()
             proc.executableURL = URL(fileURLWithPath: "/usr/bin/ssh")
             proc.arguments = [
@@ -365,15 +379,21 @@ public final class ConnectionController: ObservableObject {
                 "-o", "IdentitiesOnly=yes", "-o", "BatchMode=yes", "-o", "ConnectTimeout=4",
                 "-o", "StrictHostKeyChecking=yes", "-o", "HostKeyAlias=\(hostKeyAlias)",
                 "-o", "UserKnownHostsFile=\(HostKeyStore.openSSHConfigValue(knownHostsURL.path))",
-                "\(sshUser)@\(host)", "authorize_key \(pubKey)"
+                "--", "\(sshUser)@\(host)", "authorize_key \(pubKey)"
             ]
             let outPipe = Pipe()
             proc.standardOutput = outPipe
             proc.standardError = FileHandle.nullDevice
+            // Дедлайн: зависший ssh не должен блокировать подключение бесконечно.
+            let watchdog = DispatchWorkItem { [weak proc] in
+                if proc?.isRunning == true { proc?.terminate() }
+            }
+            DispatchQueue.global().asyncAfter(deadline: .now() + 10, execute: watchdog)
             do {
                 try proc.run()
                 let outData = outPipe.fileHandleForReading.readDataToEndOfFile()
                 proc.waitUntilExit()
+                watchdog.cancel()
                 let outStr = String(data: outData, encoding: .utf8) ?? ""
                 return proc.terminationStatus == 0 && outStr.contains("AUTHORIZED_OK")
             } catch { return false }

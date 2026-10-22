@@ -9,6 +9,9 @@ public final class RemoteSFTPDriver: FileSystemDriver, @unchecked Sendable {
     public init(host: String = "127.0.0.1", port: UInt16 = 2222, deviceId: String? = nil, coordinator: SessionCoordinator = .shared) {
         self.coordinator = coordinator
         self.packetEngine = coordinator.packetEngine
+        // T10 (оставлено намеренно): инициализатор применяет endpoint к SessionCoordinator.shared.
+        // Причина: тесты (RemoteSFTPDriver(host:port:)) и DualPaneViewModel полагаются на это поведение.
+        // Переход на явный updateEndpoint требует правки вызывающих; делается отдельно.
         if host != "127.0.0.1" || port != 2222 {
             coordinator.updateEndpoint(host: host, port: port, deviceId: deviceId)
         }
@@ -40,6 +43,11 @@ public final class RemoteSFTPDriver: FileSystemDriver, @unchecked Sendable {
         set { /* Управляется SessionCoordinator */ }
     }
     
+    /// Граница компонента: "/emulated/0" и "/emulated/0/..." совпадают, "/emulated/01" — нет.
+    static func isEmulatedZeroPath(_ path: String) -> Bool {
+        path == "/emulated/0" || path.hasPrefix("/emulated/0/")
+    }
+
     private func toSftpPath(_ path: String) -> String {
         return coordinator.toSftpPath(path)
     }
@@ -73,7 +81,7 @@ public final class RemoteSFTPDriver: FileSystemDriver, @unchecked Sendable {
                let (_, openCode, _) = try? packetEngine.parseStatusResponse(data: openPayload),
                openCode == .noSuchFile {
                 let altPath: String
-                if currentSftpPath.hasPrefix("/emulated/0") {
+                if Self.isEmulatedZeroPath(currentSftpPath) {
                     let sub = String(currentSftpPath.dropFirst("/emulated/0".count))
                     altPath = sub.isEmpty ? "/" : sub
                 } else {
@@ -191,11 +199,13 @@ public final class RemoteSFTPDriver: FileSystemDriver, @unchecked Sendable {
         let reqId = channel.allocateRequestId()
         let packet = packetEngine.createMkdirPacket(requestId: reqId, path: sftpPath)
         let (respType, payload) = try await channel.sendRequest(packet: packet, requestId: reqId)
-        if respType == .status {
-            let (_, code, msg) = try packetEngine.parseStatusResponse(data: payload)
-            if code != .ok {
-                throw NSError(domain: "RemoteSFTPDriver", code: Int(code.rawValue), userInfo: [NSLocalizedDescriptionKey: "MKDIR failed: \(msg)"])
-            }
+        // Нестатусный ответ не считается успехом (иначе каталог мог не создаться, а операция — «пройти»).
+        guard respType == .status else {
+            throw NSError(domain: "RemoteSFTPDriver", code: 2, userInfo: [NSLocalizedDescriptionKey: "MKDIR: неожиданный ответ сервера (\(respType))"])
+        }
+        let (_, code, msg) = try packetEngine.parseStatusResponse(data: payload)
+        if code != .ok {
+            throw NSError(domain: "RemoteSFTPDriver", code: Int(code.rawValue), userInfo: [NSLocalizedDescriptionKey: "MKDIR failed: \(msg)"])
         }
     }
     
@@ -301,11 +311,12 @@ public final class RemoteSFTPDriver: FileSystemDriver, @unchecked Sendable {
             let reqId = channel.allocateRequestId()
             let packet = packetEngine.createRenamePacket(requestId: reqId, oldPath: sftpSrc, newPath: sftpDst)
             let (respType, payload) = try await channel.sendRequest(packet: packet, requestId: reqId)
-            if respType == .status {
-                let (_, code, msg) = try packetEngine.parseStatusResponse(data: payload)
-                if code != .ok {
-                    throw NSError(domain: "RemoteSFTPDriver", code: Int(code.rawValue), userInfo: [NSLocalizedDescriptionKey: "Rename failed: \(msg)"])
-                }
+            guard respType == .status else {
+                throw NSError(domain: "RemoteSFTPDriver", code: 3, userInfo: [NSLocalizedDescriptionKey: "Rename: неожиданный ответ сервера (\(respType))"])
+            }
+            let (_, code, msg) = try packetEngine.parseStatusResponse(data: payload)
+            if code != .ok {
+                throw NSError(domain: "RemoteSFTPDriver", code: Int(code.rawValue), userInfo: [NSLocalizedDescriptionKey: "Rename failed: \(msg)"])
             }
     }
     

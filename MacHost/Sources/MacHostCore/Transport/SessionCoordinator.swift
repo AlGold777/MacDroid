@@ -1,5 +1,6 @@
 import Foundation
 import CryptoKit
+import AppKit
 
 /// Единый координатор сессии Mac ↔ Android, управляющий жизненным циклом соединения,
 /// каналами SFTP, бюджетами ресурсов и сопоставлением путей.
@@ -15,6 +16,8 @@ public final class SessionCoordinator: @unchecked Sendable {
     public static let shared = SessionCoordinator()
     
     private let lock = NSRecursiveLock()
+    /// Выставляется по NSWorkspace.didWakeNotification; сбрасывается после health probe.
+    private var needsProbeAfterWake = false
     
     public private(set) var host: String = "127.0.0.1"
     public private(set) var port: UInt16 = 2222
@@ -44,7 +47,22 @@ public final class SessionCoordinator: @unchecked Sendable {
     private var hostKeyAlias: String?
     private var connectingChannels: [SFTPChannel] = []
     
-    public init() {}
+    public init() {
+        // W16: после сна Mac соединение, скорее всего, мертво — проверить при следующем использовании.
+        NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didWakeNotification,
+            object: nil,
+            queue: nil
+        ) { [weak self] _ in
+            self?.markNeedsProbeAfterWake()
+        }
+    }
+
+    private func markNeedsProbeAfterWake() {
+        lock.lock()
+        defer { lock.unlock() }
+        needsProbeAfterWake = true
+    }
     
     public var isConnected: Bool {
         lock.lock()
@@ -64,6 +82,13 @@ public final class SessionCoordinator: @unchecked Sendable {
         return _bulkChannel?.isRunning == true ? _bulkChannel : _interactiveChannel
     }
     
+    /// Допустимое имя пользователя SSH: формат [A-Za-z_][A-Za-z0-9_-]{0,31}, ASCII only.
+    public static func isValidSSHUser(_ user: String) -> Bool {
+        guard let first = user.first, user.count <= 32 else { return false }
+        guard first.isASCII, first.isLetter || first == "_" else { return false }
+        return user.allSatisfy { c in c.isASCII && (c.isLetter || c.isNumber || c == "_" || c == "-") }
+    }
+
     public func updateEndpoint(host: String, port: UInt16, deviceId: String? = nil) {
         lock.lock()
         defer { lock.unlock() }
@@ -112,16 +137,22 @@ public final class SessionCoordinator: @unchecked Sendable {
         }
         if let chan = _interactiveChannel, chan.isRunning,
            activeSessionAllowsLegacyFallback == resolvedLegacyFallback {
-            let shouldProbe = chan.idleDuration >= 20
+            // После сна/пробуждения проверяем связь всегда, иначе — только после простоя.
+            let shouldProbe = needsProbeAfterWake || chan.idleDuration >= 20
+            needsProbeAfterWake = false
             lock.unlock()
             if shouldProbe {
                 do {
                     let requestId = chan.allocateRequestId()
                     let packet = packetEngine.createStatPacket(requestId: requestId, path: "/")
-                    _ = try await chan.sendRequest(packet: packet, requestId: requestId, timeoutSeconds: 5)
+                    // Короткий таймаут: мёртвая связь должна обнаруживаться за секунды, а не за 5+ с.
+                    _ = try await chan.sendRequest(packet: packet, requestId: requestId, timeoutSeconds: 2)
                 } catch {
+                    // Отмена вызывающего не означает разрыв связи: здоровую сессию не рвём.
+                    if error is CancellationError || Task.isCancelled { throw CancellationError() }
                     SSHTransportLog.write("SFTP health probe failed channel=\(chan.channelId) error=\(error.localizedDescription)")
-                    chan.close()
+                    // Полная очистка (каналы + ControlMaster), иначе ssh-процесс остаётся висеть (W8).
+                    disconnect()
                     try await ensureConnected()
                 }
             }
@@ -155,16 +186,39 @@ public final class SessionCoordinator: @unchecked Sendable {
             }
             lock.unlock()
         }
-        try await task.value
+        // T2: отмена вызывающего должна прерывать подключение, а не только ждать его.
+        try await withTaskCancellationHandler {
+            try await task.value
+        } onCancel: {
+            task.cancel()
+        }
     }
-    
+
+    /// Потокобезопасная проверка расширения сервера (значения пишутся под lock в performConnect).
+    public func hasServerExtension(_ name: String) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return serverExtensions[name] != nil
+    }
+
+    /// Потокобезопасное чтение лимитов сервера.
+    public var currentServerLimits: SFTPLimits? {
+        lock.lock()
+        defer { lock.unlock() }
+        return serverLimits
+    }
+
     private func performConnect(allowLegacyFallback: Bool, epoch: UInt64) async throws {
         lock.lock()
         guard epoch == sessionEpoch, !Task.isCancelled else {
             lock.unlock()
             throw CancellationError()
         }
-        budget.reset()
+        // T4: budget НЕ сбрасывается здесь: при активных передачах это обнулило бы их учёт.
+        // Сброс бюджета происходит только в disconnect().
+        // T3: расширения и лимиты сервера относятся к предыдущей сессии — очищаем до нового handshake.
+        serverExtensions = [:]
+        serverLimits = nil
         let currentEpoch = sessionEpoch
         let targetHost = self.host
         let targetPort = self.port
@@ -248,8 +302,12 @@ public final class SessionCoordinator: @unchecked Sendable {
                 : expectedKeyAlgorithm
             baseArgs.append(contentsOf: ["-o", "HostKeyAlgorithms=\(allowedAlgorithms)"])
         }
+        // Защита от инъекции опций: имя пользователя и адрес не могут начинаться с "-" и содержать мусор.
+        guard Self.isValidSSHUser(sshUser), !targetHost.hasPrefix("-") else {
+            throw NSError(domain: "SessionCoordinator", code: 1005, userInfo: [NSLocalizedDescriptionKey: "Недопустимое имя пользователя или адрес SSH."])
+        }
         let sshDestination = "\(sshUser)@\(targetHost)"
-        
+
         // Попытка OpenSSH Multiplexing через ControlMaster
         let socketDirectory = home.appendingPathComponent("Library/Caches/MCD", isDirectory: true)
         try FileManager.default.createDirectory(at: socketDirectory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])

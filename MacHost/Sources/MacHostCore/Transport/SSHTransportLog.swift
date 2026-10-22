@@ -2,6 +2,8 @@ import Foundation
 
 enum SSHTransportLog {
     private static let lock = NSLock()
+    // T7: один форматтер на все записи (создание ISO8601DateFormatter на каждую строку дорого).
+    private static let timestampFormatter = ISO8601DateFormatter()
 
     static var fileURL: URL {
         FileManager.default.homeDirectoryForCurrentUser
@@ -33,7 +35,7 @@ enum SSHTransportLog {
                 try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
             }
             let oneLineMessage = message.replacingOccurrences(of: "\n", with: " ").replacingOccurrences(of: "\r", with: " ")
-            let line = "\(ISO8601DateFormatter().string(from: Date())) \(oneLineMessage)\n"
+            let line = "\(timestampFormatter.string(from: Date())) \(oneLineMessage)\n"
             let data = Data(line.utf8)
             let handle = try FileHandle(forWritingTo: url)
             try handle.seekToEnd()

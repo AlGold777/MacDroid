@@ -158,6 +158,8 @@ public final class DeviceRegistry: @unchecked Sendable {
         do {
             let data = try JSONEncoder().encode(list)
             try data.write(to: storageURL, options: .atomic)
+            // Реестр доверенных устройств доступен только владельцу (как и pinned_hosts.json).
+            try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: storageURL.path)
         } catch {
             print("[DeviceRegistry] Failed to save trusted devices: \(error)")
         }

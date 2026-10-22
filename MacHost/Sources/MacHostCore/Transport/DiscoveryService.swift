@@ -173,8 +173,11 @@ public final class DiscoveryService: ObservableObject {
         resolvedServiceIds.formIntersection(currentIds)
         discoveredDevices.removeAll { !$0.isManual && !currentIds.contains($0.id) }
 
+        // W14: адрес мог смениться после DHCP-обновления без смены имени сервиса,
+        // поэтому каждое изменение browse-результатов перерезолвит все текущие сервисы.
         for (endpoint, name, type, domain, serviceId) in services
-        where !pendingServiceIds.contains(serviceId) && !resolvedServiceIds.contains(serviceId) {
+        where !pendingServiceIds.contains(serviceId) {
+            resolvedServiceIds.remove(serviceId)
             pendingServiceIds.insert(serviceId)
             resolveServiceEndpoint(endpoint, name: name, type: type, domain: domain, serviceId: serviceId)
         }
@@ -285,7 +288,7 @@ public final class DiscoveryService: ObservableObject {
         let device = DiscoveredDevice(id: serviceId, name: name, host: host, port: port)
         PhoneConnectionManager.shared.registerDevice(host: host, name: name)
         resolvedServiceIds.insert(serviceId)
-        if let index = discoveredDevices.firstIndex(where: { $0.id == device.id || $0.name == device.name }) {
+        if let index = discoveredDevices.firstIndex(where: { $0.id == device.id }) {
             discoveredDevices[index] = device
         } else {
             discoveredDevices.append(device)
@@ -328,6 +331,28 @@ public final class DiscoveryService: ObservableObject {
               let hostName = context.hostName,
               let port = context.port else { return nil }
 
+        // W15: getaddrinfo без собственного таймаута — выполняем с ограничением по времени.
+        guard let address = Self.lookupIPv4WithTimeout(hostName, timeout: 2.0) else { return nil }
+        return (address, port)
+    }
+
+    /// Фоновый getaddrinfo с ограничением по времени. Зависший вызов дорабатывает в фоне,
+    /// но не блокирует поток обнаружения.
+    nonisolated private static func lookupIPv4WithTimeout(_ hostName: String, timeout: TimeInterval) -> String? {
+        final class ResultBox: @unchecked Sendable {
+            var address: String?
+        }
+        let box = ResultBox()
+        let finished = DispatchSemaphore(value: 0)
+        DispatchQueue.global(qos: .userInitiated).async {
+            box.address = lookupIPv4(hostName)
+            finished.signal()
+        }
+        guard finished.wait(timeout: .now() + timeout) == .success else { return nil }
+        return box.address
+    }
+
+    nonisolated private static func lookupIPv4(_ hostName: String) -> String? {
         var hints = addrinfo()
         hints.ai_family = AF_INET
         hints.ai_socktype = SOCK_STREAM
@@ -344,7 +369,7 @@ public final class DiscoveryService: ObservableObject {
         guard inet_ntop(AF_INET, &ipv4Address, &addressBuffer, socklen_t(addressBuffer.count)) != nil else {
             return nil
         }
-        return (String(cString: addressBuffer), port)
+        return String(cString: addressBuffer)
     }
     
     public func addManualDevice(name: String, host: String, port: Int) {

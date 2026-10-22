@@ -62,7 +62,7 @@ public final class TransportMultiplexer: @unchecked Sendable {
         // Автоматическое переключение альтернативного сопоставления корня (/emulated/0 <-> /)
         if respType == .status, let (_, code, _) = try? packetEngine.parseStatusResponse(data: payload), code == .noSuchFile {
             let altPath: String
-            if sftpPath.hasPrefix("/emulated/0") {
+            if RemoteSFTPDriver.isEmulatedZeroPath(sftpPath) {
                 let sub = String(sftpPath.dropFirst("/emulated/0".count))
                 altPath = sub.isEmpty ? "/" : sub
             } else {
@@ -117,7 +117,7 @@ public final class TransportMultiplexer: @unchecked Sendable {
            let (_, openCode, _) = try? packetEngine.parseStatusResponse(data: openPayload),
            openCode == .noSuchFile {
             let altPath: String
-            if sftpPath.hasPrefix("/emulated/0") {
+            if RemoteSFTPDriver.isEmulatedZeroPath(sftpPath) {
                 let sub = String(sftpPath.dropFirst("/emulated/0".count))
                 altPath = sub.isEmpty ? "/" : sub
             } else {
@@ -215,7 +215,7 @@ public final class TransportMultiplexer: @unchecked Sendable {
            let (_, openCode, _) = try? packetEngine.parseStatusResponse(data: openPayload),
            openCode == .noSuchFile {
             let altPath: String
-            if currentSftpPath.hasPrefix("/emulated/0") {
+            if RemoteSFTPDriver.isEmulatedZeroPath(currentSftpPath) {
                 let sub = String(currentSftpPath.dropFirst("/emulated/0".count))
                 altPath = sub.isEmpty ? "/" : sub
             } else {
@@ -240,7 +240,7 @@ public final class TransportMultiplexer: @unchecked Sendable {
         SSHTransportLog.write("DL_HANDLE_OK path=\(currentSftpPath) handleLen=\(remoteHandle.count)")
         
         // 2. Конвейерное чтение с учетом SessionBudget (окно до 16 запросов по 256 КиБ = 4 МиБ)
-        let advertisedReadLimit = coordinator.serverLimits?.maxReadLen ?? UInt64(256 * 1024)
+        let advertisedReadLimit = coordinator.currentServerLimits?.maxReadLen ?? UInt64(256 * 1024)
         guard advertisedReadLimit > 0 else {
             throw NSError(domain: "TransportMultiplexer", code: 21, userInfo: [NSLocalizedDescriptionKey: "SFTP server advertised a zero read limit"])
         }
@@ -264,9 +264,7 @@ public final class TransportMultiplexer: @unchecked Sendable {
                     guard await budget.acquirePayload(bytes: Int(toRead), isInteractive: false) else { throw CancellationError() }
                     group.addTask {
                         defer { budget.releasePayload(bytes: Int(toRead)) }
-                        SSHTransportLog.write("DL_READ_REQ offset=\(readOffset) len=\(toRead)")
                         let data = try await self.readExactRemoteChunk(channel: channel, handle: remoteHandle, offset: readOffset, length: toRead)
-                        SSHTransportLog.write("DL_READ_DONE offset=\(readOffset) got=\(data.count)")
                         return (readOffset..<(readOffset + UInt64(data.count)), data)
                     }
                     activeInflight += 1
@@ -294,9 +292,7 @@ public final class TransportMultiplexer: @unchecked Sendable {
                         guard await budget.acquirePayload(bytes: Int(toRead), isInteractive: false) else { throw CancellationError() }
                         group.addTask {
                             defer { budget.releasePayload(bytes: Int(toRead)) }
-                            SSHTransportLog.write("DL_READ_REQ offset=\(readOffset) len=\(toRead)")
                             let data = try await self.readExactRemoteChunk(channel: channel, handle: remoteHandle, offset: readOffset, length: toRead)
-                            SSHTransportLog.write("DL_READ_DONE offset=\(readOffset) got=\(data.count)")
                             return (readOffset..<(readOffset + UInt64(data.count)), data)
                         }
                         activeInflight += 1
@@ -313,9 +309,7 @@ public final class TransportMultiplexer: @unchecked Sendable {
             
         } catch {
             SSHTransportLog.write("DL_ERROR err=\(error.localizedDescription) channel=\(channel.channelId)")
-            let closeReqId = channel.allocateRequestId()
-            let closePacket = packetEngine.createClosePacket(requestId: closeReqId, handle: remoteHandle)
-            _ = try? await channel.sendRequest(packet: closePacket, requestId: closeReqId)
+            await sendCloseUncancellable(handle: remoteHandle, channel: channel)
             throw error
         }
         
@@ -413,7 +407,7 @@ public final class TransportMultiplexer: @unchecked Sendable {
         }
         let (_, remoteHandle) = try packetEngine.parseHandleResponse(data: openPayload)
         
-        let advertisedWriteLimit = coordinator.serverLimits?.maxWriteLen ?? UInt64(256 * 1024)
+        let advertisedWriteLimit = coordinator.currentServerLimits?.maxWriteLen ?? UInt64(256 * 1024)
         guard advertisedWriteLimit > 0 else {
             throw NSError(domain: "TransportMultiplexer", code: 21, userInfo: [NSLocalizedDescriptionKey: "SFTP server advertised a zero write limit"])
         }
@@ -493,7 +487,7 @@ public final class TransportMultiplexer: @unchecked Sendable {
             }
             
             // Fsync расширение при поддержке сервером
-            if coordinator.serverExtensions["fsync@openssh.com"] != nil {
+            if coordinator.hasServerExtension("fsync@openssh.com") {
                 let fsyncReqId = channel.allocateRequestId()
                 let fsyncPacket = packetEngine.createFsyncPacket(requestId: fsyncReqId, handle: remoteHandle)
                 _ = try? await channel.sendRequest(packet: fsyncPacket, requestId: fsyncReqId)
@@ -504,9 +498,7 @@ public final class TransportMultiplexer: @unchecked Sendable {
             _ = try? await channel.sendRequest(packet: closePacket, requestId: closeReqId)
             
         } catch {
-            let closeReqId = channel.allocateRequestId()
-            let closePacket = packetEngine.createClosePacket(requestId: closeReqId, handle: remoteHandle)
-            _ = try? await channel.sendRequest(packet: closePacket, requestId: closeReqId)
+            await sendCloseUncancellable(handle: remoteHandle, channel: channel)
             throw error
         }
         
@@ -519,15 +511,41 @@ public final class TransportMultiplexer: @unchecked Sendable {
         }
     }
     
+    /// T1: SSH_FXP_CLOSE в пути отмены не должен отменяться вместе с задачей, иначе handle утекает на сервере.
+    private func sendCloseUncancellable(handle: Data, channel: SFTPChannel) async {
+        let reqId = channel.allocateRequestId()
+        let packet = packetEngine.createClosePacket(requestId: reqId, handle: handle)
+        await Task.detached {
+            _ = try? await channel.sendRequest(packet: packet, requestId: reqId, timeoutSeconds: 5)
+        }.value
+    }
+
+    /// true, если объект существует; false, если его нет (SSH_FX_NO_SUCH_FILE).
+    /// Любая другая ошибка пробрасывается: неизвестность не трактуется как «файла нет».
+    public func remotePathExists(_ path: String) async throws -> Bool {
+        do {
+            _ = try await prepareRead(actionId: UUID().uuidString, path: path)
+            return true
+        } catch let error as NSError
+            where error.domain == "TransportMultiplexer" && error.code == Int(SFTPStatusCode.noSuchFile.rawValue) {
+            return false
+        }
+    }
+
+    /// Переименование без перезаписи: если цель уже существует, возвращает false и ничего не меняет.
+    /// posix-rename@openssh.com атомарно заменяет цель, поэтому проверка выполняется до него.
     public func executeRename(oldPath: String, newPath: String) async throws -> Bool {
         try await ensureConnected()
         guard let channel = coordinator.interactiveChannel else { return false }
-        
+        if try await remotePathExists(newPath) {
+            return false
+        }
+
         let sftpOld = toSftpPath(oldPath)
         let sftpNew = toSftpPath(newPath)
         
         // Попытка через posix-rename@openssh.com при наличии
-        if coordinator.serverExtensions["posix-rename@openssh.com"] != nil {
+        if coordinator.hasServerExtension("posix-rename@openssh.com") {
             let reqId = channel.allocateRequestId()
             let posixPacket = packetEngine.createPosixRenamePacket(requestId: reqId, oldPath: sftpOld, newPath: sftpNew)
             if let (respType, payload) = try? await channel.sendRequest(packet: posixPacket, requestId: reqId), respType == .status {
@@ -575,7 +593,7 @@ public final class TransportMultiplexer: @unchecked Sendable {
     
     public func checkFreeSpace(at path: String) async -> (free: UInt64, total: UInt64)? {
         guard let channel = coordinator.interactiveChannel,
-              coordinator.serverExtensions["statvfs@openssh.com"] != nil else {
+              coordinator.hasServerExtension("statvfs@openssh.com") else {
             return nil
         }
         

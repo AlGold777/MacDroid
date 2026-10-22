@@ -229,12 +229,24 @@ public final class PhoneConnectionManager: @unchecked Sendable {
         }
     }
     
-    /// Серверное копирование файла внутри Android устройства без передачи данных на Mac
+    /// Серверное копирование файла внутри Android устройства без передачи данных на Mac.
+    /// Не перезаписывает существующий объект: проверка и cp выполняются одной командой на устройстве.
+    /// Возвращает false, если цель уже существует (код выхода 17) или копирование не удалось.
     public func copyFileOnDevice(sourcePath: String, targetPath: String, deviceId: String? = nil) -> Bool {
         let srcEsc = Self.shellEscape(sourcePath)
         let dstEsc = Self.shellEscape(targetPath)
-        let (status, _) = executeAdbShell(command: "cp -p \(srcEsc) \(dstEsc)", deviceId: deviceId)
+        let command = "if [ -e \(dstEsc) ] || [ -L \(dstEsc) ]; then exit 17; fi; cp -p -- \(srcEsc) \(dstEsc)"
+        let (status, _) = executeAdbShell(command: command, deviceId: deviceId)
         return status == 0
+    }
+
+    /// Удаление файла на устройстве через adb, строго на устройстве с указанным serial.
+    /// Без serial возвращает false: adb без -s адресует «какой-то» подключённый телефон.
+    public func removeFileViaAdb(remotePath: String, deviceId: String?) -> Bool {
+        guard let deviceId, !deviceId.isEmpty else { return false }
+        let escaped = Self.shellEscape(remotePath)
+        let res = executeAdbShell(command: "rm -f -- \(escaped)", deviceId: deviceId)
+        return res.status == 0
     }
     
     /// Запрос реального объёма свободного и общего места на Android через ADB df
@@ -687,7 +699,7 @@ public final class PhoneConnectionManager: @unchecked Sendable {
         
         let keyscanProc = Process()
         keyscanProc.executableURL = URL(fileURLWithPath: "/usr/bin/ssh-keyscan")
-        keyscanProc.arguments = ["-p", String(port), "-T", "2", host]
+        keyscanProc.arguments = ["-p", String(port), "-T", "2", "--", host]
         let scanPipe = Pipe()
         keyscanProc.standardOutput = scanPipe
         keyscanProc.standardError = FileHandle.nullDevice
@@ -754,7 +766,7 @@ public final class PhoneConnectionManager: @unchecked Sendable {
     public func isHostPortReachable(host: String, port: UInt16, timeoutSeconds: Int = 1) -> Bool {
         let (status, _) = runCommand(
             executable: "/usr/bin/nc",
-            arguments: ["-zv", "-G", String(timeoutSeconds), host, String(port)],
+            arguments: ["-zv", "-G", String(timeoutSeconds), "--", host, String(port)],
             timeoutSeconds: TimeInterval(timeoutSeconds + 2)
         )
         return status == 0
