@@ -108,57 +108,83 @@ public final class TransferQueueManager: ObservableObject {
         return task.id
     }
     
+    /// Допустимые переходы статусов: завершённая задача не возвращается в работу,
+    /// отмена не перетирает завершение, повтор возможен только из ошибки/отмены.
+    private static func isTransitionAllowed(from: TransferTaskStatus, to: TransferTaskStatus) -> Bool {
+        if from == to { return true }
+        switch from {
+        case .queued:
+            return [.running, .paused, .completed, .failed, .cancelled].contains(to)
+        case .running:
+            return [.paused, .completed, .failed, .cancelled].contains(to)
+        case .paused:
+            return [.queued, .running, .completed, .failed, .cancelled].contains(to)
+        case .failed:
+            return [.queued, .cancelled].contains(to)
+        case .cancelled:
+            return to == .queued
+        case .completed:
+            return false
+        }
+    }
+
+    /// Меняет статус задачи только по допустимому переходу. Возвращает false, если переход запрещён.
+    @discardableResult
+    private func transition(_ idx: Int, to newStatus: TransferTaskStatus) -> Bool {
+        guard Self.isTransitionAllowed(from: tasks[idx].status, to: newStatus) else { return false }
+        tasks[idx].status = newStatus
+        return true
+    }
+
     public func pauseTask(id: UUID) {
-        if let idx = indexOf(id) {
-            tasks[idx].status = .paused
+        if let idx = indexOf(id), transition(idx, to: .paused) {
             tasks[idx].speed = 0
             tasks[idx].eta = nil
             onTaskPaused?(id)
         }
     }
-    
+
     public func resumeTask(id: UUID) {
-        if let idx = indexOf(id) {
-            tasks[idx].status = .queued
+        if let idx = indexOf(id), transition(idx, to: .queued) {
             onTaskResumed?(id)
         }
     }
-    
+
     public func cancelTask(id: UUID) {
-        cancelledTaskIds.insert(id)
-        if let idx = indexOf(id) {
-            tasks[idx].status = .cancelled
-            tasks[idx].speed = 0
-            tasks[idx].eta = nil
-            onTaskCancelled?(id)
+        guard let idx = indexOf(id) else {
+            cancelledTaskIds.insert(id)
+            return
         }
+        // Завершённую задачу не отменяем
+        guard transition(idx, to: .cancelled) else { return }
+        cancelledTaskIds.insert(id)
+        tasks[idx].speed = 0
+        tasks[idx].eta = nil
+        onTaskCancelled?(id)
     }
-    
+
     public func pauseAll() {
         isGlobalPaused = true
         for i in 0..<tasks.count {
-            if tasks[i].status == .running || tasks[i].status == .queued {
-                tasks[i].status = .paused
+            if tasks[i].status == .running || tasks[i].status == .queued, transition(i, to: .paused) {
                 tasks[i].speed = 0
                 tasks[i].eta = nil
             }
         }
     }
-    
+
     public func resumeAll() {
         isGlobalPaused = false
-        for i in 0..<tasks.count {
-            if tasks[i].status == .paused {
-                tasks[i].status = .queued
-            }
+        for i in 0..<tasks.count where tasks[i].status == .paused {
+            transition(i, to: .queued)
         }
     }
-    
+
     public func cancelAll() {
         for i in 0..<tasks.count {
             cancelledTaskIds.insert(tasks[i].id)
-            if tasks[i].status == .running || tasks[i].status == .queued || tasks[i].status == .paused {
-                tasks[i].status = .cancelled
+            if tasks[i].status == .running || tasks[i].status == .queued || tasks[i].status == .paused,
+               transition(i, to: .cancelled) {
                 tasks[i].speed = 0
                 tasks[i].eta = nil
             }
@@ -188,19 +214,19 @@ public final class TransferQueueManager: ObservableObject {
             tasks[idx].speed = speed
             tasks[idx].eta = eta
             if isCompletion {
-                tasks[idx].status = .completed
-                tasks[idx].speed = 0
-                tasks[idx].eta = nil
                 lastProgressUpdate.removeValue(forKey: id)
+                if transition(idx, to: .completed) {
+                    tasks[idx].speed = 0
+                    tasks[idx].eta = nil
+                }
             } else if tasks[idx].status == .queued {
-                tasks[idx].status = .running
+                transition(idx, to: .running)
             }
         }
     }
-    
+
     public func markFailed(id: UUID, error: String) {
-        if let idx = indexOf(id) {
-            tasks[idx].status = .failed
+        if let idx = indexOf(id), transition(idx, to: .failed) {
             tasks[idx].errorMessage = error
             tasks[idx].speed = 0
             tasks[idx].eta = nil
@@ -221,9 +247,8 @@ public final class TransferQueueManager: ObservableObject {
     public func retryFailedTasks() -> Int {
         var count = 0
         for i in 0..<tasks.count {
-            if tasks[i].status == .failed || tasks[i].status == .cancelled {
+            if tasks[i].status == .failed || tasks[i].status == .cancelled, transition(i, to: .queued) {
                 cancelledTaskIds.remove(tasks[i].id)
-                tasks[i].status = .queued
                 tasks[i].errorMessage = nil
                 tasks[i].progress = 0.0
                 tasks[i].speed = 0.0

@@ -57,15 +57,17 @@ public final class SearchService: @unchecked Sendable {
                 }
             }
         } else {
-            // Удаленный рекурсивный поиск на телефоне
-            if PhoneConnectionManager.shared.isDeviceConnected {
+            // Удаленный рекурсивный поиск на телефоне.
+            // ADB-поиск выполняется ТОЛЬКО на устройстве, привязанном к этой SFTP-сессии (serial обязателен):
+            // иначе результаты могли бы относиться к другому подключённому телефону. Без привязки — только SFTP.
+            if let boundDeviceId = remoteDriver.coordinator.deviceId, !boundDeviceId.isEmpty {
                 let escapedPath = PhoneConnectionManager.shellEscape(directoryPath)
                 let escapedPattern = PhoneConnectionManager.shellEscape("*" + cleanQuery + "*")
-                
+
                 // 1. Точное определение папок через -type d
                 var dirPaths = Set<String>()
                 let dirCmd = "find \(escapedPath) -maxdepth 6 -type d -iname \(escapedPattern) 2>/dev/null"
-                let (dirStatus, dirOut) = PhoneConnectionManager.shared.executeAdbShell(command: dirCmd)
+                let (dirStatus, dirOut) = PhoneConnectionManager.shared.executeAdbShell(command: dirCmd, deviceId: boundDeviceId)
                 if dirStatus == 0 {
                     for line in dirOut.components(separatedBy: .newlines) {
                         let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -76,7 +78,7 @@ public final class SearchService: @unchecked Sendable {
                 }
                 
                 let cmd = "find \(escapedPath) -maxdepth 6 -iname \(escapedPattern) 2>/dev/null"
-                let (status, output) = PhoneConnectionManager.shared.executeAdbShell(command: cmd)
+                let (status, output) = PhoneConnectionManager.shared.executeAdbShell(command: cmd, deviceId: boundDeviceId)
                 if status == 0 && !output.isEmpty {
                     let lines = output.components(separatedBy: CharacterSet.newlines)
                     for line in lines {

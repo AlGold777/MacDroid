@@ -1,6 +1,8 @@
 import Foundation
 import SQLite3
 
+private let SQLITE_TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+
 public struct ItemRecord: Sendable {
     public let itemId: String
     public let jobId: String
@@ -60,29 +62,48 @@ public final class IntentLedger: @unchecked Sendable {
     }
     
     // PRF-01: Транзакционные методы для пакетной обработки тысяч файлов без I/O оверхеда
+    // Все транзакционные вызовы берут тот же lock, что и запись состояний (BEGIN/COMMIT не должны
+    // перемежаться с записями из других потоков).
     public func beginTransaction() {
-        executeRaw(sql: "BEGIN IMMEDIATE TRANSACTION;")
+        lock.lock()
+        defer { lock.unlock() }
+        if !executeRaw(sql: "BEGIN IMMEDIATE TRANSACTION;") {
+            print("[IntentLedger] ERROR: BEGIN IMMEDIATE не выполнен")
+        }
     }
-    
+
     public func commitTransaction() {
-        executeRaw(sql: "COMMIT TRANSACTION;")
+        lock.lock()
+        defer { lock.unlock() }
+        if !executeRaw(sql: "COMMIT TRANSACTION;") {
+            print("[IntentLedger] ERROR: COMMIT не выполнен")
+        }
     }
-    
+
     public func rollbackTransaction() {
-        executeRaw(sql: "ROLLBACK TRANSACTION;")
+        lock.lock()
+        defer { lock.unlock() }
+        if !executeRaw(sql: "ROLLBACK TRANSACTION;") {
+            print("[IntentLedger] ERROR: ROLLBACK не выполнен")
+        }
     }
-    
+
     public func withTransaction<T>(_ block: () throws -> T) throws -> T {
         lock.lock()
         defer { lock.unlock() }
-        
-        executeRaw(sql: "BEGIN IMMEDIATE TRANSACTION;")
+
+        guard executeRaw(sql: "BEGIN IMMEDIATE TRANSACTION;") else {
+            throw NSError(domain: "IntentLedger", code: 2, userInfo: [NSLocalizedDescriptionKey: "Не удалось начать транзакцию журнала"])
+        }
         do {
             let result = try block()
-            executeRaw(sql: "COMMIT TRANSACTION;")
+            guard executeRaw(sql: "COMMIT TRANSACTION;") else {
+                _ = executeRaw(sql: "ROLLBACK TRANSACTION;")
+                throw NSError(domain: "IntentLedger", code: 3, userInfo: [NSLocalizedDescriptionKey: "Не удалось зафиксировать транзакцию журнала"])
+            }
             return result
         } catch {
-            executeRaw(sql: "ROLLBACK TRANSACTION;")
+            _ = executeRaw(sql: "ROLLBACK TRANSACTION;")
             throw error
         }
     }
@@ -116,17 +137,17 @@ public final class IntentLedger: @unchecked Sendable {
         
         var stmt: OpaquePointer?
         if sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK {
-            sqlite3_bind_text(stmt, 1, (itemId as NSString).utf8String, -1, nil)
-            sqlite3_bind_text(stmt, 2, (jobId as NSString).utf8String, -1, nil)
-            sqlite3_bind_text(stmt, 3, (actionId as NSString).utf8String, -1, nil)
-            sqlite3_bind_text(stmt, 4, (requestHash as NSString).utf8String, -1, nil)
-            sqlite3_bind_text(stmt, 5, (state.rawValue as NSString).utf8String, -1, nil)
+            sqlite3_bind_text(stmt, 1, itemId, -1, SQLITE_TRANSIENT)
+            sqlite3_bind_text(stmt, 2, jobId, -1, SQLITE_TRANSIENT)
+            sqlite3_bind_text(stmt, 3, actionId, -1, SQLITE_TRANSIENT)
+            sqlite3_bind_text(stmt, 4, requestHash, -1, SQLITE_TRANSIENT)
+            sqlite3_bind_text(stmt, 5, state.rawValue, -1, SQLITE_TRANSIENT)
             sqlite3_bind_int64(stmt, 6, Int64(bytes))
             sqlite3_bind_int64(stmt, 7, Int64(total))
             sqlite3_bind_int64(stmt, 8, mtime)
             
             if let err = error {
-                sqlite3_bind_text(stmt, 9, (err as NSString).utf8String, -1, nil)
+                sqlite3_bind_text(stmt, 9, err, -1, SQLITE_TRANSIENT)
             } else {
                 sqlite3_bind_null(stmt, 9)
             }
@@ -154,7 +175,7 @@ public final class IntentLedger: @unchecked Sendable {
         var record: ItemRecord? = nil
         
         if sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK {
-            sqlite3_bind_text(stmt, 1, (itemId as NSString).utf8String, -1, nil)
+            sqlite3_bind_text(stmt, 1, itemId, -1, SQLITE_TRANSIENT)
             
             if sqlite3_step(stmt) == SQLITE_ROW {
                 let id = String(cString: sqlite3_column_text(stmt, 0))
@@ -189,12 +210,17 @@ public final class IntentLedger: @unchecked Sendable {
         return record
     }
     
-    private func executeRaw(sql: String) {
+    /// Выполняет SQL без результата. Возвращает false при ошибке (вызывающий решает, что делать).
+    @discardableResult
+    private func executeRaw(sql: String) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
         var err: UnsafeMutablePointer<CChar>?
-        sqlite3_exec(db, sql, nil, nil, &err)
+        let rc = sqlite3_exec(db, sql, nil, nil, &err)
         if let err = err {
             print("SQLite raw exec warning: \(String(cString: err))")
             sqlite3_free(err)
         }
+        return rc == SQLITE_OK
     }
 }

@@ -1,6 +1,10 @@
 import Foundation
 import SQLite3
 
+/// SQLITE_TRANSIENT из sqlite3.h (в Swift не импортируется): SQLite копирует строку при bind,
+/// поэтому указатель на временную Swift-строку безопасен только с этим destructor.
+private let SQLITE_TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+
 public struct TransferRecord: Sendable, Equatable {
     public let transferId: String
     public let sessionIdentity: String
@@ -22,28 +26,50 @@ public struct TransferRecord: Sendable, Equatable {
 }
 
 public final class TransferJournal: @unchecked Sendable {
+    /// Общий журнал. Если файл БД не открывается — in-memory журнал (возобновление работает в пределах сессии);
+    /// если и он недоступен — журнал без БД: операции возвращают ошибку/nil, передача идёт без возобновления.
     public static let shared: TransferJournal = {
-        let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
+        let fm = FileManager.default
+        let appSupport = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+            ?? URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
         let dir = appSupport.appendingPathComponent("MacDroidCommander", isDirectory: true)
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
         let dbURL = dir.appendingPathComponent("transfer_journal_v1.db")
-        return try! TransferJournal(databaseURL: dbURL)
+        if let journal = try? TransferJournal(databaseURL: dbURL) {
+            return journal
+        }
+        print("[TransferJournal] WARNING: файл журнала недоступен (\(dbURL.path)), используется in-memory журнал")
+        if let journal = try? TransferJournal(databasePath: ":memory:") {
+            return journal
+        }
+        print("[TransferJournal] ERROR: журнал недоступен, возобновление передач отключено")
+        return TransferJournal(unavailable: ())
     }()
-    
+
     private var db: OpaquePointer?
     private let lock = NSRecursiveLock()
-    
-    public init(databaseURL: URL) throws {
+
+    public convenience init(databaseURL: URL) throws {
+        try self.init(databasePath: databaseURL.path)
+    }
+
+    private init(databasePath: String) throws {
         var dbPointer: OpaquePointer?
-        if sqlite3_open(databaseURL.path, &dbPointer) != SQLITE_OK {
-            throw NSError(domain: "TransferJournal", code: 1, userInfo: [NSLocalizedDescriptionKey: "Unable to open SQLite DB at \(databaseURL.path)"])
+        if sqlite3_open(databasePath, &dbPointer) != SQLITE_OK {
+            if let dbPointer = dbPointer { sqlite3_close(dbPointer) }
+            throw NSError(domain: "TransferJournal", code: 1, userInfo: [NSLocalizedDescriptionKey: "Unable to open SQLite DB at \(databasePath)"])
         }
         self.db = dbPointer
-        
+
         executeRaw(sql: "PRAGMA journal_mode = WAL;")
         executeRaw(sql: "PRAGMA synchronous = NORMAL;")
-        
+
         setupSchema()
+    }
+
+    /// Журнал без БД (все запросы безопасно возвращают ошибку или nil).
+    private init(unavailable: Void) {
+        self.db = nil
     }
     
     deinit {
@@ -131,23 +157,23 @@ public final class TransferJournal: @unchecked Sendable {
         }
         defer { sqlite3_finalize(stmt) }
         
-        sqlite3_bind_text(stmt, 1, (transferId as NSString).utf8String, -1, nil)
-        sqlite3_bind_text(stmt, 2, (sessionIdentity as NSString).utf8String, -1, nil)
-        sqlite3_bind_text(stmt, 3, (direction as NSString).utf8String, -1, nil)
-        sqlite3_bind_text(stmt, 4, (sourcePath as NSString).utf8String, -1, nil)
+        sqlite3_bind_text(stmt, 1, transferId, -1, SQLITE_TRANSIENT)
+        sqlite3_bind_text(stmt, 2, sessionIdentity, -1, SQLITE_TRANSIENT)
+        sqlite3_bind_text(stmt, 3, direction, -1, SQLITE_TRANSIENT)
+        sqlite3_bind_text(stmt, 4, sourcePath, -1, SQLITE_TRANSIENT)
         sqlite3_bind_int64(stmt, 5, Int64(sourceSize))
         sqlite3_bind_int64(stmt, 6, sourceMtime)
         if let h = sourceHash {
-            sqlite3_bind_text(stmt, 7, (h as NSString).utf8String, -1, nil)
+            sqlite3_bind_text(stmt, 7, h, -1, SQLITE_TRANSIENT)
         } else {
             sqlite3_bind_null(stmt, 7)
         }
-        sqlite3_bind_text(stmt, 8, (targetFinalPath as NSString).utf8String, -1, nil)
-        sqlite3_bind_text(stmt, 9, (targetTempPath as NSString).utf8String, -1, nil)
+        sqlite3_bind_text(stmt, 8, targetFinalPath, -1, SQLITE_TRANSIENT)
+        sqlite3_bind_text(stmt, 9, targetTempPath, -1, SQLITE_TRANSIENT)
         sqlite3_bind_int64(stmt, 10, Int64(expectedSize))
         sqlite3_bind_int64(stmt, 11, Int64(initialFrontier))
-        sqlite3_bind_text(stmt, 12, (initialRanges as NSString).utf8String, -1, nil)
-        sqlite3_bind_text(stmt, 13, (state as NSString).utf8String, -1, nil)
+        sqlite3_bind_text(stmt, 12, initialRanges, -1, SQLITE_TRANSIENT)
+        sqlite3_bind_text(stmt, 13, state, -1, SQLITE_TRANSIENT)
         sqlite3_bind_double(stmt, 14, now)
         sqlite3_bind_double(stmt, 15, now)
         
@@ -183,10 +209,10 @@ public final class TransferJournal: @unchecked Sendable {
         defer { sqlite3_finalize(stmt) }
         
         sqlite3_bind_int64(stmt, 1, Int64(frontier))
-        sqlite3_bind_text(stmt, 2, (ranges as NSString).utf8String, -1, nil)
+        sqlite3_bind_text(stmt, 2, ranges, -1, SQLITE_TRANSIENT)
         sqlite3_bind_int(stmt, 3, durabilityEvidence ? 1 : 0)
         sqlite3_bind_double(stmt, 4, now)
-        sqlite3_bind_text(stmt, 5, (transferId as NSString).utf8String, -1, nil)
+        sqlite3_bind_text(stmt, 5, transferId, -1, SQLITE_TRANSIENT)
         
         guard sqlite3_step(stmt) == SQLITE_DONE else {
             let msg = String(cString: sqlite3_errmsg(db))
@@ -217,14 +243,14 @@ public final class TransferJournal: @unchecked Sendable {
         }
         defer { sqlite3_finalize(stmt) }
         
-        sqlite3_bind_text(stmt, 1, (state as NSString).utf8String, -1, nil)
+        sqlite3_bind_text(stmt, 1, state, -1, SQLITE_TRANSIENT)
         if let err = errorMessage {
-            sqlite3_bind_text(stmt, 2, (err as NSString).utf8String, -1, nil)
+            sqlite3_bind_text(stmt, 2, err, -1, SQLITE_TRANSIENT)
         } else {
             sqlite3_bind_null(stmt, 2)
         }
         sqlite3_bind_double(stmt, 3, now)
-        sqlite3_bind_text(stmt, 4, (transferId as NSString).utf8String, -1, nil)
+        sqlite3_bind_text(stmt, 4, transferId, -1, SQLITE_TRANSIENT)
         
         guard sqlite3_step(stmt) == SQLITE_DONE else {
             let msg = String(cString: sqlite3_errmsg(db))
@@ -241,39 +267,50 @@ public final class TransferJournal: @unchecked Sendable {
         guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return nil }
         defer { sqlite3_finalize(stmt) }
         
-        sqlite3_bind_text(stmt, 1, (transferId as NSString).utf8String, -1, nil)
+        sqlite3_bind_text(stmt, 1, transferId, -1, SQLITE_TRANSIENT)
         guard sqlite3_step(stmt) == SQLITE_ROW else { return nil }
         return parseRecord(stmt: stmt!)
     }
     
+    /// Ищет незавершённую передачу. Ключ — источник + целевой путь (`targetFinalPath`, если передан):
+    /// одинаковый источник, записываемый в другое место, не считается продолжением.
     public func findResumableTransfer(
         sessionIdentity: String,
         sourcePath: String,
         sourceSize: UInt64,
         sourceMtime: Int64,
-        direction: String
+        direction: String,
+        targetFinalPath: String? = nil
     ) -> TransferRecord? {
         lock.lock()
         defer { lock.unlock() }
-        
+
         let sql = """
         SELECT transfer_id, session_identity, direction, source_path, source_size, source_mtime, source_hash,
                target_final_path, target_temp_path, expected_size, confirmed_frontier, ranges_blob, state,
                durability_evidence, error_message, created_at, updated_at
         FROM transfers
-        WHERE session_identity = ? AND source_path = ? AND source_size = ? AND source_mtime = ? AND direction = ? AND state NOT IN ('completed', 'failed')
+        WHERE session_identity = ? AND source_path = ? AND source_size = ? AND source_mtime = ? AND direction = ?
+          AND (? IS NULL OR target_final_path = ?) AND state NOT IN ('completed', 'failed')
         ORDER BY updated_at DESC LIMIT 1;
         """
         var stmt: OpaquePointer?
         guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return nil }
         defer { sqlite3_finalize(stmt) }
-        
-        sqlite3_bind_text(stmt, 1, (sessionIdentity as NSString).utf8String, -1, nil)
-        sqlite3_bind_text(stmt, 2, (sourcePath as NSString).utf8String, -1, nil)
+
+        sqlite3_bind_text(stmt, 1, sessionIdentity, -1, SQLITE_TRANSIENT)
+        sqlite3_bind_text(stmt, 2, sourcePath, -1, SQLITE_TRANSIENT)
         sqlite3_bind_int64(stmt, 3, Int64(sourceSize))
         sqlite3_bind_int64(stmt, 4, sourceMtime)
-        sqlite3_bind_text(stmt, 5, (direction as NSString).utf8String, -1, nil)
-        
+        sqlite3_bind_text(stmt, 5, direction, -1, SQLITE_TRANSIENT)
+        if let target = targetFinalPath {
+            sqlite3_bind_text(stmt, 6, target, -1, SQLITE_TRANSIENT)
+            sqlite3_bind_text(stmt, 7, target, -1, SQLITE_TRANSIENT)
+        } else {
+            sqlite3_bind_null(stmt, 6)
+            sqlite3_bind_null(stmt, 7)
+        }
+
         guard sqlite3_step(stmt) == SQLITE_ROW else { return nil }
         return parseRecord(stmt: stmt!)
     }
@@ -284,7 +321,7 @@ public final class TransferJournal: @unchecked Sendable {
         let sql = "DELETE FROM transfers WHERE transfer_id = ?;"
         var stmt: OpaquePointer?
         if sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK {
-            sqlite3_bind_text(stmt, 1, (transferId as NSString).utf8String, -1, nil)
+            sqlite3_bind_text(stmt, 1, transferId, -1, SQLITE_TRANSIENT)
             _ = sqlite3_step(stmt)
         }
         sqlite3_finalize(stmt)

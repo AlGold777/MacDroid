@@ -20,7 +20,12 @@ public enum FileSource: String, CaseIterable, Identifiable, Sendable, Codable {
         } else if let s = FileSource(rawValue: raw) {
             self = s
         } else {
-            self = .localMac
+            // Fail-closed: неизвестный источник не должен молча трактоваться как локальный Mac
+            // (иначе операция может уйти не туда, куда ожидал пользователь).
+            throw DecodingError.dataCorruptedError(
+                in: container,
+                debugDescription: "Неизвестный источник файла: \(raw)"
+            )
         }
     }
 }

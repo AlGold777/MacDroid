@@ -13,7 +13,8 @@ public enum JobOrchestratorError: LocalizedError, Sendable {
     case transferInterrupted(reason: String)
     case unsupportedAtomicReplace(path: String)
     case indeterminate(reason: String)
-    
+    case invalidPlacement(reason: String)
+
     public var errorDescription: String? {
         switch self {
         case .insufficientSpace(let req, let avail):
@@ -28,7 +29,25 @@ public enum JobOrchestratorError: LocalizedError, Sendable {
             return "Сервер не поддерживает атомарное замещение posix-rename для «\(path)». Операция отклонена для предотвращения потери данных."
         case .indeterminate(let reason):
             return "Неопределенный результат операции: \(reason)."
+        case .invalidPlacement(let reason):
+            return "Операция отменена для защиты данных: \(reason)."
         }
+    }
+}
+
+/// Троттлинг durable-чекпоинтов передачи. Используется из @Sendable-колбэка, поэтому состояние под замком.
+private final class CheckpointThrottle: @unchecked Sendable {
+    private let lock = NSLock()
+    private var last = Date.distantPast
+
+    /// true, если с прошлого чекпоинта прошло не меньше `interval` секунд (и отметка времени обновляется)
+    func shouldCheckpoint(interval: TimeInterval) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        let now = Date()
+        guard now.timeIntervalSince(last) >= interval else { return false }
+        last = now
+        return true
     }
 }
 
@@ -40,7 +59,13 @@ public final class JobOrchestrator: @unchecked Sendable {
     public private(set) var activeLocalPartURLs: Set<URL> = []
     public private(set) var activeRemotePartPaths: Set<String> = []
     private let activePartsLock = NSLock()
-    
+    /// Временные части, которые сейчас пишет живая передача (владелец ещё работает)
+    private var ownedLocalParts: Set<URL> = []
+    private var ownedRemoteParts: Set<String> = []
+    /// Части живых передач, помеченные на очистку при отмене: удаляет владелец по завершении
+    private var pendingLocalCleanup: Set<URL> = []
+    private var pendingRemoteCleanup: Set<String> = []
+
     public init(ledger: IntentLedger, transport: TransportMultiplexer, localFS: LocalFSDriver) {
         self.ledger = ledger
         self.transport = transport
@@ -71,17 +96,61 @@ public final class JobOrchestrator: @unchecked Sendable {
         activeRemotePartPaths.remove(path)
     }
     
+    /// Регистрация временной части живой передачи (владелец обязан вызвать endOwnedLocalPart)
+    private func beginOwnedLocalPart(url: URL) {
+        activePartsLock.lock()
+        defer { activePartsLock.unlock() }
+        activeLocalPartURLs.insert(url)
+        ownedLocalParts.insert(url)
+    }
+
+    /// Снятие регистрации владельцем; если при отмене очистка была запрошена — удаляем файл сейчас
+    private func endOwnedLocalPart(url: URL) {
+        activePartsLock.lock()
+        activeLocalPartURLs.remove(url)
+        ownedLocalParts.remove(url)
+        let shouldClean = pendingLocalCleanup.remove(url) != nil
+        activePartsLock.unlock()
+        if shouldClean {
+            try? FileManager.default.removeItem(at: url)
+        }
+    }
+
+    private func beginOwnedRemotePart(path: String) {
+        activePartsLock.lock()
+        defer { activePartsLock.unlock() }
+        activeRemotePartPaths.insert(path)
+        ownedRemoteParts.insert(path)
+    }
+
+    /// Возвращает true, если удалённую часть нужно удалить (очистка была запрошена при живой передаче)
+    private func endOwnedRemotePart(path: String) -> Bool {
+        activePartsLock.lock()
+        defer { activePartsLock.unlock() }
+        activeRemotePartPaths.remove(path)
+        ownedRemoteParts.remove(path)
+        return pendingRemoteCleanup.remove(path) != nil
+    }
+
+    /// Снимает с учёта незанятые части (возвращает их для немедленного удаления).
+    /// Части живых передач остаются в учёте и помечаются на очистку: их удалит владелец по завершении,
+    /// чтобы не удалить temp-файл, который ещё пишется.
     private func extractAndClearActiveParts() -> (Set<URL>, Set<String>) {
         activePartsLock.lock()
         defer { activePartsLock.unlock() }
-        let local = activeLocalPartURLs
-        let remote = activeRemotePartPaths
-        activeLocalPartURLs.removeAll()
-        activeRemotePartPaths.removeAll()
+        let localOwned = activeLocalPartURLs.intersection(ownedLocalParts)
+        let remoteOwned = activeRemotePartPaths.intersection(ownedRemoteParts)
+        pendingLocalCleanup.formUnion(localOwned)
+        pendingRemoteCleanup.formUnion(remoteOwned)
+        let local = activeLocalPartURLs.subtracting(localOwned)
+        let remote = activeRemotePartPaths.subtracting(remoteOwned)
+        activeLocalPartURLs.subtract(local)
+        activeRemotePartPaths.subtract(remote)
         return (local, remote)
     }
-    
-    /// Безопасная немедленная зачистка всех активных недокачанных .part файлов
+
+    /// Безопасная зачистка активных недокачанных .part файлов.
+    /// Временные файлы живых передач не удаляются сразу — см. extractAndClearActiveParts.
     public func cleanAllActivePartFiles() async {
         let (localToClean, remoteToClean) = extractAndClearActiveParts()
         for url in localToClean {
@@ -90,6 +159,61 @@ public final class JobOrchestrator: @unchecked Sendable {
         for remotePath in remoteToClean {
             _ = try? await transport.executeDelete(actionId: UUID().uuidString, path: remotePath)
         }
+    }
+
+    /// Существует ли путь на телефоне. noSuchFile -> nil; любая другая ошибка пробрасывается,
+    /// чтобы сетевой сбой не выглядел как «файла нет» (и не приводил к перезаписи).
+    private func remoteStatIfExists(actionId: String, path: String) async throws -> RemoteStat? {
+        do {
+            return try await transport.prepareRead(actionId: actionId, path: path)
+        } catch {
+            if Self.isNoSuchFile(error) { return nil }
+            throw error
+        }
+    }
+
+    /// Код SFTP «нет такого файла» (status 2) из TransportMultiplexer
+    static func isNoSuchFile(_ error: Error) -> Bool {
+        let ns = error as NSError
+        return ns.domain == "TransportMultiplexer" && ns.code == Int(SFTPStatusCode.noSuchFile.rawValue)
+    }
+
+    /// Коммит локального файла. Перезапись допускается только если стратегия её уже разрешила
+    /// (цель существовала на момент решения); иначе переименование без перезаписи.
+    private func commitLocalFile(from tempPath: String, to finalPath: String) async throws {
+        if FileManager.default.fileExists(atPath: finalPath) {
+            try await localFS.replaceItem(from: tempPath, to: finalPath)
+        } else {
+            try await localFS.renameItem(from: tempPath, to: finalPath)
+        }
+    }
+
+    /// Защита Mac->Mac от потери данных: источник совпадает с целью, либо папка переносится/копируется внутрь себя
+    private func validateMacToMacPlacement(sourceURL: URL, targetDir: URL, finalURL: URL) throws {
+        let src = sourceURL.standardizedFileURL.resolvingSymlinksInPath().path
+        let dir = targetDir.standardizedFileURL.resolvingSymlinksInPath().path
+        let dst = finalURL.standardizedFileURL.resolvingSymlinksInPath().path
+        if dst == src {
+            throw JobOrchestratorError.invalidPlacement(reason: "источник и цель совпадают («\(sourceURL.lastPathComponent)»)")
+        }
+        var isDir: ObjCBool = false
+        if FileManager.default.fileExists(atPath: src, isDirectory: &isDir), isDir.boolValue,
+           dir == src || dir.hasPrefix(src + "/") {
+            throw JobOrchestratorError.invalidPlacement(reason: "нельзя перенести или скопировать папку «\(sourceURL.lastPathComponent)» внутрь неё самой")
+        }
+    }
+
+    /// Чтение размера файла (0, если недоступен)
+    private static func fileSize(at url: URL) -> UInt64 {
+        let size = (try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? NSNumber) ?? nil
+        return size?.uint64Value ?? 0
+    }
+
+    /// Сброс данных файла на диск (fsync). Ошибки игнорируются: чекпоинт тогда просто не продвигается дальше.
+    private static func fsyncFile(at url: URL) {
+        guard let handle = try? FileHandle(forUpdating: url) else { return }
+        _ = fsync(handle.fileDescriptor)
+        try? handle.close()
     }
     
     @discardableResult
@@ -153,12 +277,16 @@ public final class JobOrchestrator: @unchecked Sendable {
         let reqHash = "\(remotePath):\(stat.size):\(stat.mtime)"
         
         // 1. Pre-flight проверка свободного места (+ 5% запас надежности)
-        let space = try await localFS.checkFreeSpace(at: localTargetDir.path)
-        SSHTransportLog.write("ORCH_FREE_SPACE_OK free=\(space.free)")
+        // nil = объём неизвестен: не блокируем, но и не считаем это нулём свободного места
         let requiredWithMargin = stat.size + (stat.size / 20)
-        if space.free > 0 && space.free < requiredWithMargin {
-            SSHTransportLog.write("ORCH_INSUFFICIENT_SPACE required=\(requiredWithMargin) available=\(space.free)")
-            throw JobOrchestratorError.insufficientSpace(required: requiredWithMargin, available: space.free)
+        if let free = localFS.availableFreeSpace(at: localTargetDir.path) {
+            SSHTransportLog.write("ORCH_FREE_SPACE_OK free=\(free)")
+            if free < requiredWithMargin {
+                SSHTransportLog.write("ORCH_INSUFFICIENT_SPACE required=\(requiredWithMargin) available=\(free)")
+                throw JobOrchestratorError.insufficientSpace(required: requiredWithMargin, available: free)
+            }
+        } else {
+            SSHTransportLog.write("ORCH_FREE_SPACE_UNKNOWN path=\(localTargetDir.path) проверка места пропущена")
         }
         
         var name = URL(fileURLWithPath: remotePath).lastPathComponent.precomposedStringWithCanonicalMapping
@@ -212,58 +340,56 @@ public final class JobOrchestrator: @unchecked Sendable {
         sm.transition(to: .running)
         
         // 1. Prepare: Формируем имя временного файла и регистрируем в TransferJournal
-        let deviceId = PhoneConnectionManager.shared.getConnectedDeviceId() ?? "phone"
+        // Привязка к устройству SFTP-сессии (а не к «последнему подключённому»)
+        let deviceId = transport.coordinator.deviceId ?? PhoneConnectionManager.shared.getConnectedDeviceId() ?? "phone"
         let sessionIdentity = "\(deviceId):\(transport.coordinator.host):\(transport.coordinator.port)"
         let srcKey = "\(deviceId):\(remotePath):\(stat.size):\(stat.mtime)"
         let fingerprint = SHA256.hash(data: Data(srcKey.utf8)).map { String(format: "%02x", $0) }.joined().prefix(8)
         let tempURL = localTargetDir.appendingPathComponent(".\(name).\(fingerprint).mcdpart")
-        registerActiveLocalPart(url: tempURL)
+        beginOwnedLocalPart(url: tempURL)
         defer {
-            unregisterActiveLocalPart(url: tempURL)
+            endOwnedLocalPart(url: tempURL)
         }
-        
+
         let journal = TransferJournal.shared
         var rangeTracker = ConfirmedRangeTracker()
         var currentOffset: UInt64 = 0
-        
-        // Поиск возобновляемой сессии в TransferJournal
+
+        // Поиск возобновляемой сессии в TransferJournal: ключ — источник + целевой путь
+        var resumeAccepted = false
         if let resumable = journal.findResumableTransfer(
             sessionIdentity: sessionIdentity,
             sourcePath: remotePath,
             sourceSize: stat.size,
             sourceMtime: stat.mtime,
-            direction: "download"
+            direction: "download",
+            targetFinalPath: finalURL.path
         ) {
             let loadedTracker = ConfirmedRangeTracker.deserialize(resumable.rangesBlob)
             let frontier = loadedTracker.contiguousFrontier
-            if frontier > 0, FileManager.default.fileExists(atPath: tempURL.path) {
-                // Проверяем соответствие префикса
+            // Доверяем подтверждённому frontier, только если локальный temp не короче него и префикс совпадает
+            if frontier > 0, Self.fileSize(at: tempURL) >= frontier {
                 let prefixLen = min(frontier, 4096)
-                var prefixValid = false
                 if let handle = try? FileHandle(forReadingFrom: tempURL) {
                     let localPrefix = try? handle.read(upToCount: Int(prefixLen))
                     try? handle.close()
-                    if let localPrefix = localPrefix, localPrefix.count == Int(prefixLen) {
-                        if let remotePrefix = try? await transport.readChunk(remotePath: remotePath, offset: 0, length: UInt32(prefixLen)),
-                           remotePrefix == localPrefix {
-                            prefixValid = true
-                        }
+                    if let localPrefix = localPrefix, localPrefix.count == Int(prefixLen),
+                       let remotePrefix = try? await transport.readChunk(remotePath: remotePath, offset: 0, length: UInt32(prefixLen)),
+                       remotePrefix == localPrefix {
+                        resumeAccepted = true
                     }
                 }
-                if prefixValid {
-                    rangeTracker = loadedTracker
-                    currentOffset = frontier
-                } else {
-                    try? FileManager.default.removeItem(at: tempURL)
-                    rangeTracker = ConfirmedRangeTracker()
-                    currentOffset = 0
-                }
             }
-        } else if FileManager.default.fileExists(atPath: tempURL.path) {
-            // Старый .mcdpart без журнала не считается доказательством покрытия
+            if resumeAccepted {
+                rangeTracker = loadedTracker
+                currentOffset = frontier
+            }
+        }
+        if !resumeAccepted, FileManager.default.fileExists(atPath: tempURL.path) {
+            // Временный файл без подтверждённого журналом покрытия не доверяем: начинаем заново
             try? FileManager.default.removeItem(at: tempURL)
         }
-        
+
         try? journal.registerTransfer(
             transferId: actionId,
             sessionIdentity: sessionIdentity,
@@ -285,7 +411,8 @@ public final class JobOrchestrator: @unchecked Sendable {
         let maxAttempts = 3
         var downloadSuccess = false
         var lastError: Error?
-        
+        let checkpointThrottle = CheckpointThrottle()
+
         while attempts < maxAttempts && !downloadSuccess {
             if Task.isCancelled {
                 throw CancellationError()
@@ -301,6 +428,10 @@ public final class JobOrchestrator: @unchecked Sendable {
                     rangeTracker: rangeTracker,
                     onRangeConfirmed: { confirmedRange in
                         rangeTracker.addRange(confirmedRange)
+                        // Чекпоинт пишем только после fsync данных: журнал не должен обещать байты, которых нет на диске.
+                        // Троттлинг: fsync не чаще раза в секунду; между ними frontier в журнале просто отстаёт (безопасно).
+                        guard checkpointThrottle.shouldCheckpoint(interval: 1.0) else { return }
+                        Self.fsyncFile(at: tempURL)
                         try? journal.checkpointProgress(
                             transferId: actionId,
                             frontier: rangeTracker.contiguousFrontier,
@@ -350,19 +481,29 @@ public final class JobOrchestrator: @unchecked Sendable {
             throw JobOrchestratorError.transferInterrupted(reason: "Обнаружены непокрытые диапазоны байт (дыры) перед коммитом")
         }
         
-        let tempVals = try? tempURL.resourceValues(forKeys: [.fileSizeKey])
-        let tempSize = UInt64(tempVals?.fileSize ?? 0)
+        let tempSize = Self.fileSize(at: tempURL)
         guard tempSize == stat.size else {
             throw JobOrchestratorError.transferInterrupted(reason: "Размер загруженного файла (\(tempSize)) не совпадает с оригиналом (\(stat.size))")
         }
-        
-        // Повторная проверка источника (snapshot identity)
-        if let statAfter = try? await transport.prepareRead(actionId: actionId, path: remotePath) {
+
+        // Повторная проверка источника (snapshot identity). Неудачная проверка — неопределённость: не коммитим.
+        do {
+            let statAfter = try await transport.prepareRead(actionId: actionId, path: remotePath)
             if statAfter.size != stat.size || statAfter.mtime != stat.mtime {
                 throw JobOrchestratorError.transferInterrupted(reason: "Источник изменился во время передачи")
             }
+        } catch let error as JobOrchestratorError {
+            throw error
+        } catch {
+            if Self.isNoSuchFile(error) {
+                throw JobOrchestratorError.transferInterrupted(reason: "Источник исчез во время передачи")
+            }
+            throw JobOrchestratorError.indeterminate(reason: "не удалось повторно проверить источник перед коммитом: \(error.localizedDescription)")
         }
-        
+
+        // Данные временного файла на диск до переименования (иначе после сбоя файл может оказаться с нулями)
+        Self.fsyncFile(at: tempURL)
+
         // 4. Commit: COMMITTING
         sm.transition(to: .committing)
         try? journal.updateState(transferId: actionId, state: "committing")
@@ -376,9 +517,9 @@ public final class JobOrchestrator: @unchecked Sendable {
             total: stat.size,
             mtime: stat.mtime
         )
-        
+
         do {
-            try await localFS.renameItem(from: tempURL.path, to: finalURL.path)
+            try await commitLocalFile(from: tempURL.path, to: finalURL.path)
         } catch {
             sm.transition(to: .indeterminate, error: "Ошибка при локальном переименовании: \(error.localizedDescription)")
             try? journal.updateState(transferId: actionId, state: "indeterminate", errorMessage: error.localizedDescription)
@@ -401,28 +542,25 @@ public final class JobOrchestrator: @unchecked Sendable {
         var sourceDeletionFailed = false
         var sourceDeletionReason = ""
         if isMove {
-            var deleted = (try? await transport.executeDelete(actionId: UUID().uuidString, path: remotePath)) ?? false
+            // Удаление только через SFTP-сессию этого устройства (adb-фоллбэк без привязки к устройству удалён)
+            let deleted = (try? await transport.executeDelete(actionId: UUID().uuidString, path: remotePath)) ?? false
             if !deleted {
-                let escaped = PhoneConnectionManager.shellEscape(remotePath)
-                let adbRes = PhoneConnectionManager.shared.executeAdbShell(command: "rm -f -- \(escaped)")
-                if adbRes.status == 0 {
-                    deleted = true
-                }
-            }
-            if !deleted {
-                // Контрольная проверка: если файл уже отсутствует (удален компаньоном/системой),
-                // prepareRead выбросит ошибку noSuchFile -> удаление оригинала фактически состоялось.
+                // Удаление не подтверждено. Оригинал считаем удалённым только при noSuchFile; любая другая ошибка — нет.
                 do {
                     _ = try await transport.prepareRead(actionId: UUID().uuidString, path: remotePath)
                     sourceDeletionFailed = true
                     sourceDeletionReason = "Файл успешно загружен на Mac, но не удалось удалить оригинал на телефоне"
                 } catch {
-                    deleted = true
+                    if !Self.isNoSuchFile(error) {
+                        sourceDeletionFailed = true
+                        sourceDeletionReason = "Файл успешно загружен на Mac, но не удалось проверить оригинал на телефоне: \(error.localizedDescription)"
+                    }
                 }
             }
         }
-        
+
         // 6. Успех
+        try? journal.updateState(transferId: actionId, state: "completed")
         sm.transition(to: .completed)
         ledger.recordItemState(
             itemId: itemId,
@@ -504,7 +642,7 @@ public final class JobOrchestrator: @unchecked Sendable {
         var remoteFinalPath = (remoteTargetDir as NSString).appendingPathComponent(fileName).precomposedStringWithCanonicalMapping
         
         // Проверка конфликтов на удалённом устройстве (только если стратегия не .overwrite)
-        if strategy != .overwrite, let existingStat = try? await transport.prepareRead(actionId: actionId, path: remoteFinalPath) {
+        if strategy != .overwrite, let existingStat = try await remoteStatIfExists(actionId: actionId, path: remoteFinalPath) {
             switch strategy {
             case .skip:
                 progress(1.0)
@@ -523,7 +661,7 @@ public final class JobOrchestrator: @unchecked Sendable {
                 let ext = (fileName as NSString).pathExtension
                 let base = (fileName as NSString).deletingPathExtension
                 var counter = 1
-                while (try? await transport.prepareRead(actionId: actionId, path: remoteFinalPath)) != nil {
+                while (try await remoteStatIfExists(actionId: actionId, path: remoteFinalPath)) != nil {
                     let newName = ext.isEmpty ? "\(base)_\(counter)" : "\(base)_\(counter).\(ext)"
                     fileName = newName
                     remoteFinalPath = (remoteTargetDir as NSString).appendingPathComponent(newName).precomposedStringWithCanonicalMapping
@@ -546,58 +684,61 @@ public final class JobOrchestrator: @unchecked Sendable {
             mtime: mtime
         )
         
-        let deviceId = PhoneConnectionManager.shared.getConnectedDeviceId() ?? "phone"
+        // Привязка к устройству SFTP-сессии (а не к «последнему подключённому»)
+        let deviceId = transport.coordinator.deviceId ?? PhoneConnectionManager.shared.getConnectedDeviceId() ?? "phone"
         let sessionIdentity = "\(deviceId):\(transport.coordinator.host):\(transport.coordinator.port)"
         let srcKey = "\(deviceId):\(localSourceURL.path):\(fileSize):\(mtime)"
         let fingerprint = SHA256.hash(data: Data(srcKey.utf8)).map { String(format: "%02x", $0) }.joined().prefix(8)
         let remoteTempPath = (remoteTargetDir as NSString).appendingPathComponent(".\(fileName).\(fingerprint).mcdpart").precomposedStringWithCanonicalMapping
-        registerActiveRemotePart(path: remoteTempPath)
+        beginOwnedRemotePart(path: remoteTempPath)
         defer {
-            unregisterActiveRemotePart(path: remoteTempPath)
+            if endOwnedRemotePart(path: remoteTempPath) {
+                // Очистка запрошена при отмене: удаляем удалённую часть после завершения владельца
+                Task {
+                    _ = try? await self.transport.executeDelete(actionId: UUID().uuidString, path: remoteTempPath)
+                }
+            }
         }
-        
+
         let journal = TransferJournal.shared
         var rangeTracker = ConfirmedRangeTracker()
         var startOffset: UInt64 = 0
-        
-        // Проверяем возможность возобновления через TransferJournal
+
+        // Проверяем возможность возобновления через TransferJournal: ключ — источник + целевой путь
+        var resumeAccepted = false
         if let resumable = journal.findResumableTransfer(
             sessionIdentity: sessionIdentity,
             sourcePath: localSourceURL.path,
             sourceSize: fileSize,
             sourceMtime: mtime,
-            direction: "upload"
+            direction: "upload",
+            targetFinalPath: remoteFinalPath
         ) {
             let loadedTracker = ConfirmedRangeTracker.deserialize(resumable.rangesBlob)
             let frontier = loadedTracker.contiguousFrontier
+            // Доверяем подтверждённому frontier, только если удалённая часть не короче него и префикс совпадает
             if frontier > 0, let remoteStat = try? await transport.prepareRead(actionId: actionId, path: remoteTempPath), remoteStat.size >= frontier {
-                // Префиксная проверка целостности первых байтов перед Resume
                 let prefixLen = min(frontier, 4096)
-                var prefixValid = false
                 if let handle = try? FileHandle(forReadingFrom: localSourceURL) {
                     let localPrefix = try? handle.read(upToCount: Int(prefixLen))
                     try? handle.close()
-                    if let localPrefix = localPrefix, localPrefix.count == Int(prefixLen) {
-                        if let remotePrefix = try? await transport.readChunk(remotePath: remoteTempPath, offset: 0, length: UInt32(prefixLen)),
-                           remotePrefix == localPrefix {
-                            prefixValid = true
-                        }
+                    if let localPrefix = localPrefix, localPrefix.count == Int(prefixLen),
+                       let remotePrefix = try? await transport.readChunk(remotePath: remoteTempPath, offset: 0, length: UInt32(prefixLen)),
+                       remotePrefix == localPrefix {
+                        resumeAccepted = true
                     }
                 }
-                if prefixValid {
-                    rangeTracker = loadedTracker
-                    startOffset = frontier
-                } else {
-                    _ = try? await transport.executeDelete(actionId: actionId, path: remoteTempPath)
-                    rangeTracker = ConfirmedRangeTracker()
-                    startOffset = 0
-                }
             }
-        } else if let _ = try? await transport.prepareRead(actionId: actionId, path: remoteTempPath) {
-            // Неизвестный .mcdpart без журнала удаляем перед новой передачей
+            if resumeAccepted {
+                rangeTracker = loadedTracker
+                startOffset = frontier
+            }
+        }
+        if !resumeAccepted {
+            // Удалённая часть без подтверждённого журналом покрытия не доверяем: удаляем и начинаем заново
             _ = try? await transport.executeDelete(actionId: actionId, path: remoteTempPath)
         }
-        
+
         try? journal.registerTransfer(
             transferId: actionId,
             sessionIdentity: sessionIdentity,
@@ -647,7 +788,7 @@ public final class JobOrchestrator: @unchecked Sendable {
             }
             
             // Проверка поддержки атомарного замещения при существовании целевого файла
-            let targetExists = (try? await transport.prepareRead(actionId: actionId, path: remoteFinalPath)) != nil
+            let targetExists = try await remoteStatIfExists(actionId: actionId, path: remoteFinalPath) != nil
             if targetExists && transport.coordinator.serverExtensions["posix-rename@openssh.com"] == nil {
                 throw JobOrchestratorError.unsupportedAtomicReplace(path: remoteFinalPath)
             }
@@ -695,6 +836,7 @@ public final class JobOrchestrator: @unchecked Sendable {
                 }
             }
             
+            try? journal.updateState(transferId: actionId, state: "completed")
             sm.transition(to: .completed)
             ledger.recordItemState(
                 itemId: itemId,
@@ -711,7 +853,7 @@ public final class JobOrchestrator: @unchecked Sendable {
                 return .transferredWithoutSourceDeletion(reason: sourceDeletionReason)
             }
             return .transferred
-            
+
         } catch {
             sm.transition(to: .failed, error: error.localizedDescription)
             ledger.recordItemState(
@@ -780,13 +922,15 @@ public final class JobOrchestrator: @unchecked Sendable {
             }
         }
         
+        try validateMacToMacPlacement(sourceURL: localSourceURL, targetDir: localTargetDir, finalURL: finalURL)
+
         let actionId = UUID().uuidString
         let tempURL = localTargetDir.appendingPathComponent(".\(finalURL.lastPathComponent).part.\(actionId)")
-        registerActiveLocalPart(url: tempURL)
+        beginOwnedLocalPart(url: tempURL)
         defer {
-            unregisterActiveLocalPart(url: tempURL)
+            endOwnedLocalPart(url: tempURL)
         }
-        
+
         do {
             if FileManager.default.fileExists(atPath: tempURL.path) {
                 try? FileManager.default.removeItem(at: tempURL)
@@ -796,7 +940,7 @@ public final class JobOrchestrator: @unchecked Sendable {
                 try? FileManager.default.removeItem(at: tempURL)
                 throw CancellationError()
             }
-            try await localFS.renameItem(from: tempURL.path, to: finalURL.path)
+            try await commitLocalFile(from: tempURL.path, to: finalURL.path)
             progress(1.0)
             return .transferred
         } catch {
@@ -855,13 +999,15 @@ public final class JobOrchestrator: @unchecked Sendable {
             }
         }
         
+        try validateMacToMacPlacement(sourceURL: localSourceURL, targetDir: localTargetDir, finalURL: finalURL)
+
         let actionId = UUID().uuidString
         let tempURL = localTargetDir.appendingPathComponent(".\(finalURL.lastPathComponent).part.\(actionId)")
-        registerActiveLocalPart(url: tempURL)
+        beginOwnedLocalPart(url: tempURL)
         defer {
-            unregisterActiveLocalPart(url: tempURL)
+            endOwnedLocalPart(url: tempURL)
         }
-        
+
         do {
             if FileManager.default.fileExists(atPath: tempURL.path) {
                 try? FileManager.default.removeItem(at: tempURL)
@@ -873,7 +1019,7 @@ public final class JobOrchestrator: @unchecked Sendable {
                 try? FileManager.default.removeItem(at: tempURL)
                 throw CancellationError()
             }
-            try await localFS.renameItem(from: tempURL.path, to: finalURL.path)
+            try await commitLocalFile(from: tempURL.path, to: finalURL.path)
             
             // Верифицируем целевой файл перед удалением оригинала
             guard FileManager.default.fileExists(atPath: finalURL.path) else {
@@ -959,6 +1105,11 @@ public final class JobOrchestrator: @unchecked Sendable {
         await withTaskGroup(of: BatchItemResult.self) { group in
             var submitted = 0
             for item in items {
+                // Отмена пакета: не запускаем оставшиеся элементы, фиксируем их как отменённые
+                if Task.isCancelled {
+                    results.append(BatchItemResult(itemId: item.itemId, error: CancellationError()))
+                    continue
+                }
                 if submitted >= concurrency {
                     if let res = await group.next() {
                         results.append(res)
@@ -1005,6 +1156,11 @@ public final class JobOrchestrator: @unchecked Sendable {
         await withTaskGroup(of: BatchItemResult.self) { group in
             var submitted = 0
             for item in items {
+                // Отмена пакета: не запускаем оставшиеся элементы, фиксируем их как отменённые
+                if Task.isCancelled {
+                    results.append(BatchItemResult(itemId: item.itemId, error: CancellationError()))
+                    continue
+                }
                 if submitted >= concurrency {
                     if let res = await group.next() {
                         results.append(res)
