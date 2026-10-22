@@ -19,3 +19,7 @@ AndroidCompanion/local.properties
 *.zip
 *.ser
 .cache/
+
+# Backups and stray nested copy
+.backups/
+MacDroidCommander_Gemini/

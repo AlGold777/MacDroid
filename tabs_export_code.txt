@@ -1,0 +1,1 @@
+"    /// Экспорт всех открытых вкладок обеих панелей со статусом закрепления в JSON-файл\n    public func exportTabsToFile(url: URL) throws {\n        let exportData = TabsExportData(\n            leftTabs: leftTabs,\n            rightTabs: rightTabs,\n            leftActiveTabId: leftActiveTabId,\n            rightActiveTabId: rightActiveTabId\n        )"

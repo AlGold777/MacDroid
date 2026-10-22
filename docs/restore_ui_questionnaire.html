@@ -1,0 +1,556 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Опросник по восстановлению функционала MacDroid Commander</title>
+<style>
+  :root{
+    --bg:#faf8f5; --card:#ffffff; --text:#2b2620; --muted:#726b60;
+    --accent:#a8734f; --accent-soft:#f1e4d8; --border:#e6ddd2;
+    --accent-hover:#915f3e;
+  }
+  @media (prefers-color-scheme: dark){
+    :root:not([data-theme="light"]){
+      --bg:#1c1a17; --card:#252220; --text:#ece7df; --muted:#a89f92;
+      --accent:#d29b6e; --accent-soft:#3a2f26; --border:#3a352f;
+      --accent-hover:#e0ab80;
+    }
+  }
+  :root[data-theme="dark"]{
+    --bg:#1c1a17; --card:#252220; --text:#ece7df; --muted:#a89f92;
+    --accent:#d29b6e; --accent-soft:#3a2f26; --border:#3a352f;
+    --accent-hover:#e0ab80;
+  }
+  *{box-sizing:border-box;}
+  html{scroll-padding-top:env(safe-area-inset-top,0px);}
+  body{
+    margin:0; background:var(--bg); color:var(--text);
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
+    padding:env(safe-area-inset-top,0px) 0 env(safe-area-inset-bottom,0px) 0;
+  }
+  .wrap{max-width:760px;margin:0 auto;padding:24px 16px 60px;}
+  h1{font-size:1.35rem;margin:0 0 6px;line-height:1.3;}
+  .sub{color:var(--muted);font-size:0.88rem;margin:0 0 18px;line-height:1.45;}
+  .progress{
+    position:sticky;top:env(safe-area-inset-top,0px);background:var(--bg);
+    padding:10px 0;font-size:0.82rem;font-weight:600;color:var(--accent);z-index:10;
+    border-bottom:1px solid var(--border);margin-bottom:14px;
+    display:flex; justify-content:space-between; align-items:center;
+  }
+  .section-title{
+    font-size:0.92rem;font-weight:700;color:var(--accent);
+    margin:32px 0 12px;text-transform:uppercase;letter-spacing:.04em;
+    display:flex; align-items:center; gap:8px;
+  }
+  .card{background:var(--card); border:1px solid var(--border); border-radius:14px; padding:16px; margin-bottom:14px; box-shadow:0 1px 3px rgba(0,0,0,0.03);}
+  .q-header{display:flex; justify-content:space-between; align-items:flex-start; gap:8px; margin-bottom:10px;}
+  .q{font-weight:600; font-size:0.96rem; line-height:1.35;}
+  .badge{
+    font-size:0.7rem; font-weight:700; text-transform:uppercase;
+    padding:3px 7px; border-radius:6px; background:var(--accent-soft); color:var(--accent);
+    flex-shrink:0; letter-spacing:0.02em;
+  }
+  .opts{display:flex; flex-direction:column; gap:6px;}
+  label.opt{
+    display:flex; align-items:center; gap:10px; padding:9px 12px;
+    border-radius:10px; border:1px solid var(--border); cursor:pointer;
+    font-size:0.9rem; transition:background .15s, border-color .15s;
+    user-select:none;
+  }
+  label.opt:hover{background:var(--accent-soft);}
+  input[type=radio], input[type=checkbox]{
+    accent-color:var(--accent); width:17px; height:17px; flex:none; cursor:pointer;
+  }
+  label.opt.checked{border-color:var(--accent); background:var(--accent-soft); font-weight:500;}
+  textarea, input[type=text]{
+    width:100%; min-height:40px; margin-top:10px; padding:10px 12px;
+    border-radius:10px; border:1px solid var(--border); background:var(--bg);
+    color:var(--text); font-family:inherit; font-size:0.88rem; resize:vertical;
+  }
+  textarea.free{min-height:90px;}
+  .comment-label{font-size:0.78rem;color:var(--muted);margin-top:10px;display:block;}
+  .btn{
+    display:block; width:100%; padding:14px; margin-top:28px;
+    border:none; border-radius:12px; background:var(--accent); color:#fff;
+    font-size:1rem; font-weight:700; cursor:pointer; transition:opacity .15s, background .15s;
+  }
+  .btn:hover{background:var(--accent-hover);}
+  .btn:active{opacity:.85;}
+  .status{text-align:center; margin-top:14px; font-size:0.88rem; color:var(--muted); min-height:1.2em; line-height:1.4;}
+  .actions-row{display:flex; gap:10px; margin-top:12px;}
+  .btn-secondary{
+    background:transparent; border:1px solid var(--border); color:var(--text);
+    padding:10px; border-radius:10px; font-size:0.86rem; cursor:pointer; flex:1; font-weight:600;
+  }
+  .btn-secondary:hover{background:var(--accent-soft);}
+  .copy-box{
+    margin-top:16px; padding:12px; border-radius:10px; background:var(--bg);
+    border:1px solid var(--border); font-family:monospace; font-size:0.8rem;
+    white-space:pre-wrap; max-height:220px; overflow-y:auto; display:none;
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Опросник восстановления MacDroid Commander</h1>
+  <p class="sub">Отметьте галочками все функции, элементы интерфейса и детали поведения, которые пропали или должны присутствовать в актуальной рабочей версии. Во всех вопросах доступен мультивыбор. Внизу можно сохранить файл с ответами или скопировать их в буфер.</p>
+  
+  <div class="progress" id="progress">
+    <span id="progressText">Отвечено: 0 из 0</span>
+    <span style="font-size:0.75rem; font-weight:normal; color:var(--muted);">Мультивыбор разрешён</span>
+  </div>
+
+  <div id="root"></div>
+
+  <div class="card">
+    <div class="q">Свободный комментарий / Не упомянутые детали</div>
+    <textarea id="freeform" class="free" placeholder="Напишите всё, что пропало или как именно должен выглядеть и вести себя интерфейс..."></textarea>
+  </div>
+
+  <button class="btn" id="resultsBtn">💾 Скачать файл с ответами (.txt)</button>
+  <div class="actions-row">
+    <button class="btn-secondary" id="copyBtn">📋 Скопировать текст ответов в буфер</button>
+    <button class="btn-secondary" id="selectAllBtn">✓ Отметить все пункты</button>
+  </div>
+  
+  <div class="status" id="status"></div>
+  <div class="copy-box" id="copyBox"></div>
+</div>
+
+<script>
+const SECTIONS = [
+{
+  title: "1. Вкладки (Tabs) и контекстное меню вкладок",
+  items: [
+    {
+      id: "tabs_context",
+      text: "Какие действия должны быть в контекстном меню вкладки?",
+      multi: true,
+      opts: [
+        "Экспорт списка вкладок в файл (JSON / TXT)",
+        "Импорт вкладок из файла (восстановление списка вкладок)",
+        "Сохранить текущую сессию вкладок (быстрое сохранение/закладка)",
+        "Закрепить / Открепить вкладку (Pin/Unpin)",
+        "Дублировать вкладку (Duplicate tab)",
+        "Переименовать вкладку (двойной клик или пункт меню)",
+        "Закрыть вкладку",
+        "Закрыть все вкладки кроме активной",
+        "Закрыть вкладки справа от текущей",
+        "Копировать путь открытой вкладки в буфер"
+      ]
+    },
+    {
+      id: "tabs_ui",
+      text: "Внешний вид и поведение панели вкладок",
+      multi: true,
+      opts: [
+        "Кнопки навигации слева: Вверх (↑), Назад (←), Вперёд (→)",
+        "Кнопка добавления новой вкладки (+)",
+        "Иконка булавки/пина на закреплённых вкладках",
+        "Крестик закрытия вкладки (x) на незакреплённых",
+        "Кнопка быстрого обновления панели (Refresh) справа в строке вкладок",
+        "Переключатель Таблица / Сетка (Сетка/Галерея Cmd+2) справа в строке",
+        "Drag & Drop вкладок для изменения их порядка мышью",
+        "Перетаскивание вкладки между левой и правой панелями"
+      ]
+    }
+  ]
+},
+{
+  title: "2. Верхняя панель (Top Toolbar) и переключатели режимов",
+  items: [
+    {
+      id: "top_toolbar_elements",
+      text: "Какие элементы верхней панели инструментов должны присутствовать?",
+      multi: true,
+      opts: [
+        "Переключатель режимов T / F (Двухпанельный 'T' vs Режим Finder с боковой панелью 'F')",
+        "Кнопка сортировки папок (Папки отдельно vs Папки и файлы вместе как в Finder)",
+        "Кнопка переключения вида (Таблица / Сетка иконок)",
+        "Кнопка глобального обновления обеих панелей",
+        "Индикатор и поповер подключения телефона (CompactConnectionPopoverView)",
+        "Кнопка вызова настроек / сопряжения"
+      ]
+    },
+    {
+      id: "top_toolbar_placement",
+      text: "Где именно должна располагаться верхняя панель инструментов?",
+      multi: true,
+      opts: [
+        "В единой полосе в самом верху (над обеими панелями)",
+        "Интегрирована в нативную шапку окна macOS (window toolbar)",
+        "Внутри каждой панели индивидуально (в строке вкладок или над ней)",
+        "Показывать кнопки T/F и сортировку папок прямо в строке вкладок"
+      ]
+    }
+  ]
+},
+{
+  title: "3. Режим Finder (F) и боковая панель (FinderSidebarView)",
+  items: [
+    {
+      id: "finder_sidebar",
+      text: "Что должно отображаться в боковой панели при включении режима Finder (F)?",
+      multi: true,
+      opts: [
+        "Избранное (Рабочий стол, Документы, Загрузки, Домашняя папка)",
+        "Устройства и диски (Mac, Внешние USB накопители, Телефон)",
+        "Секция цветных тегов Finder (Красный, Синий, Зелёный и т.д.)",
+        "Возможность скрытия/показа боковой панели",
+        "Разделитель с возможностью изменения ширины боковой панели мышью",
+        "Плавная анимация сворачивания сайдбара"
+      ]
+    }
+  ]
+},
+{
+  title: "4. Цветные теги файлов (Tags System)",
+  items: [
+    {
+      id: "tags_features",
+      text: "Где и как должны работать цветные метки/теги файлов?",
+      multi: true,
+      opts: [
+        "Отдельная узкая колонка с цветными кружками-тегами в таблице файлов",
+        "Сортировка файлов по тегам при клике на заголовок колонки",
+        "Блок выбора цветных меток (7 цветов macOS) в контекстном меню файла",
+        "Возможность присваивать несколько тегов одному файлу",
+        "Присвоение/снятие тегов для группы выделенных файлов",
+        "Синхронизация тегов с нативными xattr/Finder тегами macOS",
+        "Поддержка тегов для файлов на телефоне (Android)"
+      ]
+    }
+  ]
+},
+{
+  title: "5. Режим сетки (Grid View) и слайдер масштаба",
+  items: [
+    {
+      id: "grid_view_features",
+      text: "Что должно быть в режиме графического просмотра (Сетка / Галерея)?",
+      multi: true,
+      opts: [
+        "Плавный современный слайдер размера плитки (CrispModernSlider)",
+        "Быстрые пресеты размера: Мелкие / Средние / Крупные / Огромные",
+        "Генерация и кэширование быстрых превью-эскизов (ThumbnailCacheManager)",
+        "Подписи под иконками: имя файла, размер, разрешение",
+        "Выделение рамкой (Marquee / Lasso selection) мышью",
+        "Полноэкранный модальный просмотрщик (GridFullscreenViewerModalView)",
+        "Сортировка внутри сетки (Имя, Размер, Дата, Теги)"
+      ]
+    }
+  ]
+},
+{
+  title: "6. Строка пути (Breadcrumbs) и диски",
+  items: [
+    {
+      id: "path_row_features",
+      text: "Какие функции должны работать в строке навигации и дисков?",
+      multi: true,
+      opts: [
+        "Кнопки выбора источников слева: [Mac] [Phone] [USB]",
+        "Автоматическое появление кнопки [USB] при подключении флешки",
+        "Индикатор статуса телефона (зелёная/серая точка рядом с Phone)",
+        "Хлебные крошки пути (кликабельные сегменты папок)",
+        "Двойной клик по пути переключает в текстовое поле ввода (Manual Path)",
+        "Кнопка быстрого коннекта к телефону (иконка цепочки)",
+        "Поле мгновенного фильтра файлов с кнопкой очистки (Esc)",
+        "Контекстное меню пути: Копировать путь, Открыть в Терминале, Показать в Finder"
+      ]
+    }
+  ]
+},
+{
+  title: "7. Сравнение папок и файлов (Diff / Compare)",
+  items: [
+    {
+      id: "compare_diff_features",
+      text: "Какой функционал сравнения должен быть активен?",
+      multi: true,
+      opts: [
+        "Сравнение каталогов (Cmd+D) с цветной подсветкой отсутствующих/новых файлов",
+        "Панель синхронизации: кнопки 'Выделить различия' и 'Синхронизировать → / ←'",
+        "Чекбокс 'Только различия' (фильтрация одинаковых файлов)",
+        "Сравнение содержимого двух текстовых файлов (TextDiffEngine)",
+        "Оверлей просмотра разницы файлов (FileDiffOverlayView)",
+        "Поддержка Side-by-Side и Inline режимов диффа"
+      ]
+    }
+  ]
+},
+{
+  title: "8. Контекстное меню файлов и операции",
+  items: [
+    {
+      id: "file_context_menu",
+      text: "Какие пункты должны быть в контекстном меню файлов и папок?",
+      multi: true,
+      opts: [
+        "Открыть / Открыть с помощью... (выбор приложения)",
+        "Быстрый просмотр (QuickLook / Пробел / F3)",
+        "Копировать (F5) / Переместить (F6) в противоположную панель",
+        "Новая папка с выбранными объектами",
+        "Групповое переименование (Ctrl+M) по шаблону",
+        "Создать архив (ZIP / TAR / 7z) / Распаковать",
+        "Копировать путь / Имя в буфер обмена",
+        "Удалить в Корзину / Удалить безвозвратно (Shift+Delete)",
+        "Свойства файла (Cmd+I) с подсчётом размера папки"
+      ]
+    }
+  ]
+},
+{
+  title: "9. Нижняя панель действий (Bottom Toolbar) и горячие клавиши",
+  items: [
+    {
+      id: "bottom_toolbar_features",
+      text: "Что должно отображаться в нижнем тулбаре?",
+      multi: true,
+      opts: [
+        "Кнопки стандартных команд: Копировать, Переместить, Новая папка, Свойства, Удалить, Переименовать",
+        "Кнопка Сравнить папки и Сравнить файлы",
+        "Кнопка поиска файлов (Cmd+F)",
+        "Индикатор и кнопка Очереди передач с бейджем количества задач",
+        "Свернутый прогресс текущей передачи (проценты, имя файла)",
+        "Поддержка горячих клавиш Total Commander (F2, F3, F5, F6, F7, F8)"
+      ]
+    }
+  ]
+},
+{
+  title: "10. Подключение телефона (Android / Phone)",
+  items: [
+    {
+      id: "phone_features",
+      text: "Какие детали работы с телефоном критичны?",
+      multi: true,
+      opts: [
+        "Автоподключение при переключении на вкладку Phone",
+        "Компактный поповер настроек подключения (IP, порт, пароль, статус)",
+        "Предупреждение/плашка 'Phone Offline' при обрыве связи с кнопкой Reconnect",
+        "Корректное скачивание файлов с телефона во временную папку для просмотра/открытия",
+        "Фоновая передача файлов в очереди без зависания UI"
+      ]
+    }
+  ]
+}
+];
+
+const root = document.getElementById('root');
+const progressText = document.getElementById('progressText');
+let totalQ = 0;
+
+SECTIONS.forEach(section=>{
+  const h = document.createElement('div');
+  h.className = 'section-title';
+  h.textContent = section.title;
+  root.appendChild(h);
+
+  section.items.forEach(item=>{
+    totalQ++;
+    const card = document.createElement('div');
+    card.className = 'card';
+    card.setAttribute('data-q', item.id);
+
+    const qHeader = document.createElement('div');
+    qHeader.className = 'q-header';
+
+    const q = document.createElement('div');
+    q.className = 'q';
+    q.textContent = item.text;
+    qHeader.appendChild(q);
+
+    if(item.multi){
+      const badge = document.createElement('span');
+      badge.className = 'badge';
+      badge.textContent = 'Мультивыбор';
+      qHeader.appendChild(badge);
+    }
+    card.appendChild(qHeader);
+
+    if(item.free){
+      const inp = document.createElement('input');
+      inp.type = 'text';
+      inp.setAttribute('data-free', item.id);
+      inp.placeholder = 'Ваш вариант...';
+      inp.addEventListener('input', updateProgress);
+      card.appendChild(inp);
+    } else {
+      const opts = document.createElement('div');
+      opts.className = 'opts';
+      item.opts.forEach((optText)=>{
+        const label = document.createElement('label');
+        label.className = 'opt';
+        const input = document.createElement('input');
+        input.type = item.multi ? 'checkbox' : 'radio';
+        input.name = item.id;
+        input.value = optText;
+        
+        input.addEventListener('change', ()=>{
+          if(input.type === 'radio'){
+            opts.querySelectorAll('.opt').forEach(o=>o.classList.remove('checked'));
+            if(input.checked) label.classList.add('checked');
+          } else {
+            if(input.checked){
+              label.classList.add('checked');
+            } else {
+              label.classList.remove('checked');
+            }
+          }
+          updateProgress();
+        });
+
+        label.appendChild(input);
+        label.appendChild(document.createTextNode(optText));
+        opts.appendChild(label);
+      });
+      card.appendChild(opts);
+    }
+
+    const cLabel = document.createElement('span');
+    cLabel.className = 'comment-label';
+    cLabel.textContent = 'Комментарий к вопросу (необязательно):';
+    card.appendChild(cLabel);
+
+    const ta = document.createElement('textarea');
+    ta.setAttribute('data-comment', item.id);
+    ta.placeholder = 'Уточнение, пожелание или описание...';
+    card.appendChild(ta);
+
+    root.appendChild(card);
+  });
+});
+
+function updateProgress(){
+  let answered = 0;
+  SECTIONS.forEach(s=>{
+    s.items.forEach(item=>{
+      const card = document.querySelector(`.card[data-q="${item.id}"]`);
+      if(!card) return;
+      if(item.free){
+        const inp = card.querySelector('input[data-free]');
+        if(inp && inp.value.trim().length > 0) answered++;
+      } else {
+        const checked = card.querySelectorAll('input:checked');
+        if(checked.length > 0) answered++;
+      }
+    });
+  });
+  progressText.textContent = `Заполнено вопросов: ${answered} из ${totalQ}`;
+}
+updateProgress();
+
+function generateReportText(){
+  let lines = [
+    '=================================================================',
+    'ОТВЕТЫ ПО ВОССТАНОВЛЕНИЮ ФУНКЦИОНАЛА MACDROID COMMANDER',
+    'Дата: ' + new Date().toLocaleString('ru-RU'),
+    '=================================================================',
+    ''
+  ];
+
+  SECTIONS.forEach(section=>{
+    lines.push('-----------------------------------------------------------------');
+    lines.push('### ' + section.title.toUpperCase());
+    lines.push('-----------------------------------------------------------------');
+    lines.push('');
+    section.items.forEach(item=>{
+      const card = document.querySelector(`.card[data-q="${item.id}"]`);
+      if(!card) return;
+      const comment = card.querySelector(`textarea[data-comment="${item.id}"]`).value.trim();
+      lines.push('• ' + item.text);
+      if(item.free){
+        const val = card.querySelector('input[data-free]').value.trim();
+        lines.push('  → ' + (val || '(нет ответа)'));
+      } else {
+        const checked = Array.from(card.querySelectorAll('input:checked')).map(i => i.value);
+        if(checked.length > 0){
+          checked.forEach(c => lines.push('  [x] ' + c));
+        } else {
+          lines.push('  (ничего не выбрано)');
+        }
+      }
+      if(comment){
+        lines.push('  ✎ Комментарий: ' + comment);
+      }
+      lines.push('');
+    });
+  });
+
+  const freeform = document.getElementById('freeform').value.trim();
+  lines.push('=================================================================');
+  lines.push('### ОБЩИЙ КОММЕНТАРИЙ');
+  lines.push('=================================================================');
+  lines.push(freeform || '(нет дополнительного комментария)');
+  lines.push('');
+  return lines.join('\n');
+}
+
+document.getElementById('resultsBtn').addEventListener('click', async ()=>{
+  const status = document.getElementById('status');
+  const text = generateReportText();
+  const filename = 'macdroid_ui_restore_answers.txt';
+  
+  const encoder = new TextEncoder();
+  const textBytes = encoder.encode(text);
+  const bom = new Uint8Array([0xEF, 0xBB, 0xBF]);
+  const fileBytes = new Uint8Array(bom.length + textBytes.length);
+  fileBytes.set(bom, 0);
+  fileBytes.set(textBytes, bom.length);
+  const blob = new Blob([fileBytes], {type: 'text/plain;charset=utf-8'});
+  let saved = false;
+
+  try{
+    const downloads = await window.claude?.use?.('downloads');
+    if(downloads){
+      await downloads.save({filename, data: blob});
+      saved = true;
+    }
+  }catch(e){}
+
+  if(!saved){
+    try{
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url; a.download = filename;
+      document.body.appendChild(a); a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+      saved = true;
+    }catch(e){}
+  }
+
+  status.innerHTML = saved
+    ? '<b>✓ Файл macdroid_ui_restore_answers.txt успешно сохранён!</b> Отправьте его содержимое сюда.'
+    : 'Файл не удалось скачать автоматически. Нажмите кнопку «Скопировать текст ответов» ниже.';
+});
+
+document.getElementById('copyBtn').addEventListener('click', ()=>{
+  const status = document.getElementById('status');
+  const box = document.getElementById('copyBox');
+  const text = generateReportText();
+  navigator.clipboard.writeText(text).then(()=>{
+    status.innerHTML = '<b>✓ Ответы скопированы в буфер обмена!</b> Просто вставьте (Cmd+V) их в чат.';
+    box.style.display = 'block';
+    box.textContent = text;
+  }).catch(()=>{
+    box.style.display = 'block';
+    box.textContent = text;
+    status.textContent = 'Выделите текст в рамке ниже и скопируйте (Cmd+C).';
+  });
+});
+
+document.getElementById('selectAllBtn').addEventListener('click', ()=>{
+  document.querySelectorAll('.card[data-q] input[type=checkbox]').forEach(cb=>{
+    cb.checked = true;
+    cb.closest('.opt').classList.add('checked');
+  });
+  updateProgress();
+  const status = document.getElementById('status');
+  status.textContent = 'Все опции мультивыбора отмечены. Снимите галочки с того, что НЕ нужно, и сохраните.';
+});
+</script>
+</body>
+</html>

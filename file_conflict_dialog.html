@@ -1,0 +1,382 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>File conflict</title>
+  <style>
+    :root {
+      font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", Inter, sans-serif;
+      color: #273341;
+      background: #f4f6f8;
+    }
+    * {
+      box-sizing: border-box;
+    }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      display: grid;
+      place-items: center;
+      padding: 20px;
+    }
+    .dialog {
+      width: min(100%, 530px);
+      background: #fff;
+      border: 1px solid #e0e5eb;
+      border-radius: 15px;
+      box-shadow: 0 18px 60px #26374b16;
+      overflow: hidden;
+    }
+    .header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 18px 20px 14px;
+    }
+    .header strong {
+      font-size: 19px;
+      font-weight: 650;
+    }
+    .close {
+      border: 0;
+      background: transparent;
+      color: #8b96a4;
+      font-size: 21px;
+      cursor: pointer;
+    }
+    .files {
+      margin: 0 20px 16px;
+      border: 1px solid #e9edf1;
+      border-radius: 10px;
+      overflow: hidden;
+    }
+    .file {
+      display: grid;
+      grid-template-columns: 70px 1fr auto;
+      gap: 10px;
+      align-items: center;
+      padding: 10px 13px;
+      font-size: 14px;
+    }
+    .file + .file {
+      border-top: 1px solid #eef0f3;
+    }
+    .tag {
+      color: #8a96a2;
+      font-size: 13px;
+    }
+    .name {
+      font-weight: 570;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .name-input {
+      width: 100%;
+      font-family: inherit;
+      font-size: 14px;
+      font-weight: 570;
+      color: #273341;
+      background: transparent;
+      border: 1px solid transparent;
+      border-radius: 4px;
+      padding: 2px 5px;
+      margin: -2px -5px;
+      outline: none;
+      transition: background 0.15s, border-color 0.15s;
+    }
+    .name-input:focus {
+      background: #edf3f9;
+      border-color: #92aec8;
+    }
+    .name-input::selection {
+      background: #6c9dcc;
+      color: #ffffff;
+    }
+    .meta {
+      color: #8a96a2;
+      font-variant-numeric: tabular-nums;
+      font-size: 13px;
+    }
+    .actions {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 5px;
+      margin: 0 20px;
+    }
+    .choice {
+      position: relative;
+    }
+    .choice input {
+      position: absolute;
+      opacity: 0;
+      pointer-events: none;
+    }
+    .choice span {
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      text-align: center;
+      min-height: 37px;
+      padding: 6px 3px;
+      border: 1px solid #e2e7ec;
+      border-radius: 7px;
+      color: #556372;
+      font-size: 13px;
+      white-space: nowrap;
+      cursor: pointer;
+    }
+    .choice input:checked + span {
+      background: #edf3f9;
+      border-color: #92aec8;
+      color: #345f83;
+      font-weight: 650;
+    }
+    .choice input:focus-visible + span {
+      outline: 2px solid #6c9dcc;
+      outline-offset: 2px;
+    }
+    .all {
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      gap: 7px;
+      margin: 14px 0 16px;
+      font-size: 14px;
+      color: #647282;
+      cursor: pointer;
+    }
+    .all input {
+      width: 15px;
+      height: 15px;
+      accent-color: #668aa9;
+    }
+    .footer {
+      display: flex;
+      justify-content: flex-end;
+      gap: 8px;
+      padding: 13px 20px;
+      background: #fafbfc;
+      border-top: 1px solid #eef0f3;
+    }
+    .btn {
+      border: 1px solid #dfe5eb;
+      border-radius: 8px;
+      background: white;
+      color: #4d5c69;
+      padding: 9px 19px;
+      font-size: 14px;
+      cursor: pointer;
+    }
+    .btn.primary {
+      background: #617f99;
+      color: white;
+      border-color: #617f99;
+    }
+    .dialog.single .all,
+    .dialog.single .footer {
+      display: none;
+    }
+    .dialog.single .actions {
+      margin-bottom: 20px;
+    }
+    @media (max-width: 520px) {
+      .dialog {
+        width: 100%;
+      }
+      .actions {
+        gap: 3px;
+        margin: 0 12px;
+      }
+      .choice span {
+        font-size: 12px;
+      }
+      .files {
+        margin-left: 12px;
+        margin-right: 12px;
+      }
+      .file {
+        grid-template-columns: 56px 1fr;
+        gap: 5px;
+      }
+      .meta {
+        grid-column: 2;
+      }
+    }
+  </style>
+</head>
+<body>
+
+<main class="dialog" role="dialog" aria-label="File conflict">
+  <div class="header">
+    <strong>File already exists</strong>
+    <button class="close" aria-label="Close" onclick="cancel()">×</button>
+  </div>
+
+  <section class="files">
+    <div class="file">
+      <span class="tag">Source</span>
+      <input
+        type="text"
+        class="name-input"
+        id="sourceNameInput"
+        value="document-1.pdf"
+        spellcheck="false"
+        autocomplete="off"
+        aria-label="Source file name"
+      >
+      <span class="meta">2.4 MB · Oct 15, 20:42</span>
+    </div>
+    <div class="file">
+      <span class="tag">Target</span>
+      <span class="name">document.pdf</span>
+      <span class="meta">2.1 MB · Oct 14, 17:20</span>
+    </div>
+  </section>
+
+  <div class="actions" role="radiogroup" aria-label="Conflict action">
+    <label class="choice">
+      <input type="radio" name="action" value="Skip">
+      <span>Skip</span>
+    </label>
+    <label class="choice">
+      <input type="radio" name="action" value="Auto-rename" checked>
+      <span>Auto-rename</span>
+    </label>
+    <label class="choice">
+      <input type="radio" name="action" value="Overwrite">
+      <span>Overwrite</span>
+    </label>
+    <label class="choice">
+      <input type="radio" name="action" value="Overwrite old">
+      <span>Overwrite old</span>
+    </label>
+  </div>
+
+  <label class="all">
+    <input id="all" type="checkbox" checked>
+    <span>for All</span>
+  </label>
+
+  <div class="footer">
+    <button class="btn" onclick="cancel()">Cancel</button>
+    <button class="btn primary" onclick="apply()">Continue</button>
+  </div>
+</main>
+
+<script>
+  const nameInput = document.getElementById('sourceNameInput');
+  const allCheckbox = document.getElementById('all');
+  const originalFileName = 'document.pdf';
+
+  const dialog = document.querySelector('.dialog');
+  const fileCount = 1;   // ← сюда подставляйте реальное число конфликтующих файлов
+  const isSingle = fileCount === 1;
+  dialog.classList.toggle('single', isSingle);
+
+  /**
+   * Auto-rename rule: adds -n to filename (e.g. example.txt -> example-1.txt, example-1.txt -> example-2.txt)
+   */
+  function generateAutoRename(filename) {
+    const lastDot = filename.lastIndexOf('.');
+    let base = filename;
+    let ext = '';
+
+    if (lastDot > 0) {
+      base = filename.slice(0, lastDot);
+      ext = filename.slice(lastDot);
+    }
+
+    const match = base.match(/^(.*?)-(\d+)$/);
+    if (match) {
+      const prefix = match[1];
+      const nextIndex = parseInt(match[2], 10) + 1;
+      return `${prefix}-${nextIndex}${ext}`;
+    }
+
+    return `${base}-1${ext}`;
+  }
+
+  function selectNameWithoutExtension() {
+    nameInput.focus();
+    const dot = nameInput.value.lastIndexOf('.');
+    if (dot > 0) {
+      nameInput.setSelectionRange(0, dot);
+    } else {
+      nameInput.select();
+    }
+  }
+
+  // Focus and select the filename (in blue) on load
+  window.addEventListener('DOMContentLoaded', () => {
+    nameInput.value = generateAutoRename(originalFileName); // "document-1.pdf"
+    selectNameWithoutExtension();
+  });
+
+  const choices = document.querySelectorAll('input[name=action]');
+
+  // Многофайловый режим: клик только выбирает состояние (как чекбокс)
+  choices.forEach(x => x.addEventListener('change', () => {
+    if (x.value === 'Auto-rename' && x.checked) {
+      nameInput.value = generateAutoRename(originalFileName);
+      selectNameWithoutExtension();
+    } else if (x.checked) {
+      nameInput.value = originalFileName;
+      selectNameWithoutExtension();
+    }
+  }));
+
+  // Клик по кнопке действия
+  document.querySelectorAll('.choice').forEach(label => {
+    label.addEventListener('click', e => {
+      if (e.target.tagName === 'INPUT') return;
+
+      const input = label.querySelector('input');
+      input.checked = true;
+
+      // Клик по Skip всегда сразу пропускает данный файл
+      if (input.value === 'Skip') {
+        apply('Skip');
+        return;
+      }
+
+      if (isSingle) {
+        apply(input.value);
+      }
+    });
+  });
+
+  function apply(forcedAction) {
+    const action = forcedAction
+      ?? document.querySelector('input[name=action]:checked').value;
+
+    const newName = action === 'Auto-rename'
+      ? nameInput.value.trim()
+      : originalFileName;
+
+    const result = {
+      action,
+      forAll: isSingle ? false : allCheckbox.checked,
+      newName
+    };
+
+    console.log('[File Conflict Action]', result);
+    window.dispatchEvent(new CustomEvent('file-conflict-action', { detail: result }));
+  }
+
+  function cancel() {
+    window.dispatchEvent(new CustomEvent('file-conflict-action', { detail: { action: 'Cancel' } }));
+  }
+
+  window.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') {
+      cancel();
+    } else if (e.key === 'Enter') {
+      apply();
+    }
+  });
+</script>
+
+</body>
+</html>

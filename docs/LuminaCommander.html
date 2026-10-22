@@ -1,0 +1,1168 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#f8fafc">
+  <title>Lumina Commander — dual-pane file manager</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --bg: #f4f6f9;
+      --surface: #ffffff;
+      --surface-2: #f8fafc;
+      --border: #e2e8f0;
+      --border-soft: #f1f5f9;
+      --text: #0f172a;
+      --text-secondary: #64748b;
+      --text-muted: #94a3b8;
+      --accent: #4f46e5;
+      --accent-soft: #eef2ff;
+      --accent-hover: #4338ca;
+      --success: #10b981;
+      --warning: #f59e0b;
+      --danger: #ef4444;
+      --shadow-sm: 0 1px 2px rgba(15, 23, 42, 0.04);
+      --shadow: 0 4px 16px rgba(15, 23, 42, 0.06), 0 1px 3px rgba(15, 23, 42, 0.04);
+      --shadow-lg: 0 12px 40px rgba(15, 23, 42, 0.08);
+      --radius: 12px;
+      --radius-sm: 8px;
+      --radius-xs: 6px;
+      --font: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+      --transition: 160ms cubic-bezier(0.4, 0, 0.2, 1);
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body { height: 100%; }
+    body {
+      font-family: var(--font);
+      font-size: 13.5px;
+      color: var(--text);
+      background: var(--bg);
+      line-height: 1.45;
+      overflow: hidden;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    /* ─── Top bar ─── */
+    .topbar {
+      height: 56px;
+      display: flex;
+      align-items: center;
+      gap: 16px;
+      padding: 0 20px;
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+      box-shadow: var(--shadow-sm);
+      position: relative;
+      z-index: 10;
+    }
+    .logo {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      font-weight: 700;
+      font-size: 15px;
+      letter-spacing: -0.02em;
+      color: var(--text);
+      flex-shrink: 0;
+    }
+    .logo-mark {
+      width: 28px;
+      height: 28px;
+      border-radius: 8px;
+      background: linear-gradient(135deg, #6366f1 0%, #8b5cf6 100%);
+      display: grid;
+      place-items: center;
+      color: white;
+      font-size: 14px;
+      font-weight: 700;
+      box-shadow: 0 2px 8px rgba(99, 102, 241, 0.35);
+    }
+    .logo-version {
+      font-size: 11px;
+      font-weight: 500;
+      color: var(--text-muted);
+      margin-left: 2px;
+    }
+
+    .toolbar {
+      display: flex;
+      align-items: center;
+      gap: 4px;
+      margin-left: 8px;
+    }
+    .tool-btn {
+      height: 34px;
+      min-width: 34px;
+      padding: 0 10px;
+      border: none;
+      border-radius: var(--radius-sm);
+      background: transparent;
+      color: var(--text-secondary);
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 6px;
+      cursor: pointer;
+      transition: all var(--transition);
+      font-size: 13px;
+      font-weight: 500;
+      font-family: inherit;
+    }
+    .tool-btn:hover {
+      background: var(--surface-2);
+      color: var(--text);
+    }
+    .tool-btn:active { transform: scale(0.97); }
+    .tool-btn.primary {
+      background: var(--accent);
+      color: white;
+    }
+    .tool-btn.primary:hover { background: var(--accent-hover); }
+    .tool-btn svg { width: 16px; height: 16px; flex-shrink: 0; }
+    .tool-sep {
+      width: 1px;
+      height: 20px;
+      background: var(--border);
+      margin: 0 6px;
+    }
+
+    .top-right {
+      margin-left: auto;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .search-wrap {
+      position: relative;
+      width: 220px;
+    }
+    .search-wrap input {
+      width: 100%;
+      height: 34px;
+      padding: 0 12px 0 34px;
+      border: 1px solid var(--border);
+      border-radius: 999px;
+      background: var(--surface-2);
+      font: inherit;
+      color: var(--text);
+      outline: none;
+      transition: all var(--transition);
+    }
+    .search-wrap input:focus {
+      border-color: var(--accent);
+      background: white;
+      box-shadow: 0 0 0 3px var(--accent-soft);
+    }
+    .search-wrap input::placeholder { color: var(--text-muted); }
+    .search-icon {
+      position: absolute;
+      left: 11px;
+      top: 50%;
+      transform: translateY(-50%);
+      color: var(--text-muted);
+      pointer-events: none;
+    }
+
+    /* ─── Workspace ─── */
+    .workspace {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      height: calc(100vh - 56px);
+      gap: 1px;
+      background: var(--border);
+    }
+
+    .pane {
+      display: flex;
+      flex-direction: column;
+      background: var(--surface);
+      min-width: 0;
+      min-height: 0;
+      position: relative;
+    }
+    .pane.is-active::after {
+      content: '';
+      position: absolute;
+      top: 0;
+      left: 0;
+      right: 0;
+      height: 2px;
+      background: var(--accent);
+      border-radius: 0 0 2px 2px;
+    }
+
+    /* Tabs */
+    .tabs {
+      display: flex;
+      align-items: center;
+      gap: 2px;
+      padding: 10px 12px 0;
+      background: var(--surface-2);
+      border-bottom: 1px solid var(--border);
+      overflow-x: auto;
+      scrollbar-width: none;
+    }
+    .tabs::-webkit-scrollbar { display: none; }
+    .tab {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      height: 32px;
+      padding: 0 12px;
+      border: none;
+      border-radius: var(--radius-sm) var(--radius-sm) 0 0;
+      background: transparent;
+      color: var(--text-secondary);
+      font: inherit;
+      font-size: 12.5px;
+      font-weight: 500;
+      cursor: pointer;
+      white-space: nowrap;
+      max-width: 140px;
+      transition: all var(--transition);
+      position: relative;
+    }
+    .tab:hover { color: var(--text); background: rgba(255,255,255,0.6); }
+    .tab.active {
+      background: var(--surface);
+      color: var(--text);
+      font-weight: 600;
+      box-shadow: 0 -1px 0 white;
+    }
+    .tab-name { overflow: hidden; text-overflow: ellipsis; }
+    .tab .pin { opacity: 0.45; }
+    .tab .close {
+      width: 14px;
+      height: 14px;
+      border-radius: 4px;
+      display: grid;
+      place-items: center;
+      margin-left: 2px;
+      opacity: 0;
+      transition: opacity var(--transition);
+      color: var(--text-muted);
+    }
+    .tab:hover .close { opacity: 1; }
+    .tab .close:hover { background: #fee2e2; color: var(--danger); }
+    .tab-add {
+      width: 28px;
+      height: 28px;
+      border: none;
+      border-radius: var(--radius-xs);
+      background: transparent;
+      color: var(--text-muted);
+      display: grid;
+      place-items: center;
+      cursor: pointer;
+      margin-left: 4px;
+      flex-shrink: 0;
+      transition: all var(--transition);
+    }
+    .tab-add:hover { background: white; color: var(--text); }
+
+    /* Pane controls */
+    .pane-controls {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 8px 12px;
+      background: var(--surface);
+      border-bottom: 1px solid var(--border-soft);
+    }
+    .source-switch {
+      display: flex;
+      background: var(--surface-2);
+      border-radius: var(--radius-sm);
+      padding: 2px;
+      gap: 1px;
+    }
+    .source-btn {
+      height: 28px;
+      padding: 0 10px;
+      border: none;
+      border-radius: 6px;
+      background: transparent;
+      color: var(--text-secondary);
+      font: inherit;
+      font-size: 12px;
+      font-weight: 500;
+      display: flex;
+      align-items: center;
+      gap: 5px;
+      cursor: pointer;
+      transition: all var(--transition);
+    }
+    .source-btn.active {
+      background: white;
+      color: var(--text);
+      box-shadow: var(--shadow-sm);
+      font-weight: 600;
+    }
+    .source-btn .dot {
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      background: var(--text-muted);
+    }
+    .source-btn.active .dot { background: var(--success); }
+
+    .crumbs {
+      display: flex;
+      align-items: center;
+      gap: 4px;
+      min-width: 0;
+      flex: 1;
+      overflow: hidden;
+    }
+    .crumb {
+      border: none;
+      background: none;
+      font: inherit;
+      font-weight: 600;
+      font-size: 13px;
+      color: var(--text);
+      cursor: pointer;
+      padding: 2px 6px;
+      border-radius: 4px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .crumb:hover { background: var(--surface-2); }
+    .crumb-sep { color: var(--text-muted); font-size: 11px; flex-shrink: 0; }
+
+    .filter-wrap {
+      position: relative;
+      width: 130px;
+      flex-shrink: 0;
+    }
+    .filter-wrap input {
+      width: 100%;
+      height: 28px;
+      padding: 0 8px 0 28px;
+      border: 1px solid var(--border);
+      border-radius: var(--radius-xs);
+      background: var(--surface-2);
+      font: inherit;
+      font-size: 12px;
+      color: var(--text);
+      outline: none;
+      transition: all var(--transition);
+    }
+    .filter-wrap input:focus {
+      border-color: var(--accent);
+      background: white;
+      box-shadow: 0 0 0 2px var(--accent-soft);
+    }
+    .filter-wrap input::placeholder { color: var(--text-muted); }
+    .filter-icon {
+      position: absolute;
+      left: 8px;
+      top: 50%;
+      transform: translateY(-50%);
+      color: var(--text-muted);
+      pointer-events: none;
+    }
+
+    /* Table head */
+    .table-head {
+      display: grid;
+      grid-template-columns: 1fr 90px 130px;
+      padding: 0 8px;
+      height: 32px;
+      align-items: center;
+      border-bottom: 1px solid var(--border);
+      background: var(--surface);
+      color: var(--text-secondary);
+      font-size: 11.5px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.03em;
+      user-select: none;
+    }
+    .head-cell {
+      display: flex;
+      align-items: center;
+      gap: 4px;
+      padding: 0 8px;
+      height: 100%;
+      cursor: pointer;
+      border-radius: 4px;
+      transition: background var(--transition);
+    }
+    .head-cell:hover { background: var(--surface-2); }
+    .head-cell .sort-icon { opacity: 0.5; }
+
+    /* Rows */
+    .rows {
+      flex: 1;
+      overflow-y: auto;
+      padding: 6px 8px;
+      scrollbar-width: thin;
+      scrollbar-color: #cbd5e1 transparent;
+    }
+    .rows::-webkit-scrollbar { width: 6px; }
+    .rows::-webkit-scrollbar-thumb {
+      background: #cbd5e1;
+      border-radius: 6px;
+    }
+
+    .file-row {
+      display: grid;
+      grid-template-columns: 1fr 90px 130px;
+      height: 36px;
+      align-items: center;
+      border-radius: var(--radius-sm);
+      cursor: default;
+      transition: background var(--transition);
+      position: relative;
+    }
+    .file-row:hover { background: var(--surface-2); }
+    .file-row.selected {
+      background: var(--accent-soft);
+      color: var(--accent);
+    }
+    .file-row.selected .size-cell,
+    .file-row.selected .date-cell { color: var(--accent); opacity: 0.75; }
+    .file-row.compare-diff::before {
+      content: '';
+      position: absolute;
+      left: 0;
+      top: 6px;
+      bottom: 6px;
+      width: 3px;
+      border-radius: 2px;
+      background: var(--warning);
+    }
+
+    .name-cell {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 0 10px;
+      min-width: 0;
+      overflow: hidden;
+    }
+    .folder-icon {
+      width: 18px;
+      height: 18px;
+      flex-shrink: 0;
+      color: #f59e0b;
+    }
+    .file-name {
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      font-weight: 500;
+    }
+    .size-cell, .date-cell {
+      padding: 0 8px;
+      color: var(--text-muted);
+      font-size: 12px;
+      white-space: nowrap;
+      font-variant-numeric: tabular-nums;
+    }
+
+    /* Status */
+    .statusline {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      height: 28px;
+      padding: 0 14px;
+      border-top: 1px solid var(--border);
+      background: var(--surface-2);
+      color: var(--text-muted);
+      font-size: 11.5px;
+    }
+
+    /* Grid mode */
+    .workspace.grid-mode .rows {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(110px, 1fr));
+      gap: 8px;
+      padding: 12px;
+      align-content: start;
+    }
+    .workspace.grid-mode .file-row {
+      height: auto;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 8px;
+      padding: 14px 8px;
+      border: 1px solid var(--border-soft);
+      border-radius: var(--radius);
+    }
+    .workspace.grid-mode .file-row:hover { border-color: var(--border); }
+    .workspace.grid-mode .file-row.selected {
+      border-color: var(--accent);
+      background: var(--accent-soft);
+    }
+    .workspace.grid-mode .name-cell {
+      flex-direction: column;
+      gap: 8px;
+      text-align: center;
+      padding: 0;
+    }
+    .workspace.grid-mode .folder-icon { width: 32px; height: 32px; }
+    .workspace.grid-mode .size-cell,
+    .workspace.grid-mode .date-cell { display: none; }
+
+    /* Toast */
+    .toast {
+      position: fixed;
+      left: 50%;
+      bottom: 28px;
+      transform: translateX(-50%) translateY(12px);
+      padding: 10px 18px;
+      background: #1e293b;
+      color: white;
+      border-radius: 999px;
+      font-size: 13px;
+      font-weight: 500;
+      box-shadow: var(--shadow-lg);
+      z-index: 100;
+      opacity: 0;
+      transition: all 220ms cubic-bezier(0.4, 0, 0.2, 1);
+      pointer-events: none;
+    }
+    .toast.show {
+      opacity: 1;
+      transform: translateX(-50%) translateY(0);
+    }
+
+    /* Dialog */
+    .dialog-backdrop {
+      position: fixed;
+      inset: 0;
+      background: rgba(15, 23, 42, 0.28);
+      backdrop-filter: blur(4px);
+      display: grid;
+      place-items: center;
+      z-index: 50;
+      padding: 20px;
+      animation: fadeIn 160ms ease;
+    }
+    @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
+    .dialog {
+      width: min(400px, 100%);
+      background: white;
+      border-radius: 16px;
+      padding: 24px;
+      box-shadow: var(--shadow-lg);
+      animation: slideUp 200ms cubic-bezier(0.4, 0, 0.2, 1);
+    }
+    @keyframes slideUp {
+      from { opacity: 0; transform: translateY(12px) scale(0.98); }
+      to { opacity: 1; transform: translateY(0) scale(1); }
+    }
+    .dialog h2 {
+      font-size: 17px;
+      font-weight: 700;
+      letter-spacing: -0.02em;
+      margin-bottom: 6px;
+    }
+    .dialog p {
+      color: var(--text-secondary);
+      font-size: 13px;
+      margin-bottom: 16px;
+      line-height: 1.5;
+    }
+    .dialog input {
+      width: 100%;
+      height: 38px;
+      padding: 0 12px;
+      border: 1px solid var(--border);
+      border-radius: var(--radius-sm);
+      font: inherit;
+      font-size: 14px;
+      outline: none;
+      transition: all var(--transition);
+    }
+    .dialog input:focus {
+      border-color: var(--accent);
+      box-shadow: 0 0 0 3px var(--accent-soft);
+    }
+    .dialog-actions {
+      display: flex;
+      justify-content: flex-end;
+      gap: 8px;
+      margin-top: 20px;
+    }
+    .dialog-actions button {
+      height: 34px;
+      padding: 0 16px;
+      border: 1px solid var(--border);
+      border-radius: var(--radius-sm);
+      background: white;
+      font: inherit;
+      font-size: 13px;
+      font-weight: 500;
+      cursor: pointer;
+      transition: all var(--transition);
+    }
+    .dialog-actions button:hover { background: var(--surface-2); }
+    .dialog-actions .primary {
+      background: var(--accent);
+      border-color: var(--accent);
+      color: white;
+    }
+    .dialog-actions .primary:hover { background: var(--accent-hover); }
+    .dialog-actions .danger {
+      background: var(--danger);
+      border-color: var(--danger);
+      color: white;
+    }
+
+    /* Download FAB */
+    .download-fab {
+      position: fixed;
+      right: 24px;
+      bottom: 24px;
+      z-index: 40;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      height: 44px;
+      padding: 0 18px;
+      background: linear-gradient(135deg, #4f46e5 0%, #7c3aed 100%);
+      color: white;
+      border: none;
+      border-radius: 999px;
+      font: inherit;
+      font-size: 13.5px;
+      font-weight: 600;
+      cursor: pointer;
+      box-shadow: 0 8px 24px rgba(79, 70, 229, 0.35);
+      transition: all var(--transition);
+    }
+    .download-fab:hover {
+      transform: translateY(-2px);
+      box-shadow: 0 12px 28px rgba(79, 70, 229, 0.45);
+    }
+    .download-fab:active { transform: translateY(0); }
+    .download-fab svg { width: 18px; height: 18px; }
+
+    .empty-note {
+      padding: 40px 20px;
+      text-align: center;
+      color: var(--text-muted);
+      font-size: 13px;
+    }
+
+    @media (max-width: 900px) {
+      .workspace { grid-template-columns: 1fr; }
+      .pane:last-child { display: none; }
+      .search-wrap { width: 160px; }
+      .table-head, .file-row { grid-template-columns: 1fr 70px 110px; }
+    }
+  </style>
+</head>
+<body>
+  <header class="topbar">
+    <div class="logo">
+      <div class="logo-mark">L</div>
+      <span>Lumina Commander</span>
+      <span class="logo-version">1.0</span>
+    </div>
+
+    <div class="toolbar">
+      <button class="tool-btn" data-action="copy" title="Копировать (F5)">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+      </button>
+      <button class="tool-btn" data-action="move" title="Переместить (F6)">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="5" width="11" height="14" rx="2"/><path d="M9 12h12"/><path d="m17 8 4 4-4 4"/></svg>
+      </button>
+      <button class="tool-btn" data-action="new-folder" title="Новая папка (F7)">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 10v6"/><path d="M9 13h6"/><path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9l-.81-1.2A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z"/></svg>
+      </button>
+      <button class="tool-btn" data-action="delete" title="Удалить (F8)">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/></svg>
+      </button>
+      <span class="tool-sep"></span>
+      <button class="tool-btn" data-action="back" title="Назад">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m15 18-6-6 6-6"/></svg>
+      </button>
+      <button class="tool-btn" data-action="forward" title="Вперёд">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m9 18 6-6-6-6"/></svg>
+      </button>
+      <span class="tool-sep"></span>
+      <button class="tool-btn" data-action="rename" title="Переименовать">Абв</button>
+      <button class="tool-btn" data-action="compare" title="Сравнить панели">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+          <rect x="3.5" y="3.5" width="17" height="17" rx="2"/>
+          <line x1="12" y1="1.8" x2="12" y2="22.2" stroke-dasharray="2.2 1.8"/>
+          <path d="M 6.1 14.8 L 7.8 9.4 L 9.5 14.8"/>
+          <line x1="6.7" y1="13.1" x2="8.9" y2="13.1"/>
+          <path d="M 14.4 9.4 h 2.0 c 1.0 0 1.7 0.6 1.7 1.4 c 0 0.8 -0.7 1.4 -1.7 1.4 h -2.0"/>
+          <path d="M 14.4 12.2 h 2.2 c 1.0 0 1.8 0.6 1.8 1.4 c 0 0.8 -0.8 1.4 -1.8 1.4 h -2.2"/>
+          <line x1="14.4" y1="9.4" x2="14.4" y2="15.0"/>
+          <line x1="13.7" y1="5.6" x2="13.7" y2="6.8" stroke-width="1.5"/>
+          <line x1="15.5" y1="5.6" x2="15.5" y2="6.8" stroke-width="1.5"/>
+          <line x1="17.3" y1="5.6" x2="17.3" y2="6.8" stroke-width="1.5"/>
+          <line x1="19.1" y1="5.6" x2="19.1" y2="6.8" stroke-width="1.5"/>
+          <line x1="4.9" y1="17.2" x2="4.9" y2="18.4" stroke-width="1.5"/>
+          <line x1="6.7" y1="17.2" x2="6.7" y2="18.4" stroke-width="1.5"/>
+          <line x1="8.5" y1="17.2" x2="8.5" y2="18.4" stroke-width="1.5"/>
+          <line x1="10.3" y1="17.2" x2="10.3" y2="18.4" stroke-width="1.5"/>
+        </svg>
+      </button>
+      <button class="tool-btn" data-action="view" title="Режим отображения">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>
+      </button>
+      <button class="tool-btn" data-action="refresh" title="Обновить">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/><path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"/><path d="M8 16H3v5"/></svg>
+      </button>
+    </div>
+
+    <div class="top-right">
+      <div class="search-wrap">
+        <svg class="search-icon" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></svg>
+        <input type="search" id="global-search" placeholder="Быстрый поиск…" autocomplete="off">
+      </div>
+    </div>
+  </header>
+
+  <main class="workspace" id="workspace"></main>
+
+  <div id="overlays"></div>
+  <div class="toast" id="toast"></div>
+
+  <button class="download-fab" id="download-btn" title="Скачать этот HTML-файл">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+    Скачать HTML
+  </button>
+
+  <script>
+    // ─── Data ───
+    const baseItems = [
+      ['Automation', '08.10.26 12:15'],
+      ['pipeline-card-preview', '08.10.26 09:25'],
+      ['LuminaCommander_Gemini', '07.10.26 22:58'],
+      ['LuminaCommander_Gemini — копия', '07.10.26 22:58'],
+      ['Saved sessions', '05.10.26 16:31'],
+      ['Doc_Scan', '04.10.26 23:10'],
+      ['SoundField Аудио', '04.10.26 11:46'],
+      ['Иконки', '03.10.26 13:16'],
+      ['DocScanSpikeHarness', '03.10.26 09:16'],
+      ['Telegram Desktop', '02.10.26 20:20'],
+      ['TYPESAFE', '30.09.26 23:48'],
+      ['Plan MVP', '30.09.26 13:32'],
+      ['SoundField', '30.09.26 10:59'],
+      ['Lumina', '29.09.26 07:01'],
+      ['Marcin', '28.09.26 22:34'],
+      ['SoundField 1.4.7', '28.09.26 08:11'],
+      ['Методология разработки', '26.09.26 00:09'],
+      ['Design System 2026', '25.09.26 18:40'],
+      ['API Contracts', '24.09.26 14:22'],
+      ['Prototype Lab', '23.09.26 11:05']
+    ].map(([name, date], i) => ({ id: `item-${i}`, name, date, kind: 'folder' }));
+
+    const items = [...baseItems, ...Array.from({ length: 80 }, (_, i) => {
+      const day = Math.max(1, 22 - Math.floor(i / 12));
+      const hour = 20 - (i % 12);
+      return {
+        id: `item-${i + 20}`,
+        name: `Проект ${String(i + 21).padStart(3, '0')}`,
+        date: `${String(day).padStart(2, '0')}.09.26 ${String(hour).padStart(2, '0')}:00`,
+        kind: 'folder'
+      };
+    })];
+
+    const tabsBySide = {
+      left: [
+        { name: 'Downloads', removable: true, active: true },
+        { name: 'Projects', pinned: true },
+        { name: 'GitHub', pinned: true },
+        { name: 'Archive', pinned: true }
+      ],
+      right: [
+        { name: 'Documents', pinned: true },
+        { name: 'Downloads', removable: true, active: true },
+        { name: 'Shared', pinned: true },
+        { name: '2.81.604', removable: true }
+      ]
+    };
+
+    const panes = {
+      left: {
+        side: 'left', path: 'Downloads', source: 'Mac',
+        tabs: tabsBySide.left, filter: '', sort: '', ascending: true,
+        history: [], forward: [], selected: new Set()
+      },
+      right: {
+        side: 'right', path: 'Downloads', source: 'Mac',
+        tabs: tabsBySide.right, filter: '', sort: '', ascending: true,
+        history: [], forward: [], selected: new Set(['item-3'])
+      }
+    };
+
+    let activeSide = 'right';
+    let comparing = false;
+    let gridMode = false;
+    let queueCount = 0;
+    let toastTimer;
+
+    // ─── Helpers ───
+    const esc = s => String(s).replace(/[&<>"']/g, c =>
+      ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+
+    const folderSvg = `<svg class="folder-icon" viewBox="0 0 24 24" fill="currentColor"><path d="M10 4H4c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V8c0-1.1-.9-2-2-2h-8l-2-2z"/></svg>`;
+
+    function visibleItems(pane) {
+      let list = items.filter(it =>
+        it.name.toLocaleLowerCase('ru').includes(pane.filter.trim().toLocaleLowerCase('ru'))
+      );
+      if (pane.sort) {
+        list = [...list].sort((a, b) => {
+          if (pane.sort === 'date') {
+            const ts = v => {
+              const [d, m, y, t] = v.split(/[. ]/);
+              const [h, min] = t.split(':');
+              return new Date(2000 + +y, +m - 1, +d, +h, +min).getTime();
+            };
+            return ts(a.date) - ts(b.date);
+          }
+          return a.name.localeCompare(b.name, 'ru', { numeric: true });
+        });
+        if (!pane.ascending) list.reverse();
+      }
+      return list;
+    }
+
+    function toast(msg) {
+      clearTimeout(toastTimer);
+      const el = document.getElementById('toast');
+      el.textContent = msg;
+      el.classList.add('show');
+      toastTimer = setTimeout(() => el.classList.remove('show'), 2000);
+    }
+
+    // ─── Render ───
+    function renderTabs(pane) {
+      return pane.tabs.map((tab, i) => `
+        <button class="tab ${tab.active ? 'active' : ''}" data-action="tab" data-side="${pane.side}" data-index="${i}" title="${esc(tab.name)}">
+          <span class="tab-name">${esc(tab.name)}</span>
+          ${tab.pinned ? '<svg class="pin" width="10" height="10" viewBox="0 0 24 24" fill="currentColor"><path d="M16 12V4h1V2H7v2h1v8l-2 2v2h5.2v6h1.6v-6H18v-2l-2-2z"/></svg>' : ''}
+          ${tab.removable ? `<span class="close" data-action="close-tab" data-side="${pane.side}" data-index="${i}" title="Закрыть">
+            <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M18 6 6 18M6 6l12 12"/></svg>
+          </span>` : ''}
+        </button>
+      `).join('') + `
+        <button class="tab-add" data-action="add-tab" data-side="${pane.side}" title="Новая вкладка">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 5v14M5 12h14"/></svg>
+        </button>`;
+    }
+
+    function renderRows(pane) {
+      const list = visibleItems(pane);
+      if (!list.length) return '<div class="empty-note">Ничего не найдено</div>';
+      return list.map((item, idx) => {
+        const sel = pane.selected.has(item.id);
+        const diff = comparing && idx % 7 === 3 ? ' compare-diff' : '';
+        return `
+          <div class="file-row ${sel ? 'selected' : ''}${diff}" role="row" tabindex="0"
+               data-action="row" data-side="${pane.side}" data-id="${item.id}">
+            <div class="name-cell">${folderSvg}<span class="file-name" title="${esc(item.name)}">${esc(item.name)}</span></div>
+            <div class="size-cell">—</div>
+            <div class="date-cell">${esc(item.date)}</div>
+          </div>`;
+      }).join('');
+    }
+
+    function renderPane(pane) {
+      const node = document.querySelector(`.pane[data-side="${pane.side}"]`);
+      if (!node) return;
+      node.querySelector('.tabs').innerHTML = renderTabs(pane);
+      node.querySelector('.rows').innerHTML = renderRows(pane);
+      node.querySelector('.crumb').textContent = pane.path;
+      node.querySelector('.status-count').textContent =
+        `Выделено: ${pane.selected.size} из ${items.length}`;
+      // re-bind source buttons
+      node.querySelectorAll('.source-btn').forEach(btn => {
+        btn.classList.toggle('active', btn.dataset.source === pane.source);
+      });
+    }
+
+    function createPane(pane) {
+      const active = activeSide === pane.side;
+      return `
+        <section class="pane ${active ? 'is-active' : ''}" data-side="${pane.side}">
+          <div class="tabs">${renderTabs(pane)}</div>
+          <div class="pane-controls">
+            <div class="source-switch">
+              <button class="source-btn ${pane.source === 'Mac' ? 'active' : ''}" data-action="source" data-source="Mac" data-side="${pane.side}">
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8M12 17v4"/></svg>
+                Mac
+              </button>
+              <button class="source-btn ${pane.source === 'Phone' ? 'active' : ''}" data-action="source" data-source="Phone" data-side="${pane.side}">
+                <span class="dot"></span> Phone
+              </button>
+            </div>
+            <div class="crumbs">
+              <span class="crumb-sep">›</span>
+              <button class="crumb" data-action="crumb" data-side="${pane.side}">${esc(pane.path)}</button>
+            </div>
+            <div class="filter-wrap">
+              <svg class="filter-icon" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 3H2l8 9.46V19l4 2v-8.54L22 3z"/></svg>
+              <input class="filter-input" data-side="${pane.side}" placeholder="Фильтр…" value="${esc(pane.filter)}">
+            </div>
+          </div>
+          <div class="table-head">
+            <div class="head-cell" data-action="sort" data-sort="name" data-side="${pane.side}">Имя</div>
+            <div class="head-cell" data-action="sort" data-sort="size" data-side="${pane.side}">Размер</div>
+            <div class="head-cell" data-action="sort" data-sort="date" data-side="${pane.side}">Изменён</div>
+          </div>
+          <div class="rows">${renderRows(pane)}</div>
+          <div class="statusline">
+            <span class="status-count">Выделено: ${pane.selected.size} из ${items.length}</span>
+            <span>Свободно: 153,99 ГБ из 494,38 ГБ</span>
+          </div>
+        </section>`;
+    }
+
+    // ─── Init ───
+    document.getElementById('workspace').innerHTML =
+      createPane(panes.left) + createPane(panes.right);
+
+    // ─── Actions ───
+    function setActive(side) {
+      activeSide = side;
+      document.querySelectorAll('.pane').forEach(n =>
+        n.classList.toggle('is-active', n.dataset.side === side)
+      );
+    }
+
+    function showDialog(title, message, fieldLabel, btnText, onSubmit, isDanger = false) {
+      const backdrop = document.createElement('div');
+      backdrop.className = 'dialog-backdrop';
+      backdrop.innerHTML = `
+        <div class="dialog" role="dialog" aria-modal="true">
+          <h2>${esc(title)}</h2>
+          <p>${esc(message)}</p>
+          ${fieldLabel ? `<input aria-label="${esc(fieldLabel)}" placeholder="${esc(fieldLabel)}">` : ''}
+          <div class="dialog-actions">
+            <button type="button" data-cancel>Отмена</button>
+            <button class="${isDanger ? 'danger' : 'primary'}" type="button" data-submit>${esc(btnText)}</button>
+          </div>
+        </div>`;
+      document.getElementById('overlays').replaceChildren(backdrop);
+      backdrop.querySelector('[data-cancel]').onclick = () => backdrop.remove();
+      backdrop.addEventListener('click', e => { if (e.target === backdrop) backdrop.remove(); });
+      backdrop.querySelector('[data-submit]').onclick = () => {
+        onSubmit?.(backdrop.querySelector('input')?.value || '');
+        backdrop.remove();
+      };
+      backdrop.querySelector('input')?.focus();
+    }
+
+    function navigate(pane, path) {
+      if (pane.path !== path) {
+        pane.history.push(pane.path);
+        pane.forward = [];
+        pane.path = path;
+      }
+      pane.selected.clear();
+      renderPane(pane);
+    }
+
+    function moveHistory(pane, dir) {
+      const src = dir === 'back' ? pane.history : pane.forward;
+      const tgt = dir === 'back' ? pane.forward : pane.history;
+      if (!src.length) return;
+      tgt.push(pane.path);
+      pane.path = src.pop();
+      renderPane(pane);
+    }
+
+    function rowSelection(pane, id, e) {
+      if (e.metaKey || e.ctrlKey) {
+        pane.selected.has(id) ? pane.selected.delete(id) : pane.selected.add(id);
+      } else {
+        pane.selected = new Set([id]);
+      }
+      setActive(pane.side);
+      renderPane(pane);
+    }
+
+    function doAction(action) {
+      const pane = panes[activeSide];
+      const chosen = items.filter(it => pane.selected.has(it.id));
+
+      if (action === 'back' || action === 'forward') return moveHistory(pane, action);
+
+      if (action === 'new-folder') {
+        return showDialog('Новая папка', `Создать папку в «${pane.path}»`, 'Имя папки', 'Создать', name => {
+          if (!name.trim()) return;
+          items.unshift({ id: `new-${Date.now()}`, name: name.trim(), date: '09.10.26 11:50', kind: 'folder' });
+          renderPane(panes.left);
+          renderPane(panes.right);
+          toast(`Папка «${name.trim()}» создана`);
+        });
+      }
+
+      if (action === 'rename') {
+        return showDialog('Пакетное переименование', 'Введите префикс для выбранных элементов.', 'Префикс', 'Переименовать', prefix => {
+          if (!prefix || !chosen.length) return;
+          chosen.forEach(it => { it.name = prefix + it.name; });
+          renderPane(pane);
+          toast('Имена обновлены');
+        });
+      }
+
+      if (action === 'copy' || action === 'move') {
+        if (!chosen.length) return toast('Сначала выберите элемент');
+        queueCount++;
+        return toast(`${action === 'copy' ? 'Копирование' : 'Перемещение'} добавлено в очередь (${queueCount})`);
+      }
+
+      if (action === 'delete') {
+        if (!chosen.length) return toast('Сначала выберите элемент');
+        return showDialog(
+          'Удалить?',
+          `Будут удалены ${chosen.length} элемент(ов) из демонстрационного списка.`,
+          null, 'Удалить',
+          () => {
+            const ids = new Set(chosen.map(c => c.id));
+            for (let i = items.length - 1; i >= 0; i--) {
+              if (ids.has(items[i].id)) items.splice(i, 1);
+            }
+            pane.selected.clear();
+            renderPane(panes.left);
+            renderPane(panes.right);
+            toast('Удалено');
+          }, true
+        );
+      }
+
+      if (action === 'compare') {
+        comparing = !comparing;
+        renderPane(panes.left);
+        renderPane(panes.right);
+        return toast(comparing ? 'Сравнение включено' : 'Сравнение выключено');
+      }
+
+      if (action === 'refresh') return toast('Панели обновлены');
+
+      if (action === 'view') {
+        gridMode = !gridMode;
+        document.getElementById('workspace').classList.toggle('grid-mode', gridMode);
+        return toast(gridMode ? 'Режим сетки' : 'Режим списка');
+      }
+    }
+
+    // ─── Events ───
+    document.addEventListener('click', e => {
+      const target = e.target.closest('[data-action]');
+      if (!target) return;
+      const side = target.dataset.side || activeSide;
+      const pane = panes[side];
+      const action = target.dataset.action;
+
+      if (action === 'row') return rowSelection(pane, target.dataset.id, e);
+      if (action === 'tab') {
+        pane.tabs.forEach((t, i) => t.active = i === +target.dataset.index);
+        setActive(side);
+        renderPane(pane);
+        return;
+      }
+      if (action === 'add-tab') {
+        pane.tabs.forEach(t => t.active = false);
+        pane.tabs.push({ name: pane.path, active: true, removable: true });
+        renderPane(pane);
+        return;
+      }
+      if (action === 'close-tab') {
+        const idx = +target.dataset.index;
+        const wasActive = pane.tabs[idx]?.active;
+        pane.tabs.splice(idx, 1);
+        if (!pane.tabs.length) pane.tabs.push({ name: 'Downloads', active: true, removable: true });
+        else if (wasActive) pane.tabs[Math.max(0, idx - 1)].active = true;
+        renderPane(pane);
+        return;
+      }
+      if (action === 'source') {
+        pane.source = target.dataset.source;
+        setActive(side);
+        renderPane(pane);
+        if (pane.source === 'Phone') toast('Телефон не подключён в демо');
+        return;
+      }
+      if (action === 'crumb') return navigate(pane, 'Downloads');
+      if (action === 'sort') {
+        if (pane.sort === target.dataset.sort) pane.ascending = !pane.ascending;
+        else { pane.sort = target.dataset.sort; pane.ascending = true; }
+        renderPane(pane);
+        return;
+      }
+      doAction(action);
+    });
+
+    document.addEventListener('input', e => {
+      if (e.target.matches('.filter-input')) {
+        const pane = panes[e.target.dataset.side];
+        pane.filter = e.target.value;
+        renderPane(pane);
+        const inp = document.querySelector(`.filter-input[data-side="${pane.side}"]`);
+        inp?.focus();
+        inp?.setSelectionRange(inp.value.length, inp.value.length);
+      }
+      if (e.target.id === 'global-search') {
+        const q = e.target.value;
+        panes.left.filter = q;
+        panes.right.filter = q;
+        renderPane(panes.left);
+        renderPane(panes.right);
+      }
+    });
+
+    document.addEventListener('keydown', e => {
+      if (e.target.matches('input')) {
+        if (e.key === 'Escape' && e.target.matches('.filter-input')) {
+          e.target.value = '';
+          panes[e.target.dataset.side].filter = '';
+          renderPane(panes[e.target.dataset.side]);
+        }
+        return;
+      }
+      if (e.key === 'Tab') {
+        e.preventDefault();
+        setActive(activeSide === 'left' ? 'right' : 'left');
+      }
+      if (e.key === 'Escape') document.getElementById('overlays').replaceChildren();
+      const map = { F5: 'copy', F6: 'move', F7: 'new-folder', F8: 'delete' };
+      if (map[e.key]) { e.preventDefault(); doAction(map[e.key]); }
+      if (e.key === 'Enter' && e.target.matches('.file-row')) {
+        const item = items.find(it => it.id === e.target.dataset.id);
+        if (item) navigate(panes[e.target.dataset.side], item.name);
+      }
+    });
+
+    document.addEventListener('dblclick', e => {
+      const row = e.target.closest('.file-row');
+      if (!row) return;
+      const pane = panes[row.dataset.side];
+      const item = items.find(it => it.id === row.dataset.id);
+      if (item) navigate(pane, item.name);
+    });
+
+    // ─── Download ───
+    document.getElementById('download-btn').addEventListener('click', () => {
+      const html = document.documentElement.outerHTML;
+      const blob = new Blob([html], { type: 'text/html;charset=utf-8' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = 'LuminaCommander.html';
+      a.click();
+      URL.revokeObjectURL(url);
+      toast('Файл сохранён');
+    });
+  </script>
+</body>
+</html>
