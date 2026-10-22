@@ -112,11 +112,16 @@ public final class ConnectionController: ObservableObject {
         }
         
         // 3. Автоматический выбор пути через PhoneConnectionManager (USB -> Wi-Fi)
+        if isExplicitUserAction {
+            // Свежий mDNS-запрос: пока идёт проверка известных адресов и скан подсети,
+            // Bonjour успевает отдать текущий IP телефона.
+            DiscoveryService.shared.startDiscovery()
+        }
         let res = await PhoneConnectionManager.shared.establishConnection(preferredDeviceId: preferredDeviceId)
         guard isAttemptValid(attemptId) else { return false }
 
         switch res {
-        case .usbSuccess(_, _, _, let log), .unauthorized(_, let log), .failure(_, let log):
+        case .usbSuccess(_, _, _, let log), .unauthorized(_, let log), .wifiUnpaired(_, let log), .failure(_, let log):
             lastConnectionDiagnostics = log
         case .wifiSuccess(let host, let port, _):
             lastConnectionDiagnostics = "Wi-Fi endpoint discovered: \(host):\(port)"
@@ -138,7 +143,16 @@ public final class ConnectionController: ObservableObject {
                 viewModel.statusMessage = "⚠️ Подтвердите отладку по USB на экране \(deviceId)"
             }
             return false
-            
+
+        case .wifiUnpaired(let hosts, _):
+            let hostList = hosts.joined(separator: ", ")
+            phase = .disconnected(reason: "Телефон \(hostList) не сопряжён")
+            if isExplicitUserAction {
+                viewModel.statusMessage = "Найден телефон (\(hostList)), но он ещё не сопряжён — сверьте отпечаток в окне сопряжения"
+                viewModel.showPairingDialog = true
+            }
+            return false
+
         case .failure(let reason, _):
             phase = .disconnected(reason: reason)
             if isExplicitUserAction {

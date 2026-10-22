@@ -2854,10 +2854,10 @@ public final class DualPaneViewModel: ObservableObject {
             var scanAttempted = false
             if chosenUsbDeviceId == nil && DualPaneViewModel.autoConnectAllowed(DualPaneViewModel.lanScanBackoffKey, state: backoffState) {
                 scanAttempted = true
-                if let foundIp = PhoneConnectionManager.shared.discoverPhoneIpOnLan(),
-                   let dev = DeviceRegistry.shared.device(matchingHost: foundIp) {
-                    // W6: по IP подключаемся автоматически только к устройству с уже сохранённым отпечатком.
-                    // Непроверенный отпечаток при автоподключении не сохраняется.
+                // W6: автоматически подключаемся только к телефону, чей ключ узла совпал с закреплённым.
+                // Устройство определяется по ключу, а не по адресу, поэтому новый IP после DHCP не мешает.
+                if case .paired(let foundIp, _, let pinKey, _) = await PhoneConnectionManager.shared.findPairedPhoneOnLan(deep: false),
+                   let dev = DeviceRegistry.shared.device(withId: pinKey) ?? DeviceRegistry.shared.device(matchingHost: foundIp) {
                     if dev.autoConnect, !dev.pinnedFingerprint.isEmpty,
                        DualPaneViewModel.autoConnectAllowed("lan:\(foundIp)", state: backoffState) {
                         let isV6 = foundIp.contains(":")

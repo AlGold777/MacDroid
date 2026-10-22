@@ -4892,7 +4892,30 @@ func runTest63() async {
         testVM.share(items: [sampleShareFile], side: .left, target: .gmail)
         assertCondition(testVM.statusMessage.contains("письм") || testVM.statusMessage.contains("сообщен") || !testVM.statusMessage.isEmpty, "DualPaneViewModel triggers share operation with feedback: \(testVM.statusMessage)")
         
-        print("\n🎉 ALL 65 PRODUCTION TEST SUITES PASSED!")
+        // 66. Автопоиск телефона по Wi-Fi: пакетный скан порта и перечисление подсети
+        print("\n[Test 66] Wi-Fi auto-discovery: batch port scan and subnet enumeration...")
+        let listenFd = socket(AF_INET, SOCK_STREAM, 0)
+        var listenAddr = sockaddr_in()
+        listenAddr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        listenAddr.sin_family = sa_family_t(AF_INET)
+        listenAddr.sin_port = 0
+        listenAddr.sin_addr.s_addr = inet_addr("127.0.0.1")
+        _ = withUnsafePointer(to: &listenAddr) { $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { bind(listenFd, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) } }
+        _ = listen(listenFd, 8)
+        var boundAddr = sockaddr_in()
+        var boundLen = socklen_t(MemoryLayout<sockaddr_in>.size)
+        _ = withUnsafeMutablePointer(to: &boundAddr) { $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { getsockname(listenFd, $0, &boundLen) } }
+        let listenPort = UInt16(bigEndian: boundAddr.sin_port)
+        let scanStart = Date()
+        let openHosts = NetworkPortReachability.scanOpenPort(hosts: ["127.0.0.1", "127.0.0.2", "not-an-ip"], port: listenPort, timeoutMs: 300)
+        close(listenFd)
+        assertCondition(openHosts == ["127.0.0.1"], "Batch scan finds the listening host only (got \(openHosts))")
+        assertCondition(Date().timeIntervalSince(scanStart) < 2, "Batch scan finishes within its timeout")
+        let subnetHosts = NetworkPortReachability.localSubnetHosts()
+        assertCondition(subnetHosts.count <= 254 * 4, "Subnet enumeration is capped to /24 per interface (got \(subnetHosts.count))")
+        assertCondition(subnetHosts.allSatisfy { ConnectionHostAddress.isIPv4($0) && !$0.hasPrefix("127.") }, "Subnet enumeration yields only non-loopback IPv4 hosts")
+
+        print("\n🎉 ALL 66 PRODUCTION TEST SUITES PASSED!")
         exit(0)
     }
 }
