@@ -370,7 +370,10 @@ public final class DualPaneViewModel: ObservableObject {
     /// Внешний drop (Finder и др.) сбрасывает устаревший payload, иначе тот перехватывал бы чужие файлы (D11).
     /// Возвращает true, если нужно обработать drop через внутренний payload.
     public func consumeInternalDragPayload(isInternalDrop: Bool) -> Bool {
-        guard isInternalDrop, currentDragPayload != nil else {
+        // Тип com.macdroid.dragitem не объявлен в Info.plist, поэтому hasItemsConforming его не видит.
+        // Свежий payload (drag начат в этом приложении только что) считаем внутренним drop'ом.
+        let isFresh = Date().timeIntervalSince(currentDragPayloadDate) < 30
+        guard currentDragPayload != nil, isInternalDrop || isFresh else {
             currentDragPayload = nil
             return false
         }
@@ -485,6 +488,7 @@ public final class DualPaneViewModel: ObservableObject {
     
     // Активная сессия перетаскивания (Drag & Drop) внутри приложения
     public var currentDragPayload: DragPayload? = nil
+    public var currentDragPayloadDate: Date = .distantPast
     public var draggedTabInfo: (side: PaneSide, id: UUID)? = nil
     
     // Просмотр изображений и галерея
@@ -6378,6 +6382,7 @@ public final class DualPaneViewModel: ObservableObject {
             paths: dragPaths
         )
         self.currentDragPayload = payload
+        self.currentDragPayloadDate = Date()
         SSHTransportLog.write("DND_CREATE_PROVIDER side=\(side) source=\(currentSource) paths=\(dragPaths)")
         
         let provider = NSItemProvider()
