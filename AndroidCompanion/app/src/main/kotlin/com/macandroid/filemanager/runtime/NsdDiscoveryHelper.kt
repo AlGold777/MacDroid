@@ -17,12 +17,17 @@ class NsdDiscoveryHelper(private val context: Context) {
     private var generation = 0
     private var port = 0
     private var retriesLeft = 0
+    private var retryTask: Runnable? = null
 
     fun registerService(port: Int) {
-        this.port = port
-        retriesLeft = MAX_RETRIES
-        generation++
-        register(generation)
+        onMain {
+            generation++
+            cancelRetry()
+            unregisterCurrent()
+            this.port = port
+            retriesLeft = MAX_RETRIES
+            register(generation)
+        }
     }
 
     private fun register(gen: Int) {
@@ -40,14 +45,24 @@ class NsdDiscoveryHelper(private val context: Context) {
 
         val listener = object : NsdManager.RegistrationListener {
             override fun onServiceRegistered(serviceInfo: NsdServiceInfo) {
-                Log.i(TAG, "NSD: сервис зарегистрирован (${serviceInfo.serviceName})")
+                val registeredListener = this
+                onMain {
+                    if (gen != generation || registrationListener !== registeredListener) {
+                        // Снятие регистрации могло опередить callback успешной регистрации.
+                        try { nsdManager.unregisterService(registeredListener) } catch (_: Exception) {}
+                    } else {
+                        Log.i(TAG, "NSD: сервис зарегистрирован (${serviceInfo.serviceName})")
+                    }
+                }
             }
 
             override fun onRegistrationFailed(serviceInfo: NsdServiceInfo, errorCode: Int) {
-                Log.w(TAG, "NSD: регистрация не удалась, код $errorCode")
-                if (gen == generation && retriesLeft > 0) {
-                    retriesLeft--
-                    handler.postDelayed({ if (gen == generation) register(gen) }, RETRY_DELAY_MS)
+                val failedListener = this
+                onMain {
+                    if (gen != generation || registrationListener !== failedListener) return@onMain
+                    registrationListener = null
+                    Log.w(TAG, "NSD: регистрация не удалась, код $errorCode")
+                    scheduleRetry(gen)
                 }
             }
 
@@ -63,12 +78,40 @@ class NsdDiscoveryHelper(private val context: Context) {
             nsdManager.registerService(serviceInfo, NsdManager.PROTOCOL_DNS_SD, listener)
         } catch (e: Exception) {
             Log.w(TAG, "NSD: registerService бросил исключение", e)
+            registrationListener = null
+            scheduleRetry(gen)
         }
     }
 
     fun unregisterService() {
-        generation++
-        handler.removeCallbacksAndMessages(null)
+        onMain {
+            generation++
+            cancelRetry()
+            unregisterCurrent()
+        }
+    }
+
+    /** Lifecycle, NSD callbacks и отложенные повторы меняют состояние на одном потоке. */
+    private fun onMain(action: () -> Unit) {
+        handler.post { action() }
+    }
+
+    private fun scheduleRetry(gen: Int) {
+        if (gen != generation || retriesLeft <= 0) return
+        retriesLeft--
+        cancelRetry()
+        retryTask = Runnable {
+            retryTask = null
+            if (gen == generation) register(gen)
+        }.also { handler.postDelayed(it, RETRY_DELAY_MS) }
+    }
+
+    private fun cancelRetry() {
+        retryTask?.let { handler.removeCallbacks(it) }
+        retryTask = null
+    }
+
+    private fun unregisterCurrent() {
         registrationListener?.let {
             try {
                 nsdManager.unregisterService(it)

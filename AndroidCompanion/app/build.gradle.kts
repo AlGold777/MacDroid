@@ -12,8 +12,8 @@ android {
         applicationId = "com.macandroid.filemanager"
         minSdk = 26
         targetSdk = 34
-        versionCode = 16
-        versionName = "2.1.14"
+        versionCode = 17
+        versionName = "2.1.15"
     }
 
     buildTypes {
@@ -43,7 +43,7 @@ android {
     }
 }
 
-// Имя APK содержит версию: MacDroidCompanion-2.1.14.apk (и -release для релизной сборки)
+// Имя APK содержит версию: MacDroidCompanion-2.1.15.apk (и -release для релизной сборки)
 android.applicationVariants.all {
     val variant = this
     outputs.all {

@@ -9,7 +9,10 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.net.ConnectivityManager
+import android.net.LinkProperties
 import android.net.Network
+import android.net.NetworkCapabilities
+import android.net.NetworkRequest
 import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.IBinder
@@ -169,21 +172,29 @@ class FileDaemonService : Service() {
     private fun registerNetworkCallback() {
         val cm = getSystemService(ConnectivityManager::class.java) ?: return
         val callback = object : ConnectivityManager.NetworkCallback() {
-            override fun onAvailable(network: Network) = onNetworkChanged()
-            override fun onLost(network: Network) = onNetworkChanged()
+            override fun onAvailable(network: Network) = onNetworkChanged(refreshDiscovery = true)
+            override fun onLost(network: Network) = onNetworkChanged(refreshDiscovery = true)
+            // DHCP может изменить IPv4 без потери самого Network. Перепривязываем
+            // sshd при новом IP; одно изменение DNS не требует перерегистрации NSD.
+            override fun onLinkPropertiesChanged(network: Network, linkProperties: LinkProperties) =
+                onNetworkChanged(refreshDiscovery = false)
         }
         networkCallback = callback
         try {
-            cm.registerDefaultNetworkCallback(callback)
+            // Wi-Fi остаётся важен для локального SFTP, даже если default — VPN или cellular.
+            val request = NetworkRequest.Builder()
+                .addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
+                .build()
+            cm.registerNetworkCallback(request, callback)
         } catch (e: Exception) {
             Log.w(TAG, "Не удалось подписаться на изменения сети", e)
             networkCallback = null
         }
     }
 
-    private fun onNetworkChanged() {
+    private fun onNetworkChanged(refreshDiscovery: Boolean) {
         serviceScope.launch {
-            synchronized(lifecycleLock) { ensureServerLocked(refreshDiscovery = true) }
+            synchronized(lifecycleLock) { ensureServerLocked(refreshDiscovery = refreshDiscovery) }
         }
     }
 
