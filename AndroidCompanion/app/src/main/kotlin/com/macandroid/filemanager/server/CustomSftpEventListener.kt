@@ -2,11 +2,13 @@ package com.macandroid.filemanager.server
 
 import android.content.Context
 import android.content.Intent
+import android.util.Log
 import com.macandroid.filemanager.runtime.FileDaemonService
 import com.macandroid.filemanager.storage.StorageGateway
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
 import org.apache.sshd.server.session.ServerSession
 import org.apache.sshd.sftp.server.AbstractSftpEventListenerAdapter
@@ -20,11 +22,20 @@ class CustomSftpEventListener(
     private val storageGateway: StorageGateway = StorageGateway(context)
 ) : AbstractSftpEventListenerAdapter() {
 
+    companion object {
+        private const val TAG = "CustomSftpListener"
+    }
+
     private val activeSessions = AtomicInteger(0)
 
     // Асинхронный scope для операций StorageGateway (SQLite + MediaScanner)
     // вместо runBlocking, который блокировал SSH-воркер
     private val ioScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+    /** Отмена фоновых операций при остановке сервера. */
+    fun dispose() {
+        ioScope.cancel()
+    }
 
     private fun setSyncActive(active: Boolean) {
         try {
@@ -36,22 +47,25 @@ class CustomSftpEventListener(
                 }
             }
             context.startService(intent)
-        } catch (ignored: Exception) {}
-    }
-
-    override fun initialized(session: ServerSession, version: Int) {
-        if (activeSessions.incrementAndGet() > 0) {
-            setSyncActive(true)
+        } catch (e: Exception) {
+            Log.w(TAG, "Не удалось отправить сигнал активной передачи сервису", e)
         }
     }
 
+    override fun initialized(session: ServerSession, version: Int) {
+        activeSessions.incrementAndGet()
+        setSyncActive(true)
+    }
+
     override fun destroying(session: ServerSession) {
-        if (activeSessions.decrementAndGet() <= 0) {
-            activeSessions.set(0)
+        // Атомарное уменьшение без потери параллельных инкрементов
+        val left = activeSessions.updateAndGet { if (it > 0) it - 1 else 0 }
+        if (left == 0) {
             setSyncActive(false)
         }
     }
 
+    @Volatile
     private var lastWakeLockPing: Long = 0
 
     override fun writing(
@@ -108,9 +122,12 @@ class CustomSftpEventListener(
                 }
                 // Perf fix: асинхронный launch вместо runBlocking,
                 // чтобы не блокировать SSH-воркер на время SQLite + MediaScanner
+                // actionId берётся из имени файла, которое задаёт клиент: делаем ключ уникальным,
+                // чтобы повторное имя не перезаписывало чужую квитанцию (REPLACE в журнале)
+                val receiptId = "mv_${actionId}_${System.nanoTime()}"
                 ioScope.launch {
                     storageGateway.recordCommit(
-                        actionId = actionId,
+                        actionId = receiptId,
                         requestHash = "sftp_rename_$actionId",
                         sourcePath = srcFile.absolutePath,
                         finalTargetFile = dstFile
@@ -128,7 +145,7 @@ class CustomSftpEventListener(
     ) {
         if (thrown == null) {
             val file = path.toFile()
-            val actionId = "del_${file.name}_${System.currentTimeMillis()}"
+            val actionId = "del_${file.name}_${System.nanoTime()}"
             // Perf fix: асинхронный launch вместо runBlocking
             ioScope.launch {
                 storageGateway.recordDeletion(

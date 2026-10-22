@@ -8,6 +8,8 @@ import android.content.pm.PackageManager
 import android.graphics.Color
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
+import android.net.ConnectivityManager
+import android.net.Network
 import android.net.Uri
 import android.os.BatteryManager
 import android.os.Build
@@ -16,6 +18,7 @@ import android.os.Environment
 import android.os.PowerManager
 import android.os.StatFs
 import android.provider.Settings
+import android.util.Log
 import android.view.View
 import android.widget.Button
 import android.widget.LinearLayout
@@ -35,14 +38,24 @@ import java.util.Collections
  */
 class MainActivity : Activity() {
 
+    companion object {
+        private const val TAG = "MainActivity"
+        private const val REQUEST_LEGACY_STORAGE = 1002
+    }
+
     // Экземпляр EmbeddedServer для проверки статуса сопряжения и сброса ключа
     private val embeddedServer by lazy { EmbeddedServer(applicationContext) }
+
+    // Отпечаток хост-ключа sshd (кэшируется после появления hostkey.ser)
+    private var hostKeyFingerprint: String? = null
+    private var networkCallback: ConnectivityManager.NetworkCallback? = null
 
     // Текстовые поля статуса
     private lateinit var tvServerStatus: TextView
     private lateinit var tvIpAddress: TextView
     private lateinit var tvPort: TextView
     private lateinit var tvMacHint: TextView
+    private lateinit var tvHostFingerprint: TextView
 
     private lateinit var tvPairingStatus: TextView
     private lateinit var tvPairingDesc: TextView
@@ -70,8 +83,8 @@ class MainActivity : Activity() {
         // Проверка необходимых разрешений Android 13+ и 11+
         checkInitialPermissions()
 
-        // Запуск фоновой службы при наличии доступа к файловой системе
-        if (hasStoragePermission()) {
+        // Запуск фоновой службы при наличии доступа к файловой системе (если не останавливал пользователь)
+        if (hasStoragePermission() && !FileDaemonService.isUserStopped(this)) {
             startDaemonService()
         }
     }
@@ -79,12 +92,57 @@ class MainActivity : Activity() {
     override fun onResume() {
         super.onResume()
 
-        // При возврате на экран (например, после выдачи разрешений) проверяем запуск службы и обновляем данные
-        if (hasStoragePermission() && !isServerRunning()) {
+        // При возврате на экран (например, после выдачи разрешений) проверяем запуск службы и обновляем данные.
+        // После ручной остановки пользователем демон не перезапускается.
+        if (hasStoragePermission() && !isServerRunning() && !FileDaemonService.isUserStopped(this)) {
             startDaemonService()
         }
 
         refreshDisplay()
+    }
+
+    /** IP-адрес меняется при смене сети: подписываемся на изменения, пока экран видим. */
+    override fun onStart() {
+        super.onStart()
+        val cm = getSystemService(ConnectivityManager::class.java) ?: return
+        val callback = object : ConnectivityManager.NetworkCallback() {
+            override fun onAvailable(network: Network) {
+                runOnUiThread { refreshDisplay() }
+            }
+
+            override fun onLost(network: Network) {
+                runOnUiThread { refreshDisplay() }
+            }
+        }
+        networkCallback = callback
+        try {
+            cm.registerDefaultNetworkCallback(callback)
+        } catch (e: Exception) {
+            Log.w(TAG, "Не удалось подписаться на изменения сети", e)
+            networkCallback = null
+        }
+    }
+
+    override fun onStop() {
+        networkCallback?.let {
+            try {
+                getSystemService(ConnectivityManager::class.java)?.unregisterNetworkCallback(it)
+            } catch (e: Exception) {
+                Log.w(TAG, "Не удалось отписаться от изменений сети", e)
+            }
+        }
+        networkCallback = null
+        super.onStop()
+    }
+
+    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == REQUEST_LEGACY_STORAGE) {
+            refreshDisplay()
+            if (hasStoragePermission() && !isServerRunning() && !FileDaemonService.isUserStopped(this)) {
+                startDaemonService()
+            }
+        }
     }
 
     /**
@@ -149,11 +207,22 @@ class MainActivity : Activity() {
         }
         cardServer.addView(tvMacHint)
 
+        tvHostFingerprint = TextView(this).apply {
+            textSize = 13f
+            setTextColor(0xFFE0E0E0.toInt())
+            typeface = Typeface.MONOSPACE
+            setTextIsSelectable(true)
+            setPadding(0, 0, 0, dp(12))
+        }
+        cardServer.addView(tvHostFingerprint)
+
         btnToggleServer = createButton("Запустить сервер", 0xFF2E7D32.toInt()).apply {
             setOnClickListener {
                 if (isServerRunning()) {
                     stopDaemonService()
                 } else {
+                    // Ручной запуск снимает флаг остановки пользователем
+                    FileDaemonService.setUserStopped(this@MainActivity, false)
                     startDaemonService()
                 }
                 // Небольшая пауза перед обновлением, пока сервис инициализируется
@@ -330,6 +399,13 @@ class MainActivity : Activity() {
         tvPort.text = "Port: 2222"
         tvMacHint.text = "Подключение с Mac:\nsftp -P 2222 $ipAddress"
 
+        // 1.1 Отпечаток хост-ключа sshd: пользователь сверяет его с Mac при сопряжении
+        if (hostKeyFingerprint == null) {
+            hostKeyFingerprint = embeddedServer.hostKeyFingerprint()
+        }
+        tvHostFingerprint.text = "Отпечаток ключа телефона (сверьте с Mac при сопряжении):\n" +
+                (hostKeyFingerprint ?: "ключ ещё не создан, запустите сервер")
+
         // 2. Статус сервера
         val running = isServerRunning()
         if (running) {
@@ -407,7 +483,8 @@ class MainActivity : Activity() {
                 val totalGb = (stat.blockCountLong * stat.blockSizeLong).toDouble() / (1024.0 * 1024.0 * 1024.0)
                 tvStorageMetrics.text = String.format("Память: %.2f ГБ свободно из %.2f ГБ", freeGb, totalGb)
                 tvStorageMetrics.visibility = View.VISIBLE
-            } catch (ignored: Exception) {
+            } catch (e: Exception) {
+                Log.w(TAG, "Не удалось прочитать метрики памяти", e)
                 tvStorageMetrics.visibility = View.GONE
             }
         } else {
@@ -448,6 +525,7 @@ class MainActivity : Activity() {
 
             return fallbackIp ?: "127.0.0.1 (нет Wi-Fi)"
         } catch (e: Exception) {
+            Log.w(TAG, "Не удалось определить IP-адрес", e)
             return "Не удалось определить: ${e.message}"
         }
     }
@@ -538,12 +616,14 @@ class MainActivity : Activity() {
         return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
             Environment.isExternalStorageManager()
         } else {
-            true
+            // API 26-29: обычные runtime-разрешения на хранилище
+            checkSelfPermission(android.Manifest.permission.READ_EXTERNAL_STORAGE) == PackageManager.PERMISSION_GRANTED &&
+                    checkSelfPermission(android.Manifest.permission.WRITE_EXTERNAL_STORAGE) == PackageManager.PERMISSION_GRANTED
         }
     }
 
     /**
-     * Запрос системного разрешения MANAGE_EXTERNAL_STORAGE.
+     * Запрос доступа к файлам: MANAGE_EXTERNAL_STORAGE (API 30+) или runtime-разрешения (API 26-29).
      */
     private fun requestStoragePermission() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
@@ -553,9 +633,22 @@ class MainActivity : Activity() {
                 }
                 startActivity(intent)
             } catch (e: Exception) {
-                val fallbackIntent = Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION)
-                startActivity(fallbackIntent)
+                Log.w(TAG, "Экран ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION недоступен", e)
+                try {
+                    startActivity(Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION))
+                } catch (e2: android.content.ActivityNotFoundException) {
+                    Log.e(TAG, "Нет экрана выдачи доступа ко всем файлам", e2)
+                    Toast.makeText(this, "Не удалось открыть настройки доступа к файлам", Toast.LENGTH_LONG).show()
+                }
             }
+        } else {
+            requestPermissions(
+                arrayOf(
+                    android.Manifest.permission.READ_EXTERNAL_STORAGE,
+                    android.Manifest.permission.WRITE_EXTERNAL_STORAGE
+                ),
+                REQUEST_LEGACY_STORAGE
+            )
         }
     }
 
@@ -575,6 +668,8 @@ class MainActivity : Activity() {
      * Остановка службы файлового демона.
      */
     private fun stopDaemonService() {
+        // Ручная остановка: не перезапускать при возврате в приложение
+        FileDaemonService.setUserStopped(this, true)
         val stopIntent = Intent(this, FileDaemonService::class.java).apply {
             action = FileDaemonService.ACTION_STOP
         }

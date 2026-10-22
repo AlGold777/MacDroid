@@ -1,25 +1,38 @@
 package com.macandroid.filemanager.server
 
 import android.content.Context
+import android.util.Log
 import com.macandroid.filemanager.storage.StorageGateway
+import org.apache.sshd.common.AttributeRepository
+import org.apache.sshd.common.config.keys.AuthorizedKeyEntry
+import org.apache.sshd.common.config.keys.KeyUtils
 import org.apache.sshd.common.file.virtualfs.VirtualFileSystemFactory
 import org.apache.sshd.server.SshServer
 import org.apache.sshd.server.auth.pubkey.PublickeyAuthenticator
 import org.apache.sshd.server.keyprovider.SimpleGeneratorHostKeyProvider
 import org.apache.sshd.sftp.server.SftpSubsystemFactory
 import java.io.File
+import java.net.Inet4Address
+import java.net.NetworkInterface
 import java.nio.file.Paths
 import java.security.PublicKey
 import java.util.Base64
 import java.util.Collections
 
+/**
+ * SFTP/SSH-сервер телефона. Слушает только Wi-Fi-адрес (wlan*), если он определён;
+ * иначе (Wi-Fi недоступен) — все интерфейсы (поведение по решению, см. документацию).
+ *
+ * @param bindHost адрес для прослушивания; null — все интерфейсы.
+ */
 class EmbeddedServer(
     private val context: Context,
-    private val port: Int = 2222
+    private val port: Int = 2222,
+    private val bindHost: String? = null
 ) {
     private var sshd: SshServer? = null
+    private var sftpListener: CustomSftpEventListener? = null
     private val authorizedKeysFile = File(context.filesDir, "authorized_keys")
-    private val pairingLock = Any()
 
     fun start() {
         if (sshd != null) return
@@ -28,8 +41,9 @@ class EmbeddedServer(
             System.setProperty("user.home", context.filesDir.absolutePath)
         }
 
-        sshd = SshServer.setUpDefaultServer().apply {
+        val server = SshServer.setUpDefaultServer().apply {
             this.port = this@EmbeddedServer.port
+            bindHost?.let { this.host = it }
 
             // Хост-ключи сервера
             val hostKeyFile = File(context.filesDir, "hostkey.ser")
@@ -39,46 +53,49 @@ class EmbeddedServer(
             // Применяем строгую проверку открытого ключа (Public Key Auth)
             passwordAuthenticator = null
 
-            publickeyAuthenticator = PublickeyAuthenticator { _, key: PublicKey, _ ->
+            publickeyAuthenticator = PublickeyAuthenticator { _, key: PublicKey, session ->
+                var accepted = false
                 synchronized(pairingLock) {
                     val encodedKey = Base64.getEncoder().encodeToString(key.encoded)
                     if (!authorizedKeysFile.exists() || authorizedKeysFile.length() == 0L) {
-                        // Every first key requires an explicit, time-limited pairing window.
+                        // Первый ключ принимается только в окне сопряжения, окно закрывается сразу после записи.
                         if (isPairingModeActive) {
                             authorizedKeysFile.writeText(encodedKey + "\n")
                             closePairingWindow()
-                            true
-                        } else {
-                            false
+                            accepted = true
                         }
                     } else {
-                        // Subsequent connections must match an already enrolled public key.
+                        // Последующие подключения должны совпадать с уже сохранёнными ключами.
                         val authorizedKeys = authorizedKeysFile.readLines()
                             .map { it.trim() }
                             .filter { it.isNotEmpty() }
 
-                        if (encodedKey in authorizedKeys) {
+                        val knownKey = if (encodedKey in authorizedKeys) {
                             true
                         } else {
                             authorizedKeys.any { line ->
-                                if (line.startsWith("ssh-")) {
-                                    try {
-                                        val entry = org.apache.sshd.common.config.keys.AuthorizedKeyEntry.parseAuthorizedKeyEntry(line)
-                                        val resolved = entry?.resolvePublicKey(null, null, null)
-                                        resolved != null && org.apache.sshd.common.config.keys.KeyUtils.compareKeys(key, resolved)
-                                    } catch (_: Throwable) {
-                                        false
-                                    }
-                                } else {
+                                line.startsWith("ssh-") && try {
+                                    val entry = AuthorizedKeyEntry.parseAuthorizedKeyEntry(line)
+                                    val resolved = entry?.resolvePublicKey(null, null, null)
+                                    resolved != null && KeyUtils.compareKeys(key, resolved)
+                                } catch (e: Exception) {
+                                    Log.w(TAG, "Не удалось разобрать строку authorized_keys", e)
                                     false
                                 }
                             }
                         }
+                        accepted = knownKey
                     }
                 }
+                // Право на authorize_key получают только сессии, принятые в окне сопряжения (первый ключ)
+                // либо вошедшие уже сохранённым ключом (миграция legacy-устройств при закрытом окне).
+                session.setAttribute(ENROLLED_SESSION_KEY, accepted)
+                accepted
             }
 
-            // Корневой путь хранилища Android (поддержка внутренней памяти и SD/OTG карт)
+            // Корневой путь хранилища Android (поддержка внутренней памяти и SD/OTG карт).
+            // Принятый риск: корень целиком /storage (Android/data и obb на API 30+ недоступны и так);
+            // сужение до allowlist ломает доступ к SD/OTG-картам и не делается в этом исправлении.
             val rootPath = Paths.get("/storage")
             fileSystemFactory = VirtualFileSystemFactory(rootPath)
 
@@ -95,7 +112,7 @@ class EmbeddedServer(
 
                     override fun start(channel: org.apache.sshd.server.channel.ChannelSession?, env: org.apache.sshd.server.Environment?) {
                         val trimmed = command.trim()
-                        if (trimmed.startsWith("df")) {
+                        if (trimmed == "df" || trimmed.startsWith("df ")) {
                             try {
                                 val stat = android.os.StatFs(android.os.Environment.getExternalStorageDirectory().path)
                                 val blockSize = stat.blockSizeLong
@@ -104,41 +121,56 @@ class EmbeddedServer(
                                 val totalBytes = totalBlocks * blockSize
                                 val availBytes = availBlocks * blockSize
                                 val usedBytes = totalBytes - availBytes
+                                // Реальный процент занятости (округление вверх, как в coreutils df)
+                                val usedPercent = if (totalBytes > 0) (usedBytes * 100 + totalBytes - 1) / totalBytes else 0L
 
                                 val output = "Filesystem 1B-blocks Used Available Use% Mounted on\n" +
-                                        "/storage/emulated/0 $totalBytes $usedBytes $availBytes 50% /storage/emulated/0\n"
+                                        "/storage/emulated/0 $totalBytes $usedBytes $availBytes $usedPercent% /storage/emulated/0\n"
                                 outStream?.write(output.toByteArray(java.nio.charset.StandardCharsets.UTF_8))
                                 outStream?.flush()
                                 exitCallback?.onExit(0)
                             } catch (e: Exception) {
+                                Log.e(TAG, "df: ошибка чтения StatFs", e)
                                 outStream?.write("df error: ${e.message}\n".toByteArray(java.nio.charset.StandardCharsets.UTF_8))
                                 outStream?.flush()
                                 exitCallback?.onExit(1)
                             }
                         } else if (trimmed.startsWith("authorize_key ")) {
                             val newKey = trimmed.substringAfter("authorize_key ").trim()
-                            if (newKey.isNotEmpty()) {
+                            val sessionEnrolled = channel?.session?.getAttribute(ENROLLED_SESSION_KEY) == true
+                            if (!isPairingModeActive && !sessionEnrolled) {
+                                outStream?.write("ERROR_NOT_ALLOWED\n".toByteArray(java.nio.charset.StandardCharsets.UTF_8))
+                                outStream?.flush()
+                                exitCallback?.onExit(1)
+                            } else if (newKey.isEmpty()) {
+                                outStream?.write("ERROR_EMPTY_KEY\n".toByteArray(java.nio.charset.StandardCharsets.UTF_8))
+                                outStream?.flush()
+                                exitCallback?.onExit(1)
+                            } else if (parseSingleAuthorizedKey(newKey) == null) {
+                                outStream?.write("ERROR_INVALID_KEY\n".toByteArray(java.nio.charset.StandardCharsets.UTF_8))
+                                outStream?.flush()
+                                exitCallback?.onExit(1)
+                            } else {
                                 try {
-                                    val currentKeys = if (authorizedKeysFile.exists()) {
-                                        authorizedKeysFile.readLines().map { it.trim() }.filter { it.isNotEmpty() }
-                                    } else {
-                                        emptyList()
-                                    }
-                                    if (!currentKeys.contains(newKey)) {
-                                        authorizedKeysFile.appendText(newKey + "\n")
+                                    synchronized(pairingLock) {
+                                        val currentKeys = if (authorizedKeysFile.exists()) {
+                                            authorizedKeysFile.readLines().map { it.trim() }.filter { it.isNotEmpty() }
+                                        } else {
+                                            emptyList()
+                                        }
+                                        if (!currentKeys.contains(newKey)) {
+                                            authorizedKeysFile.appendText(newKey + "\n")
+                                        }
                                     }
                                     outStream?.write("AUTHORIZED_OK\n".toByteArray(java.nio.charset.StandardCharsets.UTF_8))
                                     outStream?.flush()
                                     exitCallback?.onExit(0)
                                 } catch (e: Exception) {
+                                    Log.e(TAG, "authorize_key: не удалось записать authorized_keys", e)
                                     outStream?.write("ERROR: ${e.message}\n".toByteArray(java.nio.charset.StandardCharsets.UTF_8))
                                     outStream?.flush()
                                     exitCallback?.onExit(1)
                                 }
-                            } else {
-                                outStream?.write("ERROR_EMPTY_KEY\n".toByteArray(java.nio.charset.StandardCharsets.UTF_8))
-                                outStream?.flush()
-                                exitCallback?.onExit(1)
                             }
                         } else if (trimmed.startsWith("mediastore_query ")) {
                             val folder = trimmed.substringAfter("mediastore_query ").trim()
@@ -149,6 +181,7 @@ class EmbeddedServer(
                                 outStream?.flush()
                                 exitCallback?.onExit(0)
                             } catch (e: Exception) {
+                                Log.e(TAG, "mediastore_query: ошибка запроса", e)
                                 outStream?.write("ERROR: ${e.message}\n".toByteArray(java.nio.charset.StandardCharsets.UTF_8))
                                 outStream?.flush()
                                 exitCallback?.onExit(1)
@@ -167,7 +200,9 @@ class EmbeddedServer(
             // SFTP Subsystem с перехватчиком событий коммита
             val sftpFactory = SftpSubsystemFactory.Builder()
                 .build()
-            sftpFactory.addSftpEventListener(CustomSftpEventListener(context))
+            val listener = CustomSftpEventListener(context)
+            sftpListener = listener
+            sftpFactory.addSftpEventListener(listener)
             subsystemFactories = Collections.singletonList(sftpFactory)
 
             // Perf & FS Limiter: Увеличиваем буферы I/O и SSH channel window, ограничиваем дескрипторы для защиты памяти
@@ -185,26 +220,44 @@ class EmbeddedServer(
             serverProps["sftp-max-writedata-packet-length"] = (256 * 1024).toString()
         }
 
-        sshd?.start()
+        try {
+            server.start()
+        } catch (e: Exception) {
+            sftpListener?.dispose()
+            sftpListener = null
+            throw e
+        }
+        sshd = server
+        liveSshd = server
     }
 
     fun stop() {
-        sshd?.stop(true)
+        val server = sshd ?: return
         sshd = null
+        if (liveSshd === server) liveSshd = null
+        sftpListener?.dispose()
+        sftpListener = null
+        server.stop(true)
     }
 
     /**
-     * Сброс сопряжения: удаляет файл authorized_keys,
-     * чтобы при следующем подключении сработал механизм TOFU.
+     * Сброс сопряжения: удаляет файл authorized_keys, закрывает живые SSH-сессии,
+     * чтобы при следующем подключении сработал механизм сопряжения (TOFU).
      * @return true, если файл был успешно удален или не существовал
      */
     fun resetPairing(): Boolean {
         closePairingWindow()
-        return if (authorizedKeysFile.exists()) {
-            authorizedKeysFile.delete()
-        } else {
-            true
+        val deleted = synchronized(pairingLock) {
+            if (authorizedKeysFile.exists()) authorizedKeysFile.delete() else true
         }
+        liveSshd?.activeSessions?.forEach { session ->
+            try {
+                session.close(true)
+            } catch (e: Exception) {
+                Log.w(TAG, "resetPairing: не удалось закрыть сессию", e)
+            }
+        }
+        return deleted
     }
 
     /**
@@ -214,8 +267,35 @@ class EmbeddedServer(
         return authorizedKeysFile.exists() && authorizedKeysFile.length() > 0L
     }
 
+    /**
+     * SHA256-отпечаток хост-ключа sshd в формате `ssh-keygen -lf` (SHA256:...).
+     * Читает тот же hostkey.ser, что и сервер; null, если ключ ещё не создан.
+     */
+    fun hostKeyFingerprint(): String? {
+        val hostKeyFile = File(context.filesDir, "hostkey.ser")
+        if (!hostKeyFile.exists()) return null
+        return try {
+            val keyPair = SimpleGeneratorHostKeyProvider(hostKeyFile.toPath()).loadKeys(null).firstOrNull()
+            keyPair?.public?.let { KeyUtils.getFingerPrint(it) }
+        } catch (e: Exception) {
+            Log.w(TAG, "Не удалось прочитать отпечаток хост-ключа", e)
+            null
+        }
+    }
+
     companion object {
+        private const val TAG = "EmbeddedServer"
         private const val PAIRING_WINDOW_MILLIS = 60_000L
+
+        /** Общий lock на файл authorized_keys (auth, authorize_key, сброс). */
+        private val pairingLock = Any()
+
+        /** Признак сессии, вошедшей уже сохранённым ключом. */
+        private val ENROLLED_SESSION_KEY = AttributeRepository.AttributeKey<Boolean>()
+
+        /** Запущенный sshd (для закрытия живых сессий из других экземпляров, например MainActivity). */
+        @Volatile
+        private var liveSshd: SshServer? = null
 
         @Volatile
         private var pairingWindowEndsAt: Long = 0L
@@ -229,6 +309,37 @@ class EmbeddedServer(
 
         fun closePairingWindow() {
             pairingWindowEndsAt = 0L
+        }
+
+        /**
+         * IPv4-адрес активного Wi-Fi-интерфейса (wlan*), без loopback. null, если определить нельзя.
+         */
+        fun findWifiIpv4Address(): String? {
+            return try {
+                Collections.list(NetworkInterface.getNetworkInterfaces())
+                    .filter { it.isUp && !it.isLoopback && it.name.startsWith("wlan", ignoreCase = true) }
+                    .flatMap { Collections.list(it.inetAddresses) }
+                    .firstOrNull { it is Inet4Address && !it.isLoopbackAddress }
+                    ?.hostAddress
+            } catch (e: Exception) {
+                Log.w(TAG, "Не удалось определить адрес Wi-Fi", e)
+                null
+            }
+        }
+
+        /**
+         * Одна строка открытого ключа в формате authorized_keys (без переводов строк).
+         * @return разобранный публичный ключ или null, если строка некорректна.
+         */
+        private fun parseSingleAuthorizedKey(line: String): PublicKey? {
+            if (line.contains('\n') || line.contains('\r')) return null
+            if (!line.startsWith("ssh-") && !line.startsWith("ecdsa-sha2-")) return null
+            return try {
+                AuthorizedKeyEntry.parseAuthorizedKeyEntry(line)?.resolvePublicKey(null, null, null)
+            } catch (e: Exception) {
+                Log.w(TAG, "authorize_key: строка ключа не разобрана", e)
+                null
+            }
         }
     }
 }

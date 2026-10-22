@@ -2,6 +2,7 @@ package com.macandroid.filemanager.storage
 
 import android.content.Context
 import android.media.MediaScannerConnection
+import android.util.Log
 import com.macandroid.filemanager.data.ActionJournalDb
 import com.macandroid.filemanager.data.ActionReceipt
 import kotlinx.coroutines.CoroutineScope
@@ -14,6 +15,10 @@ import java.io.File
 import java.util.Collections
 
 class StorageGateway(private val context: Context) {
+    companion object {
+        private const val TAG = "StorageGateway"
+    }
+
     private val db = ActionJournalDb.getDatabase(context)
     private val dao = db.actionReceiptDao()
 
@@ -77,7 +82,9 @@ class StorageGateway(private val context: Context) {
                     "${android.provider.MediaStore.MediaColumns.DATA} = ?",
                     arrayOf(fileToDelete.absolutePath)
                 )
-            } catch (ignored: Exception) {}
+            } catch (e: Exception) {
+                Log.w(TAG, "MediaStore: не удалось удалить запись", e)
+            }
             notifyMediaScanner(fileToDelete.absolutePath)
         }
         return deleted
@@ -124,7 +131,9 @@ class StorageGateway(private val context: Context) {
                 "${android.provider.MediaStore.MediaColumns.DATA} = ?",
                 arrayOf(deletedFile.absolutePath)
             )
-        } catch (ignored: Exception) {}
+        } catch (e: Exception) {
+            Log.w(TAG, "MediaStore: не удалось удалить запись", e)
+        }
         notifyMediaScanner(deletedFile.absolutePath)
     }
 
@@ -172,7 +181,9 @@ class StorageGateway(private val context: Context) {
                     chunk.toTypedArray(),
                     null
                 ) { _, _ -> }
-            } catch (ignored: Exception) {}
+            } catch (e: Exception) {
+                Log.w(TAG, "MediaScanner: сбой пакета сканирования", e)
+            }
         }
     }
 
@@ -187,8 +198,9 @@ class StorageGateway(private val context: Context) {
             android.provider.MediaStore.MediaColumns.DATA
         )
         val uri = android.provider.MediaStore.Files.getContentUri("external")
-        val selection = "${android.provider.MediaStore.MediaColumns.DATA} LIKE ?"
-        val selectionArgs = arrayOf("$cleanPath/%")
+        // LIKE со спецсимволами пути (% и _ из имени папки) экранируем символом '\'
+        val selection = "${android.provider.MediaStore.MediaColumns.DATA} LIKE ? ESCAPE '\\'"
+        val selectionArgs = arrayOf(escapeLikePattern(cleanPath) + "/%")
         val sb = StringBuilder()
         
         try {
@@ -206,12 +218,12 @@ class StorageGateway(private val context: Context) {
                 val dataCol = cursor.getColumnIndex(android.provider.MediaStore.MediaColumns.DATA)
 
                 while (cursor.moveToNext()) {
-                    val filePath = if (dataCol >= 0) cursor.getString(dataCol) ?: "" else ""
-                    val name = if (nameCol >= 0) cursor.getString(nameCol) ?: "" else ""
+                    val filePath = if (dataCol >= 0) sanitizeField(cursor.getString(dataCol) ?: "") else ""
+                    val name = if (nameCol >= 0) sanitizeField(cursor.getString(nameCol) ?: "") else ""
                     val size = if (sizeCol >= 0) cursor.getLong(sizeCol) else 0L
                     val mtime = if (dateCol >= 0) cursor.getLong(dateCol) else 0L
-                    val mime = if (mimeCol >= 0) cursor.getString(mimeCol) ?: "" else ""
-                    
+                    val mime = if (mimeCol >= 0) sanitizeField(cursor.getString(mimeCol) ?: "") else ""
+
                     if (name.isNotEmpty()) {
                         sb.append(name).append("\t")
                             .append(size).append("\t")
@@ -222,8 +234,23 @@ class StorageGateway(private val context: Context) {
                 }
             }
         } catch (e: Exception) {
+            Log.e(TAG, "mediastore_query: сбой запроса MediaStore", e)
             return "ERROR: ${e.message}\n"
         }
         return sb.toString()
     }
+
+    /** Экранирование спецсимволов LIKE: '\', '%' и '_'. */
+    private fun escapeLikePattern(value: String): String {
+        val out = StringBuilder(value.length)
+        for (ch in value) {
+            if (ch == '\\' || ch == '%' || ch == '_') out.append('\\')
+            out.append(ch)
+        }
+        return out.toString()
+    }
+
+    /** Управляющие символы (включая \t, \n, \r) в полях построчного ответа заменяются пробелом. */
+    private fun sanitizeField(value: String): String =
+        value.replace(Regex("[\\u0000-\\u001F\\u007F]"), " ")
 }
