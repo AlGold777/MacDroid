@@ -238,26 +238,11 @@ struct MacFileManagerApp: App {
                 }
                 .keyboardShortcut("d", modifiers: [.command, .shift])
                 
-                Button("Ввести путь вручную (Cmd+L)") {
-                    viewModel.startEditingPath(side: viewModel.activePane)
-                }
-                .keyboardShortcut("l", modifiers: [.command])
-                
                 Button("Поменять панели местами (Cmd+U)") {
                     viewModel.swapPanes()
                 }
                 .keyboardShortcut("u", modifiers: [.command])
-                
-                Button("Сравнить каталоги (Cmd+D)") {
-                    viewModel.comparePanes()
-                }
-                .keyboardShortcut("d", modifiers: [.command])
 
-                Button("Быстрый просмотр / Просмотрщик (Ctrl+Q)") {
-                    viewModel.toggleQuickView()
-                }
-                .keyboardShortcut("q", modifiers: [.control])
-                
                 Button("Групповое переименование (Ctrl+M)") {
                     viewModel.triggerBatchRename()
                 }

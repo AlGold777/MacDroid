@@ -703,7 +703,7 @@ public struct FileGridCell: View {
         let isMove = NSEvent.modifierFlags.contains(.command)
         let targetDir = item.isDirectory ? item.path : nil
         SSHTransportLog.write("DND_GRID_FOLDER_DROP side=\(side) folder=\(item.name) hasPayload=\(vm.currentDragPayload != nil)")
-        if vm.currentDragPayload != nil {
+        if vm.consumeInternalDragPayload(isInternalDrop: DualPaneViewModel.providersCarryInternalPayload(providers)) {
             return vm.handleDroppedProviders([], toSide: side, targetDirPath: targetDir, isMove: isMove)
         }
         return vm.handleDroppedProviders(providers, toSide: side, targetDirPath: targetDir, isMove: isMove)
@@ -864,8 +864,8 @@ public struct FileGridDropDelegate: DropDelegate {
         let isMove = NSEvent.modifierFlags.contains(.command)
         SSHTransportLog.write("DND_GRID_PERFORM_DROP side=\(side) hasPayload=\(vm.currentDragPayload != nil) targetDir=\(targetDirPath ?? "nil")")
         
-        // 1. Приоритетный путь для внутреннего Drag & Drop между панелями
-        if vm.currentDragPayload != nil {
+        // 1. Приоритетный путь для внутреннего Drag & Drop между панелями (внешний drop сбрасывает устаревший payload, D11)
+        if vm.consumeInternalDragPayload(isInternalDrop: info.hasItemsConforming(to: [DualPaneViewModel.dragUTType])) {
             return vm.handleDroppedProviders([], toSide: side, targetDirPath: targetDirPath, isMove: isMove)
         }
         

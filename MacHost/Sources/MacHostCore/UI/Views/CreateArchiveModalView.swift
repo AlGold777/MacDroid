@@ -100,6 +100,12 @@ public struct CreateArchiveModalView: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .background(Color(nsColor: .controlBackgroundColor))
                     .cornerRadius(4)
+
+                if let problem = vm.archiveDestinationProblem() {
+                    Text(problem)
+                        .font(.caption)
+                        .foregroundColor(.red)
+                }
             }
             
             if vm.isArchiving {
@@ -131,7 +137,7 @@ public struct CreateArchiveModalView: View {
                 }
                 .buttonStyle(.borderedProminent)
                 .keyboardShortcut(.defaultAction)
-                .disabled(vm.archiveName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || vm.isArchiving)
+                .disabled(vm.archiveName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || vm.isArchiving || vm.archiveDestinationProblem() != nil)
             }
         }
         .padding(20)

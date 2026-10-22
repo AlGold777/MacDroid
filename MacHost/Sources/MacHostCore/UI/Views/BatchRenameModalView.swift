@@ -188,10 +188,18 @@ public struct BatchRenameModalView: View {
         for res in results {
             nameCounts[res.newName, default: 0] += 1
         }
-        
+
+        // Имена, уже занятые в панели. Объекты, которые переименовываются в этой же операции, освобождают своё имя
+        // (цепочки и циклы выполняются через временные имена), остальные занятые имена — конфликт.
+        let activeSide = side ?? vm.batchRenameSide
+        let listing = (activeSide == .left) ? vm.leftItems : vm.rightItems
+        let vacatedNames = Set(results.filter { $0.oldItem.name != $0.newName }.map { $0.oldItem.name })
+        let occupiedNames = Set(listing.map { $0.name }).subtracting(vacatedNames)
+
         return results.map { mapping in
-            let conflict = (nameCounts[mapping.newName] ?? 0) > 1
-            return (mapping.oldItem, mapping.newName, conflict)
+            let duplicate = (nameCounts[mapping.newName] ?? 0) > 1
+            let takenByOther = mapping.oldItem.name != mapping.newName && occupiedNames.contains(mapping.newName)
+            return (mapping.oldItem, mapping.newName, duplicate || takenByOther)
         }
     }
     

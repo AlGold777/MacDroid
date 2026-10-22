@@ -10,6 +10,7 @@ public struct QuickViewPaneView: View {
     @State private var imageResolution: CGSize = .zero
     @State private var isLoading: Bool = false
     @State private var loadError: String? = nil
+    @State private var loadGeneration: Int = 0
     
     private static let supportedImageExtensions: Set<String> = [
         "jpg", "jpeg", "png", "heic", "dng", "webp", "gif", "bmp", "tiff", "tif"
@@ -182,6 +183,7 @@ public struct QuickViewPaneView: View {
     
     private func loadImageIfNeeded() {
         guard let item = item, isImage else {
+            loadGeneration += 1
             loadedImage = nil
             imageResolution = .zero
             isLoading = false
@@ -189,13 +191,16 @@ public struct QuickViewPaneView: View {
             return
         }
         
+        // Поколение загрузки: результат устаревшей загрузки (элемент уже сменился) не применяется.
+        loadGeneration += 1
+        let generation = loadGeneration
         loadedImage = nil
         imageResolution = .zero
         loadError = nil
         isLoading = true
         
-        // Проверяем кэш миниатюр
-        if let cached = ThumbnailCacheManager.shared.getThumbnail(for: item.path) {
+        // Кэш миниатюр по тому же ключу, что и в сетке (путь + размер + mtime)
+        if let cached = ThumbnailCacheManager.shared.getThumbnail(for: item) {
             self.loadedImage = cached
             self.imageResolution = cached.size
             self.isLoading = false
@@ -205,31 +210,33 @@ public struct QuickViewPaneView: View {
         if item.source == .localMac {
             DispatchQueue.global(qos: .userInitiated).async {
                 let url = URL(fileURLWithPath: item.path)
-                let img = self.decodeImage(url: url)
+                let img = QuickViewPaneView.decodeImage(url: url)
                 DispatchQueue.main.async {
+                    if let img = img {
+                        ThumbnailCacheManager.shared.storeThumbnail(image: img, for: item)
+                    }
+                    guard generation == self.loadGeneration else { return }
                     self.isLoading = false
                     if let img = img {
                         self.loadedImage = img
                         self.imageResolution = img.size
-                        ThumbnailCacheManager.shared.storeThumbnail(image: img, for: item.path)
                     } else {
                         self.loadError = "Не удалось декодировать изображение"
                     }
                 }
             }
         } else {
-            // Удалённый файл с телефона: скачиваем во временный кэш
-            let fileName = item.name
-            let tempURL = FileManager.default.temporaryDirectory
-                .appendingPathComponent("MacDroidQuickView")
-                .appendingPathComponent(fileName)
+            // Удалённый файл с телефона: уникальный временный каталог на каждую загрузку,
+            // чтобы параллельные загрузки файлов с одинаковым именем не портили друг друга.
+            let workDir = FileManager.default.temporaryDirectory
+                .appendingPathComponent("MacDroidQuickView", isDirectory: true)
+                .appendingPathComponent(UUID().uuidString, isDirectory: true)
+            let tempURL = workDir.appendingPathComponent(item.name)
             
             Task {
+                defer { try? FileManager.default.removeItem(at: workDir) }
                 do {
-                    try FileManager.default.createDirectory(
-                        at: tempURL.deletingLastPathComponent(),
-                        withIntermediateDirectories: true
-                    )
+                    try FileManager.default.createDirectory(at: workDir, withIntermediateDirectories: true)
                     
                     try await vm.downloadRemoteFile(
                         remotePath: item.path,
@@ -237,19 +244,26 @@ public struct QuickViewPaneView: View {
                         totalSize: item.size
                     )
                     
-                    let img = self.decodeImage(url: tempURL)
+                    // Декод вне главного потока
+                    let img = await Task.detached(priority: .userInitiated) {
+                        QuickViewPaneView.decodeImage(url: tempURL)
+                    }.value
                     await MainActor.run {
+                        if let img = img {
+                            ThumbnailCacheManager.shared.storeThumbnail(image: img, for: item)
+                        }
+                        guard generation == self.loadGeneration else { return }
                         self.isLoading = false
                         if let img = img {
                             self.loadedImage = img
                             self.imageResolution = img.size
-                            ThumbnailCacheManager.shared.storeThumbnail(image: img, for: item.path)
                         } else {
                             self.loadError = "Не удалось декодировать фото с телефона"
                         }
                     }
                 } catch {
                     await MainActor.run {
+                        guard generation == self.loadGeneration else { return }
                         self.isLoading = false
                         self.loadError = "Ошибка загрузки: \(error.localizedDescription)"
                     }
@@ -258,7 +272,7 @@ public struct QuickViewPaneView: View {
         }
     }
     
-    private func decodeImage(url: URL) -> NSImage? {
+    private static func decodeImage(url: URL) -> NSImage? {
         guard let source = CGImageSourceCreateWithURL(url as CFURL, nil) else {
             return NSImage(contentsOf: url)
         }

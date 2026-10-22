@@ -107,27 +107,27 @@ public final class KeyCommandMonitor {
             return nil
         }
 
-        let code = Int(event.keyCode)
-        let chars = event.charactersIgnoringModifiers?.lowercased()
+        // Приоритет у символа раскладки: на Dvorak/других раскладках физический keyCode 8
+        // может давать иной символ (например, Cmd+J), и тогда он не должен становиться «Копировать».
+        let chars = (event.charactersIgnoringModifiers ?? "").lowercased()
+        switch chars {
+        case "c", "с": return .copy      // Cyrillic 'с'
+        case "v", "м": return .paste     // Cyrillic 'м'
+        case "x", "ч": return .cut       // Cyrillic 'ч'
+        case "a", "ф": return .selectAll // Cyrillic 'ф'
+        default: break
+        }
+        // Символ известен, но не является текстовым действием
+        if !chars.isEmpty { return nil }
 
-        // Keycode 8 = C, Cyrillic 'с'
-        if code == 8 || chars == "c" || chars == "с" {
-            return .copy
+        // Фолбэк по keyCode только когда символ не определён (charactersIgnoringModifiers пуст)
+        switch event.keyCode {
+        case 8: return .copy       // C
+        case 9: return .paste      // V
+        case 7: return .cut        // X
+        case 0: return .selectAll  // A
+        default: return nil
         }
-        // Keycode 9 = V, Cyrillic 'м'
-        if code == 9 || chars == "v" || chars == "м" {
-            return .paste
-        }
-        // Keycode 7 = X, Cyrillic 'ч'
-        if code == 7 || chars == "x" || chars == "ч" {
-            return .cut
-        }
-        // Keycode 0 = A, Cyrillic 'ф'
-        if code == 0 || chars == "a" || chars == "ф" {
-            return .selectAll
-        }
-
-        return nil
     }
 
     /// Returns nil when the event was handled in the focused text editor (consuming the event).

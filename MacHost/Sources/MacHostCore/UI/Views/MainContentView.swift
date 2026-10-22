@@ -41,12 +41,11 @@ public struct MainContentView: View {
             }
             .environmentObject(vm)
         }
-        .sheet(isPresented: $vm.showConflictDialog) {
+        // Закрытие без выбора (Esc, «Отмена передачи») отменяет передачу, которая ждёт решения
+        .sheet(isPresented: $vm.showConflictDialog, onDismiss: { vm.resolveConflict(nil) }) {
             if let conflict = vm.activeConflict {
                 ConflictResolutionModalView(conflict: conflict) { strategy, applyToAll in
-                    if applyToAll {
-                        vm.rememberedStrategy = strategy
-                    }
+                    vm.resolveConflict((strategy, applyToAll))
                 }
             }
         }

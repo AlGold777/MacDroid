@@ -10,7 +10,9 @@ public struct ImageViewerModalView: View {
     @State private var currentImage: NSImage?
     @State private var scale: CGFloat = 1.0
     @State private var preloadedImages: [Int: NSImage] = [:]
-    
+    /// Окно предзагрузки: только текущее изображение ±2, остальное вытесняется (защита от OOM).
+    private static let preloadRadius = 2
+
     public init(images: [FileItem], startIndex: Int) {
         self.images = images
         self._currentIndex = State(initialValue: startIndex)
@@ -121,20 +123,35 @@ public struct ImageViewerModalView: View {
         if currentIndex + 1 < images.count {
             currentIndex += 1
             scale = 1.0
+            pruneOutsideWindow()
             loadCurrentImage()
             prefetchNeighbors()
         }
     }
-    
+
     private func prev() {
         if currentIndex > 0 {
             currentIndex -= 1
             scale = 1.0
+            pruneOutsideWindow()
             loadCurrentImage()
             prefetchNeighbors()
         }
     }
-    
+
+    /// Удаляет предзагруженные изображения вне окна ±preloadRadius от текущего.
+    private func pruneOutsideWindow() {
+        let center = currentIndex
+        preloadedImages = preloadedImages.filter { abs($0.key - center) <= Self.preloadRadius }
+    }
+
+    /// Сохраняет декодированное изображение только если оно входит в окно предзагрузки.
+    private func storePreloaded(_ img: NSImage, at idx: Int) {
+        guard abs(idx - currentIndex) <= Self.preloadRadius else { return }
+        preloadedImages[idx] = img
+        pruneOutsideWindow()
+    }
+
     private func loadCurrentImage() {
         if let preloaded = preloadedImages[currentIndex] {
             self.currentImage = preloaded
@@ -143,14 +160,14 @@ public struct ImageViewerModalView: View {
         guard currentIndex < images.count else { return }
         let item = images[currentIndex]
         self.currentImage = nil
-        
+
         if FileManager.default.fileExists(atPath: item.path) {
             DispatchQueue.global(qos: .userInitiated).async {
                 let img = self.decodeHEICorStandard(url: URL(fileURLWithPath: item.path))
                 DispatchQueue.main.async {
                     self.currentImage = img
                     if let img = img {
-                        self.preloadedImages[self.currentIndex] = img
+                        self.storePreloaded(img, at: self.currentIndex)
                     }
                 }
             }
@@ -160,7 +177,7 @@ public struct ImageViewerModalView: View {
                 DispatchQueue.main.async {
                     self.currentImage = img
                     if let img = img {
-                        self.preloadedImages[self.currentIndex] = img
+                        self.storePreloaded(img, at: self.currentIndex)
                     }
                 }
             }
@@ -171,21 +188,21 @@ public struct ImageViewerModalView: View {
                     await MainActor.run {
                         self.currentImage = img
                         if let img = img {
-                            self.preloadedImages[self.currentIndex] = img
+                            self.storePreloaded(img, at: self.currentIndex)
                         }
                     }
                 }
             }
         }
     }
-    
+
     private func prefetchNeighbors() {
         Task {
             for offset in [-1, 1, -2, 2] {
                 let idx = self.currentIndex + offset
                 guard idx >= 0 && idx < self.images.count && self.preloadedImages[idx] == nil else { continue }
                 let item = self.images[idx]
-                
+
                 let localURL: URL?
                 if FileManager.default.fileExists(atPath: item.path) {
                     localURL = URL(fileURLWithPath: item.path)
@@ -194,10 +211,10 @@ public struct ImageViewerModalView: View {
                 } else {
                     localURL = await vm.downloadRemoteFile(item: item)
                 }
-                
+
                 if let url = localURL, let img = self.decodeHEICorStandard(url: url) {
                     await MainActor.run {
-                        self.preloadedImages[idx] = img
+                        self.storePreloaded(img, at: idx)
                     }
                 }
             }

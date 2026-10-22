@@ -4,6 +4,18 @@ import AppKit
 import UniformTypeIdentifiers
 import DiskArbitration
 
+/// Ошибки проверок перед переименованием/перемещением, которые нельзя обходить молча
+public enum FileOperationNameError: LocalizedError, Sendable {
+    case nameTaken(name: String)
+
+    public var errorDescription: String? {
+        switch self {
+        case .nameTaken(let name):
+            return "Объект с именем «\(name)» уже существует"
+        }
+    }
+}
+
 public enum SortField: String, CaseIterable, Sendable {
     case name = "Имя"
     case size = "Размер"
@@ -190,6 +202,24 @@ public final class DualPaneViewModel: ObservableObject {
         dragHoverFolderId = nil
         dragInsertionIndex = nil
     }
+
+    /// Есть ли среди провайдеров наш внутренний тип перетаскивания (drop из этого же приложения)
+    public static func providersCarryInternalPayload(_ providers: [NSItemProvider]) -> Bool {
+        providers.contains { provider in
+            provider.hasItemConformingToTypeIdentifier(dragUTType) || provider.registeredTypeIdentifiers.contains(dragUTType)
+        }
+    }
+
+    /// Внутренний payload действителен только для drop из того же drag-сеанса приложения.
+    /// Внешний drop (Finder и др.) сбрасывает устаревший payload, иначе тот перехватывал бы чужие файлы (D11).
+    /// Возвращает true, если нужно обработать drop через внутренний payload.
+    public func consumeInternalDragPayload(isInternalDrop: Bool) -> Bool {
+        guard isInternalDrop, currentDragPayload != nil else {
+            currentDragPayload = nil
+            return false
+        }
+        return true
+    }
     @Published public var isTransferCompleted: Bool = false
     @Published public var transferCompletionMessage: String = ""
     @Published public var operationReport: OperationReport? = nil
@@ -222,7 +252,8 @@ public final class DualPaneViewModel: ObservableObject {
     @Published public var showConflictDialog: Bool = false
     @Published public var activeConflict: ConflictContext? = nil
     @Published public var rememberedStrategy: ConflictResolutionStrategy? = nil
-    
+    private var conflictContinuation: CheckedContinuation<(strategy: ConflictResolutionStrategy, applyToAll: Bool)?, Never>? = nil
+
     // Активная сессия перетаскивания (Drag & Drop) внутри приложения
     public var currentDragPayload: DragPayload? = nil
     public var draggedTabInfo: (side: PaneSide, id: UUID)? = nil
@@ -253,6 +284,8 @@ public final class DualPaneViewModel: ObservableObject {
     @Published public var detectedUsbDrives: [UsbDriveInfo] = []
     @Published public var isPhoneConnected: Bool = false
     private var connectionMonitorTimer: Timer?
+    /// Между willSleep и didWake проверки связи не запускаем (W16)
+    private var isSystemAsleep = false
     private var wifiReachabilityMisses: Int = 0
     private var connectionProbeRunning = false
     private let wifiReachabilityMissLimit = 3
@@ -274,6 +307,8 @@ public final class DualPaneViewModel: ObservableObject {
     
     private var leftRefreshTask: Task<Void, Never>?
     private var rightRefreshTask: Task<Void, Never>?
+    private var leftRefreshGeneration = 0
+    private var rightRefreshGeneration = 0
     
     private lazy var orchestrator: JobOrchestrator = {
         let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
@@ -289,10 +324,13 @@ public final class DualPaneViewModel: ObservableObject {
             let fallbackURL = FileManager.default.temporaryDirectory.appendingPathComponent("mac_android_ledger_fallback.db")
             if let secondaryLedger = try? IntentLedger(databaseURL: fallbackURL) {
                 ledger = secondaryLedger
+            } else if let tempLedger = try? IntentLedger(databaseURL: FileManager.default.temporaryDirectory.appendingPathComponent("ledger_\(UUID().uuidString).db")) {
+                // Последний резерв: уникальный временный файл (без force-unwrap/try! и без краша)
+                ledger = tempLedger
             } else {
-                // В худшем случае in-memory база, гарантирующая отсутствие краша
-                ledger = (try? IntentLedger(databaseURL: URL(fileURLWithPath: ":memory:")))
-                    ?? (try! IntentLedger(databaseURL: FileManager.default.temporaryDirectory.appendingPathComponent("ledger_\(UUID().uuidString).db")))
+                // Сюда попадаем только если ФС недоступна целиком; IntentLedger не умеет in-memory
+                // (open по пути), поэтому явно сообщаем о неисправимом состоянии вместо молчаливого краша.
+                fatalError("IntentLedger: не удалось открыть ни одну базу журнала (диск недоступен)")
             }
         }
         return JobOrchestrator(ledger: ledger, transport: transport, localFS: localDriver)
@@ -441,6 +479,29 @@ public final class DualPaneViewModel: ObservableObject {
             }
         }
         
+        // Сон/пробуждение (W16): во сне сокеты не отвечают, поэтому проверки связи приостанавливаем,
+        // а после пробуждения сразу выполняем health check (сеть успевает подняться за 2 с)
+        NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.willSleepNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.isSystemAsleep = true
+            }
+        }
+        NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didWakeNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.isSystemAsleep = false
+                try? await Task.sleep(nanoseconds: 2_000_000_000)
+                self?.checkPhoneConnectionState()
+            }
+        }
+
         // Глобальный перехватчик Ctrl+V, Ctrl+C, Ctrl+X, Ctrl+A в текстовых полях
         KeyCommandMonitor.installGlobalMonitor()
         
@@ -1172,6 +1233,13 @@ public final class DualPaneViewModel: ObservableObject {
     }
     
     public func swapPanes() {
+        // Идущие обновления относятся к старым источникам панелей: отменяем их, иначе результат
+        // попадёт в чужую панель. После обмена обе панели перечитываются заново (U3).
+        leftRefreshTask?.cancel()
+        rightRefreshTask?.cancel()
+        leftIsRefreshing = false
+        rightIsRefreshing = false
+
         let tempSource = leftSource
         let tempPath = leftPath
         let tempItems = leftItems
@@ -1219,6 +1287,8 @@ public final class DualPaneViewModel: ObservableObject {
         
         statusMessage = "Панели поменяны местами"
         saveSession()
+        refreshPane(side: .left)
+        refreshPane(side: .right)
     }
     
     /// Переключение между режимом таблицы и графической сетки
@@ -1349,6 +1419,21 @@ public final class DualPaneViewModel: ObservableObject {
                 isExplicitUserAction: isExplicit,
                 viewModel: self
             )
+            // W7: учёт backoff автоподключения. Ручное действие снимает паузы и подавление.
+            let autoKey = self.autoConnectKey(targetPath: targetPath, preferredDeviceId: preferredDeviceId)
+            if isExplicit {
+                self.autoConnectBackoff[DualPaneViewModel.lanScanBackoffKey] = nil
+                if let key = autoKey { self.autoConnectBackoff[key] = nil }
+            } else if let key = autoKey {
+                if success {
+                    self.autoConnectBackoff[key] = nil
+                } else if case .authFailed = ConnectionController.shared.phase {
+                    // Неверный ключ/отладка не подтверждена: повторять автоматически нельзя до ручного подключения
+                    self.suppressAutoConnect(key: key)
+                } else {
+                    self.recordAutoConnectFailure(key: key)
+                }
+            }
             if success {
                 self.leftIsStale = false
                 self.rightIsStale = false
@@ -1375,6 +1460,50 @@ public final class DualPaneViewModel: ObservableObject {
         if rightSource == .remotePhone { refreshPane(side: .right) }
     }
     
+    // MARK: - Backoff автоподключения (W7)
+    
+    /// Состояние повторных попыток автоподключения по endpoint (USB-серийник, IP, или общий поиск в LAN)
+    private struct AutoConnectBackoff: Sendable {
+        var failures: Int = 0
+        var nextAttemptAt: Date = .distantPast
+        /// После authFailed автоподключение по endpoint не повторяется до ручного действия пользователя
+        var suppressed: Bool = false
+    }
+    
+    private static let lanScanBackoffKey = "lan-scan"
+    private var autoConnectBackoff: [String: AutoConnectBackoff] = [:]
+    
+    private nonisolated static func autoConnectAllowed(_ key: String, state: [String: AutoConnectBackoff], now: Date = Date()) -> Bool {
+        guard let entry = state[key] else { return true }
+        return !entry.suppressed && now >= entry.nextAttemptAt
+    }
+    
+    /// Экспоненциальная пауза после неудачи: 5, 10, 20 … 300 секунд
+    private func recordAutoConnectFailure(key: String) {
+        var entry = autoConnectBackoff[key] ?? AutoConnectBackoff()
+        entry.failures += 1
+        let delay = min(2.5 * pow(2.0, Double(min(entry.failures, 8))), 300)
+        entry.nextAttemptAt = Date().addingTimeInterval(delay)
+        autoConnectBackoff[key] = entry
+    }
+    
+    private func suppressAutoConnect(key: String) {
+        var entry = autoConnectBackoff[key] ?? AutoConnectBackoff()
+        entry.suppressed = true
+        autoConnectBackoff[key] = entry
+    }
+    
+    private func autoConnectKey(targetPath: CandidatePath?, preferredDeviceId: String?) -> String? {
+        if let path = targetPath {
+            switch path {
+            case .lan(let host, _, _): return "lan:\(host)"
+            case .usb(let deviceId, _): return "usb:\(deviceId)"
+            }
+        }
+        if let id = preferredDeviceId { return "usb:\(id)" }
+        return nil
+    }
+    
     /// Автоматическое подключение к телефону при обнаружении USB или Wi-Fi связи
     public func autoConnectPhoneIfAvailable() {
         guard !isConnectingPhone && !isAutoConnecting && !remoteDriver.isConnected else {
@@ -1388,23 +1517,31 @@ public final class DualPaneViewModel: ObservableObject {
         }
         isAutoConnecting = true
         
+        // Снимок состояния backoff передаём в фоновую задачу: проверки делаются до дорогих операций (adb, nc-пробы)
+        let backoffState = autoConnectBackoff
         Task.detached(priority: .userInitiated) { [weak self] in
             guard let self = self else { return }
             // 1. Проверяем наличие USB-устройства через ADB и его политику autoConnect
-            var chosenCandidate: CandidatePath? = nil
             var chosenUsbDeviceId: String? = nil
             for id in PhoneConnectionManager.shared.authorizedAdbDeviceIds() {
-                if let dev = DeviceRegistry.shared.device(withId: id), dev.autoConnect {
+                if let dev = DeviceRegistry.shared.device(withId: id), dev.autoConnect,
+                   DualPaneViewModel.autoConnectAllowed("usb:\(id)", state: backoffState) {
                     chosenUsbDeviceId = id
                     break
                 }
             }
             
             // 2. Если по USB не обнаружен, сканируем Wi-Fi для доверенных устройств с autoConnect == true
-            if chosenUsbDeviceId == nil {
-                if let foundIp = PhoneConnectionManager.shared.discoverPhoneIpOnLan() {
-                    let dev = DeviceRegistry.shared.device(matchingHost: foundIp)
-                    if dev?.autoConnect == true {
+            var chosenCandidate: CandidatePath? = nil
+            var scanAttempted = false
+            if chosenUsbDeviceId == nil && DualPaneViewModel.autoConnectAllowed(DualPaneViewModel.lanScanBackoffKey, state: backoffState) {
+                scanAttempted = true
+                if let foundIp = PhoneConnectionManager.shared.discoverPhoneIpOnLan(),
+                   let dev = DeviceRegistry.shared.device(matchingHost: foundIp) {
+                    // W6: по IP подключаемся автоматически только к устройству с уже сохранённым отпечатком.
+                    // Непроверенный отпечаток при автоподключении не сохраняется.
+                    if dev.autoConnect, !dev.pinnedFingerprint.isEmpty,
+                       DualPaneViewModel.autoConnectAllowed("lan:\(foundIp)", state: backoffState) {
                         let isV6 = foundIp.contains(":")
                         chosenCandidate = .lan(host: foundIp, port: 2222, isV6: isV6)
                     }
@@ -1413,8 +1550,16 @@ public final class DualPaneViewModel: ObservableObject {
 
             let candidateToConnect = chosenCandidate
             let usbDeviceToConnect = chosenUsbDeviceId
+            let scanProducedCandidate = chosenCandidate != nil
             await MainActor.run {
                 self.isAutoConnecting = false
+                if scanAttempted {
+                    if scanProducedCandidate {
+                        self.autoConnectBackoff[DualPaneViewModel.lanScanBackoffKey] = nil
+                    } else {
+                        self.recordAutoConnectFailure(key: DualPaneViewModel.lanScanBackoffKey)
+                    }
+                }
                 // Важно: повторная проверка подавления прямо перед коннектом
                 guard !ConnectionController.shared.isManualDisconnectSuppressed else { return }
                 if (candidateToConnect != nil || usbDeviceToConnect != nil), !self.isConnectingPhone && !self.remoteDriver.isConnected {
@@ -1491,7 +1636,7 @@ public final class DualPaneViewModel: ObservableObject {
     
     /// Проверка актуального состояния подключения телефона
     public func checkPhoneConnectionState() {
-        guard !isConnectingPhone && !connectionProbeRunning else { return }
+        guard !isConnectingPhone && !connectionProbeRunning && !isSystemAsleep else { return }
         if !remoteDriver.isConnected {
             wifiReachabilityMisses = 0
             if isPhoneConnected {
@@ -1812,25 +1957,26 @@ public final class DualPaneViewModel: ObservableObject {
         }
         
         let driver: FileSystemDriver = (source == .localMac) ? localDriver : remoteDriver
-        
+
+        // Номер поколения загрузки: спиннер гаснет только по последней запущенной загрузке панели (U3)
+        let generation: Int
         if side == .left {
+            leftRefreshGeneration &+= 1
+            generation = leftRefreshGeneration
             leftIsRefreshing = true
             leftRefreshTask?.cancel()
         } else {
+            rightRefreshGeneration &+= 1
+            generation = rightRefreshGeneration
             rightIsRefreshing = true
             rightRefreshTask?.cancel()
         }
-        
+
         let task = Task { @MainActor in
-            if side == .left {
-                self.leftIsRefreshing = true
-            } else {
-                self.rightIsRefreshing = true
-            }
             defer {
                 if side == .left {
-                    self.leftIsRefreshing = false
-                } else {
+                    if generation == self.leftRefreshGeneration { self.leftIsRefreshing = false }
+                } else if generation == self.rightRefreshGeneration {
                     self.rightIsRefreshing = false
                 }
             }
@@ -2130,13 +2276,9 @@ public final class DualPaneViewModel: ObservableObject {
         }
         guard trimmed != targetItem.name else { return }
         
-        let parentPath = URL(fileURLWithPath: targetItem.path).deletingLastPathComponent().path
-        let newPath = (parentPath as NSString).appendingPathComponent(trimmed).precomposedStringWithCanonicalMapping
-        let driver: FileSystemDriver = (targetItem.source == .localMac) ? localDriver : remoteDriver
-        
         Task {
             do {
-                try await driver.renameItem(from: targetItem.path, to: newPath)
+                try await self.renameChecked(from: targetItem.path, toName: trimmed, source: targetItem.source)
                 await MainActor.run {
                     self.statusMessage = "Переименовано: '\(targetItem.name)' → '\(trimmed)'"
                     self.refreshPane(side: targetSide)
@@ -2150,6 +2292,35 @@ public final class DualPaneViewModel: ObservableObject {
         }
     }
     
+    /// Занято ли имя в папке. Для Mac — проверка по ФС (совпадение inode с самим объектом не считается конфликтом),
+    /// для телефона — свежий листинг без кэша. Ошибка листинга пробрасывается: не считаем имя свободным вслепую.
+    private func isNameTaken(inDirectory dir: String, name: String, originalPath: String, source: FileSource) async throws -> Bool {
+        let target = (dir as NSString).appendingPathComponent(name)
+        if source == .localMac {
+            guard FileManager.default.fileExists(atPath: target) else { return false }
+            let targetInode = (try? FileManager.default.attributesOfItem(atPath: target))?[.systemFileNumber] as? NSNumber
+            let originalInode = (try? FileManager.default.attributesOfItem(atPath: originalPath))?[.systemFileNumber] as? NSNumber
+            if let targetInode = targetInode, let originalInode = originalInode, targetInode == originalInode {
+                return false
+            }
+            return true
+        }
+        let originalName = (originalPath as NSString).lastPathComponent
+        let items = try await remoteDriver.listDirectory(at: dir, forceRefresh: true)
+        return items.contains { $0.name.lowercased() == name.lowercased() && $0.name != originalName }
+    }
+
+    /// Переименование с проверкой занятого имени: rename поверх существующего объекта уничтожил бы его (D7)
+    private func renameChecked(from oldPath: String, toName newName: String, source: FileSource) async throws {
+        let dir = (oldPath as NSString).deletingLastPathComponent
+        if try await isNameTaken(inDirectory: dir, name: newName, originalPath: oldPath, source: source) {
+            throw FileOperationNameError.nameTaken(name: newName)
+        }
+        let newPath = (dir as NSString).appendingPathComponent(newName).precomposedStringWithCanonicalMapping
+        let driver: FileSystemDriver = (source == .localMac) ? localDriver : remoteDriver
+        try await driver.renameItem(from: oldPath, to: newPath)
+    }
+
     public func cancelInlineRename() {
         editingItemId = nil
         editingItemSide = nil
@@ -2178,14 +2349,11 @@ public final class DualPaneViewModel: ObservableObject {
         }
         guard trimmed != item.name else { return }
         
-        let parentPath = URL(fileURLWithPath: item.path).deletingLastPathComponent().path
-        let newPath = (parentPath as NSString).appendingPathComponent(trimmed).precomposedStringWithCanonicalMapping
-        let driver: FileSystemDriver = (item.source == .localMac) ? localDriver : remoteDriver
         let side: PaneSide = (item.source == leftSource && leftItems.contains(where: { $0.id == item.id })) ? .left : .right
-        
+
         Task {
             do {
-                try await driver.renameItem(from: item.path, to: newPath)
+                try await self.renameChecked(from: item.path, toName: trimmed, source: item.source)
                 await MainActor.run {
                     self.statusMessage = "Переименовано: '\(item.name)' → '\(trimmed)'"
                     self.refreshPane(side: side)
@@ -2433,6 +2601,23 @@ public final class DualPaneViewModel: ObservableObject {
         statusMessage = "Скопировано в буфер: \(targetItems.count) объектов"
     }
     
+    /// Копирование локальных объектов вне MainActor. Возвращает число успешных копий и тексты ошибок.
+    private func copyLocalItemsOffMain(_ pairs: [(src: URL, dst: URL)]) async -> (copied: Int, errors: [String]) {
+        await Task.detached(priority: .userInitiated) {
+            var copied = 0
+            var errors: [String] = []
+            for pair in pairs {
+                do {
+                    try FileManager.default.copyItem(at: pair.src, to: pair.dst)
+                    copied += 1
+                } catch {
+                    errors.append("\(pair.src.lastPathComponent): \(error.localizedDescription)")
+                }
+            }
+            return (copied, errors)
+        }.value
+    }
+    
     public func pasteFromClipboard(targetSide: PaneSide? = nil) {
         let destSide = targetSide ?? activePane
         let destPath = (destSide == .left) ? leftPath : rightPath
@@ -2443,40 +2628,34 @@ public final class DualPaneViewModel: ObservableObject {
             let source = clipboardSource
             let itemsToPaste = clipboardItems
             
-            if source == destSource {
-                // Копирование в пределах одного хранилища
-                Task {
-                    var successCount = 0
-                    for item in itemsToPaste {
-                        let originalURL = URL(fileURLWithPath: item.path)
-                        var targetName = originalURL.lastPathComponent
-                        
-                        // Если вставляем в ту же самую папку — генерируем имя "(копия)"
-                        if originalURL.deletingLastPathComponent().path == destPath {
-                            targetName = self.generateDuplicateName(baseName: item.name, in: (destSide == .left ? self.leftItems : self.rightItems))
-                        }
-                        
-                        let targetURL = URL(fileURLWithPath: destPath).appendingPathComponent(targetName)
-                        do {
-                            if destSource == .localMac {
-                                try FileManager.default.copyItem(at: originalURL, to: targetURL)
-                            } else {
-                                self.queueManager.enqueue(source: item, targetDir: destPath, isMove: false)
-                            }
-                            successCount += 1
-                        } catch {
-                            print("Paste error: \(error)")
-                        }
+            if source == destSource && destSource == .localMac {
+                // Копирование в пределах Mac: имена для вставки в ту же папку считаем на MainActor, копируем вне его
+                let sideItems = (destSide == .left) ? leftItems : rightItems
+                let pairs: [(src: URL, dst: URL)] = itemsToPaste.map { item in
+                    let originalURL = URL(fileURLWithPath: item.path)
+                    var targetName = originalURL.lastPathComponent
+                    // Если вставляем в ту же самую папку — генерируем имя "(копия)"
+                    if originalURL.deletingLastPathComponent().path == destPath {
+                        targetName = self.generateDuplicateName(baseName: item.name, in: sideItems)
                     }
+                    return (src: originalURL, dst: URL(fileURLWithPath: destPath).appendingPathComponent(targetName))
+                }
+                Task {
+                    let result = await self.copyLocalItemsOffMain(pairs)
                     self.refreshPane(side: destSide)
-                    self.statusMessage = "Вставлено объектов: \(successCount)"
+                    self.statusMessage = "Вставлено объектов: \(result.copied)"
+                    if !result.errors.isEmpty {
+                        self.errorMessage = "Не вставлено объектов: \(result.errors.count)\n" + result.errors.prefix(10).joined(separator: "\n")
+                        self.showErrorAlert = true
+                    }
                 }
             } else {
-                // Межплатформенная вставка (Mac <-> Android)
+                // Телефон → телефон и межплатформенная вставка идут через оркестратор (конфликты, проверки, отчёт)
                 self.executeTransfer(
                     paths: itemsToPaste.map(\.path),
                     fromSource: source,
                     toSide: destSide,
+                    targetDirPath: destPath,
                     isMove: false
                 )
             }
@@ -2487,21 +2666,27 @@ public final class DualPaneViewModel: ObservableObject {
         if let urls = NSPasteboard.general.readObjects(forClasses: [NSURL.self], options: nil) as? [URL], !urls.isEmpty {
             let paths = urls.map(\.path)
             if destSource == .localMac {
+                let pairs: [(src: URL, dst: URL)] = urls.map { url in
+                    (src: url, dst: URL(fileURLWithPath: destPath).appendingPathComponent(url.lastPathComponent))
+                }
                 Task {
-                    var successCount = 0
-                    for url in urls {
-                        let targetURL = URL(fileURLWithPath: destPath).appendingPathComponent(url.lastPathComponent)
-                        try? FileManager.default.copyItem(at: url, to: targetURL)
-                        successCount += 1
-                    }
+                    // Успех считаем только если все операции прошли; ошибки показываем пользователю
+                    let result = await self.copyLocalItemsOffMain(pairs)
                     self.refreshPane(side: destSide)
-                    self.statusMessage = "Вставлено из Finder: \(successCount) объектов"
+                    if result.errors.isEmpty {
+                        self.statusMessage = "Вставлено из Finder: \(result.copied) объектов"
+                    } else {
+                        self.statusMessage = "Вставлено из Finder: \(result.copied), ошибок: \(result.errors.count)"
+                        self.errorMessage = "Не вставлено объектов: \(result.errors.count)\n" + result.errors.prefix(10).joined(separator: "\n")
+                        self.showErrorAlert = true
+                    }
                 }
             } else {
                 self.executeTransfer(
                     paths: paths,
                     fromSource: .localMac,
                     toSide: destSide,
+                    targetDirPath: destPath,
                     isMove: false
                 )
             }
@@ -2534,18 +2719,41 @@ public final class DualPaneViewModel: ObservableObject {
         let newPath = URL(fileURLWithPath: dir).appendingPathComponent(newName).path
         
         Task {
-            do {
-                if source == .localMac {
-                    try FileManager.default.copyItem(atPath: target.path, toPath: newPath)
-                } else {
-                    let dupItem = FileItem(id: target.id, name: target.name, path: target.path, size: target.size, mtime: target.mtime, isDirectory: target.isDirectory, source: .remotePhone)
-                    self.queueManager.enqueue(source: dupItem, targetDir: dir, isMove: false)
+            if source == .localMac {
+                do {
+                    try await Task.detached(priority: .userInitiated) {
+                        try FileManager.default.copyItem(atPath: target.path, toPath: newPath)
+                    }.value
+                    self.refreshPane(side: currentSide)
+                    self.statusMessage = "Создан дубликат: \(newName)"
+                } catch {
+                    self.errorMessage = "Не удалось дублировать: \(error.localizedDescription)"
+                    self.showErrorAlert = true
                 }
-                self.refreshPane(side: currentSide)
-                self.statusMessage = "Создан дубликат: \(newName)"
-            } catch {
-                self.errorMessage = "Не удалось дублировать: \(error.localizedDescription)"
-                self.showErrorAlert = true
+            } else {
+                // Телефон: прямое копирование внутри устройства. Папки пока не поддерживаются, честно сообщаем об этом.
+                guard !target.isDirectory else {
+                    self.errorMessage = "Дублирование папок на телефоне пока не поддерживается"
+                    self.showErrorAlert = true
+                    return
+                }
+                // Свежий листинг: имя должно быть свободно (cp на телефоне перезаписывает цель)
+                let siblings = try? await self.remoteDriver.listDirectory(at: dir, forceRefresh: true)
+                guard let existing = siblings, !existing.contains(where: { $0.name == newName }) else {
+                    self.errorMessage = "Не удалось дублировать: объект с именем «\(newName)» уже существует или папка недоступна"
+                    self.showErrorAlert = true
+                    return
+                }
+                let copied = await Task.detached(priority: .userInitiated) {
+                    PhoneConnectionManager.shared.copyFileOnDevice(sourcePath: target.path, targetPath: newPath)
+                }.value
+                if copied {
+                    self.refreshPane(side: currentSide)
+                    self.statusMessage = "Создан дубликат: \(newName)"
+                } else {
+                    self.errorMessage = "Не удалось дублировать на телефоне: \(target.name)"
+                    self.showErrorAlert = true
+                }
             }
         }
     }
@@ -2723,29 +2931,112 @@ public final class DualPaneViewModel: ObservableObject {
         let source = (targetSide == .left) ? leftSource : rightSource
         let driver: FileSystemDriver = (source == .localMac) ? localDriver : remoteDriver
         
+        // Меняются только реально изменённые имена
+        let changes = mappings.filter { $0.oldItem.name != $0.newName }
+        guard !changes.isEmpty else { return }
+        
         Task {
-            var renamedCount = 0
-            var history: [(oldPath: String, newPath: String)] = []
-            for mapping in mappings {
-                guard mapping.oldItem.name != mapping.newName else { continue }
-                let dir = URL(fileURLWithPath: mapping.oldItem.path).deletingLastPathComponent().path
-                let canonicalNewName = mapping.newName.precomposedStringWithCanonicalMapping
-                let newPath = URL(fileURLWithPath: dir).appendingPathComponent(canonicalNewName).path
-                do {
-                    try await driver.renameItem(from: mapping.oldItem.path, to: newPath)
-                    renamedCount += 1
-                    history.append((oldPath: mapping.oldItem.path, newPath: newPath))
-                } catch {
-                    print("Rename error for \(mapping.oldItem.name): \(error)")
+            // 1. Актуальный листинг каталогов: модальное окно могло быть открыто на устаревшем списке (D8)
+            var namesByDir: [String: Set<String>] = [:]
+            do {
+                for change in changes {
+                    let dir = (change.oldItem.path as NSString).deletingLastPathComponent
+                    if namesByDir[dir] == nil {
+                        let listing: [FileItem]
+                        if source == .localMac {
+                            listing = try await self.localDriver.listDirectory(at: dir)
+                        } else {
+                            listing = try await self.remoteDriver.listDirectory(at: dir, forceRefresh: true)
+                        }
+                        namesByDir[dir] = Set(listing.map { $0.name })
+                    }
+                }
+            } catch {
+                self.errorMessage = "Переименование отменено: не удалось прочитать папку (\(error.localizedDescription))"
+                self.showErrorAlert = true
+                return
+            }
+            
+            // 2. Конфликты: цель занята объектом, который не переименовывается в этой же операции, либо две цели совпадают
+            let vacatedPaths = Set(changes.map { $0.oldItem.path })
+            var seenTargets = Set<String>()
+            var conflictNames: [String] = []
+            for change in changes {
+                let dir = (change.oldItem.path as NSString).deletingLastPathComponent
+                let targetPath = (dir as NSString).appendingPathComponent(change.newName).precomposedStringWithCanonicalMapping
+                let occupied = (namesByDir[dir] ?? []).contains(change.newName) && !vacatedPaths.contains(targetPath)
+                if occupied || !seenTargets.insert(targetPath).inserted {
+                    conflictNames.append(change.newName)
                 }
             }
+            guard conflictNames.isEmpty else {
+                self.errorMessage = "Переименование отменено: конфликт имён (\(conflictNames.prefix(5).joined(separator: ", ")))"
+                self.showErrorAlert = true
+                return
+            }
+            
+            // 3. Двухфазное переименование: сначала во временные имена, затем в целевые.
+            // Так цепочки (A→B, B→C) и циклы (A→B, B→A) выполняются без затирания друг друга.
+            let token = UUID().uuidString.prefix(8)
+            let steps: [(oldPath: String, tempPath: String, finalPath: String)] = changes.enumerated().map { index, change in
+                let dir = (change.oldItem.path as NSString).deletingLastPathComponent
+                let tempPath = (dir as NSString).appendingPathComponent(".mcd_rename_\(token)_\(index).tmp")
+                let finalPath = (dir as NSString).appendingPathComponent(change.newName).precomposedStringWithCanonicalMapping
+                return (change.oldItem.path, tempPath, finalPath)
+            }
+            
+            // История хранит ВСЕ фактически выполненные переименования по порядку: отмена идёт в обратном порядке.
+            var history: [(oldPath: String, newPath: String)] = []
+            
+            // Фаза 1: старое имя → временное
+            var phase1Done: [(oldPath: String, tempPath: String)] = []
+            do {
+                for step in steps {
+                    try await driver.renameItem(from: step.oldPath, to: step.tempPath)
+                    phase1Done.append((step.oldPath, step.tempPath))
+                    history.append((step.oldPath, step.tempPath))
+                }
+            } catch {
+                // Откат уже выполненной части фазы 1: операция не должна оставить скрытые временные файлы
+                for pair in phase1Done.reversed() {
+                    try? await driver.renameItem(from: pair.tempPath, to: pair.oldPath)
+                }
+                self.errorMessage = "Переименование отменено: \(error.localizedDescription)"
+                self.showErrorAlert = true
+                self.refreshPane(side: targetSide)
+                return
+            }
+            
+            // Фаза 2: временное имя → целевое имя
+            var renamedCount = 0
+            var failures: [String] = []
+            for step in steps {
+                do {
+                    try await driver.renameItem(from: step.tempPath, to: step.finalPath)
+                    history.append((step.tempPath, step.finalPath))
+                    renamedCount += 1
+                } catch {
+                    failures.append("\(URL(fileURLWithPath: step.oldPath).lastPathComponent): \(error.localizedDescription)")
+                    // Возвращаем объект под исходное имя, чтобы не оставлять скрытый временный файл
+                    if (try? await driver.renameItem(from: step.tempPath, to: step.oldPath)) != nil {
+                        history.removeAll { $0.oldPath == step.oldPath && $0.newPath == step.tempPath }
+                    }
+                }
+            }
+            
             if !history.isEmpty {
                 self.lastBatchRenameHistory = history
                 self.lastBatchRenameSide = targetSide
                 self.canUndoBatchRename = true
             }
             self.refreshPane(side: targetSide)
-            self.statusMessage = "Успешно переименовано объектов: \(renamedCount)"
+            if failures.isEmpty {
+                self.statusMessage = "Успешно переименовано объектов: \(renamedCount)"
+            } else {
+                self.statusMessage = "Переименовано: \(renamedCount), ошибок: \(failures.count)"
+                self.errorMessage = "Не переименовано:\n" + failures.prefix(10).joined(separator: "\n")
+                self.showErrorAlert = true
+            }
         }
     }
     
@@ -2853,14 +3144,42 @@ public final class DualPaneViewModel: ObservableObject {
         }
     }
     
+    /// Назначение архива на телефоне (по пути), иначе Mac
+    private var archiveDestinationIsPhone: Bool {
+        archiveDestinationPath.hasPrefix("/sdcard") || archiveDestinationPath.hasPrefix("/storage")
+    }
+    
+    /// Причина, по которой архив нельзя создать с текущим именем (nil — можно). Используется диалогом.
+    public func archiveDestinationProblem() -> String? {
+        let trimmedName = archiveName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedName.isEmpty, !archiveDestinationIsPhone else { return nil }
+        let destFull = URL(fileURLWithPath: archiveDestinationPath).appendingPathComponent(trimmedName).path
+        var isDir: ObjCBool = false
+        if FileManager.default.fileExists(atPath: destFull, isDirectory: &isDir), isDir.boolValue {
+            return "По этому имени уже есть папка"
+        }
+        if archiveTargetItems.contains(where: { ($0.path as NSString).standardizingPath == destFull }) {
+            return "Архив не может совпадать с архивируемым объектом"
+        }
+        return nil
+    }
+    
     public func confirmCreateArchive() {
         guard !archiveTargetItems.isEmpty else { return }
         let trimmedName = archiveName.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedName.isEmpty else { return }
         
+        // D10: отказ, если цель — папка или совпадает с архивируемым объектом (до запуска работы)
+        if let problem = archiveDestinationProblem() {
+            errorMessage = "Архив не создан: \(problem)"
+            showErrorAlert = true
+            return
+        }
+        
         let format = archiveFormat
         let targetItems = archiveTargetItems
         let destPath = archiveDestinationPath
+        let destIsPhone = archiveDestinationIsPhone
         let destFullURL = URL(fileURLWithPath: destPath).appendingPathComponent(trimmedName)
         let activeSide = activePane
         let source = (activeSide == .left) ? leftSource : rightSource
@@ -2870,23 +3189,27 @@ public final class DualPaneViewModel: ObservableObject {
         
         Task { @MainActor [weak self] in
             guard let self = self else { return }
+            // Архив всегда собирается во временной папке; в место назначения попадает только готовый результат
+            let workDir = FileManager.default.temporaryDirectory
+                .appendingPathComponent("MacDroidArchive_\(UUID().uuidString)", isDirectory: true)
             do {
+                try FileManager.default.createDirectory(at: workDir, withIntermediateDirectories: true)
+                defer { try? FileManager.default.removeItem(at: workDir) }
+                let tempArchiveURL = workDir.appendingPathComponent(trimmedName)
+                
                 if source == .localMac {
-                    let sourcePaths = targetItems.map { $0.path }
                     try await ArchiveService.shared.createArchive(
-                        sources: sourcePaths,
-                        destinationPath: destFullURL.path,
+                        sources: targetItems.map { $0.path },
+                        destinationPath: tempArchiveURL.path,
                         format: format
                     )
                 } else {
                     // Телефон (Remote SFTP): скачиваем во временный каталог, архивируем
-                    let tempDir = FileManager.default.temporaryDirectory
-                        .appendingPathComponent("MacDroidArchive_\(UUID().uuidString)")
-                    try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
-                    
+                    let downloadDir = workDir.appendingPathComponent("src", isDirectory: true)
+                    try FileManager.default.createDirectory(at: downloadDir, withIntermediateDirectories: true)
                     var downloadedPaths: [String] = []
                     for item in targetItems {
-                        let localDest = tempDir.appendingPathComponent(item.name)
+                        let localDest = downloadDir.appendingPathComponent(item.name)
                         let stat = try await self.transport.prepareRead(actionId: UUID().uuidString, path: item.path)
                         try await self.transport.downloadFileStreaming(
                             actionId: UUID().uuidString,
@@ -2896,34 +3219,34 @@ public final class DualPaneViewModel: ObservableObject {
                         ) { _ in }
                         downloadedPaths.append(localDest.path)
                     }
-                    
-                    // Создаем архив локально
-                    let tempArchiveURL = tempDir.appendingPathComponent(trimmedName)
                     try await ArchiveService.shared.createArchive(
                         sources: downloadedPaths,
                         destinationPath: tempArchiveURL.path,
                         format: format
                     )
-                    
-                    let destSource = (destPath.hasPrefix("/sdcard") || destPath.hasPrefix("/storage")) ? FileSource.remotePhone : FileSource.localMac
-                    if destSource == .localMac {
-                        let finalDest = URL(fileURLWithPath: destPath).appendingPathComponent(trimmedName)
-                        try? FileManager.default.removeItem(at: finalDest)
-                        try FileManager.default.moveItem(at: tempArchiveURL, to: finalDest)
-                    } else {
-                        let archiveSize = (try? FileManager.default.attributesOfItem(atPath: tempArchiveURL.path)[.size] as? UInt64) ?? 0
-                        let queueItem = FileItem(
-                            id: tempArchiveURL.path,
-                            name: trimmedName,
-                            path: tempArchiveURL.path,
-                            size: archiveSize,
-                            mtime: Date().timeIntervalSince1970,
-                            isDirectory: false
-                        )
-                        self.queueManager.enqueue(source: queueItem, targetDir: destPath, isMove: true)
+                }
+                
+                if destIsPhone {
+                    // Загрузка на телефон через оркестратор (очередь без исполнителя больше не используется, D12).
+                    // Существующий файл не перезаписываем.
+                    let result = try await self.orchestrator.executeCopyMacToPhone(
+                        jobId: UUID().uuidString,
+                        itemId: UUID().uuidString,
+                        localSourceURL: tempArchiveURL,
+                        remoteTargetDir: destPath,
+                        strategy: .skip,
+                        progress: { _ in }
+                    )
+                    if case .skipped(let reason) = result {
+                        throw FileOperationNameError.nameTaken(name: "\(trimmedName) (\(reason))")
                     }
-                    
-                    try? FileManager.default.removeItem(at: tempDir)
+                } else {
+                    // Существующий файл заменяем атомарно, и только после успешного создания архива
+                    if FileManager.default.fileExists(atPath: destFullURL.path) {
+                        _ = try FileManager.default.replaceItemAt(destFullURL, withItemAt: tempArchiveURL)
+                    } else {
+                        try FileManager.default.moveItem(at: tempArchiveURL, to: destFullURL)
+                    }
                 }
                 
                 self.isArchiving = false
@@ -2943,6 +3266,43 @@ public final class DualPaneViewModel: ObservableObject {
     
     public func isArchive(item: FileItem) -> Bool {
         return ArchiveService.isArchive(fileName: item.name)
+    }
+    
+    /// Загрузка распакованного дерева на телефон через оркестратор. Существующие файлы не перезаписываются
+    /// (считаются пропущенными), сетевые и прочие ошибки пробрасываются.
+    private func uploadExtractedTreeToPhone(localDir: URL, remoteDir: String) async throws -> (uploaded: Int, skipped: Int) {
+        // Папка может уже существовать: ошибку создания не считаем фатальной, загрузка сама покажет проблему
+        _ = try? await remoteDriver.createDirectory(at: remoteDir)
+        var uploaded = 0
+        var skipped = 0
+        let entries = (try? FileManager.default.contentsOfDirectory(at: localDir, includingPropertiesForKeys: [.isDirectoryKey], options: [])) ?? []
+        for entry in entries {
+            let isDir = (try? entry.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) ?? false
+            if isDir {
+                let sub = try await uploadExtractedTreeToPhone(
+                    localDir: entry,
+                    remoteDir: (remoteDir as NSString).appendingPathComponent(entry.lastPathComponent)
+                )
+                uploaded += sub.uploaded
+                skipped += sub.skipped
+            } else {
+                let result = try await orchestrator.executeCopyMacToPhone(
+                    jobId: UUID().uuidString,
+                    itemId: UUID().uuidString,
+                    localSourceURL: entry,
+                    remoteTargetDir: remoteDir,
+                    strategy: .skip,
+                    progress: { _ in }
+                )
+                switch result {
+                case .skipped:
+                    skipped += 1
+                case .transferred, .transferredWithoutSourceDeletion:
+                    uploaded += 1
+                }
+            }
+        }
+        return (uploaded, skipped)
     }
     
     public func unarchive(item: FileItem? = nil, side: PaneSide? = nil, to destinationDir: String? = nil) {
@@ -3000,20 +3360,11 @@ public final class DualPaneViewModel: ObservableObject {
                         destinationPath: tempExtractDir.path
                     )
                     
-                    let extractedFiles = (try? FileManager.default.contentsOfDirectory(atPath: tempExtractDir.path)) ?? []
-                    for name in extractedFiles {
-                        let localFilePath = tempExtractDir.appendingPathComponent(name).path
-                        let isDir = (try? FileManager.default.attributesOfItem(atPath: localFilePath)[.type] as? FileAttributeType) == .typeDirectory
-                        let size = (try? FileManager.default.attributesOfItem(atPath: localFilePath)[.size] as? UInt64) ?? 0
-                        let queueItem = FileItem(
-                            id: localFilePath,
-                            name: name,
-                            path: localFilePath,
-                            size: size,
-                            mtime: Date().timeIntervalSince1970,
-                            isDirectory: isDir
-                        )
-                        self.queueManager.enqueue(source: queueItem, targetDir: destinationPath, isMove: true)
+                    // D12: распакованное дерево загружается на телефон через оркестратор до удаления временной папки
+                    let upload = try await self.uploadExtractedTreeToPhone(localDir: tempExtractDir, remoteDir: destinationPath)
+                    if upload.skipped > 0 {
+                        self.errorMessage = "На телефоне уже есть файлы с такими именами, пропущено: \(upload.skipped)"
+                        self.showErrorAlert = true
                     }
                     try? FileManager.default.removeItem(at: tempDir)
                 } else {
@@ -3045,20 +3396,11 @@ public final class DualPaneViewModel: ObservableObject {
                             destinationPath: tempExtractDir.path
                         )
                         
-                        let extractedFiles = (try? FileManager.default.contentsOfDirectory(atPath: tempExtractDir.path)) ?? []
-                        for name in extractedFiles {
-                            let localFilePath = tempExtractDir.appendingPathComponent(name).path
-                            let isDir = (try? FileManager.default.attributesOfItem(atPath: localFilePath)[.type] as? FileAttributeType) == .typeDirectory
-                            let size = (try? FileManager.default.attributesOfItem(atPath: localFilePath)[.size] as? UInt64) ?? 0
-                            let queueItem = FileItem(
-                                id: localFilePath,
-                                name: name,
-                                path: localFilePath,
-                                size: size,
-                                mtime: Date().timeIntervalSince1970,
-                                isDirectory: isDir
-                            )
-                            self.queueManager.enqueue(source: queueItem, targetDir: destinationPath, isMove: true)
+                        // D12: распакованное дерево загружается на телефон через оркестратор до удаления временной папки
+                        let upload = try await self.uploadExtractedTreeToPhone(localDir: tempExtractDir, remoteDir: destinationPath)
+                        if upload.skipped > 0 {
+                            self.errorMessage = "На телефоне уже есть файлы с такими именами, пропущено: \(upload.skipped)"
+                            self.showErrorAlert = true
                         }
                     }
                     
@@ -3580,7 +3922,14 @@ public final class DualPaneViewModel: ObservableObject {
         }
         
         // 3. Внешний драг (из Finder, Desktop и других сторонних приложений)
+        // Callback'и loadObject/loadItem приходят из разных потоков: запись в массив защищаем замком (U2)
+        let localPathsLock = NSLock()
         var localPaths: [String] = []
+        let appendLocalPath: (String) -> Void = { path in
+            localPathsLock.lock()
+            localPaths.append(path)
+            localPathsLock.unlock()
+        }
         let group = DispatchGroup()
         
         for provider in providers {
@@ -3589,7 +3938,7 @@ public final class DualPaneViewModel: ObservableObject {
                 _ = provider.loadObject(ofClass: URL.self) { url, error in
                     defer { group.leave() }
                     if let url = url {
-                        localPaths.append(url.path)
+                        appendLocalPath(url.path)
                     }
                 }
             } else if provider.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) {
@@ -3597,16 +3946,16 @@ public final class DualPaneViewModel: ObservableObject {
                 provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier, options: nil) { item, error in
                     defer { group.leave() }
                     if let data = item as? Data, let url = URL(dataRepresentation: data, relativeTo: nil) {
-                        localPaths.append(url.path)
+                        appendLocalPath(url.path)
                     } else if let url = item as? URL {
-                        localPaths.append(url.path)
+                        appendLocalPath(url.path)
                     } else if let nsurl = item as? NSURL, let p = nsurl.path {
-                        localPaths.append(p)
+                        appendLocalPath(p)
                     } else if let str = item as? String {
                         if str.hasPrefix("file://"), let u = URL(string: str) {
-                            localPaths.append(u.path)
+                            appendLocalPath(u.path)
                         } else {
-                            localPaths.append(str)
+                            appendLocalPath(str)
                         }
                     }
                 }
@@ -3614,9 +3963,12 @@ public final class DualPaneViewModel: ObservableObject {
         }
         
         group.notify(queue: .main) {
-            if !localPaths.isEmpty {
+            localPathsLock.lock()
+            let collectedPaths = localPaths
+            localPathsLock.unlock()
+            if !collectedPaths.isEmpty {
                 self.executeTransfer(
-                    paths: localPaths,
+                    paths: collectedPaths,
                     fromSource: .localMac,
                     toSide: toSide,
                     targetDirPath: destinationDir,
@@ -3648,6 +4000,8 @@ public final class DualPaneViewModel: ObservableObject {
     public func cancelTransfer() {
         currentTransferTask?.cancel()
         currentTransferTask = nil
+        // Если передача ждёт решения в диалоге конфликта, освобождаем ожидание
+        resolveConflict(nil)
         isTransferPaused = false
         showTransferProgress = false
         isTransferCompleted = false
@@ -3665,18 +4019,168 @@ public final class DualPaneViewModel: ObservableObject {
         showTransferProgress = false
     }
     
+    /// Источник лежит прямо в папке назначения, совпадает с ней или является её предком (Mac→Mac).
+    /// Такие перенос/копирование недопустимы: move удалил бы единственную копию, copy дал бы конфликт с самим собой.
+    static func isSameOrInsideTarget(sourcePath: String, targetDir: String) -> Bool {
+        let src = (sourcePath as NSString).standardizingPath
+        let parent = (src as NSString).deletingLastPathComponent
+        return parent == targetDir || src == targetDir || targetDir.hasPrefix(src + "/")
+    }
+
+    /// Ответ диалога конфликта имён. Резюмирует continuation, которую ждёт `requestConflictDecision`.
+    /// nil — диалог закрыт без выбора (отмена передачи).
+    public func resolveConflict(_ answer: (strategy: ConflictResolutionStrategy, applyToAll: Bool)?) {
+        showConflictDialog = false
+        activeConflict = nil
+        if let answer = answer, answer.applyToAll {
+            rememberedStrategy = answer.strategy
+        }
+        let continuation = conflictContinuation
+        conflictContinuation = nil
+        continuation?.resume(returning: answer)
+    }
+
+    /// Показывает диалог конфликта и ждёт решения пользователя; nil — передача отменена.
+    private func requestConflictDecision(_ conflict: ConflictContext) async -> (strategy: ConflictResolutionStrategy, applyToAll: Bool)? {
+        await withCheckedContinuation { continuation in
+            // На случай незакрытого предыдущего запроса не оставляем его висеть
+            conflictContinuation?.resume(returning: nil)
+            conflictContinuation = continuation
+            activeConflict = conflict
+            showConflictDialog = true
+        }
+    }
+
+    /// Метаданные локального файла для сравнения при конфликте
+    private static func localFileItem(atPath path: String) -> FileItem {
+        let attrs = (try? FileManager.default.attributesOfItem(atPath: path)) ?? [:]
+        let size = (attrs[.size] as? NSNumber)?.uint64Value ?? 0
+        let mtime = (attrs[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0
+        let isDir = (attrs[.type] as? FileAttributeType) == .typeDirectory
+        return FileItem(
+            id: path,
+            name: URL(fileURLWithPath: path).lastPathComponent,
+            path: path,
+            size: size,
+            mtime: mtime,
+            isDirectory: isDir,
+            source: .localMac
+        )
+    }
+
+    /// Ищет объект с тем же именем в папке назначения. Листинг телефона берётся без кэша (forceRefresh),
+    /// ошибка листинга пробрасывается: нельзя молча считать папку пустой.
+    private func detectTransferConflict(
+        file: TransferPlanItem,
+        fromSource: FileSource,
+        targetSource: FileSource,
+        listingCache: inout [String: [String: FileItem]]
+    ) async throws -> ConflictContext? {
+        let targetPath = (file.targetDirPath as NSString).appendingPathComponent(file.fileName)
+        let targetItem: FileItem
+        if targetSource == .localMac {
+            guard FileManager.default.fileExists(atPath: targetPath) else { return nil }
+            targetItem = Self.localFileItem(atPath: targetPath)
+        } else {
+            if listingCache[file.targetDirPath] == nil {
+                let items = try await remoteDriver.listDirectory(at: file.targetDirPath, forceRefresh: true)
+                listingCache[file.targetDirPath] = Dictionary(items.map { ($0.name, $0) }, uniquingKeysWith: { first, _ in first })
+            }
+            guard let found = listingCache[file.targetDirPath]?[file.fileName] else { return nil }
+            targetItem = found
+        }
+
+        let sourceItem: FileItem
+        if fromSource == .localMac {
+            sourceItem = Self.localFileItem(atPath: file.sourcePath)
+        } else {
+            // mtime источника на телефоне в плане не хранится: сравнение по дате для него недоступно
+            sourceItem = FileItem(
+                id: file.sourcePath,
+                name: file.fileName,
+                path: file.sourcePath,
+                size: file.size,
+                mtime: 0,
+                isDirectory: false,
+                source: fromSource
+            )
+        }
+        return ConflictContext(sourceItem: sourceItem, targetItem: targetItem)
+    }
+
+    private enum PhonePlacement {
+        case place(targetPath: String)
+        case skip(reason: String)
+    }
+
+    /// Решение по конфликту для phone→phone: cp/rename на телефоне перезаписывают цель,
+    /// поэтому выбор стратегии выполняем здесь, до вызова низкоуровневых команд.
+    private func resolvePhonePlacement(
+        fileName: String,
+        targetDir: String,
+        conflict: ConflictContext?,
+        strategy: ConflictResolutionStrategy,
+        listingCache: [String: [String: FileItem]]
+    ) -> PhonePlacement {
+        let defaultTarget = (targetDir as NSString).appendingPathComponent(fileName)
+        guard let conflict = conflict else { return .place(targetPath: defaultTarget) }
+        switch strategy {
+        case .overwrite:
+            return .place(targetPath: defaultTarget)
+        case .skip:
+            return .skip(reason: "Файл уже существует")
+        case .skipIfIdentical:
+            // Дата источника на телефоне в плане не хранится: без неё «идентичность» не доказать,
+            // поэтому не перезаписываем (безопасный выбор)
+            if conflict.sourceItem.mtime == 0 {
+                return .skip(reason: "Не удалось сравнить с существующим файлом (дата источника недоступна)")
+            }
+            return conflict.isIdentical ? .skip(reason: "Идентичный файл уже существует") : .place(targetPath: defaultTarget)
+        case .overwriteIfNewer:
+            return conflict.isSourceNewer ? .place(targetPath: defaultTarget) : .skip(reason: "Существующий файл новее или такой же (дата источника недоступна)")
+        case .autoRename:
+            let existing = Set(listingCache[targetDir]?.keys.map { $0 } ?? [])
+            let ext = (fileName as NSString).pathExtension
+            let base = (fileName as NSString).deletingPathExtension
+            var counter = 1
+            var candidate = fileName
+            while existing.contains(candidate) {
+                candidate = ext.isEmpty ? "\(base)_\(counter)" : "\(base)_\(counter).\(ext)"
+                counter += 1
+            }
+            return .place(targetPath: (targetDir as NSString).appendingPathComponent(candidate))
+        }
+    }
+
     public func executeTransfer(
-        paths: [String],
+        paths requestedPaths: [String],
         fromSource: FileSource,
         toSide: PaneSide,
         targetDirPath: String? = nil,
         isMove: Bool
     ) {
-        guard !paths.isEmpty else { return }
-        
+        guard !requestedPaths.isEmpty else { return }
+
         let targetSource = (toSide == .left) ? leftSource : rightSource
         let targetDirPath = targetDirPath ?? ((toSide == .left) ? leftPath : rightPath)
-        
+
+        // D5: защита от переноса/копирования в ту же папку (включая drop из Finder)
+        var allowedPaths = requestedPaths
+        if fromSource == .localMac && targetSource == .localMac {
+            let targetNorm = (targetDirPath as NSString).standardizingPath
+            let blocked = requestedPaths.filter { Self.isSameOrInsideTarget(sourcePath: $0, targetDir: targetNorm) }
+            if !blocked.isEmpty {
+                allowedPaths = requestedPaths.filter { !blocked.contains($0) }
+                statusMessage = "Пропущено объектов, уже находящихся в папке назначения: \(blocked.count)"
+                SSHTransportLog.write("UI_TRANSFER_SAME_FOLDER_BLOCKED count=\(blocked.count) target=\(targetNorm)")
+            }
+        }
+        let paths = allowedPaths
+        guard !paths.isEmpty else { return }
+
+        // D6: выбор «применить ко всем» действует только в пределах одной операции
+        rememberedStrategy = nil
+
         showTransferProgress = true
         isTransferMinimized = false
         currentTransferFileName = ""
@@ -3745,7 +4249,10 @@ public final class DualPaneViewModel: ObservableObject {
             let totalCount = plan.filesToTransfer.count
             var completedCount = 0
             let startTime = Date()
-            let strategy = rememberedStrategy ?? .overwrite
+            // Стратегия конфликта выбирается для каждого файла: по диалогу либо по «применить ко всем»
+            var strategy: ConflictResolutionStrategy = .skip
+            var targetListingCache: [String: [String: FileItem]] = [:]
+            var stoppedByUser = false
             var transferredMediaPaths: [String] = []
             let mediaExtensions = Set(["jpg", "jpeg", "png", "heic", "dng", "webp", "mp4", "mov", "mkv", "avi", "3gp", "mp3", "flac", "wav", "aac", "m4a"])
             
@@ -3763,7 +4270,42 @@ public final class DualPaneViewModel: ObservableObject {
                     try? await Task.sleep(nanoseconds: 100_000_000)
                 }
                 if Task.isCancelled { break }
-                
+
+                // D6: детект конфликта имён в цели и диалог выбора (раньше диалог не показывался и всё перезаписывалось)
+                let conflict: ConflictContext?
+                do {
+                    conflict = try await self.detectTransferConflict(
+                        file: file,
+                        fromSource: fromSource,
+                        targetSource: targetSource,
+                        listingCache: &targetListingCache
+                    )
+                } catch {
+                    failed.append((path: file.sourcePath, error: "Не удалось проверить папку назначения: \(error.localizedDescription)"))
+                    completedCount += 1
+                    if let tid = taskId {
+                        TransferQueueManager.shared.markFailed(id: tid, error: error.localizedDescription)
+                    }
+                    continue
+                }
+                if let conflict = conflict {
+                    if let remembered = rememberedStrategy {
+                        strategy = remembered
+                    } else {
+                        self.statusMessage = "Конфликт имени: \(file.fileName)"
+                        guard let answer = await self.requestConflictDecision(conflict) else {
+                            // Диалог закрыт без выбора: прекращаем всю передачу (не через currentTransferTask,
+                            // т.к. за время диалога могла стартовать другая передача)
+                            stoppedByUser = true
+                            break
+                        }
+                        strategy = answer.strategy
+                    }
+                } else {
+                    strategy = rememberedStrategy ?? .skip
+                }
+                if Task.isCancelled { break }
+
                 let jobId = UUID().uuidString
                 let itemId = UUID().uuidString
                 let path = file.sourcePath
@@ -3899,46 +4441,63 @@ public final class DualPaneViewModel: ObservableObject {
                         }
                         
                     case (.remotePhone, .remotePhone):
-                        let targetPath = (targetSubDir as NSString).appendingPathComponent(fileName)
-                        if isMove {
-                            let ok = try await orchestrator.transport.executeRename(oldPath: path, newPath: targetPath)
-                            if ok {
-                                result = .transferred
-                            } else if PhoneConnectionManager.shared.copyFileOnDevice(sourcePath: path, targetPath: targetPath) {
-                                // Обработка EXDEV (Cross-device link): если перенос между разделами (SD-карта / память), копируем и удаляем оригинал
-                                _ = try? await orchestrator.transport.executeDelete(actionId: itemId, path: path)
-                                onProgress(1.0)
-                                result = .transferred
+                        // D9: стратегия конфликта применяется здесь, т.к. cp/rename на телефоне перезаписывают цель
+                        let placement = self.resolvePhonePlacement(
+                            fileName: fileName,
+                            targetDir: targetSubDir,
+                            conflict: conflict,
+                            strategy: strategy,
+                            listingCache: targetListingCache
+                        )
+                        switch placement {
+                        case .skip(let reason):
+                            result = .skipped(reason: reason)
+                        case .place(let targetPath):
+                            if isMove {
+                                let ok = try await orchestrator.transport.executeRename(oldPath: path, newPath: targetPath)
+                                if ok {
+                                    result = .transferred
+                                } else if PhoneConnectionManager.shared.copyFileOnDevice(sourcePath: path, targetPath: targetPath) {
+                                    // Обработка EXDEV (Cross-device link): если перенос между разделами (SD-карта / память), копируем и удаляем оригинал.
+                                    // Результат удаления проверяем: иначе копия есть, а исходник тихо остался.
+                                    let deleted = (try? await orchestrator.transport.executeDelete(actionId: itemId, path: path)) ?? false
+                                    onProgress(1.0)
+                                    result = deleted
+                                        ? .transferred
+                                        : .transferredWithoutSourceDeletion(reason: "Копия создана, но исходный файл на телефоне не удалён")
+                                } else {
+                                    result = .skipped(reason: "Не удалось переименовать или переместить на телефоне (защита Scoped Storage или разные разделы)")
+                                }
                             } else {
-                                result = .skipped(reason: "Не удалось переименовать или переместить на телефоне (защита Scoped Storage или разные разделы)")
-                            }
-                        } else {
-                            // Оптимизация P1: Прямое серверное копирование файла внутри телефона без прокачки 20 ГБ трафика через Mac
-                            if PhoneConnectionManager.shared.copyFileOnDevice(sourcePath: path, targetPath: targetPath) {
-                                onProgress(1.0)
-                                result = .transferred
-                            } else {
-                                // Фоллбэк: если прямое копирование на телефоне недоступно (нет ADB / беспроводной SFTP без shell)
-                                let tempDir = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("MacDroidCommander/PhoneCopy", isDirectory: true)
-                                try? FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
-                                try await orchestrator.executeCopyPhoneToMac(
-                                    jobId: jobId,
-                                    itemId: itemId,
-                                    remotePath: path,
-                                    localTargetDir: tempDir,
-                                    strategy: .overwrite,
-                                    progress: onProgress
-                                )
-                                let tempLocalURL = tempDir.appendingPathComponent(fileName)
-                                result = try await orchestrator.executeCopyMacToPhone(
-                                    jobId: jobId,
-                                    itemId: itemId,
-                                    localSourceURL: tempLocalURL,
-                                    remoteTargetDir: targetSubDir,
-                                    strategy: strategy,
-                                    progress: onProgress
-                                )
-                                try? FileManager.default.removeItem(at: tempLocalURL)
+                                // Оптимизация P1: Прямое серверное копирование файла внутри телефона без прокачки 20 ГБ трафика через Mac
+                                if PhoneConnectionManager.shared.copyFileOnDevice(sourcePath: path, targetPath: targetPath) {
+                                    onProgress(1.0)
+                                    result = .transferred
+                                } else {
+                                    // Фоллбэк: если прямое копирование на телефоне недоступно (нет ADB / беспроводной SFTP без shell).
+                                    // Решение по конфликту уже принято выше, поэтому второй шаг не перепроверяет его заново.
+                                    let tempDir = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("MacDroidCommander/PhoneCopy", isDirectory: true)
+                                    try? FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+                                    try await orchestrator.executeCopyPhoneToMac(
+                                        jobId: jobId,
+                                        itemId: itemId,
+                                        remotePath: path,
+                                        localTargetDir: tempDir,
+                                        strategy: .overwrite,
+                                        progress: onProgress
+                                    )
+                                    let tempLocalURL = tempDir.appendingPathComponent(fileName)
+                                    defer { try? FileManager.default.removeItem(at: tempLocalURL) }
+                                    let fallbackStrategy: ConflictResolutionStrategy = (strategy == .autoRename) ? .autoRename : .overwrite
+                                    result = try await orchestrator.executeCopyMacToPhone(
+                                        jobId: jobId,
+                                        itemId: itemId,
+                                        localSourceURL: tempLocalURL,
+                                        remoteTargetDir: targetSubDir,
+                                        strategy: fallbackStrategy,
+                                        progress: onProgress
+                                    )
+                                }
                             }
                         }
                     }
@@ -3996,10 +4555,11 @@ public final class DualPaneViewModel: ObservableObject {
                 }
             }
             
+            let transferAborted = Task.isCancelled || stoppedByUser
             // Если перемещение (Move): удаляем исходные папки ТОЛЬКО если они стали ПУСТЫМИ!
             // Если внутри папки остался хотя бы один пропущенный или непереданный файл,
             // rmdir / deleteEmptyDirectory не удалит папку, сохранив её вместе с файлами.
-            if isMove && !Task.isCancelled {
+            if isMove && !transferAborted {
                 for folder in plan.sourceFoldersToDeleteOnMove {
                     if fromSource == .localMac {
                         if let contents = try? FileManager.default.contentsOfDirectory(atPath: folder) {
@@ -4026,7 +4586,7 @@ public final class DualPaneViewModel: ObservableObject {
                 PhoneConnectionManager.shared.notifyMediaScanner(paths: transferredMediaPaths, deviceId: self.remoteDriver.coordinator.deviceId)
             }
             
-            if Task.isCancelled {
+            if transferAborted {
                 await self.orchestrator.cleanAllActivePartFiles()
                 TransferQueueManager.shared.cancelAll()
             }
@@ -4051,7 +4611,7 @@ public final class DualPaneViewModel: ObservableObject {
             )
             NSSound(named: "Glass")?.play()
             
-            if Task.isCancelled {
+            if transferAborted {
                 self.showTransferProgress = false
                 self.isTransferCompleted = false
                 self.isTransferMinimized = false
@@ -4108,6 +4668,13 @@ public final class DualPaneViewModel: ObservableObject {
         fromSource: FileSource,
         targetBaseDirPath: String
     ) async -> (directoriesToCreate: [String], filesToTransfer: [TransferPlanItem], sourceFoldersToDeleteOnMove: [String], skippedFolders: [(path: String, reason: String)]) {
+        if fromSource == .localMac {
+            // Обход локальных папок выполняем вне MainActor: на больших деревьях он подвешивал UI
+            return await Task.detached(priority: .userInitiated) {
+                DualPaneViewModel.scanLocalTransferPlan(paths: paths, targetBaseDirPath: targetBaseDirPath)
+            }.value
+        }
+        
         var directoriesToCreate: [String] = []
         var filesToTransfer: [TransferPlanItem] = []
         var sourceFoldersToDeleteOnMove: [String] = []
@@ -4120,34 +4687,93 @@ public final class DualPaneViewModel: ObservableObject {
             let normPath = path.precomposedStringWithCanonicalMapping
             
             var remoteStatSize: UInt64? = nil
-            if fromSource == .localMac {
-                var isDirectoryObjC: ObjCBool = false
-                let exists = FileManager.default.fileExists(atPath: path, isDirectory: &isDirectoryObjC)
-                isDir = exists && isDirectoryObjC.boolValue
-            } else {
-                let allSourceItems = leftItems + rightItems
-                if let item = allSourceItems.first(where: {
-                    $0.id == path || $0.path == path ||
-                    $0.path.precomposedStringWithCanonicalMapping == normPath ||
-                    $0.path.trimmingCharacters(in: CharacterSet(charactersIn: "/")) == cleanPath
-                }) {
-                    isDir = item.isDirectory
-                    remoteStatSize = item.size
-                } else if let stat = try? await self.transport.prepareRead(actionId: UUID().uuidString, path: path) {
-                    isDir = stat.isDirectory
-                    remoteStatSize = stat.size
-                } else if let _ = try? await self.remoteDriver.listDirectory(at: path) {
-                    isDir = true
-                }
+            let allSourceItems = leftItems + rightItems
+            if let item = allSourceItems.first(where: {
+                $0.id == path || $0.path == path ||
+                $0.path.precomposedStringWithCanonicalMapping == normPath ||
+                $0.path.trimmingCharacters(in: CharacterSet(charactersIn: "/")) == cleanPath
+            }) {
+                isDir = item.isDirectory
+                remoteStatSize = item.size
+            } else if let stat = try? await self.transport.prepareRead(actionId: UUID().uuidString, path: path) {
+                isDir = stat.isDirectory
+                remoteStatSize = stat.size
+            } else if let _ = try? await self.remoteDriver.listDirectory(at: path) {
+                isDir = true
             }
             
             if !isDir {
-                let size: UInt64
-                if fromSource == .localMac {
-                    size = (try? FileManager.default.attributesOfItem(atPath: path)[.size] as? UInt64) ?? 0
-                } else {
-                    size = remoteStatSize ?? 0
+                filesToTransfer.append(TransferPlanItem(
+                    sourcePath: path,
+                    targetDirPath: targetBaseDirPath,
+                    fileName: fileName,
+                    size: remoteStatSize ?? 0
+                ))
+            } else {
+                sourceFoldersToDeleteOnMove.append(path)
+                let folderTargetBase = (targetBaseDirPath as NSString).appendingPathComponent(fileName)
+                directoriesToCreate.append(folderTargetBase)
+                
+                var visitedRemoteDirs = Set<String>()
+                func scanRemote(remoteDir: String, currentTargetDir: String, depth: Int = 0) async {
+                    guard depth < 30 else { return }
+                    guard visitedRemoteDirs.insert(remoteDir).inserted else { return }
+                    let contents = try? await remoteDriver.listDirectory(at: remoteDir)
+                    guard let validContents = contents else {
+                        if remoteDir != path {
+                            print("scanRemote: failed to list directory at \(remoteDir)")
+                            skippedFolders.append((path: remoteDir, reason: "Папка недоступна или защищена политикой доступа Android"))
+                        }
+                        return
+                    }
+                    for item in validContents {
+                        if item.name == "." || item.name == ".." { continue }
+                        if item.name.hasPrefix(".") && (item.name.contains(".part.") || item.name.hasSuffix(".mcdpart")) { continue }
+                        let subTarget = (currentTargetDir as NSString).appendingPathComponent(item.name)
+                        if item.isDirectory {
+                            sourceFoldersToDeleteOnMove.append(item.path)
+                            directoriesToCreate.append(subTarget)
+                            await scanRemote(remoteDir: item.path, currentTargetDir: subTarget, depth: depth + 1)
+                        } else {
+                            filesToTransfer.append(TransferPlanItem(
+                                sourcePath: item.path,
+                                targetDirPath: currentTargetDir,
+                                fileName: item.name,
+                                size: item.size
+                            ))
+                        }
+                    }
                 }
+                await scanRemote(remoteDir: path, currentTargetDir: folderTargetBase, depth: 0)
+            }
+        }
+        
+        // Сортируем каталоги по длине пути по убыванию (deepest first / post-order),
+        // чтобы при переносе сначала удалялись самые глубокие пустые подпапки
+        sourceFoldersToDeleteOnMove.sort { $0.count > $1.count }
+        
+        return (directoriesToCreate, filesToTransfer, sourceFoldersToDeleteOnMove, skippedFolders)
+    }
+    
+    /// План передачи для локальных источников (Mac). Чистая функция без обращения к состоянию VM,
+    /// поэтому вызывается вне MainActor.
+    nonisolated static func scanLocalTransferPlan(
+        paths: [String],
+        targetBaseDirPath: String
+    ) -> (directoriesToCreate: [String], filesToTransfer: [TransferPlanItem], sourceFoldersToDeleteOnMove: [String], skippedFolders: [(path: String, reason: String)]) {
+        var directoriesToCreate: [String] = []
+        var filesToTransfer: [TransferPlanItem] = []
+        var sourceFoldersToDeleteOnMove: [String] = []
+        var skippedFolders: [(path: String, reason: String)] = []
+        
+        for path in paths {
+            let fileName = URL(fileURLWithPath: path).lastPathComponent
+            var isDirObjC: ObjCBool = false
+            let exists = FileManager.default.fileExists(atPath: path, isDirectory: &isDirObjC)
+            let isDir = exists && isDirObjC.boolValue
+            
+            if !isDir {
+                let size = (try? FileManager.default.attributesOfItem(atPath: path)[.size] as? UInt64) ?? 0
                 filesToTransfer.append(TransferPlanItem(
                     sourcePath: path,
                     targetDirPath: targetBaseDirPath,
@@ -4159,77 +4785,41 @@ public final class DualPaneViewModel: ObservableObject {
                 let folderTargetBase = (targetBaseDirPath as NSString).appendingPathComponent(fileName)
                 directoriesToCreate.append(folderTargetBase)
                 
-                if fromSource == .localMac {
-                    func scanLocal(dirURL: URL, currentTargetDir: String) {
-                        guard let contents = try? FileManager.default.contentsOfDirectory(
-                            at: dirURL,
-                            includingPropertiesForKeys: [.isDirectoryKey, .fileSizeKey],
-                            options: []
-                        ) else {
-                            if dirURL.path != path {
-                                skippedFolders.append((path: dirURL.path, reason: "Не удалось прочитать локальную папку"))
-                            }
-                            return
+                func scanLocal(dirURL: URL, currentTargetDir: String) {
+                    guard let contents = try? FileManager.default.contentsOfDirectory(
+                        at: dirURL,
+                        includingPropertiesForKeys: [.isDirectoryKey, .fileSizeKey],
+                        options: []
+                    ) else {
+                        if dirURL.path != path {
+                            skippedFolders.append((path: dirURL.path, reason: "Не удалось прочитать локальную папку"))
                         }
-                        for item in contents {
-                            let name = item.lastPathComponent
-                            if name.hasPrefix(".") && (name.contains(".part.") || name.hasSuffix(".mcdpart")) { continue }
-                            let isSubDir = (try? item.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory ?? false
-                            let subTarget = (currentTargetDir as NSString).appendingPathComponent(name)
-                            if isSubDir {
-                                sourceFoldersToDeleteOnMove.append(item.path)
-                                directoriesToCreate.append(subTarget)
-                                scanLocal(dirURL: item, currentTargetDir: subTarget)
-                            } else {
-                                let fSize = UInt64((try? item.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0)
-                                filesToTransfer.append(TransferPlanItem(
-                                    sourcePath: item.path,
-                                    targetDirPath: currentTargetDir,
-                                    fileName: name,
-                                    size: fSize
-                                ))
-                            }
+                        return
+                    }
+                    for item in contents {
+                        let name = item.lastPathComponent
+                        if name.hasPrefix(".") && (name.contains(".part.") || name.hasSuffix(".mcdpart")) { continue }
+                        let isSubDir = (try? item.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory ?? false
+                        let subTarget = (currentTargetDir as NSString).appendingPathComponent(name)
+                        if isSubDir {
+                            sourceFoldersToDeleteOnMove.append(item.path)
+                            directoriesToCreate.append(subTarget)
+                            scanLocal(dirURL: item, currentTargetDir: subTarget)
+                        } else {
+                            let fSize = UInt64((try? item.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0)
+                            filesToTransfer.append(TransferPlanItem(
+                                sourcePath: item.path,
+                                targetDirPath: currentTargetDir,
+                                fileName: name,
+                                size: fSize
+                            ))
                         }
                     }
-                    scanLocal(dirURL: URL(fileURLWithPath: path), currentTargetDir: folderTargetBase)
-                } else {
-                    var visitedRemoteDirs = Set<String>()
-                    func scanRemote(remoteDir: String, currentTargetDir: String, depth: Int = 0) async {
-                        guard depth < 30 else { return }
-                        guard visitedRemoteDirs.insert(remoteDir).inserted else { return }
-                        let contents = try? await remoteDriver.listDirectory(at: remoteDir)
-                        guard let validContents = contents else {
-                            if remoteDir != path {
-                                print("scanRemote: failed to list directory at \(remoteDir)")
-                                skippedFolders.append((path: remoteDir, reason: "Папка недоступна или защищена политикой доступа Android"))
-                            }
-                            return
-                        }
-                        for item in validContents {
-                            if item.name == "." || item.name == ".." { continue }
-                            if item.name.hasPrefix(".") && (item.name.contains(".part.") || item.name.hasSuffix(".mcdpart")) { continue }
-                            let subTarget = (currentTargetDir as NSString).appendingPathComponent(item.name)
-                            if item.isDirectory {
-                                sourceFoldersToDeleteOnMove.append(item.path)
-                                directoriesToCreate.append(subTarget)
-                                await scanRemote(remoteDir: item.path, currentTargetDir: subTarget, depth: depth + 1)
-                            } else {
-                                filesToTransfer.append(TransferPlanItem(
-                                    sourcePath: item.path,
-                                    targetDirPath: currentTargetDir,
-                                    fileName: item.name,
-                                    size: item.size
-                                ))
-                            }
-                        }
-                    }
-                    await scanRemote(remoteDir: path, currentTargetDir: folderTargetBase, depth: 0)
                 }
+                scanLocal(dirURL: URL(fileURLWithPath: path), currentTargetDir: folderTargetBase)
             }
         }
         
-        // Сортируем каталоги по длине пути по убыванию (deepest first / post-order),
-        // чтобы при переносе сначала удалялись самые глубокие пустые подпапки
         sourceFoldersToDeleteOnMove.sort { $0.count > $1.count }
         
         return (directoriesToCreate, filesToTransfer, sourceFoldersToDeleteOnMove, skippedFolders)

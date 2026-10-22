@@ -2143,7 +2143,8 @@ public struct PaneTableDropDelegate: DropDelegate {
         // 1. Приоритетный путь для внутреннего Drag & Drop между панелями
         // Если payload активен, обрабатываем напрямую без запроса провайдеров из AppKit/NSPasteboard,
         // предотвращая синхронную блокировку главного потока и дедлок.
-        if vm.currentDragPayload != nil {
+        // Внешний drop (Finder) сбрасывает устаревший payload и идёт обычным путём (D11).
+        if vm.consumeInternalDragPayload(isInternalDrop: info.hasItemsConforming(to: [DualPaneViewModel.dragUTType])) {
             return vm.handleDroppedProviders([], toSide: side, targetDirPath: targetDirPath, isMove: isMove)
         }
         

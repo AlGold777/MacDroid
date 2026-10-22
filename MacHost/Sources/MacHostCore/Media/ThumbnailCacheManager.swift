@@ -1,6 +1,7 @@
 import Foundation
 import AppKit
 import ImageIO
+import CryptoKit
 import UniformTypeIdentifiers
 #if canImport(QuickLookThumbnailing)
 import QuickLookThumbnailing
@@ -13,7 +14,11 @@ public final class ThumbnailCacheManager: @unchecked Sendable {
     private let fileManager = FileManager.default
     private let cacheDir: URL
     private let maxDiskBytes: UInt64 = 500 * 1024 * 1024 // 500 MB LRU Limit
-    
+    // Полный скан диска (O(N) по файлам) не чаще раза в минуту, а не на каждое сохранение
+    private let cleanupLock = NSLock()
+    private var lastCleanupAt = Date.distantPast
+    private static let cleanupInterval: TimeInterval = 60
+
     // Transfer QoS Arbiter: флаг приоритизации трансфера перед подгрузкой эскизов
     private let throttleLock = NSLock()
     private var _isThrottledDueToTransfer = false
@@ -353,11 +358,22 @@ public final class ThumbnailCacheManager: @unchecked Sendable {
         return NSImage(cgImage: cgImage, size: NSSize(width: cgImage.width, height: cgImage.height))
     }
     
+    /// Имя файла на диске: фиксированной длины (SHA-256 hex). Исходный ключ содержит путь,
+    /// который для длинных путей Android превышает лимит имени файла (255 байт).
     private func sanitizedKey(_ key: String) -> String {
-        return key.addingPercentEncoding(withAllowedCharacters: .alphanumerics) ?? UUID().uuidString
+        SHA256.hash(data: Data(key.utf8)).map { String(format: "%02x", $0) }.joined()
     }
-    
+
     private func cleanupDiskIfNeeded() {
+        cleanupLock.lock()
+        let now = Date()
+        guard now.timeIntervalSince(lastCleanupAt) >= Self.cleanupInterval else {
+            cleanupLock.unlock()
+            return
+        }
+        lastCleanupAt = now
+        cleanupLock.unlock()
+
         DispatchQueue.global(qos: .background).async { [weak self] in
             guard let self = self else { return }
             guard let files = try? self.fileManager.contentsOfDirectory(

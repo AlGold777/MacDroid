@@ -10,6 +10,11 @@ public struct PairingModalView: View {
     @State private var isConnecting: Bool = false
     @State private var history: [SavedConnection] = []
     @State private var currentFingerprint: String = "— Ожидание подключения —"
+    /// Отпечаток, полученный с узла при последнем опросе: только его можно подтвердить кнопкой доверия
+    @State private var observedFingerprint: String? = nil
+    @State private var fingerprintTask: Task<Void, Never>? = nil
+    /// Отпечатки для подтверждения сброса ключа: закреплённый и текущий
+    @State private var pendingReset: (old: String, new: String)? = nil
     
     public init() {}
     
@@ -70,7 +75,7 @@ public struct PairingModalView: View {
                         Section("История подключений") {
                             ForEach(history) { item in
                                 let isLive = liveIPv4Devices.contains(where: { $0.host == item.host })
-                                let matchingLive = liveIPv4Devices.first(where: { $0.name == item.name && $0.host != item.host })
+                                let matchingLive = uniqueLiveDevice(named: item.name).flatMap { $0.host != item.host ? $0 : nil }
                                 Button(action: {
                                     selectConnection(name: item.name, host: item.host, port: item.port)
                                 }) {
@@ -170,29 +175,45 @@ public struct PairingModalView: View {
                 
                 Toggle("Автоматически подключаться к этому устройству при запуске", isOn: Binding(
                     get: {
-                        if let dev = DeviceRegistry.shared.device(matchingHost: inputHost) {
-                            return dev.autoConnect
-                        }
-                        return false
+                        DeviceRegistry.shared.device(matchingHost: inputHost)?.autoConnect ?? false
                     },
                     set: { newValue in
+                        // Только для уже сопряжённого устройства: непроверенный адрес не сохраняется
                         if let dev = DeviceRegistry.shared.device(matchingHost: inputHost) {
                             DeviceRegistry.shared.setAutoConnect(id: dev.id, enabled: newValue)
-                        } else if !inputHost.isEmpty {
-                            let devName = currentSelectionTitle.components(separatedBy: " — ").first ?? "Телефон Android"
-                            DeviceRegistry.shared.registerOrUpdate(
-                                id: "device_\(inputHost)",
-                                name: devName,
-                                fingerprint: currentFingerprint.hasPrefix("SHA256:") ? currentFingerprint : "",
-                                host: inputHost,
-                                port: UInt16(Int(inputPort) ?? 2222),
-                                autoConnect: newValue
-                            )
                         }
                     }
                 ))
+                .disabled(DeviceRegistry.shared.device(matchingHost: inputHost) == nil)
                 .font(.caption)
                 .padding(.top, 4)
+                
+                if DeviceRegistry.shared.device(matchingHost: inputHost) == nil {
+                    Text("Станет доступно после подтверждённого сопряжения")
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+                }
+                
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Отпечаток ключа телефона (сверьте с экраном телефона):")
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+                    Text(currentFingerprint)
+                        .font(.system(.caption, design: .monospaced))
+                        .textSelection(.enabled)
+                    if pinnedFingerprintForCurrentHost != nil {
+                        Label("Ключ этого телефона уже доверенный", systemImage: "checkmark.seal.fill")
+                            .font(.caption2)
+                            .foregroundColor(.green)
+                    } else {
+                        Button("Отпечаток совпадает — доверять") {
+                            confirmTrust()
+                        }
+                        .buttonStyle(.bordered)
+                        .disabled(observedFingerprint == nil || isConnecting)
+                    }
+                }
+                .padding(.top, 2)
                 
                 Text(pairingStatus)
                     .font(.caption)
@@ -213,21 +234,36 @@ public struct PairingModalView: View {
                 
                 if pairingStatus.contains("Host Key") || pairingStatus.contains("не совпадает") {
                     VStack(alignment: .leading, spacing: 6) {
-                        Text("Если на телефоне был сгенерирован новый ключ или переустановлен демон, можно обновить сохранённый ключ:")
+                        Text("Ключ телефона изменился. Сбрасывайте его только если сами переустановили демон или сгенерировали новый ключ на телефоне:")
                             .font(.caption2)
                             .foregroundColor(.secondary)
-                        Button(action: {
-                            let portInt = Int(inputPort) ?? 2222
-                            HostKeyStore.shared.resetHostKey(host: inputHost, port: portInt)
-                            HostKeyStore.shared.resetHostKey(host: "127.0.0.1", port: portInt)
-                            pairingStatus = "Старый ключ сброшен. Повторное подключение..."
-                            startConnection()
-                        }) {
-                            Label("Сбросить старый ключ и доверять текущему", systemImage: "arrow.triangle.2.circlepath")
-                                .foregroundColor(.orange)
-                                .font(.caption)
+                        if let reset = pendingReset {
+                            Text("Сохранённый: \(reset.old)")
+                                .font(.system(.caption2, design: .monospaced))
+                                .textSelection(.enabled)
+                            Text("Текущий на узле: \(reset.new)")
+                                .font(.system(.caption2, design: .monospaced))
+                                .textSelection(.enabled)
+                            HStack {
+                                Button("Отмена") {
+                                    pendingReset = nil
+                                }
+                                Button("Оба отпечатка совпадают — доверять новому") {
+                                    commitReset(reset)
+                                }
+                                .buttonStyle(.borderedProminent)
+                                .tint(.orange)
+                                .disabled(isConnecting)
+                            }
+                        } else {
+                            Button(action: prepareReset) {
+                                Label("Сбросить старый ключ и доверять текущему", systemImage: "arrow.triangle.2.circlepath")
+                                    .foregroundColor(.orange)
+                                    .font(.caption)
+                            }
+                            .buttonStyle(.bordered)
+                            .disabled(isConnecting)
                         }
-                        .buttonStyle(.bordered)
                     }
                     .padding(.top, 2)
                 }
@@ -248,7 +284,7 @@ public struct PairingModalView: View {
                         .scaleEffect(0.8)
                 }
                 
-                Button("Подключиться и сохранить ключ (TOFU)") {
+                Button("Подключиться") {
                     startConnection()
                 }
                 .buttonStyle(.borderedProminent)
@@ -309,6 +345,7 @@ public struct PairingModalView: View {
             updateFingerprintDisplay()
         }
         .onChange(of: inputHost) { _ in
+            pendingReset = nil
             updateFingerprintDisplay()
         }
         .onChange(of: inputPort) { _ in
@@ -364,6 +401,8 @@ public struct PairingModalView: View {
                 
                 try? await Task.sleep(nanoseconds: 600_000_000)
                 dismiss()
+            } else if pinnedFingerprintForCurrentHost == nil {
+                pairingStatus = "⚠️ Устройство не сопряжено. Сверьте отпечаток с телефоном и нажмите «Отпечаток совпадает — доверять»."
             } else {
                 if case .authFailed(let reason) = ConnectionController.shared.phase {
                     pairingStatus = "⚠️ Ошибка авторизации: \(reason)"
@@ -375,6 +414,8 @@ public struct PairingModalView: View {
     }
     
     private func updateFingerprintDisplay() {
+        fingerprintTask?.cancel()
+        observedFingerprint = nil
         guard !inputHost.isEmpty else {
             currentFingerprint = "— Введите IP-адрес телефона —"
             return
@@ -382,16 +423,123 @@ public struct PairingModalView: View {
         let host = inputHost
         let port = UInt16(inputPort) ?? 2222
         currentFingerprint = "Опрос отпечатка узла..."
-        Task.detached(priority: .userInitiated) {
-            let fp = PhoneConnectionManager.shared.fetchHostFingerprint(host: host, port: port)
-            await MainActor.run {
-                if let fp = fp {
-                    self.currentFingerprint = fp
-                } else if let dev = DeviceRegistry.shared.device(matchingHost: host), !dev.pinnedFingerprint.isEmpty {
-                    self.currentFingerprint = "\(dev.pinnedFingerprint) (сохраненный)"
-                } else {
-                    self.currentFingerprint = "— Узел недоступен или порт закрыт —"
-                }
+        fingerprintTask = Task { @MainActor in
+            // Пауза на время ввода: запросы не уходят на каждый символ, предыдущий опрос отменяется
+            try? await Task.sleep(nanoseconds: 400_000_000)
+            guard !Task.isCancelled else { return }
+            let fp = try? await HostKeyStore.shared.fetchHostKeyFingerprint(host: host, port: port)
+            guard !Task.isCancelled, host == inputHost else { return }
+            if let fp = fp {
+                observedFingerprint = fp
+                currentFingerprint = fp
+            } else if let dev = DeviceRegistry.shared.device(matchingHost: host), !dev.pinnedFingerprint.isEmpty {
+                currentFingerprint = "\(dev.pinnedFingerprint) (сохраненный)"
+            } else {
+                currentFingerprint = "— Узел недоступен или порт закрыт —"
+            }
+        }
+    }
+    
+    /// Ключ, закреплённый за этим телефоном (nil — сопряжения ещё нет)
+    private var pinnedFingerprintForCurrentHost: String? {
+        HostKeyStore.shared.pinnedFingerprint(deviceId: pairingDeviceId(
+            host: ConnectionHostAddress.normalized(inputHost),
+            port: Int(inputPort) ?? 2222
+        ))
+    }
+    
+    /// Стабильный идентификатор телефона для закрепления ключа: зарегистрированное устройство по адресу,
+    /// иначе экземпляр mDNS на этом адресе, иначе адрес, введённый вручную.
+    private func pairingDeviceId(host: String, port: Int) -> String {
+        if let dev = DeviceRegistry.shared.device(matchingHost: host) {
+            return dev.id
+        }
+        if let live = vm.discoveryService.discoveredDevices.first(where: { $0.host == host && $0.port == port }) {
+            return live.id
+        }
+        return "manual_\(host)_\(port)"
+    }
+    
+    /// Живое IPv4-устройство с этим именем экземпляра, только если оно единственное.
+    /// Два телефона с одинаковым именем не склеиваются в одно устройство.
+    private func uniqueLiveDevice(named name: String) -> DiscoveredDevice? {
+        let matches = vm.discoveryService.discoveredDevices.filter {
+            $0.name == name && ConnectionHostAddress.isIPv4($0.host)
+        }
+        return matches.count == 1 ? matches[0] : nil
+    }
+    
+    /// Пин только по явному подтверждению пользователя. pinHostKey заново получает ключ
+    /// и закрепляет его, только если он совпадает с показанным отпечатком.
+    private func confirmTrust() {
+        guard let expected = observedFingerprint, !inputHost.isEmpty else { return }
+        let host = ConnectionHostAddress.normalized(inputHost)
+        let portInt = Int(inputPort) ?? 2222
+        let deviceId = pairingDeviceId(host: host, port: portInt)
+        isConnecting = true
+        pairingStatus = "Закрепляю подтверждённый ключ..."
+        Task { @MainActor in
+            do {
+                try await HostKeyStore.shared.pinHostKey(
+                    deviceId: deviceId,
+                    host: host,
+                    port: UInt16(portInt),
+                    expectedFingerprint: expected
+                )
+                isConnecting = false
+                pairingStatus = "✓ Отпечаток подтверждён и сохранён. Подключаюсь..."
+                startConnection()
+            } catch {
+                isConnecting = false
+                pairingStatus = "⚠️ Сопряжение не выполнено: \(error.localizedDescription)"
+            }
+        }
+    }
+    
+    /// Шаг 1 сброса: получить закреплённый и текущий отпечатки для показа. Ничего не меняет.
+    private func prepareReset() {
+        let host = ConnectionHostAddress.normalized(inputHost)
+        let portInt = Int(inputPort) ?? 2222
+        let deviceId = pairingDeviceId(host: host, port: portInt)
+        pairingStatus = "Получаю текущий отпечаток узла для сверки..."
+        Task { @MainActor in
+            do {
+                let pair = try await HostKeyStore.shared.prepareHostKeyReset(
+                    deviceId: deviceId,
+                    host: host,
+                    port: UInt16(portInt)
+                )
+                pendingReset = (old: pair.old, new: pair.new)
+                pairingStatus = "Сверьте оба отпечатка с телефоном и подтвердите сброс."
+            } catch {
+                pairingStatus = "⚠️ Сброс недоступен: \(error.localizedDescription)"
+            }
+        }
+    }
+    
+    /// Шаг 2 сброса: применить смену, только если закреплённый и текущий отпечатки совпадают с подтверждёнными.
+    private func commitReset(_ reset: (old: String, new: String)) {
+        let host = ConnectionHostAddress.normalized(inputHost)
+        let portInt = Int(inputPort) ?? 2222
+        let deviceId = pairingDeviceId(host: host, port: portInt)
+        isConnecting = true
+        Task { @MainActor in
+            do {
+                try await HostKeyStore.shared.commitHostKeyReset(
+                    deviceId: deviceId,
+                    host: host,
+                    port: UInt16(portInt),
+                    expectedOldFingerprint: reset.old,
+                    expectedNewFingerprint: reset.new
+                )
+                pendingReset = nil
+                isConnecting = false
+                pairingStatus = "✓ Ключ обновлён. Повторное подключение..."
+                startConnection()
+            } catch {
+                pendingReset = nil
+                isConnecting = false
+                pairingStatus = "⚠️ Сброс отменён: \(error.localizedDescription)"
             }
         }
     }
@@ -412,7 +560,7 @@ public struct PairingModalView: View {
     private func selectConnection(name: String, host: String, port: Int) {
         // Если устройство с таким же именем сейчас обнаружено в mDNS по новому IP,
         // автоматически используем актуальный IP
-        if let liveDev = vm.discoveryService.discoveredDevices.first(where: { $0.name == name }) {
+        if let liveDev = uniqueLiveDevice(named: name) {
             inputHost = liveDev.host
             inputPort = String(liveDev.port)
         } else {

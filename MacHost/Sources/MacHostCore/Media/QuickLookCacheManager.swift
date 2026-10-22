@@ -8,7 +8,25 @@ public final class QuickLookCacheManager: @unchecked Sendable {
     public let cacheDir: URL
     public var maxDiskBytes: UInt64 = 1024 * 1024 * 1024 // 1 GB LRU Limit
     
-    private var inFlightTasks: [URL: Task<URL, Error>] = [:]
+    private struct InFlightDownload {
+        let id: UUID
+        let task: Task<URL, Error>
+        var waiters: Int
+    }
+    /// Снятие ожидающего выполняется один раз (из отмены или из штатного завершения).
+    private final class WaiterRelease {
+        private let flagLock = NSLock()
+        private var claimed = false
+        func claim() -> Bool {
+            flagLock.lock()
+            defer { flagLock.unlock() }
+            if claimed { return false }
+            claimed = true
+            return true
+        }
+    }
+    
+    private var inFlightTasks: [URL: InFlightDownload] = [:]
     private let lock = NSLock()
     
     public init(customCacheDir: URL? = nil) {
@@ -22,7 +40,7 @@ public final class QuickLookCacheManager: @unchecked Sendable {
     }
     
     public func cacheURL(for item: FileItem) -> URL {
-        let ext = URL(fileURLWithPath: item.name).pathExtension
+        let ext = String(URL(fileURLWithPath: item.name).pathExtension.prefix(16))
         let baseName = URL(fileURLWithPath: item.name).deletingPathExtension().lastPathComponent
         // Оптимизация P2: Включаем deviceId, path, size и mtime в ключ кэша.
         // Это предотвращает коллизии разных телефонов и возврат устаревших данных при изменении файла
@@ -30,7 +48,8 @@ public final class QuickLookCacheManager: @unchecked Sendable {
         let keyData = Data("\(deviceId):\(item.path):\(item.size):\(Int64(item.mtime))".utf8)
         let pathHash = SHA256.hash(data: keyData)
             .prefix(8).map { String(format: "%02x", $0) }.joined()
-        let safeBase = baseName.addingPercentEncoding(withAllowedCharacters: .alphanumerics) ?? "preview"
+        // Ограничение длины: имя файла на APFS не длиннее 255 байт, а имя с телефона может быть любым
+        let safeBase = String((baseName.addingPercentEncoding(withAllowedCharacters: .alphanumerics) ?? "preview").prefix(64))
         
         let filename: String
         if ext.isEmpty {
@@ -67,11 +86,14 @@ public final class QuickLookCacheManager: @unchecked Sendable {
         
         let targetURL = cacheURL(for: item)
         
-        // Оптимизация P2: Дедупликация конкурентных запросов одного и того же файла
+        // Дедупликация конкурентных запросов одного файла. Загрузка общая для всех ожидающих и
+        // отменяется только когда отменился последний ожидающий (счётчик ожидающих).
         lock.lock()
-        if let existingTask = inFlightTasks[targetURL] {
+        if var entry = inFlightTasks[targetURL] {
+            entry.waiters += 1
+            inFlightTasks[targetURL] = entry
             lock.unlock()
-            return try await existingTask.value
+            return try await awaitShared(entry, key: targetURL)
         }
         
         let task = Task<URL, Error> { [weak self] () -> URL in
@@ -82,6 +104,7 @@ public final class QuickLookCacheManager: @unchecked Sendable {
             
             do {
                 try await downloader(item.path, partURL, item.size, onProgress)
+                try Task.checkCancellation()
                 try self.fileManager.moveItem(at: partURL, to: targetURL)
                 self.cleanupDiskIfNeeded()
                 return targetURL
@@ -90,16 +113,37 @@ public final class QuickLookCacheManager: @unchecked Sendable {
                 throw error
             }
         }
-        inFlightTasks[targetURL] = task
+        let entry = InFlightDownload(id: UUID(), task: task, waiters: 1)
+        inFlightTasks[targetURL] = entry
         lock.unlock()
-        
+        return try await awaitShared(entry, key: targetURL)
+    }
+    
+    /// Ожидание общей загрузки. Отмена вызывающего снимает его с ожидания (и отменяет загрузку,
+    /// если ожидающих не осталось). Снятие выполняется ровно один раз.
+    private func awaitShared(_ entry: InFlightDownload, key: URL) async throws -> URL {
+        let release = WaiterRelease()
         defer {
-            lock.lock()
-            inFlightTasks.removeValue(forKey: targetURL)
-            lock.unlock()
+            if release.claim() { releaseWaiter(key: key, id: entry.id) }
         }
-        
-        return try await task.value
+        return try await withTaskCancellationHandler {
+            try await entry.task.value
+        } onCancel: {
+            if release.claim() { self.releaseWaiter(key: key, id: entry.id) }
+        }
+    }
+    
+    private func releaseWaiter(key: URL, id: UUID) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard var entry = inFlightTasks[key], entry.id == id else { return }
+        entry.waiters -= 1
+        if entry.waiters <= 0 {
+            inFlightTasks.removeValue(forKey: key)
+            entry.task.cancel()
+        } else {
+            inFlightTasks[key] = entry
+        }
     }
     
     public func fetchFile(
