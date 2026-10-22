@@ -59,6 +59,7 @@ public final class ConnectionController: ObservableObject {
     @Published public private(set) var isManualDisconnectSuppressed: Bool = false
     
     private var activeAttemptId: UUID? = nil
+    private var lanSearchTask: Task<LanPhoneSearchResult, Never>?
     
     private weak var activeViewModel: DualPaneViewModel?
     
@@ -88,6 +89,8 @@ public final class ConnectionController: ObservableObject {
         }
         
         activeViewModel = viewModel
+        lanSearchTask?.cancel()
+        lanSearchTask = nil
         let attemptId = UUID()
         activeAttemptId = attemptId
         lastConnectionDiagnostics = ""
@@ -111,13 +114,40 @@ public final class ConnectionController: ObservableObject {
             return await connectToCandidate(path, attemptId: attemptId, isExplicit: isExplicitUserAction, viewModel: viewModel)
         }
         
-        // 3. Автоматический выбор пути через PhoneConnectionManager (USB -> Wi-Fi)
-        if isExplicitUserAction {
-            // Свежий mDNS-запрос: пока идёт проверка известных адресов и скан подсети,
-            // Bonjour успевает отдать текущий IP телефона.
-            DiscoveryService.shared.startDiscovery()
+        let res: ConnectionResult
+        if preferredDeviceId == nil {
+            // PHONE ищет Wi-Fi endpoint независимо от доступности других транспортов.
+            // Поиск принадлежит текущей попытке и прекращается при отмене/новом выборе.
+            DiscoveryService.shared.refresh()
+            let searchTask = Task.detached(priority: .userInitiated) {
+                await PhoneConnectionManager.shared.findPairedPhoneOnLan(deep: true)
+            }
+            lanSearchTask = searchTask
+            let searchResult = await withTaskCancellationHandler {
+                await searchTask.value
+            } onCancel: {
+                searchTask.cancel()
+            }
+            guard isAttemptValid(attemptId) else { return false }
+            lanSearchTask = nil
+            switch searchResult {
+            case .paired(let host, let port, _, let name):
+                res = .wifiSuccess(host: host, port: port, name: name)
+            case .unpaired(let hosts):
+                res = .wifiUnpaired(hosts: hosts, log: "Wi-Fi endpoints require pairing: \(hosts.joined(separator: ", "))")
+            case .notFound:
+                res = .failure(
+                    reason: "Телефон не найден по Wi-Fi. Проверьте общую сеть и откройте MacDroid Companion на телефоне.",
+                    log: "Wi-Fi discovery finished without a reachable paired endpoint."
+                )
+            }
+        } else {
+            // Явно выбранное устройство сохраняет существующий путь подключения.
+            if isExplicitUserAction {
+                DiscoveryService.shared.startDiscovery()
+            }
+            res = await PhoneConnectionManager.shared.establishConnection(preferredDeviceId: preferredDeviceId)
         }
-        let res = await PhoneConnectionManager.shared.establishConnection(preferredDeviceId: preferredDeviceId)
         guard isAttemptValid(attemptId) else { return false }
 
         switch res {
@@ -248,6 +278,7 @@ public final class ConnectionController: ObservableObject {
                 UserDefaults.standard.removeObject(forKey: "lastConnectedDeviceId")
                 UserDefaults.standard.set(ConnectionHostAddress.normalized(host), forKey: "lastSuccessfulPhoneHost")
                 UserDefaults.standard.set(Int(port), forKey: "lastSuccessfulPhonePort")
+                UserDefaults.standard.set(pinKey, forKey: "lastSuccessfulPhoneDeviceId")
                 Self.rememberConnection(name: devName, host: host, port: port)
             } else if let deviceId {
                 UserDefaults.standard.set("127.0.0.1", forKey: "lastConnectedHost")
@@ -431,6 +462,8 @@ public final class ConnectionController: ObservableObject {
     public func cancel(viewModel: DualPaneViewModel? = nil) {
         isManualDisconnectSuppressed = true
         activeAttemptId = nil
+        lanSearchTask?.cancel()
+        lanSearchTask = nil
         let targetVm = viewModel ?? activeViewModel
         targetVm?.remoteDriver.disconnect()
         phase = .disconnected(reason: "Подключение отменено пользователем")
@@ -448,7 +481,7 @@ public final class ConnectionController: ObservableObject {
     }
     
     private func isAttemptValid(_ id: UUID) -> Bool {
-        return activeAttemptId == id
+        return activeAttemptId == id && !Task.isCancelled
     }
 
     private static func rememberConnection(name: String, host: String, port: UInt16) {

@@ -5,7 +5,6 @@ public struct CompactConnectionPopoverView: View {
     
     @State private var inputHost: String = ""
     @State private var inputPort: String = "2222"
-    @State private var isConnecting: Bool = false
     
     private var historyPhones: [SavedConnection] {
         PairingModalView.loadInitialHistory()
@@ -171,7 +170,7 @@ public struct CompactConnectionPopoverView: View {
                     )
                     .frame(width: 130)
                 
-                if isConnecting {
+                if vm.isConnectingPhone {
                     ProgressView()
                         .scaleEffect(0.7)
                 }
@@ -182,7 +181,7 @@ public struct CompactConnectionPopoverView: View {
                 .font(.system(size: 14, weight: .semibold))
                 .buttonStyle(.borderedProminent)
                 .keyboardShortcut(.defaultAction)
-                .disabled(inputHost.isEmpty || isConnecting)
+                .disabled(inputHost.isEmpty || vm.isConnectingPhone)
                 
                 Spacer()
             }
@@ -220,32 +219,16 @@ public struct CompactConnectionPopoverView: View {
     }
     
     private func startConnection() {
-        guard !inputHost.isEmpty else { return }
-        isConnecting = true
+        guard !inputHost.isEmpty, !vm.isConnectingPhone else { return }
         let host = inputHost
         let port = UInt16(inputPort) ?? 2222
-        
-        Task { @MainActor in
-            defer { isConnecting = false }
-            let success = await ConnectionController.shared.connect(
-                customHost: host,
-                customPort: port,
-                isExplicitUserAction: true,
-                viewModel: vm
-            )
-            if success {
-                vm.failedConnectionSide = nil
-                vm.leftIsStale = false
-                vm.rightIsStale = false
-                if vm.rightSource != .remotePhone && vm.leftSource != .remotePhone {
-                    vm.changeSource(to: .remotePhone, side: .right)
-                } else {
-                    if vm.leftSource == .remotePhone { vm.refreshPane(side: .left) }
-                    if vm.rightSource == .remotePhone { vm.refreshPane(side: .right) }
-                }
-                vm.refreshDetectedVolumes()
-            }
-        }
+
+        vm.connectPhone(
+            customHost: host,
+            customPort: port,
+            forceActivate: true,
+            isExplicit: true
+        )
     }
 }
 

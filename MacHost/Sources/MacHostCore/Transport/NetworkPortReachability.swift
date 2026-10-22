@@ -90,7 +90,7 @@ public enum NetworkPortReachability {
         }
         var open = Set<String>()
         var start = 0
-        while start < unique.count {
+        while start < unique.count && !Task.isCancelled {
             let batch = Array(unique[start..<min(start + batchSize, unique.count)])
             start += batchSize
             open.formUnion(scanBatch(batch, port: port, timeoutMs: timeoutMs))
@@ -131,7 +131,7 @@ public enum NetworkPortReachability {
         }
 
         let deadline = Date().addingTimeInterval(Double(timeoutMs) / 1000)
-        while !pending.isEmpty {
+        while !pending.isEmpty && !Task.isCancelled {
             let remainingMs = Int32(max(0, deadline.timeIntervalSinceNow * 1000))
             guard remainingMs > 0 else { break }
             var pfds = pending.map { pollfd(fd: $0.fd, events: Int16(POLLOUT), revents: 0) }
@@ -212,10 +212,16 @@ public enum NetworkPortReachability {
         let pipe = Pipe()
         proc.standardOutput = pipe
         proc.standardError = FileHandle.nullDevice
+        let watchdog = DispatchWorkItem { [weak proc] in
+            if proc?.isRunning == true { proc?.terminate() }
+        }
+        DispatchQueue.global().asyncAfter(deadline: .now() + 2, execute: watchdog)
+        defer { watchdog.cancel() }
         do {
             try proc.run()
-            proc.waitUntilExit()
+            // Drain before waiting: a large ARP table can fill the pipe and deadlock waitUntilExit.
             let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            proc.waitUntilExit()
             let str = String(decoding: data, as: UTF8.self)
             var ips: [String] = []
             for line in str.components(separatedBy: "\n") {

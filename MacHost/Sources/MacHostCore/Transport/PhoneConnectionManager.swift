@@ -33,7 +33,7 @@ public final class PhoneConnectionManager: @unchecked Sendable {
     public static let shared = PhoneConnectionManager()
     
     public private(set) var lastConnectedDeviceId: String?
-    private var discoveredIps: [String] = []
+    private var discoveredDevices: [DiscoveredDevice] = []
     private var deviceNamesByHost: [String: String] = [:]
     private let lock = NSLock()
     
@@ -44,9 +44,6 @@ public final class PhoneConnectionManager: @unchecked Sendable {
         let normHost = ConnectionHostAddress.normalized(host)
         deviceNamesByHost[host] = name
         deviceNamesByHost[normHost] = name
-        if !discoveredIps.contains(normHost) {
-            discoveredIps.insert(normHost, at: 0)
-        }
         lock.unlock()
         
         if name != "Телефон Android" && name != "Android" && !name.isEmpty {
@@ -717,111 +714,103 @@ public final class PhoneConnectionManager: @unchecked Sendable {
         return nil
     }
 
-    /// Известные адреса телефона в порядке приоритета: последний успешный, история, реестр, Bonjour.
-    public func knownWifiCandidateHosts() -> [String] {
+    /// Replaces the live Bonjour snapshot; withdrawn services must not accumulate forever.
+    public func replaceDiscoveredDevices(_ devices: [DiscoveredDevice]) {
         lock.lock()
-        let discovered = self.discoveredIps
+        discoveredDevices = devices
         lock.unlock()
+        for device in devices { registerDevice(host: device.host, name: device.name) }
+    }
 
-        var priorities: [String] = []
+    public func knownWifiCandidateHosts() -> [String] {
+        var seen = Set<String>()
+        return knownWifiCandidates().map { $0.endpoint.host }.filter { seen.insert($0).inserted }
+    }
 
-        if let lastSuccessful = UserDefaults.standard.string(forKey: "lastSuccessfulPhoneHost"), !lastSuccessful.isEmpty {
-            priorities.append(ConnectionHostAddress.normalized(lastSuccessful))
+    /// Preserve ports from every source. Fresh Bonjour routes precede historical addresses;
+    /// the verified device identity determines the final selection, rather than a stale IP.
+    public func knownWifiCandidates(defaultPort: UInt16 = 2222) -> [WiFiSearchCandidate] {
+        lock.lock()
+        let discovered = discoveredDevices
+        lock.unlock()
+        let defaults = UserDefaults.standard
+        var candidates: [WiFiSearchCandidate] = []
+        var seen = Set<WiFiEndpoint>()
+        func append(_ host: String, _ port: Int, bonjour: Bool = false) {
+            let host = ConnectionHostAddress.normalized(host)
+            guard ConnectionHostAddress.isIPv4(host), !host.hasPrefix("127."), host != "0.0.0.0",
+                  let port = UInt16(exactly: port), port > 0 else { return }
+            let endpoint = WiFiEndpoint(host: host, port: port)
+            if seen.insert(endpoint).inserted {
+                candidates.append(WiFiSearchCandidate(endpoint: endpoint, isBonjour: bonjour))
+            }
         }
-
-        if let saved = UserDefaults.standard.string(forKey: "lastConnectedHost"),
-           !saved.isEmpty, saved != "127.0.0.1" {
-            let normalized = ConnectionHostAddress.normalized(saved)
-            if !priorities.contains(normalized) { priorities.append(normalized) }
+        for device in discovered.sorted(by: { $0.id < $1.id }) {
+            append(device.host, device.port, bonjour: !device.isManual)
         }
-        
-        if let data = UserDefaults.standard.data(forKey: "phoneConnectionHistory"),
-           let savedList = try? JSONDecoder().decode([SavedConnection].self, from: data) {
-            for item in savedList {
-                let host = ConnectionHostAddress.normalized(item.host)
-                if !priorities.contains(host) {
-                    priorities.append(host)
+        for prefix in ["lastSuccessfulPhone", "lastConnected"] {
+            if let host = defaults.string(forKey: prefix + "Host") {
+                let port = defaults.object(forKey: prefix + "Port") == nil
+                    ? Int(defaultPort) : defaults.integer(forKey: prefix + "Port")
+                append(host, port)
+            }
+        }
+        if let data = defaults.data(forKey: "phoneConnectionHistory"),
+           let history = try? JSONDecoder().decode([SavedConnection].self, from: data) {
+            for item in history { append(item.host, item.port) }
+        }
+        for device in DeviceRegistry.shared.allDevices() {
+            append(device.lastKnownHost, Int(device.lastKnownPort))
+        }
+        return candidates
+    }
+
+    /// PHONE waits for Bonjour and retries phones that are waking up. Background searches
+    /// inspect only known routes and apply per-device eligibility before choosing a result.
+    public func findPairedPhoneOnLan(
+        deep: Bool,
+        port: UInt16 = 2222,
+        autoConnectOnly: Bool = false,
+        excludedHosts: Set<String> = []
+    ) async -> LanPhoneSearchResult {
+        let defaults = UserDefaults.standard
+        let preferred = defaults.string(forKey: "lastSuccessfulPhoneDeviceId")
+            ?? defaults.string(forKey: "lastSuccessfulPhoneHost").flatMap {
+                DeviceRegistry.shared.device(matchingHost: $0)?.id
+            }
+        return await WiFiPhoneSearch.search(
+            deep: deep,
+            preferredDeviceId: preferred,
+            candidates: {
+                self.knownWifiCandidates(defaultPort: port).filter { !excludedHosts.contains($0.endpoint.host) }
+            },
+            fallbackCandidates: {
+                guard !Task.isCancelled else { return [] }
+                let hosts = NetworkPortReachability.fetchActiveLanIps() + NetworkPortReachability.localSubnetHosts()
+                let open = NetworkPortReachability.scanOpenPort(hosts: hosts, port: port, timeoutMs: 450)
+                return open.sorted().filter { !excludedHosts.contains($0) }.map {
+                    WiFiSearchCandidate(endpoint: WiFiEndpoint(host: $0, port: port))
                 }
-            }
-        }
-
-        for host in discovered where !priorities.contains(ConnectionHostAddress.normalized(host)) {
-            priorities.append(ConnectionHostAddress.normalized(host))
-        }
-
-        for dev in DeviceRegistry.shared.allDevices() {
-            let host = ConnectionHostAddress.normalized(dev.lastKnownHost)
-            if !host.isEmpty, host != "127.0.0.1", !priorities.contains(host) {
-                priorities.append(host)
-            }
-        }
-
-        return priorities
-    }
-
-    /// Автоматический поиск сопряжённого телефона в Wi-Fi сети.
-    /// Адрес сам по себе не даёт доверия: телефон считается найденным, только если его ключ узла
-    /// совпадает с закреплённым при сопряжении. Поэтому смена IP (DHCP, другой роутер) не мешает
-    /// подключению, а чужое устройство на порту 2222 не будет принято за телефон.
-    /// - Parameter deep: дополнительно опросить ARP-таблицу и всю локальную /24 подсеть,
-    ///   если по известным адресам телефон не найден (кнопка PHONE). Для фонового автоподключения — false.
-    public func findPairedPhoneOnLan(deep: Bool, port: UInt16 = 2222) async -> LanPhoneSearchResult {
-        let known = knownWifiCandidateHosts()
-        let quickOpen = NetworkPortReachability.scanOpenPort(hosts: known, port: port, timeoutMs: 600)
-        var unpaired: [String] = []
-        // Порядок приоритета сохраняется: первым проверяется последний успешный адрес.
-        if let match = await firstPairedHost(in: known.filter { quickOpen.contains($0) }, port: port, unpaired: &unpaired) {
-            return match
-        }
-        guard deep else {
-            return unpaired.isEmpty ? .notFound : .unpaired(hosts: unpaired)
-        }
-
-        let checked = Set(known)
-        var wide = NetworkPortReachability.fetchActiveLanIps().filter { !checked.contains($0) }
-        let arpSet = Set(wide)
-        wide += NetworkPortReachability.localSubnetHosts().filter { !checked.contains($0) && !arpSet.contains($0) }
-        let wideOpen = NetworkPortReachability.scanOpenPort(hosts: wide, port: port, timeoutMs: 450)
-        // Хосты, только что объявленные через Bonjour, тоже учитываются.
-        let lateKnown = knownWifiCandidateHosts().filter { !checked.contains($0) }
-        let lateOpen = NetworkPortReachability.scanOpenPort(hosts: lateKnown, port: port, timeoutMs: 450)
-        let candidates = lateKnown.filter { lateOpen.contains($0) } + wide.filter { wideOpen.contains($0) && !lateOpen.contains($0) }
-        if let match = await firstPairedHost(in: candidates, port: port, unpaired: &unpaired) {
-            return match
-        }
-        return unpaired.isEmpty ? .notFound : .unpaired(hosts: unpaired)
-    }
-
-    /// Сверяет ключи узлов параллельно и возвращает первый (по порядку `hosts`) сопряжённый телефон.
-    private func firstPairedHost(in hosts: [String], port: UInt16, unpaired: inout [String]) async -> LanPhoneSearchResult? {
-        guard !hosts.isEmpty else { return nil }
-        let pinKeys: [String: String?] = await withTaskGroup(of: (String, String?).self) { group in
-            for host in hosts {
-                group.addTask {
-                    guard let fp = PhoneConnectionManager.shared.fetchHostKeyObservation(host: host, port: port)?.fingerprint,
-                          let pinKey = HostKeyStore.shared.pinnedDeviceId(matchingFingerprint: fp),
-                          case .trusted = HostKeyStore.shared.verifyPinned(deviceId: pinKey, fingerprint: fp) else {
-                        return (host, nil)
-                    }
-                    return (host, pinKey)
+            },
+            probe: { candidate in
+                guard !Task.isCancelled else { return .unavailable }
+                let endpoint = candidate.endpoint
+                guard let observation = self.fetchHostKeyObservation(host: endpoint.host, port: endpoint.port) else {
+                    return .unavailable
                 }
+                guard !Task.isCancelled else { return .unavailable }
+                guard let pinKey = HostKeyStore.shared.pinnedDeviceId(matchingFingerprint: observation.fingerprint),
+                      case .trusted = HostKeyStore.shared.verifyPinned(deviceId: pinKey, fingerprint: observation.fingerprint) else {
+                    return .unpaired
+                }
+                let device = DeviceRegistry.shared.device(withId: pinKey)
+                if autoConnectOnly && device?.autoConnect != true { return .unavailable }
+                let name = device?.name ?? self.deviceNameForHost(endpoint.host) ?? "Телефон Android"
+                return .paired(pinKey: pinKey, name: name)
             }
-            var result: [String: String?] = [:]
-            for await (host, key) in group { result[host] = key }
-            return result
-        }
-        for host in hosts {
-            if let pinKey = pinKeys[host] ?? nil {
-                let name = DeviceRegistry.shared.device(withId: pinKey)?.name
-                    ?? deviceNameForHost(host)
-                    ?? "Телефон Android"
-                return .paired(host: host, port: port, pinKey: pinKey, name: name)
-            }
-            if !unpaired.contains(host) { unpaired.append(host) }
-        }
-        return nil
+        )
     }
-    
+
     /// Получает ключ через ssh-keyscan и возвращает строку known_hosts для строгой проверки самой SSH-сессии.
     public func fetchHostKeyObservation(host: String, port: UInt16) -> SSHHostKeyObservation? {
         guard isHostPortReachable(host: host, port: port, timeoutSeconds: 1) else { return nil }

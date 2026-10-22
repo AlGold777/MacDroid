@@ -457,7 +457,7 @@ public struct PairingModalView: View {
                 .font(.system(size: 14, weight: .semibold))
                 .buttonStyle(.borderedProminent)
                 .keyboardShortcut(.defaultAction)
-                .disabled(inputHost.isEmpty || isConnecting)
+                .disabled(inputHost.isEmpty || isConnecting || vm.isConnectingPhone)
             }
             .padding(.top, 4)
         }
@@ -625,43 +625,30 @@ public struct PairingModalView: View {
     }
     
     private func startConnection() {
-        guard !inputHost.isEmpty else {
-            pairingStatus = "⚠️ Введите IP-адрес телефона"
+        guard !vm.isConnectingPhone else {
+            pairingStatus = "Подключение уже выполняется. Дождитесь завершения текущей попытки."
             return
         }
         let host = ConnectionHostAddress.normalized(inputHost)
+        guard !host.isEmpty else {
+            pairingStatus = "⚠️ Введите IP-адрес телефона"
+            return
+        }
+        guard let port = validatedInputPort() else { return }
         inputHost = host
-        let portInt = Int(inputPort) ?? 2222
+        inputPort = String(port)
         isConnecting = true
         pairingStatus = "Проверка доступности и авторизация SFTP..."
-        
-        Task { @MainActor in
-            defer { isConnecting = false }
-            
-            let success = await ConnectionController.shared.connect(
-                customHost: host,
-                customPort: UInt16(portInt),
-                isExplicitUserAction: true,
-                viewModel: vm
-            )
-            
+
+        vm.connectPhone(
+            customHost: host,
+            customPort: port,
+            forceActivate: true,
+            isExplicit: true
+        ) { success in
+            isConnecting = false
             if success {
-                UserDefaults.standard.set(host, forKey: "lastConnectedHost")
-                UserDefaults.standard.set(inputPort, forKey: "lastConnectedPort")
-                UserDefaults.standard.set(host, forKey: "lastSuccessfulPhoneHost")
-                UserDefaults.standard.set(portInt, forKey: "lastSuccessfulPhonePort")
-                saveToHistory(host: host, port: portInt)
-                
                 pairingStatus = "✓ Подключение успешно установлено"
-                if vm.rightSource != .remotePhone && vm.leftSource != .remotePhone {
-                    vm.changeSource(to: .remotePhone, side: .right)
-                } else {
-                    if vm.leftSource == .remotePhone { vm.refreshPane(side: .left) }
-                    if vm.rightSource == .remotePhone { vm.refreshPane(side: .right) }
-                }
-                vm.refreshDetectedVolumes()
-                
-                try? await Task.sleep(nanoseconds: 600_000_000)
                 dismiss()
             } else if pinnedFingerprintForCurrentHost == nil {
                 pairingStatus = "⚠️ Устройство не сопряжено. Сверьте отпечаток с телефоном и нажмите «Отпечаток совпадает — доверять»."
@@ -669,10 +656,23 @@ public struct PairingModalView: View {
                 if case .authFailed(let reason) = ConnectionController.shared.phase {
                     pairingStatus = "⚠️ Ошибка авторизации: \(reason)"
                 } else {
-                    pairingStatus = "⚠️ Не удалось подключиться к \(inputHost):\(portInt)"
+                    pairingStatus = "⚠️ Не удалось подключиться к \(host):\(port)"
                 }
             }
         }
+    }
+
+    private func validatedInputPort() -> UInt16? {
+        let text = inputPort.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else {
+            pairingStatus = "⚠️ Введите порт телефона (от 1 до 65535)."
+            return nil
+        }
+        guard let value = Int(text), let port = UInt16(exactly: value), port > 0 else {
+            pairingStatus = "⚠️ Некорректный порт: введите число от 1 до 65535."
+            return nil
+        }
+        return port
     }
     
     private func updateFingerprintDisplay() {
@@ -682,8 +682,11 @@ public struct PairingModalView: View {
             currentFingerprint = "— Введите IP-адрес телефона —"
             return
         }
+        guard let port = validatedInputPort() else {
+            currentFingerprint = "— Некорректный порт —"
+            return
+        }
         let host = inputHost
-        let port = UInt16(inputPort) ?? 2222
         currentFingerprint = "Опрос отпечатка узла..."
         fingerprintTask = Task { @MainActor in
             // Пауза на время ввода: запросы не уходят на каждый символ, предыдущий опрос отменяется
@@ -704,9 +707,10 @@ public struct PairingModalView: View {
     
     /// Ключ, закреплённый за этим телефоном (nil — сопряжения ещё нет)
     private var pinnedFingerprintForCurrentHost: String? {
-        HostKeyStore.shared.pinnedFingerprint(deviceId: pairingDeviceId(
+        guard let port = Int(inputPort), let validPort = UInt16(exactly: port), validPort > 0 else { return nil }
+        return HostKeyStore.shared.pinnedFingerprint(deviceId: pairingDeviceId(
             host: ConnectionHostAddress.normalized(inputHost),
-            port: Int(inputPort) ?? 2222
+            port: Int(validPort)
         ))
     }
     
@@ -734,9 +738,9 @@ public struct PairingModalView: View {
     /// Пин только по явному подтверждению пользователя. pinHostKey заново получает ключ
     /// и закрепляет его, только если он совпадает с показанным отпечатком.
     private func confirmTrust() {
-        guard let expected = observedFingerprint, !inputHost.isEmpty else { return }
+        guard let expected = observedFingerprint, !inputHost.isEmpty, let port = validatedInputPort() else { return }
         let host = ConnectionHostAddress.normalized(inputHost)
-        let portInt = Int(inputPort) ?? 2222
+        let portInt = Int(port)
         let deviceId = pairingDeviceId(host: host, port: portInt)
         isConnecting = true
         pairingStatus = "Закрепляю подтверждённый ключ..."
@@ -745,7 +749,7 @@ public struct PairingModalView: View {
                 try await HostKeyStore.shared.pinHostKey(
                     deviceId: deviceId,
                     host: host,
-                    port: UInt16(portInt),
+                    port: port,
                     expectedFingerprint: expected
                 )
                 isConnecting = false
@@ -760,8 +764,9 @@ public struct PairingModalView: View {
     
     /// Шаг 1 сброса: получить закреплённый и текущий отпечатки для показа. Ничего не меняет.
     private func prepareReset() {
+        guard let port = validatedInputPort() else { return }
         let host = ConnectionHostAddress.normalized(inputHost)
-        let portInt = Int(inputPort) ?? 2222
+        let portInt = Int(port)
         let deviceId = pairingDeviceId(host: host, port: portInt)
         pairingStatus = "Получаю текущий отпечаток узла для сверки..."
         Task { @MainActor in
@@ -769,7 +774,7 @@ public struct PairingModalView: View {
                 let pair = try await HostKeyStore.shared.prepareHostKeyReset(
                     deviceId: deviceId,
                     host: host,
-                    port: UInt16(portInt)
+                    port: port
                 )
                 pendingReset = (old: pair.old, new: pair.new)
                 pairingStatus = "Сверьте оба отпечатка с телефоном и подтвердите сброс."
@@ -781,8 +786,9 @@ public struct PairingModalView: View {
     
     /// Шаг 2 сброса: применить смену, только если закреплённый и текущий отпечатки совпадают с подтверждёнными.
     private func commitReset(_ reset: (old: String, new: String)) {
+        guard let port = validatedInputPort() else { return }
         let host = ConnectionHostAddress.normalized(inputHost)
-        let portInt = Int(inputPort) ?? 2222
+        let portInt = Int(port)
         let deviceId = pairingDeviceId(host: host, port: portInt)
         isConnecting = true
         Task { @MainActor in
@@ -790,7 +796,7 @@ public struct PairingModalView: View {
                 try await HostKeyStore.shared.commitHostKeyReset(
                     deviceId: deviceId,
                     host: host,
-                    port: UInt16(portInt),
+                    port: port,
                     expectedOldFingerprint: reset.old,
                     expectedNewFingerprint: reset.new
                 )

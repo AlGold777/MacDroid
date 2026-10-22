@@ -2705,9 +2705,13 @@ public final class DualPaneViewModel: ObservableObject {
         customPort: UInt16? = nil,
         preferredDeviceId: String? = nil,
         forceActivate: Bool = true,
-        isExplicit: Bool = true
+        isExplicit: Bool = true,
+        completion: ((Bool) -> Void)? = nil
     ) {
-        guard !isConnectingPhone else { return }
+        guard !isConnectingPhone else {
+            completion?(false)
+            return
+        }
         isConnectingPhone = true
         if leftSource == .remotePhone { leftIsStale = false }
         if rightSource == .remotePhone { rightIsStale = false }
@@ -2716,7 +2720,6 @@ public final class DualPaneViewModel: ObservableObject {
         }
         
         Task { @MainActor in
-            defer { self.isConnectingPhone = false }
             let success = await ConnectionController.shared.connect(
                 targetCandidate: targetPath,
                 customHost: customHost,
@@ -2730,6 +2733,9 @@ public final class DualPaneViewModel: ObservableObject {
             if isExplicit {
                 self.autoConnectBackoff[DualPaneViewModel.lanScanBackoffKey] = nil
                 if let key = autoKey { self.autoConnectBackoff[key] = nil }
+                if let customHost {
+                    self.autoConnectBackoff["lan:\(ConnectionHostAddress.normalized(customHost))"] = nil
+                }
             } else if let key = autoKey {
                 if success {
                     self.autoConnectBackoff[key] = nil
@@ -2741,6 +2747,15 @@ public final class DualPaneViewModel: ObservableObject {
                 }
             }
             if success {
+                self.failedConnectionSide = nil
+                // При автоматическом подборе адреса входной targetPath отсутствует.
+                // Ручной успех снимает подавление именно с фактического endpoint.
+                if isExplicit,
+                   let currentPath = ConnectionController.shared.currentPath,
+                   case .lan(let host, _, _) = currentPath {
+                    self.autoConnectBackoff["lan:\(host)"] = nil
+                    self.autoConnectBackoff["lan:\(ConnectionHostAddress.normalized(host))"] = nil
+                }
                 self.leftIsStale = false
                 self.rightIsStale = false
                 if forceActivate && self.rightSource != .remotePhone && self.leftSource != .remotePhone {
@@ -2761,6 +2776,8 @@ public final class DualPaneViewModel: ObservableObject {
                 if self.rightSource == .remotePhone { self.rightIsStale = true }
                 self.refreshUsbDrives()
             }
+            self.isConnectingPhone = false
+            completion?(success)
         }
     }
     
@@ -2814,7 +2831,7 @@ public final class DualPaneViewModel: ObservableObject {
     private func autoConnectKey(targetPath: CandidatePath?, preferredDeviceId: String?) -> String? {
         if let path = targetPath {
             switch path {
-            case .lan(let host, _, _): return "lan:\(host)"
+            case .lan(let host, _, _): return "lan:\(ConnectionHostAddress.normalized(host))"
             case .usb(let deviceId, _): return "usb:\(deviceId)"
             }
         }
@@ -2854,15 +2871,19 @@ public final class DualPaneViewModel: ObservableObject {
             var scanAttempted = false
             if chosenUsbDeviceId == nil && DualPaneViewModel.autoConnectAllowed(DualPaneViewModel.lanScanBackoffKey, state: backoffState) {
                 scanAttempted = true
-                // W6: автоматически подключаемся только к телефону, чей ключ узла совпал с закреплённым.
-                // Устройство определяется по ключу, а не по адресу, поэтому новый IP после DHCP не мешает.
-                if case .paired(let foundIp, _, let pinKey, _) = await PhoneConnectionManager.shared.findPairedPhoneOnLan(deep: false),
-                   let dev = DeviceRegistry.shared.device(withId: pinKey) ?? DeviceRegistry.shared.device(matchingHost: foundIp) {
-                    if dev.autoConnect, !dev.pinnedFingerprint.isEmpty,
-                       DualPaneViewModel.autoConnectAllowed("lan:\(foundIp)", state: backoffState) {
-                        let isV6 = foundIp.contains(":")
-                        chosenCandidate = .lan(host: foundIp, port: 2222, isV6: isV6)
-                    }
+                // Политика и backoff применяются до выбора первого доверенного телефона:
+                // отключённое устройство не должно скрывать следующий доступный endpoint.
+                let excludedHosts = Set(backoffState.keys.compactMap { key -> String? in
+                    guard key.hasPrefix("lan:"),
+                          !DualPaneViewModel.autoConnectAllowed(key, state: backoffState) else { return nil }
+                    return ConnectionHostAddress.normalized(String(key.dropFirst(4)))
+                })
+                if case .paired(let foundIp, let foundPort, _, _) = await PhoneConnectionManager.shared.findPairedPhoneOnLan(
+                    deep: false,
+                    autoConnectOnly: true,
+                    excludedHosts: excludedHosts
+                ) {
+                    chosenCandidate = .lan(host: foundIp, port: foundPort, isV6: foundIp.contains(":"))
                 }
             }
 

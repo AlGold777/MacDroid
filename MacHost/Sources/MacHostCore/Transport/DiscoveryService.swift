@@ -64,9 +64,9 @@ public final class DiscoveryService: ObservableObject {
     
     private var browser: NWBrowser?
     private var searchTimer: Task<Void, Never>?
-    private var resolvingConnections: [NWConnection] = []
-    private var pendingServiceIds: Set<String> = []
-    private var resolvedServiceIds: Set<String> = []
+    private var discoveryGeneration: UInt64 = 0
+    private var resolvingConnections: [UUID: NWConnection] = [:]
+    private var pendingServiceResolutions: [String: UUID] = [:]
     private var activeServiceIds: Set<String> = []
 
     private final class BonjourResolveContext: @unchecked Sendable {
@@ -78,116 +78,91 @@ public final class DiscoveryService: ObservableObject {
     public init() {}
     
     public func startDiscovery() {
-        if browser != nil {
-            refresh()
-            return
-        }
-        
-        let params = NWParameters()
-        params.includePeerToPeer = true
-        let descriptor = NWBrowser.Descriptor.bonjour(type: "_macphone_sftp._tcp", domain: "local.")
-        let newBrowser = NWBrowser(for: descriptor, using: params)
-        self.browser = newBrowser
-        
-        isSearching = true
-        scheduleSearchTimeout()
-        
-        newBrowser.stateUpdateHandler = { [weak self] state in
-            Task { @MainActor [weak self] in
-                switch state {
-                case .failed, .cancelled:
-                    self?.isSearching = false
-                default:
-                    break
-                }
-            }
-        }
-        
-        newBrowser.browseResultsChangedHandler = { [weak self] results, changes in
-            Task { @MainActor [weak self] in
-                guard let self = self else { return }
-                self.updateBrowseResults(results)
-            }
-        }
-        
-        newBrowser.start(queue: .main)
+        guard browser == nil else { return }
+        beginDiscovery()
     }
     
     public func refresh() {
-        isSearching = true
-        scheduleSearchTimeout()
-        
-        // Перезапуск браузера для принудительного mDNS запроса в локальную сеть
-        browser?.cancel()
-        browser = nil
-        resolvingConnections.forEach { $0.cancel() }
-        resolvingConnections.removeAll()
-        pendingServiceIds.removeAll()
-        resolvedServiceIds.removeAll()
-        activeServiceIds.removeAll()
-        
+        // PHONE запрашивает свежие адреса. Старые callbacks не должны менять новый поиск.
+        stopDiscovery()
+        beginDiscovery()
+    }
+
+    private func beginDiscovery() {
+        discoveryGeneration &+= 1
+        let generation = discoveryGeneration
         let params = NWParameters()
         params.includePeerToPeer = true
         let descriptor = NWBrowser.Descriptor.bonjour(type: "_macphone_sftp._tcp", domain: "local.")
         let newBrowser = NWBrowser(for: descriptor, using: params)
         self.browser = newBrowser
-        
+        isSearching = true
+        scheduleSearchTimeout(generation: generation)
+
         newBrowser.stateUpdateHandler = { [weak self] state in
             Task { @MainActor [weak self] in
+                guard let self, self.discoveryGeneration == generation else { return }
                 switch state {
                 case .failed, .cancelled:
-                    self?.isSearching = false
+                    self.stopDiscovery()
                 default:
                     break
                 }
             }
         }
         
-        newBrowser.browseResultsChangedHandler = { [weak self] results, changes in
+        newBrowser.browseResultsChangedHandler = { [weak self] results, _ in
             Task { @MainActor [weak self] in
-                guard let self = self else { return }
-                self.updateBrowseResults(results)
+                guard let self, self.discoveryGeneration == generation else { return }
+                self.updateBrowseResults(results, generation: generation)
             }
         }
         
         newBrowser.start(queue: .main)
     }
     
-    private func scheduleSearchTimeout() {
+    private func scheduleSearchTimeout(generation: UInt64) {
         searchTimer?.cancel()
         searchTimer = Task { @MainActor [weak self] in
-            try? await Task.sleep(nanoseconds: 4_000_000_000) // 4 секунды активного поиска
-            self?.isSearching = false
+            do {
+                try await Task.sleep(nanoseconds: 6_000_000_000)
+            } catch { return }
+            guard let self, self.discoveryGeneration == generation else { return }
+            self.isSearching = false
         }
     }
     
-    private func updateBrowseResults(_ results: Set<NWBrowser.Result>) {
-        let services = results.compactMap { result -> (NWEndpoint, String, String, String, String)? in
+    private func updateBrowseResults(_ results: Set<NWBrowser.Result>, generation: UInt64) {
+        let services = results.compactMap { result -> (NWEndpoint, String, String)? in
             guard case .service(let name, let type, let domain, _) = result.endpoint else { return nil }
             let serviceId = "\(name).\(type)\(domain)"
-            return (result.endpoint, name, type, domain, serviceId)
+            return (result.endpoint, name, serviceId)
         }
-        let currentIds = Set(services.map { $0.4 })
+        let currentIds = Set(services.map { $0.2 })
         activeServiceIds = currentIds
-        pendingServiceIds.formIntersection(currentIds)
-        resolvedServiceIds.formIntersection(currentIds)
+        let removed = pendingServiceResolutions.filter { !currentIds.contains($0.key) }
+        for (serviceId, resolutionId) in removed {
+            pendingServiceResolutions.removeValue(forKey: serviceId)
+            resolvingConnections.removeValue(forKey: resolutionId)?.cancel()
+        }
         discoveredDevices.removeAll { !$0.isManual && !currentIds.contains($0.id) }
+        publishDiscoveredDevices()
 
         // W14: адрес мог смениться после DHCP-обновления без смены имени сервиса,
         // поэтому каждое изменение browse-результатов перерезолвит все текущие сервисы.
-        for (endpoint, name, type, domain, serviceId) in services
-        where !pendingServiceIds.contains(serviceId) {
-            resolvedServiceIds.remove(serviceId)
-            pendingServiceIds.insert(serviceId)
-            resolveServiceEndpoint(endpoint, name: name, type: type, domain: domain, serviceId: serviceId)
+        for (endpoint, name, serviceId) in services
+        where pendingServiceResolutions[serviceId] == nil {
+            let resolutionId = UUID()
+            pendingServiceResolutions[serviceId] = resolutionId
+            resolveServiceEndpoint(endpoint, name: name, serviceId: serviceId, resolutionId: resolutionId, generation: generation)
         }
     }
 
     /// Настоящий Bonjour/mDNS резолвинг IP-адреса устройства из сетевого пакета
-    private func resolveServiceEndpoint(_ endpoint: NWEndpoint, name: String, type: String, domain: String, serviceId: String) {
+    private func resolveServiceEndpoint(_ endpoint: NWEndpoint, name: String, serviceId: String, resolutionId: UUID, generation: UInt64) {
         let params = NWParameters.tcp
         let conn = NWConnection(to: endpoint, using: params)
-        resolvingConnections.append(conn)
+        resolvingConnections[resolutionId] = conn
         
         conn.stateUpdateHandler = { [weak self, weak conn] state in
             guard let conn = conn else { return }
@@ -212,6 +187,9 @@ public final class DiscoveryService: ObservableObject {
                     resolvedPort = Int(port.rawValue)
                 }
                 
+                // TCP выполнил свою работу. Pending остаётся до окончания DNS fallback;
+                // .cancelled этого сокета не должен разрешать вторую параллельную попытку.
+                conn.stateUpdateHandler = nil
                 conn.cancel()
 
                 if ConnectionHostAddress.isIPv4(resolvedIp) {
@@ -221,7 +199,8 @@ public final class DiscoveryService: ObservableObject {
                             name: name,
                             host: resolvedIp,
                             port: resolvedPort,
-                            connection: conn
+                            resolutionId: resolutionId,
+                            generation: generation
                         )
                     }
                 } else if case .service(let serviceName, let serviceType, let serviceDomain, let interface) = endpoint {
@@ -240,7 +219,8 @@ public final class DiscoveryService: ObservableObject {
                                 name: name,
                                 host: address?.host,
                                 port: address?.port ?? fallbackPort,
-                                connection: conn
+                                resolutionId: resolutionId,
+                                generation: generation
                             )
                         }
                     }
@@ -251,16 +231,20 @@ public final class DiscoveryService: ObservableObject {
                             name: name,
                             host: nil,
                             port: resolvedPort,
-                            connection: conn
+                            resolutionId: resolutionId,
+                            generation: generation
                         )
                     }
                 }
                 
             case .failed, .cancelled:
+                conn.stateUpdateHandler = nil
                 conn.cancel()
                 Task { @MainActor [weak self] in
-                    self?.pendingServiceIds.remove(serviceId)
-                    self?.resolvingConnections.removeAll { $0 === conn }
+                    guard let self, self.discoveryGeneration == generation,
+                          self.pendingServiceResolutions[serviceId] == resolutionId else { return }
+                    self.pendingServiceResolutions.removeValue(forKey: serviceId)
+                    self.resolvingConnections.removeValue(forKey: resolutionId)
                 }
                 
             default:
@@ -278,22 +262,26 @@ public final class DiscoveryService: ObservableObject {
         conn.start(queue: DispatchQueue.global(qos: .userInitiated))
     }
 
-    private func finishServiceResolution(serviceId: String, name: String, host: String?, port: Int, connection: NWConnection) {
-        resolvingConnections.removeAll { $0 === connection }
-        pendingServiceIds.remove(serviceId)
+    private func finishServiceResolution(serviceId: String, name: String, host: String?, port: Int, resolutionId: UUID, generation: UInt64) {
+        guard discoveryGeneration == generation,
+              pendingServiceResolutions[serviceId] == resolutionId else { return }
+        resolvingConnections.removeValue(forKey: resolutionId)
+        pendingServiceResolutions.removeValue(forKey: serviceId)
         guard activeServiceIds.contains(serviceId),
               let host,
               ConnectionHostAddress.isIPv4(host) else { return }
 
         let device = DiscoveredDevice(id: serviceId, name: name, host: host, port: port)
-        PhoneConnectionManager.shared.registerDevice(host: host, name: name)
-        resolvedServiceIds.insert(serviceId)
         if let index = discoveredDevices.firstIndex(where: { $0.id == device.id }) {
             discoveredDevices[index] = device
         } else {
             discoveredDevices.append(device)
         }
-        isSearching = false
+        publishDiscoveredDevices()
+    }
+
+    private func publishDiscoveredDevices() {
+        PhoneConnectionManager.shared.replaceDiscoveredDevices(discoveredDevices.filter { !$0.isManual })
     }
 
     nonisolated private static func resolveBonjourIPv4(
@@ -386,14 +374,19 @@ public final class DiscoveryService: ObservableObject {
     }
     
     public func stopDiscovery() {
+        discoveryGeneration &+= 1
         searchTimer?.cancel()
         searchTimer = nil
-        for conn in resolvingConnections {
+        for conn in resolvingConnections.values {
             conn.cancel()
         }
         resolvingConnections.removeAll()
+        pendingServiceResolutions.removeAll()
+        activeServiceIds.removeAll()
         browser?.cancel()
         browser = nil
+        discoveredDevices.removeAll { !$0.isManual }
+        publishDiscoveredDevices()
         isSearching = false
     }
 }

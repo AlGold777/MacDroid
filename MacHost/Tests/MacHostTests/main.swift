@@ -20,6 +20,87 @@ func assertCondition(_ condition: Bool, _ message: String) {
     }
 }
 
+private actor WiFiSearchTestHarness {
+    private let snapshots: [[WiFiSearchCandidate]]
+    private let fallback: [WiFiSearchCandidate]
+    private let outcomes: [WiFiEndpoint: [WiFiProbeResult]]
+    private let delays: [WiFiEndpoint: UInt64]
+    private var snapshotIndex = 0
+    private var outcomeIndexes: [WiFiEndpoint: Int] = [:]
+    private var activeProbes = 0
+    private var maximumConcurrentProbes = 0
+    private var startedHosts: [String] = []
+    private var fallbackCalls = 0
+
+    init(
+        snapshots: [[WiFiSearchCandidate]],
+        fallback: [WiFiSearchCandidate] = [],
+        outcomes: [WiFiEndpoint: [WiFiProbeResult]],
+        delays: [WiFiEndpoint: UInt64] = [:]
+    ) {
+        self.snapshots = snapshots
+        self.fallback = fallback
+        self.outcomes = outcomes
+        self.delays = delays
+    }
+
+    func nextSnapshot() -> [WiFiSearchCandidate] {
+        guard !snapshots.isEmpty else { return [] }
+        let index = min(snapshotIndex, snapshots.count - 1)
+        snapshotIndex += 1
+        return snapshots[index]
+    }
+
+    func fallbackCandidates() -> [WiFiSearchCandidate] {
+        fallbackCalls += 1
+        return fallback
+    }
+
+    func probe(_ candidate: WiFiSearchCandidate) async -> WiFiProbeResult {
+        let endpoint = candidate.endpoint
+        let index = outcomeIndexes[endpoint, default: 0]
+        outcomeIndexes[endpoint] = index + 1
+        let script = outcomes[endpoint] ?? []
+        let result = script.isEmpty ? WiFiProbeResult.unavailable : script[min(index, script.count - 1)]
+        activeProbes += 1
+        maximumConcurrentProbes = max(maximumConcurrentProbes, activeProbes)
+        startedHosts.append(endpoint.host)
+        if let delay = delays[endpoint], delay > 0 {
+            do { try await Task.sleep(nanoseconds: delay) } catch { }
+        }
+        activeProbes -= 1
+        return result
+    }
+
+    func probeCount() -> Int { outcomeIndexes.values.reduce(0, +) }
+
+    func metrics() -> (maximumConcurrent: Int, startedHosts: [String], fallbackCalls: Int) {
+        (maximumConcurrentProbes, startedHosts, fallbackCalls)
+    }
+}
+
+private func runWiFiSearch(
+    _ harness: WiFiSearchTestHarness,
+    deep: Bool = true,
+    preferredDeviceId: String? = nil,
+    deadline: Double = 0.12,
+    retryNanoseconds: UInt64 = 1_000_000
+) async -> LanPhoneSearchResult {
+    await WiFiPhoneSearch.search(
+        deep: deep,
+        preferredDeviceId: preferredDeviceId,
+        discoveryWaitSeconds: deadline,
+        retryIntervalNanoseconds: retryNanoseconds,
+        candidates: { await harness.nextSnapshot() },
+        fallbackCandidates: { await harness.fallbackCandidates() },
+        probe: { candidate in await harness.probe(candidate) }
+    )
+}
+
+private func wifiCandidate(_ host: String, _ port: UInt16 = 2222, bonjour: Bool = false) -> WiFiSearchCandidate {
+    WiFiSearchCandidate(endpoint: WiFiEndpoint(host: host, port: port), isBonjour: bonjour)
+}
+
 print("==================================================")
 print("  Running MacDroid Commander Full System Tests    ")
 print("==================================================")
@@ -4914,9 +4995,169 @@ func runTest63() async {
         let subnetHosts = NetworkPortReachability.localSubnetHosts()
         assertCondition(subnetHosts.count <= 254 * 4, "Subnet enumeration is capped to /24 per interface (got \(subnetHosts.count))")
         assertCondition(subnetHosts.allSatisfy { ConnectionHostAddress.isIPv4($0) && !$0.hasPrefix("127.") }, "Subnet enumeration yields only non-loopback IPv4 hosts")
+    }
 
-        // 67. Имя APK компаньона содержит версию; выбирается самая свежая
-        print("\n[Test 67] Versioned companion APK naming...")
+        // 67. Deterministic Wi-Fi PHONE search races, identity, ports and cancellation
+        print("\n[Test 67] Wi-Fi PHONE search: late Bonjour, retry, identity, fallback and cancellation...")
+
+        let lateBonjour = wifiCandidate("192.0.2.41", 2323, bonjour: true)
+        let lateBonjourHarness = WiFiSearchTestHarness(
+            snapshots: [[], [lateBonjour]],
+            outcomes: [lateBonjour.endpoint: [.paired(pinKey: "phone-known", name: "Known phone")]]
+        )
+        let lateBonjourResult = await runWiFiSearch(lateBonjourHarness)
+        assertCondition(
+            lateBonjourResult == .paired(host: "192.0.2.41", port: 2323, pinKey: "phone-known", name: "Known phone"),
+            "Late Bonjour candidate is discovered after an initially empty snapshot and retains its advertised port"
+        )
+
+        let wakingPhone = wifiCandidate("192.0.2.42", 2222)
+        let wakingPhoneHarness = WiFiSearchTestHarness(
+            snapshots: [[wakingPhone]],
+            outcomes: [wakingPhone.endpoint: [
+                .unavailable,
+                .paired(pinKey: "phone-waking", name: "Waking phone")
+            ]]
+        )
+        let wakingPhoneResult = await runWiFiSearch(wakingPhoneHarness)
+        let wakingPhoneProbeCount = await wakingPhoneHarness.probeCount()
+        assertCondition(
+            wakingPhoneResult == .paired(host: "192.0.2.42", port: 2222, pinKey: "phone-waking", name: "Waking phone")
+                && wakingPhoneProbeCount >= 2,
+            "Known IP is retried and connects when the phone starts answering on the second probe"
+        )
+
+        let rotatedEndpoint = wifiCandidate("192.0.2.43", 45678, bonjour: true)
+        let rotatedHarness = WiFiSearchTestHarness(
+            snapshots: [[rotatedEndpoint]],
+            outcomes: [rotatedEndpoint.endpoint: [.paired(pinKey: "phone-dhcp", name: "DHCP phone")]]
+        )
+        let rotatedResult = await runWiFiSearch(rotatedHarness, deep: false)
+        assertCondition(
+            rotatedResult == .paired(host: "192.0.2.43", port: 45678, pinKey: "phone-dhcp", name: "DHCP phone"),
+            "New DHCP address and nonstandard Bonjour port survive through the selected result"
+        )
+
+        let otherPhone = wifiCandidate("192.0.2.44", 2222)
+        let preferredPhone = wifiCandidate("192.0.2.45", 3333, bonjour: true)
+        let preferredHarness = WiFiSearchTestHarness(
+            snapshots: [[otherPhone], [otherPhone, preferredPhone]],
+            outcomes: [
+                otherPhone.endpoint: [.paired(pinKey: "other-phone", name: "Other phone")],
+                preferredPhone.endpoint: [.paired(pinKey: "preferred-phone", name: "Preferred phone")]
+            ]
+        )
+        let preferredResult = await runWiFiSearch(preferredHarness, preferredDeviceId: "preferred-phone")
+        assertCondition(
+            preferredResult == .paired(host: "192.0.2.45", port: 3333, pinKey: "preferred-phone", name: "Preferred phone"),
+            "Preferred trusted identity arriving in a later snapshot wins over an earlier trusted endpoint"
+        )
+
+        let fallbackTrusted = wifiCandidate("192.0.2.46", 2222)
+        let fallbackHarness = WiFiSearchTestHarness(
+            snapshots: [[]],
+            fallback: [fallbackTrusted],
+            outcomes: [fallbackTrusted.endpoint: [.paired(pinKey: "other-trusted-phone", name: "Other trusted phone")]]
+        )
+        let fallbackResult = await runWiFiSearch(
+            fallbackHarness,
+            preferredDeviceId: "preferred-phone",
+            deadline: 0.04
+        )
+        let fallbackMetrics = await fallbackHarness.metrics()
+        assertCondition(
+            fallbackResult == .paired(host: "192.0.2.46", port: 2222, pinKey: "other-trusted-phone", name: "Other trusted phone"),
+            "Trusted fallback scan result is returned after waiting for the preferred identity deadline"
+        )
+        assertCondition(
+            fallbackMetrics.fallbackCalls == 1,
+            "LAN fallback scan is performed once and its candidate is inspected"
+        )
+
+        let unknownBonjour = wifiCandidate("192.0.2.47", 24567, bonjour: true)
+        let unknownBonjourHarness = WiFiSearchTestHarness(
+            snapshots: [[unknownBonjour]],
+            outcomes: [unknownBonjour.endpoint: [.unpaired]]
+        )
+        let unknownBonjourResult = await runWiFiSearch(unknownBonjourHarness, deep: false)
+        assertCondition(
+            unknownBonjourResult == .unpaired(hosts: ["192.0.2.47:24567"]),
+            "Unknown Bonjour-advertised MacDroid service is returned as an unpaired phone candidate"
+        )
+
+        let genericSSH = wifiCandidate("192.0.2.48", 22)
+        let genericSSHharness = WiFiSearchTestHarness(
+            snapshots: [[genericSSH]],
+            outcomes: [genericSSH.endpoint: [.unpaired]]
+        )
+        let genericSSHResult = await runWiFiSearch(genericSSHharness, deep: false)
+        assertCondition(
+            genericSSHResult == .notFound,
+            "Unpaired generic SSH response without Bonjour is not presented as a MacDroid phone"
+        )
+
+        let cancellableEndpoint = wifiCandidate("192.0.2.49", 2222)
+        let cancellationHarness = WiFiSearchTestHarness(
+            snapshots: [[cancellableEndpoint]],
+            outcomes: [cancellableEndpoint.endpoint: [.unavailable]]
+        )
+        let cancellationTask = Task {
+            await runWiFiSearch(
+                cancellationHarness,
+                deadline: 1.0,
+                retryNanoseconds: 500_000_000
+            )
+        }
+        // The first pass always scans fallbacks and continues immediately, so this endpoint can
+        // be probed once in each of those two passes before the retry sleep begins.
+        while await cancellationHarness.probeCount() < 2 {
+            try? await Task.sleep(nanoseconds: 1_000_000)
+        }
+        let probesAtCancellation = await cancellationHarness.probeCount()
+        cancellationTask.cancel()
+        let cancellationResult = await cancellationTask.value
+        let cancellationProbeCount = await cancellationHarness.probeCount()
+        assertCondition(
+            cancellationResult == .notFound && cancellationProbeCount == probesAtCancellation,
+            "Cancellation during the retry wait returns notFound and prevents later probes"
+        )
+
+        let orderedCandidates = (0..<9).map { index in
+            wifiCandidate("192.0.2.\(100 + index)", UInt16(3000 + index))
+        }
+        let orderedOutcomes = Dictionary(uniqueKeysWithValues: orderedCandidates.enumerated().map { index, candidate in
+            (candidate.endpoint, [WiFiProbeResult.paired(pinKey: "device-\(index)", name: "Device \(index)")])
+        })
+        let orderedDelays = Dictionary(uniqueKeysWithValues: orderedCandidates.enumerated().map { index, candidate in
+            (candidate.endpoint, UInt64((9 - index) * 1_000_000))
+        })
+        let concurrencyHarness = WiFiSearchTestHarness(
+            snapshots: [orderedCandidates],
+            outcomes: orderedOutcomes,
+            delays: orderedDelays
+        )
+        let concurrencyResult = await runWiFiSearch(
+            concurrencyHarness,
+            deep: false,
+            preferredDeviceId: "device-8"
+        )
+        let concurrencyMetrics = await concurrencyHarness.metrics()
+        assertCondition(
+            concurrencyResult == .paired(host: "192.0.2.108", port: 3008, pinKey: "device-8", name: "Device 8"),
+            "Preferred result follows candidate priority rather than asynchronous probe completion order"
+        )
+        assertCondition(
+            concurrencyMetrics.maximumConcurrent <= 4,
+            "Wi-Fi host-key probes stay within the four-process concurrency limit (observed \(concurrencyMetrics.maximumConcurrent))"
+        )
+        assertCondition(
+            concurrencyMetrics.startedHosts.count == orderedCandidates.count
+                && Set(concurrencyMetrics.startedHosts) == Set(orderedCandidates.map(\.endpoint.host)),
+            "Concurrent probing visits each candidate exactly once, regardless of completion order"
+        )
+
+        // 68. Имя APK компаньона содержит версию; выбирается самая свежая
+        print("\n[Test 68] Versioned companion APK naming...")
         assertCondition(PhoneConnectionManager.companionApkVersion(fileName: "MacDroidCompanion-2.1.14.apk") == [2, 1, 14], "Version parsed from MacDroidCompanion-2.1.14.apk")
         assertCondition(PhoneConnectionManager.companionApkVersion(fileName: "app-debug.apk") == nil, "Legacy app-debug.apk has no version")
         assertCondition(PhoneConnectionManager.companionApkVersion(fileName: "MacDroidCompanion-2.1.x.apk") == nil, "Malformed version rejected")
@@ -4928,9 +5169,8 @@ func runTest63() async {
         assertCondition(PhoneConnectionManager.newestCompanionApk(in: apkDir)?.hasSuffix("MacDroidCompanion-2.1.14.apk") == true, "Newest versioned APK chosen (2.1.14 > 2.1.9 > app-debug)")
         try? FileManager.default.removeItem(atPath: apkDir)
 
-        print("\n🎉 ALL 67 PRODUCTION TEST SUITES PASSED!")
+        print("\n🎉 ALL 68 PRODUCTION TEST SUITES PASSED!")
         exit(0)
-    }
 }
 
 dispatchMain()
