@@ -391,6 +391,11 @@ func runTest51() async {
         assertCondition(localSize == firstFile.size, "Transferred file size matches source size (\(localSize) == \(firstFile.size))")
         print("  ✓ Live Phone-to-Mac copy succeeded perfectly!")
     } catch {
+        // Live-тест: без сопряжённого устройства (закреплённый ключ) вход запрещён намеренно (W4) — пропускаем.
+        if "\(error)".contains("Permission denied") || "\(error)".contains("notPaired") || "\(error)".contains("hostKey") {
+            print("  ⚠️ Устройство на 127.0.0.1:2222 не сопряжено — live-тест пропущен: \(error)")
+            return
+        }
         print("❌ runTest51 failed: \(error)")
         assertCondition(false, "runTest51 failed with error: \(error)")
     }
@@ -625,7 +630,7 @@ Task { @MainActor in
         // 12. Client Ed25519 Key Management Tests
         print("\n[TEST 12] Client Key Manager (Ed25519):")
         let keyMgr = ClientKeyManager.shared
-        let pubKeyStr = keyMgr.openSSHPublicKeyString
+        let pubKeyStr = try keyMgr.openSSHPublicKeyString
         assertCondition(pubKeyStr.hasPrefix("ssh-ed25519 "), "Generated valid OpenSSH Ed25519 public key string")
         let testSig = try keyMgr.sign(data: Data("hello_android".utf8))
         assertCondition(testSig.count == 64, "Ed25519 signature is exact 64 bytes")
@@ -1221,6 +1226,8 @@ Task { @MainActor in
             }
             let copiedDestA = destDir.appendingPathComponent("fileA.txt")
             for _ in 0..<100 {
+                // D6: конфликт имён теперь показывает диалог; тест отвечает «пропустить для всех»
+                await MainActor.run { if vm24.showConflictDialog { vm24.resolveConflict((strategy: .skip, applyToAll: true)) } }
                 if FileManager.default.fileExists(atPath: copiedDestA.path) { break }
                 try await Task.sleep(nanoseconds: 50_000_000)
             }
@@ -1241,8 +1248,15 @@ Task { @MainActor in
                 _ = vm24.handleDroppedProviders([moveProvider], toSide: .right, isMove: true)
             }
             for _ in 0..<100 {
+                await MainActor.run { if vm24.showConflictDialog { vm24.resolveConflict((strategy: .skip, applyToAll: true)) } }
                 if !FileManager.default.fileExists(atPath: dragFileA.path) { break }
                 try await Task.sleep(nanoseconds: 50_000_000)
+            }
+            if !FileManager.default.fileExists(atPath: copiedDestA.path) {
+                let sMsg = await MainActor.run { vm24.statusMessage }
+                let destList = (try? FileManager.default.contentsOfDirectory(atPath: destDir.path)) ?? []
+                let dlg = await MainActor.run { vm24.showConflictDialog }; let tr = 0
+                print("TEST 5 FAIL DIAG: dialog=\(dlg) isTransferring=\(tr) destList=\(destList), srcExists=\(FileManager.default.fileExists(atPath: dragFileA.path)), statusMessage=\(sMsg)")
             }
             assertCondition(FileManager.default.fileExists(atPath: copiedDestA.path), "fileA.txt exists in destination after move")
             assertCondition(!FileManager.default.fileExists(atPath: dragFileA.path), "Original fileA.txt deleted after move")
@@ -3349,9 +3363,9 @@ Task { @MainActor in
         do {
             let malformedString = Data([0, 0, 0, 1, 0xFF])
             let reader = SFTPPacketReader(data: malformedString)
-            var rejectedInvalidUtf8 = false
-            do { _ = try reader.readString() } catch { rejectedInvalidUtf8 = true }
-            assertCondition(rejectedInvalidUtf8, "Invalid UTF-8 in an SFTP filename is rejected")
+            var decodedLossy: String? = nil
+            do { decodedLossy = try reader.readString() } catch { decodedLossy = nil }
+            assertCondition(decodedLossy == "\u{FFFD}", "Invalid UTF-8 in an SFTP filename is decoded lossily (one bad name does not fail the listing)")
         }
         let statvfsPkt = pe.createStatVfsPacket(requestId: 888, path: "/storage/emulated/0")
         assertCondition(statvfsPkt.count > 10, "statvfs packet generated")
@@ -3431,6 +3445,37 @@ Task { @MainActor in
             direction: "upload"
         )
         assertCondition(nonResumable == nil, "Completed transfer cleared from resumable search")
+        
+        // 45.4b Регрессии peer-review 2026-10-22: журнал по target-пути, SQLite bind, rename без перезаписи
+        let uniSource = "/источник/видео_Ж😀.mp4"
+        try journal.registerTransfer(
+            transferId: "tx-uni-1", sessionIdentity: "s-uni", direction: "download",
+            sourcePath: uniSource, sourceSize: 10, sourceMtime: 5, sourceHash: nil,
+            targetFinalPath: "/цель/A/видео.mp4", targetTempPath: "/цель/A/.видео.part",
+            expectedSize: 10, initialFrontier: 4, initialRanges: "[]", state: "in_progress"
+        )
+        let sameTarget = journal.findResumableTransfer(
+            sessionIdentity: "s-uni", sourcePath: uniSource, sourceSize: 10, sourceMtime: 5,
+            direction: "download", targetFinalPath: "/цель/A/видео.mp4"
+        )
+        assertCondition(sameTarget?.transferId == "tx-uni-1" && sameTarget?.sourcePath == uniSource, "Journal: Unicode paths survive SQLite binding and match by target")
+        let otherTarget = journal.findResumableTransfer(
+            sessionIdentity: "s-uni", sourcePath: uniSource, sourceSize: 10, sourceMtime: 5,
+            direction: "download", targetFinalPath: "/цель/B/видео.mp4"
+        )
+        assertCondition(otherTarget == nil, "Journal: resume is keyed by target path (other target does not resume)")
+        
+        let renameDir = FileManager.default.temporaryDirectory.appendingPathComponent("mcd_rename_\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: renameDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: renameDir) }
+        let renA = renameDir.appendingPathComponent("a.txt")
+        let renB = renameDir.appendingPathComponent("b.txt")
+        try "AAA".write(to: renA, atomically: true, encoding: .utf8)
+        try "BBB".write(to: renB, atomically: true, encoding: .utf8)
+        var renameRefused = false
+        do { try await LocalFSDriver().renameItem(from: renA.path, to: renB.path) } catch { renameRefused = true }
+        assertCondition(renameRefused, "LocalFSDriver.renameItem refuses to overwrite an existing target")
+        assertCondition((try? String(contentsOf: renB, encoding: .utf8)) == "BBB" && FileManager.default.fileExists(atPath: renA.path), "Existing target and source are untouched after refused rename")
         
         // 45.5 SessionCoordinator Path Mapping & Normalization
         let coord = SessionCoordinator.shared
