@@ -43,7 +43,9 @@ class EmbeddedServer(
 
         val server = SshServer.setUpDefaultServer().apply {
             this.port = this@EmbeddedServer.port
-            bindHost?.let { this.host = it }
+            // Кроме Wi-Fi адреса слушаем loopback: через него идёт `adb forward` (подключение по кабелю).
+            // MINA SSHD принимает список адресов через запятую.
+            bindHost?.let { this.host = "$it,127.0.0.1" }
 
             // Хост-ключи сервера
             val hostKeyFile = File(context.filesDir, "hostkey.ser")

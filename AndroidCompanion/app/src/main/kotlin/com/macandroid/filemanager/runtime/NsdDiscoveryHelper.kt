@@ -34,7 +34,8 @@ class NsdDiscoveryHelper(private val context: Context) {
         val serviceInfo = NsdServiceInfo().apply {
             serviceName = "$devName (MacDroid)"
             serviceType = "_macphone_sftp._tcp"
-            setPort(port)
+            // Внутри apply `port` — это NsdServiceInfo.port (0), поэтому явно берём порт хелпера
+            setPort(this@NsdDiscoveryHelper.port)
         }
 
         val listener = object : NsdManager.RegistrationListener {
