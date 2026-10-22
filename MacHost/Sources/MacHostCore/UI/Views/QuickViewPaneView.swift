@@ -1,6 +1,7 @@
 import SwiftUI
 import AppKit
 import ImageIO
+import WebKit
 
 public struct QuickViewPaneView: View {
     @EnvironmentObject var vm: DualPaneViewModel
@@ -8,11 +9,16 @@ public struct QuickViewPaneView: View {
     
     @State private var loadedImage: NSImage? = nil
     @State private var imageResolution: CGSize = .zero
+    @State private var markdownHTML: String? = nil
     @State private var isLoading: Bool = false
     @State private var loadError: String? = nil
     
     private static let supportedImageExtensions: Set<String> = [
         "jpg", "jpeg", "png", "heic", "dng", "webp", "gif", "bmp", "tiff", "tif"
+    ]
+    
+    private static let supportedMarkdownExtensions: Set<String> = [
+        "md", "markdown", "mdown", "mkd", "mkdn"
     ]
     
     public init(item: FileItem?) {
@@ -25,6 +31,12 @@ public struct QuickViewPaneView: View {
         return Self.supportedImageExtensions.contains(ext)
     }
     
+    private var isMarkdown: Bool {
+        guard let item = item else { return false }
+        let ext = URL(fileURLWithPath: item.name).pathExtension.lowercased()
+        return Self.supportedMarkdownExtensions.contains(ext)
+    }
+    
     public var body: some View {
         VStack(spacing: 0) {
             // Верхняя плашка управления режимом
@@ -33,7 +45,7 @@ public struct QuickViewPaneView: View {
                     Image(systemName: "eye.fill")
                         .foregroundColor(.accentColor)
                     Text("Быстрый просмотр (Quick View)")
-                        .font(.system(size: 11, weight: .semibold))
+                        .font(.system(size: 12, weight: .semibold))
                 }
                 Spacer()
                 Button(action: { vm.isQuickViewActive = false }) {
@@ -54,6 +66,8 @@ public struct QuickViewPaneView: View {
             if let currentItem = item {
                 if isImage {
                     imagePreviewArea(item: currentItem)
+                } else if isMarkdown {
+                    markdownPreviewArea(item: currentItem)
                 } else {
                     filePreviewArea(item: currentItem)
                 }
@@ -71,10 +85,69 @@ public struct QuickViewPaneView: View {
             }
         }
         .onAppear {
-            loadImageIfNeeded()
+            loadContentIfNeeded()
         }
         .onChange(of: item?.id) { _, _ in
-            loadImageIfNeeded()
+            loadContentIfNeeded()
+        }
+    }
+    
+    @ViewBuilder
+    private func markdownPreviewArea(item: FileItem) -> some View {
+        VStack(spacing: 0) {
+            if let html = markdownHTML {
+                MarkdownWebView(htmlContent: html)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else if isLoading {
+                VStack(spacing: 8) {
+                    ProgressView()
+                        .progressViewStyle(.circular)
+                    Text("Рендеринг Markdown (GFM)...")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else if let err = loadError {
+                VStack(spacing: 8) {
+                    Image(systemName: "exclamationmark.triangle")
+                        .font(.system(size: 32))
+                        .foregroundColor(.orange)
+                    Text(err)
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                        .multilineTextAlignment(.center)
+                        .padding(.horizontal)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
+            
+            Divider()
+            
+            // Информационный подвал с метаданными
+            HStack(spacing: 16) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(item.name)
+                        .font(.system(size: 12, weight: .bold))
+                        .lineLimit(1)
+                    Text("GFM Markdown Документ")
+                        .font(.system(size: 11))
+                        .foregroundColor(.secondary)
+                }
+                
+                Spacer()
+                
+                VStack(alignment: .trailing, spacing: 2) {
+                    Text(ByteCountFormatter.string(fromByteCount: Int64(item.size), countStyle: .file))
+                        .font(.system(size: 11, design: .monospaced))
+                        .foregroundColor(.secondary)
+                    Text(item.source == .localMac ? "Mac" : "Phone")
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundColor(.accentColor)
+                }
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 6)
+            .background(Color(nsColor: .windowBackgroundColor))
         }
     }
     
@@ -148,9 +221,7 @@ public struct QuickViewPaneView: View {
     @ViewBuilder
     private func filePreviewArea(item: FileItem) -> some View {
         VStack(spacing: 16) {
-            Image(systemName: item.isDirectory ? "folder.fill" : "doc.fill")
-                .font(.system(size: 64))
-                .foregroundColor(item.isDirectory ? .yellow : .blue)
+            FileItemIconView(isDirectory: item.isDirectory, fileName: item.name, size: 64)
             
             VStack(spacing: 4) {
                 Text(item.name)
@@ -180,15 +251,96 @@ public struct QuickViewPaneView: View {
         .background(Color(nsColor: .windowBackgroundColor))
     }
     
-    private func loadImageIfNeeded() {
-        guard let item = item, isImage else {
+    private func loadContentIfNeeded() {
+        guard let item = item else {
             loadedImage = nil
             imageResolution = .zero
+            markdownHTML = nil
             isLoading = false
             loadError = nil
             return
         }
         
+        if isImage {
+            loadImage(for: item)
+        } else if isMarkdown {
+            loadMarkdown(for: item)
+        } else {
+            loadedImage = nil
+            imageResolution = .zero
+            markdownHTML = nil
+            isLoading = false
+            loadError = nil
+        }
+    }
+    
+    private func loadMarkdown(for item: FileItem) {
+        loadedImage = nil
+        imageResolution = .zero
+        markdownHTML = nil
+        loadError = nil
+        isLoading = true
+        
+        if item.source == .localMac {
+            DispatchQueue.global(qos: .userInitiated).async {
+                do {
+                    let url = URL(fileURLWithPath: item.path)
+                    let data = try Data(contentsOf: url)
+                    let mdStr = String(data: data, encoding: .utf8) ?? String(decoding: data, as: UTF8.self)
+                    let html = GFMMarkdownRenderer.shared.renderToHTML(markdown: mdStr, title: item.name)
+                    DispatchQueue.main.async {
+                        self.isLoading = false
+                        self.markdownHTML = html
+                    }
+                } catch {
+                    DispatchQueue.main.async {
+                        self.isLoading = false
+                        self.loadError = "Не удалось прочитать Markdown файл: \(error.localizedDescription)"
+                    }
+                }
+            }
+        } else {
+            // Удалённый файл
+            Task {
+                if let cached = QuickLookCacheManager.shared.isCached(for: item) {
+                    do {
+                        let data = try Data(contentsOf: cached)
+                        let mdStr = String(data: data, encoding: .utf8) ?? String(decoding: data, as: UTF8.self)
+                        let html = GFMMarkdownRenderer.shared.renderToHTML(markdown: mdStr, title: item.name)
+                        await MainActor.run {
+                            self.isLoading = false
+                            self.markdownHTML = html
+                        }
+                        return
+                    } catch {}
+                }
+                
+                let targetURL = QuickLookCacheManager.shared.cacheURL(for: item)
+                do {
+                    try await vm.downloadRemoteFile(
+                        remotePath: item.path,
+                        targetURL: targetURL,
+                        totalSize: item.size
+                    )
+                    let data = try Data(contentsOf: targetURL)
+                    let mdStr = String(data: data, encoding: .utf8) ?? String(decoding: data, as: UTF8.self)
+                    let html = GFMMarkdownRenderer.shared.renderToHTML(markdown: mdStr, title: item.name)
+                    await MainActor.run {
+                        self.isLoading = false
+                        self.markdownHTML = html
+                    }
+                } catch {
+                    await MainActor.run {
+                        self.isLoading = false
+                        self.loadError = "Ошибка загрузки Markdown: \(error.localizedDescription)"
+                    }
+                }
+            }
+        }
+    }
+    
+    private func loadImage(for item: FileItem) {
+        markdownHTML = nil
         loadedImage = nil
         imageResolution = .zero
         loadError = nil
@@ -271,5 +423,21 @@ public struct QuickViewPaneView: View {
             return NSImage(cgImage: cgImg, size: NSSize(width: cgImg.width, height: cgImg.height))
         }
         return NSImage(contentsOf: url)
+    }
+}
+
+/// Нативный веб-компонент WebKit для отображения GFM Markdown в панели быстрого просмотра
+struct MarkdownWebView: NSViewRepresentable {
+    let htmlContent: String
+    
+    func makeNSView(context: Context) -> WKWebView {
+        let config = WKWebViewConfiguration()
+        let webView = WKWebView(frame: .zero, configuration: config)
+        webView.setValue(false, forKey: "drawsBackground")
+        return webView
+    }
+    
+    func updateNSView(_ nsView: WKWebView, context: Context) {
+        nsView.loadHTMLString(htmlContent, baseURL: nil)
     }
 }

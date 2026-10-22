@@ -10,9 +10,11 @@ class NsdDiscoveryHelper(private val context: Context) {
     private var registrationListener: NsdManager.RegistrationListener? = null
 
     fun registerService(port: Int) {
+        val brand = Build.BRAND.replaceFirstChar { if (it.isLowerCase()) it.titlecase() else it.toString() }
         val manufacturer = Build.MANUFACTURER.replaceFirstChar { if (it.isLowerCase()) it.titlecase() else it.toString() }
+        val primaryBrand = if (brand.isNotBlank() && !brand.equals("Android", ignoreCase = true)) brand else manufacturer
         val model = Build.MODEL
-        val devName = if (model.startsWith(manufacturer, ignoreCase = true)) model else "$manufacturer $model"
+        val devName = if (model.startsWith(primaryBrand, ignoreCase = true)) model else "$primaryBrand $model"
         val serviceInfo = NsdServiceInfo().apply {
             serviceName = "$devName (MacDroid)"
             serviceType = "_macphone_sftp._tcp"

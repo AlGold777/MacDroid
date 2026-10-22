@@ -6,12 +6,12 @@ import Quartz
 public final class QuickLookBridge: NSObject, @preconcurrency QLPreviewPanelDataSource, QLPreviewPanelDelegate {
     public static let shared = QuickLookBridge()
     private var previewURL: URL?
+    private var currentItem: (any QLPreviewItem)?
     
     public var onNavigateNext: (() -> Void)?
     public var onNavigatePrevious: (() -> Void)?
     
     public var isVisible: Bool {
-        guard Thread.isMainThread else { return false }
         guard QLPreviewPanel.sharedPreviewPanelExists() else { return false }
         return QLPreviewPanel.shared()?.isVisible ?? false
     }
@@ -20,9 +20,14 @@ public final class QuickLookBridge: NSObject, @preconcurrency QLPreviewPanelData
         return previewURL
     }
     
-    public func preview(url: URL) {
-        guard Thread.isMainThread else { return }
+    public var currentPreviewItem: (any QLPreviewItem)? {
+        return currentItem
+    }
+    
+    public func preview(url: URL, title: String? = nil) {
         self.previewURL = url
+        self.currentItem = preparePreviewItem(for: url, title: title)
+        guard NSApp != nil, !NSApp.windows.isEmpty else { return }
         guard let panel = QLPreviewPanel.shared() else { return }
         panel.dataSource = self
         panel.delegate = self
@@ -32,9 +37,9 @@ public final class QuickLookBridge: NSObject, @preconcurrency QLPreviewPanelData
     }
     
     /// Динамическое обновление отображаемого файла в уже открытом окне без перехвата фокуса клавиатуры
-    public func updatePreview(url: URL) {
-        guard Thread.isMainThread else { return }
+    public func updatePreview(url: URL, title: String? = nil) {
         self.previewURL = url
+        self.currentItem = preparePreviewItem(for: url, title: title)
         guard QLPreviewPanel.sharedPreviewPanelExists() else { return }
         guard let panel = QLPreviewPanel.shared(), panel.isVisible else { return }
         panel.dataSource = self
@@ -45,18 +50,64 @@ public final class QuickLookBridge: NSObject, @preconcurrency QLPreviewPanelData
     
     public func close() {
         self.previewURL = nil
-        guard Thread.isMainThread else { return }
+        self.currentItem = nil
         guard QLPreviewPanel.sharedPreviewPanelExists() else { return }
         guard let panel = QLPreviewPanel.shared(), panel.isVisible else { return }
         panel.orderOut(nil)
     }
     
     public func numberOfPreviewItems(in panel: QLPreviewPanel!) -> Int {
-        return previewURL != nil ? 1 : 0
+        return currentItem != nil ? 1 : 0
     }
     
     public func previewPanel(_ panel: QLPreviewPanel!, previewItemAt index: Int) -> QLPreviewItem! {
-        return previewURL as NSURL?
+        return currentItem
+    }
+    
+    // MARK: - Подготовка элемента Quick Look (включая GFM Markdown -> HTML)
+    
+    private func preparePreviewItem(for url: URL, title: String?) -> any QLPreviewItem {
+        let displayTitle = title ?? url.lastPathComponent
+        let ext = url.pathExtension.lowercased()
+        let titleExt = URL(fileURLWithPath: displayTitle).pathExtension.lowercased()
+        let markdownExtensions: Set<String> = ["md", "markdown", "mdown", "mkd", "mkdn"]
+        
+        let isMarkdown = markdownExtensions.contains(ext) || markdownExtensions.contains(titleExt)
+        if isMarkdown {
+            if let htmlURL = generateMarkdownPreviewHTML(from: url, title: displayTitle) {
+                return QuickLookPreviewItem(url: htmlURL, title: displayTitle)
+            }
+        }
+        
+        return QuickLookPreviewItem(url: url, title: displayTitle)
+    }
+    
+    private func generateMarkdownPreviewHTML(from sourceURL: URL, title: String) -> URL? {
+        do {
+            let data = try Data(contentsOf: sourceURL)
+            let markdown: String
+            if let str = String(data: data, encoding: .utf8) {
+                markdown = str
+            } else {
+                markdown = String(decoding: data, as: UTF8.self)
+            }
+            
+            let html = GFMMarkdownRenderer.shared.renderToHTML(markdown: markdown, title: title)
+            
+            let cacheDir = QuickLookCacheManager.shared.cacheDir.appendingPathComponent("md_previews")
+            try FileManager.default.createDirectory(at: cacheDir, withIntermediateDirectories: true)
+            
+            let safeName = title.addingPercentEncoding(withAllowedCharacters: .alphanumerics) ?? "preview"
+            let fileHash = abs(sourceURL.path.hashValue)
+            let htmlFilename = "\(safeName)_\(fileHash).html"
+            let targetHTMLURL = cacheDir.appendingPathComponent(htmlFilename)
+            
+            try html.write(to: targetHTMLURL, atomically: true, encoding: .utf8)
+            return targetHTMLURL
+        } catch {
+            print("ERROR: Failed to generate GFM preview for \(sourceURL): \(error)")
+            return nil
+        }
     }
     
     // Перехват событий клавиатуры, когда окно Quick Look находится в фокусе (как в macOS Finder)
@@ -109,6 +160,18 @@ extension NSWindow {
     }
     
     @objc open override func endPreviewPanelControl(_ panel: QLPreviewPanel!) {
+    }
+}
+
+/// Элемент быстрого просмотра Quick Look, поддерживающий кастомный URL (например, сгенерированный HTML) и отображаемый заголовок
+public final class QuickLookPreviewItem: NSObject, QLPreviewItem {
+    public let previewItemURL: URL?
+    public let previewItemTitle: String?
+    
+    public init(url: URL?, title: String? = nil) {
+        self.previewItemURL = url
+        self.previewItemTitle = title ?? url?.lastPathComponent
+        super.init()
     }
 }
 

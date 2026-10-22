@@ -2,38 +2,37 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-    <key>CFBundleDevelopmentRegion</key>
-    <string>ru</string>
-    <key>CFBundleExecutable</key>
-    <string>MacHost</string>
-    <key>CFBundleIconFile</key>
-    <string>AppIcon</string>
-    <key>CFBundleIdentifier</key>
-    <string>com.macandroid.MacDroidCommander</string>
-    <key>CFBundleInfoDictionaryVersion</key>
-    <string>6.0</string>
-    <key>CFBundleName</key>
-    <string>MacDroid Commander</string>
-    <key>CFBundleDisplayName</key>
-    <string>MacDroid Commander</string>
-    <key>CFBundlePackageType</key>
-    <string>APPL</string>
-    <key>CFBundleShortVersionString</key>
-    <string>2.1.24</string>
-    <key>CFBundleVersion</key>
-    <string>26</string>
-    <key>LSMinimumSystemVersion</key>
-    <string>14.0</string>
-    <key>NSHighResolutionCapable</key>
-    <true/>
-    <key>NSSupportsAutomaticGraphicsSwitching</key>
-    <true/>
-    <!-- Сетевые разрешения для macOS 14/15 (Sonoma / Sequoia) -->
-    <key>NSLocalNetworkUsageDescription</key>
-    <string>MacDroid Commander требует доступ к локальной сети для обнаружения смартфона Xiaomi по Bonjour и безопасного обмена файлами по SFTP.</string>
-    <key>NSBonjourServices</key>
-    <array>
-        <string>_macphone_sftp._tcp</string>
-    </array>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>ru</string>
+	<key>CFBundleDisplayName</key>
+	<string>MacDroid Commander</string>
+	<key>CFBundleExecutable</key>
+	<string>MacHost</string>
+	<key>CFBundleIconFile</key>
+	<string>AppIcon</string>
+	<key>CFBundleIdentifier</key>
+	<string>com.macandroid.MacDroidCommander</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>MacDroid Commander 2.1.222</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>2.1.222</string>
+	<key>CFBundleVersion</key>
+	<string>27</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>14.0</string>
+	<key>NSBonjourServices</key>
+	<array>
+		<string>_macphone_sftp._tcp</string>
+	</array>
+	<key>NSHighResolutionCapable</key>
+	<true/>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>MacDroid Commander требует доступ к локальной сети для обнаружения смартфона Xiaomi по Bonjour и безопасного обмена файлами по SFTP.</string>
+	<key>NSSupportsAutomaticGraphicsSwitching</key>
+	<true/>
 </dict>
 </plist>

@@ -10,6 +10,7 @@ public struct PaneView: View {
     @State private var editingTabId: UUID? = nil
     @State private var editingTabTitle: String = ""
     @FocusState private var isTabTitleFocused: Bool
+    @State private var hoveredTabId: UUID? = nil
     @State private var isConnectHovered: Bool = false
     @State private var isPhoneHovered: Bool = false
     @State private var lastTabClickTime: Date = .distantPast
@@ -28,6 +29,10 @@ public struct PaneView: View {
     
     private var tabs: [PanelTab] {
         side == .left ? vm.leftTabs : vm.rightTabs
+    }
+    
+    private var visibleTabs: [PanelTab] {
+        vm.visibleTabs(for: side)
     }
     
     private var activeTabId: UUID {
@@ -69,26 +74,42 @@ public struct PaneView: View {
                     return [KeyPathComparator(\FileItem.size, order: order)]
                 case .date:
                     return [KeyPathComparator(\FileItem.mtime, order: order)]
+                case .tags:
+                    return [KeyPathComparator(\FileItem.tagSortKey, order: order)]
+                case .type:
+                    return [KeyPathComparator(\FileItem.fileType, order: order)]
+                case .status:
+                    return [KeyPathComparator(\FileItem.name, order: order)]
                 }
             },
             set: { newOrder in
                 guard let first = newOrder.first else { return }
-                let isAsc = (first.order == .forward)
                 let field: SortField
                 if first.keyPath == \FileItem.size {
                     field = .size
                 } else if first.keyPath == \FileItem.mtime {
                     field = .date
+                } else if first.keyPath == \FileItem.tagSortKey {
+                    field = .tags
+                } else if first.keyPath == \FileItem.fileType {
+                    field = .type
                 } else {
                     field = .name
+                }
+                let currentField = (side == .left) ? vm.leftSortField : vm.rightSortField
+                let targetAsc: Bool
+                if field == currentField {
+                    targetAsc = (first.order == .forward)
+                } else {
+                    targetAsc = (field == .size || field == .date) ? false : true
                 }
                 DispatchQueue.main.async {
                     if side == .left {
                         vm.leftSortField = field
-                        vm.leftSortAscending = isAsc
+                        vm.leftSortAscending = targetAsc
                     } else {
                         vm.rightSortField = field
-                        vm.rightSortAscending = isAsc
+                        vm.rightSortAscending = targetAsc
                     }
                 }
             }
@@ -104,7 +125,7 @@ public struct PaneView: View {
                         vm.activePane = .left
                     }
                     vm.leftSelection = newSelection
-                    if !newSelection.isEmpty {
+                    if !newSelection.isEmpty && !vm.isFileDiffActive {
                         if !vm.rightSelection.isEmpty {
                             vm.rightSelection.removeAll()
                             TableDoubleClickHandler.HandlerView.rightTableView?.deselectAll(nil)
@@ -115,7 +136,7 @@ public struct PaneView: View {
                         vm.activePane = .right
                     }
                     vm.rightSelection = newSelection
-                    if !newSelection.isEmpty {
+                    if !newSelection.isEmpty && !vm.isFileDiffActive {
                         if !vm.leftSelection.isEmpty {
                             vm.leftSelection.removeAll()
                             TableDoubleClickHandler.HandlerView.leftTableView?.deselectAll(nil)
@@ -128,269 +149,79 @@ public struct PaneView: View {
     
     public var body: some View {
         VStack(spacing: 0) {
-            // Вкладки панели (Tabs)
-            HStack(spacing: 3) {
-                // Навигация: ↑ , ←, → слева от первой tab
-                let navArrowColor = Color(nsColor: NSColor(name: nil) { appearance in
-                    appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
-                        ? NSColor(white: 0.85, alpha: 0.7)
-                        : NSColor(red: 28/255.0, green: 26/255.0, blue: 26/255.0, alpha: 0.7)
-                })
-                
-                NavArrowButton(
-                    systemImage: "arrow.up",
-                    tooltip: "На уровень выше (Cmd+Up)",
-                    isEnabled: true,
-                    color: navArrowColor
-                ) {
-                    if vm.activePane != side { vm.activePane = side }
-                    vm.navigateUp(side: side)
-                }
-                Rectangle()
-                    .fill(Color.secondary.opacity(0.35))
-                    .frame(width: 1.5, height: 14)
-                
-                NavArrowButton(
-                    systemImage: "arrow.left",
-                    tooltip: "Назад (Cmd+[)",
-                    isEnabled: vm.canNavigateBack(side: side),
-                    color: navArrowColor
-                ) {
-                    if vm.activePane != side { vm.activePane = side }
-                    vm.navigateBack(side: side)
-                }
-                Rectangle()
-                    .fill(Color.secondary.opacity(0.35))
-                    .frame(width: 1.5, height: 14)
-                
-                NavArrowButton(
-                    systemImage: "arrow.right",
-                    tooltip: "Вперёд (Cmd+])",
-                    isEnabled: vm.canNavigateForward(side: side),
-                    color: navArrowColor
-                ) {
-                    if vm.activePane != side { vm.activePane = side }
-                    vm.navigateForward(side: side)
-                }
-                Rectangle()
-                    .fill(Color.secondary.opacity(0.35))
-                    .frame(width: 1.5, height: 14)
-                
-                ForEach(tabs) { tab in
-                    HStack(spacing: 4) {
-                        if editingTabId == tab.id {
-                            TextField("", text: $editingTabTitle, onCommit: {
-                                commitTabRename(tab: tab)
-                            })
-                            .textFieldStyle(.plain)
-                            .font(.system(size: 13, weight: .bold))
-                            .frame(minWidth: 50, maxWidth: 120)
-                            .focused($isTabTitleFocused)
-                            .onExitCommand {
-                                editingTabId = nil
-                            }
-                            
-                            Button(action: { commitTabRename(tab: tab) }) {
-                                Image(systemName: "checkmark")
-                                    .font(.system(size: 9, weight: .bold))
-                                    .foregroundColor(.green)
-                            }
-                            .buttonStyle(.plain)
-                        } else {
-                            Text(tab.title)
-                                .font(.system(size: 13, weight: .regular))
-                                .lineLimit(1)
-                        }
-                        
-                        if tab.isPinned {
-                            Image(systemName: "pin.fill")
-                                .font(.system(size: 6.3))
-                                .foregroundColor(.secondary)
-                                .rotationEffect(.degrees(30))
-                                .offset(x: 1.5, y: -1.5)
-                        }
-                        
-                        if !tab.isPinned && tabs.count > 1 && editingTabId != tab.id {
-                            Button(action: { vm.closeTab(id: tab.id, side: side) }) {
-                                Image(systemName: "xmark")
-                                    .font(.system(size: 9))
-                                    .foregroundColor(.secondary)
-                            }
-                            .buttonStyle(.plain)
-                        }
-                    }
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 4)
-                    .background(tab.id == activeTabId ? Color(nsColor: .controlBackgroundColor) : Color(nsColor: .windowBackgroundColor).opacity(0.5))
-                    .cornerRadius(4)
-                    .contentShape(Rectangle())
-                    .onTapGesture {
-                        let now = Date()
-                        let isDoubleClick = (lastClickedTabId == tab.id && now.timeIntervalSince(lastTabClickTime) < 0.35)
-                        lastTabClickTime = now
-                        lastClickedTabId = tab.id
-                        
-                        if isDoubleClick {
-                            startTabRename(tab: tab)
-                        } else if editingTabId != tab.id {
-                            if vm.activePane != side {
-                                vm.activePane = side
-                            }
-                            if tab.id != activeTabId {
-                                vm.switchTab(id: tab.id, side: side)
-                            }
-                        }
-                    }
-                    .onDrag {
-                        vm.draggedTabInfo = (side: side, id: tab.id)
-                        return NSItemProvider(object: tab.id.uuidString as NSString)
-                    }
-                    .onDrop(of: [UTType.text.identifier, UTType.plainText.identifier], delegate: TabReorderDropDelegate(targetTab: tab, side: side, vm: vm))
-                    .contextMenu {
-                        if tab.source == .remotePhone {
-                            if vm.isPhoneConnected && vm.remoteDriver.isConnected {
-                                Button(action: {
-                                    vm.disconnectPhone()
-                                }) {
-                                    Label("Disconnect", systemImage: "link.badge.slash")
-                                }
-                            } else {
-                                Button(action: {
-                                    if vm.activePane != side { vm.activePane = side }
-                                    vm.switchTab(id: tab.id, side: side)
-                                    vm.connectPhone(forceActivate: false, isExplicit: true)
-                                }) {
-                                    Label("Connect", systemImage: "link")
-                                }
-                                .disabled(vm.isConnectingPhone)
-                            }
-                            
-                            Divider()
-                        }
-                        Button(action: { startTabRename(tab: tab) }) {
-                            Label("Переименовать вкладку...", systemImage: "pencil")
-                        }
-                        Divider()
-                        Button(action: { vm.togglePinTab(id: tab.id, side: side) }) {
-                            Label(tab.isPinned ? "Открепить вкладку" : "Закрепить вкладку", systemImage: tab.isPinned ? "pin.slash" : "pin")
-                        }
-                        Button(action: { vm.duplicateTab(id: tab.id, side: side) }) {
-                            Label("Дублировать вкладку", systemImage: "plus.square.on.square")
-                        }
-                        if !tab.isPinned && tabs.count > 1 {
-                            Divider()
-                            Button(role: .destructive, action: { vm.closeTab(id: tab.id, side: side) }) {
-                                Label("Закрыть вкладку", systemImage: "xmark")
-                            }
-                        }
-                    }
-                }
-                
-                Button(action: { vm.addTab(side: side) }) {
-                    Image(systemName: "plus")
-                        .font(.system(size: 11, weight: .semibold))
-                        .padding(4)
-                }
-                .buttonStyle(.plain)
-                
-                Spacer()
-                
-                // Кнопка обновления содержимого панели (слева от иконки плитки)
-                let isRefreshing = (side == .left ? vm.leftIsRefreshing : vm.rightIsRefreshing)
-                PaneRefreshButton(isRefreshing: isRefreshing) {
-                    if vm.activePane != side { vm.activePane = side }
-                    vm.refreshPane(side: side)
-                }
-                
-                // Переключатель режима отображения: Сетка (галерея) / Список (таблица)
-                let currentMode = (side == .left ? vm.leftViewMode : vm.rightViewMode)
-                Button(action: {
-                    if vm.activePane != side { vm.activePane = side }
-                    vm.toggleViewMode(for: side)
-                }) {
-                    Image(systemName: currentMode == .table ? "square.grid.2x2" : "line.3.horizontal")
-                        .font(.system(size: 14.76, weight: .medium))
-                        .foregroundColor(currentMode == .grid ? .accentColor : .secondary)
-                        .padding(4)
-                        .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-                .help(currentMode == .table ? "Включить режим сетки (просмотрщик) [Cmd+2]" : "Включить режим списка (таблица) [Cmd+1]")
-                .keyboardShortcut(currentMode == .table ? KeyEquivalent("2") : KeyEquivalent("1"), modifiers: .command)
-            }
-            .padding(.horizontal, 6)
-            .padding(.top, 4)
-            .background(Color(nsColor: .windowBackgroundColor))
-            
-            Divider()
-            
-            // Заголовок панели: выбор источника (диска), путь (хлебные крошки), фильтр
-            HStack(spacing: 6) {
-                // 1. Выбор источника (диска): кнопки Mac, Phone и автоматически появляющаяся USB
-                HStack(spacing: 3) {
+            // Вкладки панели (Tabs) и кнопки выбора источников (слева)
+            HStack(spacing: 0) {
+                // 1. Кнопки источников (дисков) слева от вкладок: Mac, Phone и USB (Вариант 3: Подчеркивание)
+                HStack(spacing: 6) {
                     let currentSrc = (side == .left ? vm.leftSource : vm.rightSource)
                     let currentP = (side == .left ? vm.leftPath : vm.rightPath)
                     let activeUsb = vm.detectedUsbDrives.first(where: { currentP.hasPrefix($0.path) })
                     let isMacActive = (currentSrc == .localMac && activeUsb == nil)
-                    let isPhoneActive = (currentSrc == .remotePhone && activeUsb == nil)
+                    let isPhoneActive = (sourceBinding.wrappedValue == .remotePhone && activeUsb == nil)
                     let isUsbActive = (activeUsb != nil)
                     
                     // Кнопка Mac
-                    Button(action: {
+                    DriveTabToolbarButton(
+                        isActive: isMacActive,
+                        tooltip: "Локальные файлы Mac"
+                    ) {
                         vm.changeSource(to: .localMac, side: side)
-                    }) {
-                        HStack(spacing: 4) {
-                            Image(systemName: "laptopcomputer")
-                                .font(.system(size: 10))
-                            Text("Mac")
-                                .font(.system(size: 13, weight: isMacActive ? .semibold : .medium))
-                        }
-                        .padding(.horizontal, 6)
-                        .padding(.vertical, 3)
-                        .background(Color.clear)
-                        .foregroundColor(isMacActive ? .primary : .secondary)
-                        .overlay(alignment: .top) {
-                            if isMacActive {
-                                RoundedRectangle(cornerRadius: 1.5)
-                                    .fill(Color.blue)
-                                    .frame(height: 3)
-                            }
-                        }
-                        .cornerRadius(4)
+                    } content: {
+                        MacToolbarIconView(size: 20)
                     }
-                    .buttonStyle(.plain)
-                    .help("Локальные файлы Mac")
                     
-                    // Кнопка Phone
-                    Button(action: {
+                    // Кнопка Phone (минималистичная иконка смартфона)
+                    DriveTabToolbarButton(
+                        isActive: isPhoneActive,
+                        tooltip: vm.connectedPhoneTooltip ?? "Смартфон"
+                    ) {
                         vm.changeSource(to: .remotePhone, side: side)
-                    }) {
-                        HStack(spacing: 4) {
-                            PhoneConnectionIndicatorView(
-                                isConnected: vm.isPhoneConnected && vm.remoteDriver.isConnected,
-                                isConnecting: vm.isConnectingPhone
-                            )
-                            Text("Phone")
-                                .font(.system(size: 13, weight: isPhoneActive ? .semibold : .medium))
-                        }
-                        .padding(.horizontal, 6)
-                        .padding(.vertical, 3)
-                        .background(isPhoneHovered ? Color(nsColor: .controlColor).opacity(0.35) : Color.clear)
-                        .foregroundColor(isPhoneActive ? .primary : .secondary)
-                        .overlay(alignment: .top) {
-                            if isPhoneActive {
-                                RoundedRectangle(cornerRadius: 1.5)
-                                    .fill(Color.blue)
-                                    .frame(height: 3)
-                            }
-                        }
-                        .cornerRadius(4)
+                    } content: {
+                        PhoneToolbarIconView(size: 18.6)
                     }
-                    .buttonStyle(.plain)
+                    .background(GeometryReader { geo in
+                        Color.clear
+                            .onAppear {
+                                let f = geo.frame(in: .named("MainContentSpace"))
+                                if side == .left {
+                                    vm.phoneButtonFrameLeft = f
+                                } else {
+                                    vm.phoneButtonFrameRight = f
+                                }
+                            }
+                            .onChange(of: geo.frame(in: .named("MainContentSpace"))) { newFrame in
+                                if side == .left {
+                                    vm.phoneButtonFrameLeft = newFrame
+                                } else {
+                                    vm.phoneButtonFrameRight = newFrame
+                                }
+                            }
+                    })
+                    .simultaneousGesture(TapGesture(count: 2).onEnded {
+                        vm.failedConnectionSide = side
+                    })
+                    .popover(
+                        isPresented: Binding(
+                            get: { vm.failedConnectionSide == side },
+                            set: { isPresented in
+                                if !isPresented && vm.failedConnectionSide == side {
+                                    vm.failedConnectionSide = nil
+                                }
+                            }
+                        ),
+                        arrowEdge: .bottom
+                    ) {
+                        CompactConnectionPopoverView()
+                            .environmentObject(vm)
+                    }
                     .onHover { hovering in
                         isPhoneHovered = hovering
+                        if hovering {
+                            vm.hoveredPhoneButtonSide = side
+                        } else if vm.hoveredPhoneButtonSide == side {
+                            vm.hoveredPhoneButtonSide = nil
+                        }
                     }
-                    .help(vm.isConnectingPhone ? "Подключение к телефону..." : ((vm.isPhoneConnected && vm.remoteDriver.isConnected) ? "Телефон подключен (правый клик: контекстное меню)" : "Телефон не подключен (нажмите для перехода или правый клик: Connect)"))
                     .contextMenu {
                         if vm.isPhoneConnected && vm.remoteDriver.isConnected {
                             Button(action: {
@@ -419,33 +250,18 @@ public struct PaneView: View {
                         }
                     }
                     
-                    // Автоматическая кнопка USB при подключении внешнего накопителя
+                    // Автоматическая кнопка USB при наличии внешних накопителей
                     if !vm.detectedUsbDrives.isEmpty {
                         if vm.detectedUsbDrives.count == 1, let singleUsb = vm.detectedUsbDrives.first {
-                            Button(action: {
+                            DriveTabToolbarButton(
+                                isActive: isUsbActive,
+                                tooltip: "Внешний USB накопитель: \(singleUsb.name)"
+                            ) {
                                 vm.switchToUsbDrive(singleUsb, side: side)
-                            }) {
-                                HStack(spacing: 4) {
-                                    Image(systemName: "externaldrive.fill")
-                                        .font(.system(size: 10))
-                                    Text("USB")
-                                        .font(.system(size: 13, weight: isUsbActive ? .semibold : .medium))
-                                }
-                                .padding(.horizontal, 6)
-                                .padding(.vertical, 3)
-                                .background(Color.clear)
-                                .foregroundColor(isUsbActive ? .primary : .secondary)
-                                .overlay(alignment: .top) {
-                                    if isUsbActive {
-                                        RoundedRectangle(cornerRadius: 1.5)
-                                            .fill(Color.blue)
-                                            .frame(height: 3)
-                                    }
-                                }
-                                .cornerRadius(4)
+                            } content: {
+                                Image(systemName: "externaldrive")
+                                    .font(.system(size: 14))
                             }
-                            .buttonStyle(.plain)
-                            .help("Внешний USB накопитель: \(singleUsb.name)")
                         } else {
                             Menu {
                                 ForEach(vm.detectedUsbDrives) { usb in
@@ -461,26 +277,21 @@ public struct PaneView: View {
                                     }
                                 }
                             } label: {
-                                HStack(spacing: 4) {
-                                    Image(systemName: "externaldrive.fill")
-                                        .font(.system(size: 10))
-                                    Text("USB")
-                                        .font(.system(size: 13, weight: isUsbActive ? .semibold : .medium))
-                                    Image(systemName: "chevron.down")
-                                        .font(.system(size: 8))
+                                let usbColor: Color = isUsbActive ? .primary : .secondary
+                                let usbLineColor: Color = isUsbActive ? .primary : inactiveUnderlineColor
+                                VStack(spacing: 1.31) {
+                                    Image(systemName: "externaldrive")
+                                        .font(.system(size: 14))
+                                        .frame(width: 20, height: 20)
+                                    RoundedRectangle(cornerRadius: 1)
+                                        .fill(usbLineColor)
+                                        .frame(width: 22, height: 2)
                                 }
                                 .padding(.horizontal, 6)
-                                .padding(.vertical, 3)
-                                .background(Color.clear)
-                                .foregroundColor(isUsbActive ? .primary : .secondary)
-                                .overlay(alignment: .top) {
-                                    if isUsbActive {
-                                        RoundedRectangle(cornerRadius: 1.5)
-                                            .fill(Color.blue)
-                                            .frame(height: 3)
-                                    }
-                                }
-                                .cornerRadius(4)
+                                .padding(.top, 2)
+                                .padding(.bottom, 1)
+                                .foregroundColor(usbColor)
+                                .contentShape(Rectangle())
                             }
                             .menuStyle(.borderlessButton)
                             .fixedSize()
@@ -488,9 +299,186 @@ public struct PaneView: View {
                         }
                     }
                 }
-                .fixedSize()
+                .padding(.leading, 6)
+                .padding(.trailing, 3)
                 
-                // 2. Путь: Переключение между Breadcrumbs и Manual Input (сразу за выбором дисков, без фона)
+                // Тонкий вертикальный разделитель между кнопками дисков и вкладками (только если есть видимые вкладки)
+                if !visibleTabs.isEmpty {
+                    Rectangle()
+                        .fill(Color(nsColor: .separatorColor).opacity(0.35))
+                        .frame(width: 1, height: 16)
+                        .padding(.horizontal, 1.5)
+                }
+                
+                // Список вкладок со скроллом и кнопка добавления новой вкладки
+                ZStack(alignment: .trailing) {
+                    if !visibleTabs.isEmpty {
+                        ScrollView(.horizontal, showsIndicators: false) {
+                            HStack(spacing: 3) {
+                                ForEach(visibleTabs) { tab in
+                                HStack(spacing: 4) {
+                                    if editingTabId == tab.id {
+                                        TextField("", text: $editingTabTitle, onCommit: {
+                                            commitTabRename(tab: tab)
+                                        })
+                                        .textFieldStyle(.plain)
+                                        .font(.system(size: 14, weight: .bold))
+                                        .frame(minWidth: 50, maxWidth: 120)
+                                        .focused($isTabTitleFocused)
+                                        .onExitCommand {
+                                            editingTabId = nil
+                                        }
+                                        
+                                        Button(action: { commitTabRename(tab: tab) }) {
+                                            Image(systemName: "checkmark")
+                                                .font(.system(size: 9, weight: .bold))
+                                                .foregroundColor(.green)
+                                        }
+                                        .buttonStyle(.plain)
+                                    } else {
+                                        Text(tab.title)
+                                            .font(.system(size: 14, weight: .regular))
+                                            .lineLimit(1)
+                                    }
+                                    
+                                    if tab.isPinned {
+                                        TabPinButton(isPinned: true) {
+                                            vm.togglePinTab(id: tab.id, side: side)
+                                        }
+                                    } else if editingTabId != tab.id && hoveredTabId == tab.id {
+                                        TabPinButton(isPinned: false) {
+                                            if tab.id != activeTabId {
+                                                if vm.activePane != side { vm.activePane = side }
+                                                vm.switchTab(id: tab.id, side: side)
+                                            }
+                                            vm.togglePinTab(id: tab.id, side: side)
+                                        }
+                                    }
+                                    
+                                    if !tab.isPinned && editingTabId != tab.id && hoveredTabId == tab.id {
+                                        Button(action: { vm.closeTab(id: tab.id, side: side) }) {
+                                            Image(systemName: "xmark")
+                                                .font(.system(size: 9))
+                                                .foregroundColor(.secondary)
+                                        }
+                                        .buttonStyle(.plain)
+                                        .help("Закрыть вкладку")
+                                    }
+                                }
+                                .padding(.horizontal, 8)
+                                .padding(.vertical, 4)
+                                .background(tab.id == activeTabId ? Color(nsColor: .controlBackgroundColor) : Color(nsColor: .windowBackgroundColor).opacity(0.5))
+                                .cornerRadius(4)
+                                .contentShape(Rectangle())
+                                .onHover { hovering in
+                                    if hovering {
+                                        hoveredTabId = tab.id
+                                    } else if hoveredTabId == tab.id {
+                                        hoveredTabId = nil
+                                    }
+                                }
+                                .onTapGesture {
+                                    let now = Date()
+                                    let isDoubleClick = (lastClickedTabId == tab.id && now.timeIntervalSince(lastTabClickTime) < 0.35)
+                                    lastTabClickTime = now
+                                    lastClickedTabId = tab.id
+                                    
+                                    if isDoubleClick {
+                                        startTabRename(tab: tab)
+                                    } else if editingTabId != tab.id {
+                                        if vm.activePane != side {
+                                            vm.activePane = side
+                                        }
+                                        if tab.id != activeTabId {
+                                            vm.switchTab(id: tab.id, side: side)
+                                        }
+                                    }
+                                }
+                                .onDrag {
+                                    vm.draggedTabInfo = (side: side, id: tab.id)
+                                    return NSItemProvider(object: tab.id.uuidString as NSString)
+                                }
+                                .onDrop(of: [UTType.text.identifier, UTType.plainText.identifier], delegate: TabReorderDropDelegate(targetTab: tab, side: side, vm: vm))
+                                .contextMenu {
+                                    if tab.source == .remotePhone {
+                                        if vm.isPhoneConnected && vm.remoteDriver.isConnected {
+                                            Button(action: {
+                                                vm.disconnectPhone()
+                                            }) {
+                                                Label("Disconnect", systemImage: "link.badge.slash")
+                                            }
+                                        } else {
+                                            Button(action: {
+                                                if vm.activePane != side { vm.activePane = side }
+                                                vm.switchTab(id: tab.id, side: side)
+                                                vm.connectPhone(forceActivate: false, isExplicit: true)
+                                            }) {
+                                                Label("Connect", systemImage: "link")
+                                            }
+                                            .disabled(vm.isConnectingPhone)
+                                        }
+                                        
+                                        Divider()
+                                    }
+                                    Button(action: { startTabRename(tab: tab) }) {
+                                        Label("Переименовать вкладку...", systemImage: "pencil")
+                                    }
+                                    Divider()
+                                    Button(action: { vm.togglePinTab(id: tab.id, side: side) }) {
+                                        Label(tab.isPinned ? "Открепить вкладку" : "Закрепить вкладку", systemImage: tab.isPinned ? "pin.slash" : "pin")
+                                    }
+                                    Button(action: { vm.addTab(side: side) }) {
+                                        Label("Новая вкладка", systemImage: "plus")
+                                    }
+                                    Button(role: .destructive, action: { vm.closeTab(id: tab.id, side: side) }) {
+                                        Label("Закрыть вкладку", systemImage: "xmark")
+                                    }
+                                    .disabled(tab.isPinned)
+                                    Divider()
+                                    Button(action: { vm.saveTabsWithSavePanel() }) {
+                                        Label("Save tabs...", systemImage: "square.and.arrow.up")
+                                    }
+                                    Button(action: { vm.importTabsWithOpenPanel(mode: .replace) }) {
+                                        Label("Import tabs...", systemImage: "square.and.arrow.down")
+                                    }
+                                    Button(action: { vm.importTabsWithOpenPanel(mode: .append) }) {
+                                        Label("Add tabs...", systemImage: "plus.square.dashed")
+                                    }
+                                }
+                            }
+                        }
+                        .padding(.leading, 3)
+                        .padding(.trailing, 28)
+                    }
+                } else {
+                    Color.clear
+                        .frame(maxWidth: .infinity, maxHeight: 27)
+                }
+                    
+                    // Закрепленная справа иконка '+' (вкладки могут прокручиваться под неё)
+                    Button(action: { vm.addTab(side: side) }) {
+                        Image(systemName: "plus")
+                            .font(.system(size: 12, weight: .semibold))
+                            .foregroundColor(.secondary)
+                            .frame(width: 22, height: 22)
+                            .background(Color(nsColor: .windowBackgroundColor))
+                            .cornerRadius(4)
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .help("Новая вкладка (Cmd+T)")
+                    .padding(.trailing, 4)
+                }
+                
+            }
+            .padding(.horizontal, 6)
+            .padding(.top, 4)
+            .background(Color(nsColor: .windowBackgroundColor))
+            
+            Divider()
+            
+            // Блок строки пути (Breadcrumbs / Manual Input)
+            HStack(spacing: 6) {
                 let isEditingPath = (side == .left) ? vm.isEditingLeftPath : vm.isEditingRightPath
                 if isEditingPath {
                     HStack(spacing: 2) {
@@ -498,7 +486,7 @@ public struct PaneView: View {
                             vm.commitManualPath(side: side)
                         })
                         .textFieldStyle(.plain)
-                        .font(.system(size: 13, design: .monospaced))
+                        .font(.system(size: 14, design: .monospaced))
                         .padding(.horizontal, 4)
                         .focused($isPathInputFocused)
                         .onAppear {
@@ -536,187 +524,65 @@ public struct PaneView: View {
                                     Button(action: {
                                         vm.navigateTo(path: crumb.fullPath, side: side)
                                     }) {
-                                        Text(crumb.isRoot ? "›" : crumb.title)
-                                            .font(.system(size: 13, weight: crumb.isRoot ? .regular : .medium))
-                                            .foregroundColor(.secondary)
+                                        HStack(spacing: 5) {
+                                            if source == .remotePhone && crumb.isRoot {
+                                                PhoneConnectionIndicatorView(
+                                                    isConnected: vm.isPhoneConnected && vm.remoteDriver.isConnected,
+                                                    isConnecting: vm.isConnectingPhone,
+                                                    size: 7.5
+                                                )
+                                            }
+                                            Text(crumb.title)
+                                                .font(.system(size: 14, weight: crumb.isRoot ? .semibold : .medium))
+                                                .foregroundColor(.primary)
+                                        }
                                     }
                                     .buttonStyle(.plain)
 
                                     if index < crumbs.count - 1 {
                                         Text("›")
-                                            .font(.system(size: 13, weight: .regular))
-                                            .foregroundColor(.secondary)
+                                            .font(.system(size: 14, weight: .regular))
+                                            .foregroundColor(.primary)
                                     }
                                 }
                             }
                             .padding(.horizontal, 2)
-                            .padding(.vertical, 3)
+                            .padding(.vertical, 1)
                         }
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .contentShape(Rectangle())
                         .onTapGesture(count: 2) { beginPathEditing() }
-                        .padding(.top, 5)
-                        .offset(y: -2.5)
+                        .padding(.top, 4)
+                        .offset(y: -2)
                     }
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .overlay(alignment: .top) {
                         Color.clear
-                            .frame(height: 5)
+                            .frame(height: 4)
                             .contentShape(Rectangle())
                             .onTapGesture { beginPathEditing() }
                     }
                     .contextMenu { pathContextMenu }
                     .help("Нажмите над крошками, чтобы ввести путь; нажмите на папку, чтобы перейти")
                 }
-                
-                // Кнопка быстрого соединения (слева от поля фильтра, без текста)
-                Button(action: {
-                    if vm.isPhoneConnected && vm.remoteDriver.isConnected {
-                        vm.disconnectPhone()
-                    } else {
-                        let currentSrc = (side == .left ? vm.leftSource : vm.rightSource)
-                        let otherSrc = (side == .left ? vm.rightSource : vm.leftSource)
-                        if currentSrc != .remotePhone && otherSrc != .remotePhone {
-                            vm.changeSource(to: .remotePhone, side: side)
-                        }
-                        vm.connectPhone(forceActivate: false, isExplicit: true)
-                    }
-                }) {
-                    Group {
-                        if vm.isConnectingPhone {
-                            ProgressView()
-                                .controlSize(.mini)
-                                .scaleEffect(0.65)
-                                .frame(width: 18, height: 18)
-                        } else {
-                            Image(systemName: "link")
-                                .font(.system(size: 12, weight: .medium))
-                                .foregroundColor(isConnectHovered ? Color(nsColor: .controlTextColor) : Color(nsColor: .systemGray))
-                                .frame(width: 18, height: 18)
-                        }
-                    }
-                    .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-                .disabled(vm.isConnectingPhone)
-                .onHover { hovering in
-                    isConnectHovered = hovering
-                }
-                .help(vm.isConnectingPhone ? "Подключение к телефону..." : ((vm.isPhoneConnected && vm.remoteDriver.isConnected) ? "Телефон подключен (клик: отключить, правый клик: меню)" : "Подключить телефон (Connect)"))
-                .contextMenu {
-                    if vm.isPhoneConnected && vm.remoteDriver.isConnected {
-                        Button(action: {
-                            vm.disconnectPhone()
-                        }) {
-                            Label("Disconnect", systemImage: "link.badge.slash")
-                        }
-                    } else {
-                        Button(action: {
-                            let currentSrc = (side == .left ? vm.leftSource : vm.rightSource)
-                            if currentSrc != .remotePhone {
-                                vm.changeSource(to: .remotePhone, side: side)
-                            }
-                            vm.connectPhone(forceActivate: false, isExplicit: true)
-                        }) {
-                            Label("Connect", systemImage: "link")
-                        }
-                        .disabled(vm.isConnectingPhone)
-                    }
-                    
-                    Divider()
-                    
-                    Button(action: {
-                        vm.showPairingDialog = true
-                    }) {
-                        Label("Настройки подключения (SFTP)...", systemImage: "gearshape")
-                    }
-                }
-                
-                // 3. Поле фильтра (с иконкой, кнопкой очистки и очисткой по Esc)
-                HStack(spacing: 3) {
-                    Image(systemName: "line.3.horizontal.decrease.circle")
-                        .foregroundColor(.secondary)
-                        .font(.system(size: 10))
-                    
-                    TextField("Фильтр...", text: (side == .left ? $vm.leftFilter : $vm.rightFilter))
-                        .textFieldStyle(.plain)
-                        .font(.system(size: 11))
-                        .onExitCommand {
-                            if side == .left {
-                                vm.leftFilter = ""
-                            } else {
-                                vm.rightFilter = ""
-                            }
-                        }
-                    
-                    let filterText = (side == .left ? vm.leftFilter : vm.rightFilter)
-                    if !filterText.isEmpty {
-                        Button(action: {
-                            if side == .left {
-                                vm.leftFilter = ""
-                            } else {
-                                vm.rightFilter = ""
-                            }
-                        }) {
-                            Image(systemName: "xmark.circle.fill")
-                                .foregroundColor(.secondary)
-                                .font(.system(size: 10))
-                        }
-                        .buttonStyle(.plain)
-                        .help("Очистить фильтр (Esc)")
-                    }
-                }
-                .padding(.horizontal, 5)
-                .padding(.vertical, 3)
-                .background(
-                    RoundedRectangle(cornerRadius: 6)
-                        .fill(Color(nsColor: .controlBackgroundColor))
-                )
-                .overlay(
-                    RoundedRectangle(cornerRadius: 6)
-                        .stroke(Color.secondary.opacity(0.3), lineWidth: 1)
-                )
-                .frame(width: 76)
-                .padding(.trailing, 6)
             }
-            .padding(6)
+            .padding(.horizontal, 6)
+            .padding(.vertical, 2)
             .background(Color(nsColor: .windowBackgroundColor))
-            
-            if isStale {
-                HStack(spacing: 8) {
-                    Spacer()
-                    Text("Phone Offline")
-                        .font(.system(size: 12))
-                        .foregroundColor(.secondary)
-                    Image(systemName: "exclamationmark.triangle.fill")
-                        .foregroundColor(.orange)
-                    Button(action: {
-                        vm.showPairingDialog = true
-                    }) {
-                        Label("Connect", systemImage: "wifi")
-                            .font(.system(size: 12))
-                    }
-                    .buttonStyle(.bordered)
-                    .controlSize(.mini)
-                }
-                .padding(.horizontal, 8)
-                .padding(.vertical, 3)
-                .background(Color.yellow.opacity(0.15))
-            }
-            
+
             if vm.isComparing {
                 HStack(spacing: 8) {
                     Image(systemName: "arrow.left.arrow.right")
                         .foregroundColor(.accentColor)
                     Text("Сравнение: \(vm.comparisonResult.different.count) отл., \(vm.comparisonResult.onlyLeft.count) только слева, \(vm.comparisonResult.onlyRight.count) только справа (\(vm.comparisonResult.identical.count) одинаковых)")
-                        .font(.system(size: 11))
+                        .font(.system(size: 12))
                         .lineLimit(1)
                     
                     Spacer()
                     
                     Button(action: { vm.selectDifferences() }) {
                         Label("Выделить различия", systemImage: "checkmark.circle")
-                            .font(.system(size: 11))
+                            .font(.system(size: 12))
                     }
                     .buttonStyle(.bordered)
                     .controlSize(.mini)
@@ -730,18 +596,18 @@ public struct PaneView: View {
                         }
                     } label: {
                         Label("Синхронизировать", systemImage: "arrow.triangle.2.circlepath")
-                            .font(.system(size: 11))
+                            .font(.system(size: 12))
                     }
                     .menuStyle(.borderlessButton)
                     .controlSize(.mini)
                     
                     Toggle("Только различия", isOn: $vm.hideIdenticalInComparison)
                         .toggleStyle(.checkbox)
-                        .font(.system(size: 11))
+                        .font(.system(size: 12))
                     
                     Button(action: { vm.comparePanes() }) {
                         Image(systemName: "xmark")
-                            .font(.system(size: 10))
+                            .font(.system(size: 11))
                     }
                     .buttonStyle(.plain)
                     .help("Закрыть сравнение")
@@ -769,38 +635,70 @@ public struct PaneView: View {
                 Table(items, selection: selectionBinding, sortOrder: sortOrderBinding) {
                     TableColumn("Имя", value: \FileItem.name) { item in
                         let isHoverFolder = (item.isDirectory && vm.dragHoverSide == side && vm.dragHoverFolderId == item.id)
-                        let rowIndex = items.firstIndex(where: { $0.id == item.id }) ?? -1
-                        let isInsertTop = (vm.dragHoverSide == side && vm.dragHoverFolderId == nil && vm.dragInsertionIndex == rowIndex)
-                        let isInsertBottom = (vm.dragHoverSide == side && vm.dragHoverFolderId == nil && vm.dragInsertionIndex == items.count && rowIndex == items.count - 1)
                         
                         HStack(spacing: 6) {
-                            Image(systemName: item.isDirectory ? "folder.fill" : fileIconName(for: item.name))
-                                .foregroundColor(item.isDirectory ? .yellow : .blue)
+                            FileItemIconView(isDirectory: item.isDirectory, fileName: item.name, size: 14)
                             
                             if vm.editingItemId == item.id && vm.editingItemSide == side {
-                                InlineRenameTextField(
-                                    text: $vm.editingItemName,
-                                    isDirectory: item.isDirectory,
-                                    onCommit: {
-                                        vm.commitInlineRename(item: item, side: side)
-                                    },
-                                    onCancel: {
-                                        vm.cancelInlineRename()
-                                    }
-                                )
-                                .frame(height: 22)
-                            } else {
-                                Text(item.name)
-                                    .font(.system(size: 13))
-                                    .onLongPressGesture(minimumDuration: 0.55) {
-                                        if vm.activePane != side { vm.activePane = side }
-                                        if side == .left {
-                                            vm.leftSelection = [item.id]
-                                        } else {
-                                            vm.rightSelection = [item.id]
+                                let baseName = InlineRenameHelper.baseName(for: vm.editingItemName, isDirectory: item.isDirectory)
+                                let baseNameWidth = InlineRenameHelper.textWidth(for: baseName)
+                                
+                                HStack(spacing: 0) {
+                                    InlineRenameTextField(
+                                        text: $vm.editingItemName,
+                                        isDirectory: item.isDirectory,
+                                        onCommit: {
+                                            vm.commitInlineRename(item: item, side: side)
+                                        },
+                                        onCancel: {
+                                            vm.cancelInlineRename()
                                         }
-                                        vm.triggerRename(item: item, side: side)
+                                    )
+                                    .frame(height: 18)
+                                }
+                                .padding(.vertical, 2)
+                                .padding(.horizontal, 5)
+                                .background(ConflictColors.renameInputBg)
+                                .cornerRadius(4)
+                                .overlay(
+                                    RoundedRectangle(cornerRadius: 4)
+                                        .stroke(ConflictColors.inputFocusBorder, lineWidth: 1)
+                                )
+                                .overlay(alignment: .topLeading) {
+                                    CopyFragmentButtonView(baseName: baseName) {
+                                        let fragment = InlineRenameHelper.currentFragment(for: vm.editingItemName, isDirectory: item.isDirectory)
+                                        NSPasteboard.general.clearContents()
+                                        NSPasteboard.general.setString(fragment, forType: .string)
+                                        vm.statusMessage = "Скопирован фрагмент: \(fragment)"
                                     }
+                                    .frame(width: 26, height: 26)
+                                    .offset(x: max(10, 5 + baseNameWidth + 6), y: -14)
+                                }
+                                .zIndex(100)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                            } else {
+                                VStack(alignment: .leading, spacing: 1) {
+                                    Text(item.name)
+                                        .font(.system(size: 14))
+                                    let query = (side == .left ? vm.leftSearchQuery : vm.rightSearchQuery).trimmingCharacters(in: .whitespaces)
+                                    if vm.isSearchActive(for: side) && !query.isEmpty {
+                                        let parentPath = URL(fileURLWithPath: item.path).deletingLastPathComponent().path
+                                        Text(parentPath)
+                                            .font(.system(size: 11))
+                                            .foregroundColor(.secondary)
+                                            .lineLimit(1)
+                                            .truncationMode(.middle)
+                                    }
+                                }
+                                .onLongPressGesture(minimumDuration: 0.55) {
+                                    if vm.activePane != side { vm.activePane = side }
+                                    if side == .left {
+                                        vm.leftSelection = [item.id]
+                                    } else {
+                                        vm.rightSelection = [item.id]
+                                    }
+                                    vm.triggerRename(item: item, side: side)
+                                }
                             }
                             
                             if vm.isComparing {
@@ -815,20 +713,6 @@ public struct PaneView: View {
                             UnevenRoundedRectangle(topLeadingRadius: 4, bottomLeadingRadius: 4, bottomTrailingRadius: 0, topTrailingRadius: 0)
                                 .fill(isHoverFolder ? Color.accentColor.opacity(0.35) : Color.clear)
                         )
-                        .overlay(alignment: .top) {
-                            if isInsertTop {
-                                Rectangle()
-                                    .fill(Color.accentColor)
-                                    .frame(height: 2)
-                            }
-                        }
-                        .overlay(alignment: .bottom) {
-                            if isInsertBottom {
-                                Rectangle()
-                                    .fill(Color.accentColor)
-                                    .frame(height: 2)
-                            }
-                        }
                         .contentShape(Rectangle())
                         .simultaneousGesture(TapGesture(count: 2).onEnded {
                             print("DUAL_PANE: Cell double tap on \(item.name)")
@@ -836,17 +720,17 @@ public struct PaneView: View {
                         })
                         .onDrag {
                             vm.createDragItemProvider(for: item, side: side)
+                        } preview: {
+                            Color.clear.frame(width: 1, height: 1)
                         }
                         .contextMenu {
                             rowContextMenu(for: item)
                         }
                     }
+                    .width(min: 120)
                     
                     TableColumn("Размер", value: \FileItem.size) { item in
                         let isHoverFolder = (item.isDirectory && vm.dragHoverSide == side && vm.dragHoverFolderId == item.id)
-                        let rowIndex = items.firstIndex(where: { $0.id == item.id }) ?? -1
-                        let isInsertTop = (vm.dragHoverSide == side && vm.dragHoverFolderId == nil && vm.dragInsertionIndex == rowIndex)
-                        let isInsertBottom = (vm.dragHoverSide == side && vm.dragHoverFolderId == nil && vm.dragInsertionIndex == items.count && rowIndex == items.count - 1)
                         
                         HStack {
                             if item.isDirectory {
@@ -856,16 +740,14 @@ public struct PaneView: View {
                                         .scaleEffect(0.7)
                                 } else if let size = vm.calculatedFolderSizes[item.path] {
                                     Text(formatBytes(size))
-                                        .font(.system(size: 12, design: .monospaced))
+                                        .font(.system(size: 13, design: .monospaced))
                                         .foregroundColor(.primary)
                                 } else {
-                                    Text("<ПАПКА>")
-                                        .font(.system(size: 12, design: .monospaced))
-                                        .foregroundColor(.secondary)
+                                    Text("")
                                 }
                             } else {
                                 Text(formatBytes(item.size))
-                                    .font(.system(size: 12, design: .monospaced))
+                                    .font(.system(size: 13, design: .monospaced))
                                     .foregroundColor(.secondary)
                             }
                             Spacer(minLength: 0)
@@ -877,37 +759,63 @@ public struct PaneView: View {
                             Rectangle()
                                 .fill(isHoverFolder ? Color.accentColor.opacity(0.35) : Color.clear)
                         )
-                        .overlay(alignment: .top) {
-                            if isInsertTop {
-                                Rectangle()
-                                    .fill(Color.accentColor)
-                                    .frame(height: 2)
-                            }
-                        }
-                        .overlay(alignment: .bottom) {
-                            if isInsertBottom {
-                                Rectangle()
-                                    .fill(Color.accentColor)
-                                    .frame(height: 2)
-                            }
-                        }
                         .contentShape(Rectangle())
                         .simultaneousGesture(TapGesture(count: 2).onEnded {
                             print("DUAL_PANE: Cell double tap on \(item.name)")
                             vm.openItem(item: item, side: side)
                         })
                     }
-                    .width(min: 80, ideal: 100, max: 120)
+                    .width(min: 55, ideal: 70, max: 130)
+                    
+                    TableColumn("", value: \FileItem.tagSortKey) { item in
+                        let isHoverFolder = (item.isDirectory && vm.dragHoverSide == side && vm.dragHoverFolderId == item.id)
+                        
+                        HStack(spacing: 3) {
+                            Spacer(minLength: 0)
+                            if !item.tags.isEmpty {
+                                ForEach(item.tags.prefix(3), id: \.self) { tagName in
+                                    if let tag = FileTag.tag(for: tagName) {
+                                        Circle()
+                                            .fill(tag.color)
+                                            .frame(width: 9, height: 9)
+                                    } else {
+                                        Circle()
+                                            .fill(Color.secondary)
+                                            .frame(width: 9, height: 9)
+                                    }
+                                }
+                            }
+                            Spacer(minLength: 0)
+                        }
+                        .padding(.vertical, 2)
+                        .padding(.horizontal, 2)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        .background(
+                            Rectangle()
+                                .fill(isHoverFolder ? Color.accentColor.opacity(0.35) : Color.clear)
+                        )
+                        .contentShape(Rectangle())
+                        .simultaneousGesture(TapGesture(count: 2).onEnded {
+                            print("DUAL_PANE: Cell double tap on \(item.name)")
+                            vm.openItem(item: item, side: side)
+                        })
+                        .onDrag {
+                            vm.createDragItemProvider(for: item, side: side)
+                        } preview: {
+                            Color.clear.frame(width: 1, height: 1)
+                        }
+                        .contextMenu {
+                            rowContextMenu(for: item)
+                        }
+                    }
+                    .width(min: 17, ideal: 21, max: 35)
                     
                     TableColumn("Дата изменения", value: \FileItem.mtime) { item in
                         let isHoverFolder = (item.isDirectory && vm.dragHoverSide == side && vm.dragHoverFolderId == item.id)
-                        let rowIndex = items.firstIndex(where: { $0.id == item.id }) ?? -1
-                        let isInsertTop = (vm.dragHoverSide == side && vm.dragHoverFolderId == nil && vm.dragInsertionIndex == rowIndex)
-                        let isInsertBottom = (vm.dragHoverSide == side && vm.dragHoverFolderId == nil && vm.dragInsertionIndex == items.count && rowIndex == items.count - 1)
                         
                         HStack {
                             Text(formatDate(item.mtime))
-                                .font(.system(size: 11))
+                                .font(.system(size: 12))
                                 .foregroundColor(.secondary)
                             Spacer(minLength: 0)
                         }
@@ -915,31 +823,45 @@ public struct PaneView: View {
                         .padding(.horizontal, 4)
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .background(
-                            UnevenRoundedRectangle(topLeadingRadius: 0, bottomLeadingRadius: 0, bottomTrailingRadius: 4, topTrailingRadius: 4)
+                            Rectangle()
                                 .fill(isHoverFolder ? Color.accentColor.opacity(0.35) : Color.clear)
                         )
-                        .overlay(alignment: .top) {
-                            if isInsertTop {
-                                Rectangle()
-                                    .fill(Color.accentColor)
-                                    .frame(height: 2)
-                            }
-                        }
-                        .overlay(alignment: .bottom) {
-                            if isInsertBottom {
-                                Rectangle()
-                                    .fill(Color.accentColor)
-                                    .frame(height: 2)
-                            }
-                        }
                         .contentShape(Rectangle())
                         .simultaneousGesture(TapGesture(count: 2).onEnded {
                             print("DUAL_PANE: Cell double tap on \(item.name)")
                             vm.openItem(item: item, side: side)
                         })
                     }
-                    .width(min: 120, ideal: 140, max: 160)
+                    .width(min: 90, ideal: 105, max: 180)
+                    
+                    TableColumn("Тип", value: \FileItem.fileType) { item in
+                        let isHoverFolder = (item.isDirectory && vm.dragHoverSide == side && vm.dragHoverFolderId == item.id)
+                        
+                        HStack {
+                            Text(item.fileType)
+                                .font(.system(size: 12))
+                                .foregroundColor(.secondary)
+                                .lineLimit(1)
+                                .truncationMode(.tail)
+                            Spacer(minLength: 0)
+                        }
+                        .padding(.vertical, 2)
+                        .padding(.leading, 10.5)
+                        .padding(.trailing, 2)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(
+                            UnevenRoundedRectangle(topLeadingRadius: 0, bottomLeadingRadius: 0, bottomTrailingRadius: 4, topTrailingRadius: 4)
+                                .fill(isHoverFolder ? Color.accentColor.opacity(0.35) : Color.clear)
+                        )
+                        .contentShape(Rectangle())
+                        .simultaneousGesture(TapGesture(count: 2).onEnded {
+                            print("DUAL_PANE: Cell double tap on \(item.name)")
+                            vm.openItem(item: item, side: side)
+                        })
+                    }
+                    .width(58)
                 }
+                .id("\(side)-\(vm.splitViewResetId)")
                 .onKeyPress(KeyEquivalent(Character(UnicodeScalar(NSF2FunctionKey)!)), phases: .down) { press in
                     if KeyCommandMonitor.isTextEditingActive(in: vm) {
                         return .ignored
@@ -997,6 +919,29 @@ public struct PaneView: View {
                     }
                 )
                 .onDrop(of: [DualPaneViewModel.dragUTType, UTType.fileURL.identifier, UTType.utf8PlainText.identifier], delegate: PaneTableDropDelegate(side: side, vm: vm, items: items))
+                .overlay {
+                    let query = (side == .left ? vm.leftSearchQuery : vm.rightSearchQuery).trimmingCharacters(in: .whitespaces)
+                    let isSearching = (side == .left ? vm.isLeftSearching : vm.isRightSearching)
+                    if vm.isSearchActive(for: side) && !query.isEmpty && items.isEmpty {
+                        VStack(spacing: 8) {
+                            if isSearching {
+                                ProgressView("Поиск файлов...")
+                                    .font(.system(size: 14))
+                                    .foregroundColor(.secondary)
+                            } else {
+                                Image(systemName: "doc.text.magnifyingglass")
+                                    .font(.system(size: 28))
+                                    .foregroundColor(.secondary.opacity(0.6))
+                                Text("Ничего не найдено по запросу «\(query)»")
+                                    .font(.system(size: 13))
+                                    .foregroundColor(.secondary)
+                            }
+                        }
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        .background(Color(nsColor: .windowBackgroundColor).opacity(0.65))
+                        .allowsHitTesting(false)
+                    }
+                }
             }
         }
         
@@ -1009,15 +954,15 @@ public struct PaneView: View {
                         .controlSize(.small)
                         .scaleEffect(0.75)
                     Text("Обновление...")
-                        .font(.system(size: 11, weight: .medium))
+                        .font(.system(size: 12, weight: .medium))
                         .foregroundColor(.secondary)
                 } else {
                     Image(systemName: pullProgress >= 1.0 ? "arrow.clockwise" : "arrow.down")
-                        .font(.system(size: 11, weight: .semibold))
+                        .font(.system(size: 12, weight: .semibold))
                         .foregroundColor(pullProgress >= 1.0 ? .accentColor : .secondary)
                         .rotationEffect(.degrees(pullProgress >= 1.0 ? 180 : 0))
                     Text(pullProgress >= 1.0 ? "Отпустите для обновления" : "Потяните для обновления")
-                        .font(.system(size: 11, weight: .medium))
+                        .font(.system(size: 12, weight: .medium))
                         .foregroundColor(pullProgress >= 1.0 ? .primary : .secondary)
                 }
             }
@@ -1059,35 +1004,69 @@ public struct PaneView: View {
             
             Divider()
             
-            // Подвал панели: объекты, выделение и свободное место
-            HStack {
+            // Подвал панели: объекты, выделение, свободное место и зеркальное отражение
+            HStack(spacing: 0) {
+                if side == .right {
+                    PaneMirrorButton(arrow: "⇨", tooltip: "Отразить левую панель в правой (⇨)") {
+                        vm.mirrorPane(from: .left, to: .right)
+                    }
+                    .padding(.trailing, 8)
+                }
+                
                 let selectedIds = (side == .left) ? vm.leftSelection : vm.rightSelection
                 if selectedIds.isEmpty {
                     Text("\(items.count) объектов")
-                        .font(.system(size: 11))
+                        .font(.system(size: 12))
                         .foregroundColor(.secondary)
                 } else {
                     let selectedItems = items.filter { selectedIds.contains($0.id) || selectedIds.contains($0.path) }
-                    let selectedBytes = selectedItems.reduce(0) { $0 + $1.size }
-                    Text("Выделено: \(selectedItems.count) из \(items.count) (\(formatBytes(selectedBytes)))")
-                        .font(.system(size: 11, weight: .medium))
-                        .foregroundColor(.secondary)
+                    let selectedBytes = vm.selectedBytes(for: side)
+                    let isCalculating = vm.isCalculatingSelectedFolderSizes(for: side)
+                    
+                    HStack(spacing: 4) {
+                        Text("Выделено: \(selectedItems.count) из \(items.count) (\(formatBytes(selectedBytes)))")
+                            .font(.system(size: 12, weight: .medium))
+                            .foregroundColor(.secondary)
+                        
+                        if isCalculating {
+                            ProgressView()
+                                .controlSize(.mini)
+                                .scaleEffect(0.6)
+                                .frame(width: 10, height: 10)
+                        }
+                    }
                 }
-                Spacer()
+                
+                Spacer(minLength: 8)
+                
                 if freeSpace.total > 0 {
                     Text("Свободно: \(formatBytes(freeSpace.free)) из \(formatBytes(freeSpace.total))")
-                        .font(.system(size: 11))
+                        .font(.system(size: 12))
                         .foregroundColor(.secondary)
+                }
+                
+                if side == .left {
+                    PaneMirrorButton(arrow: "⇦", tooltip: "Отразить правую панель в левой (⇦)") {
+                        vm.mirrorPane(from: .right, to: .left)
+                    }
+                    .padding(.leading, 8)
                 }
             }
             .padding(.horizontal, 8)
-            .padding(.vertical, 4)
+            .padding(.vertical, 3)
             .background(Color(nsColor: .windowBackgroundColor))
         }
         .contentShape(Rectangle())
         .simultaneousGesture(TapGesture().onEnded {
             if vm.activePane != side {
                 vm.activePane = side
+                TableDoubleClickHandler.HandlerView.setActiveSide(side)
+                TableDoubleClickHandler.HandlerView.ensureTableViewsDiscovered()
+                let tv = (side == .left) ? TableDoubleClickHandler.HandlerView.leftTableView : TableDoubleClickHandler.HandlerView.rightTableView
+                let win = tv?.window ?? NSApplication.shared.keyWindow ?? NSApplication.shared.mainWindow
+                if let tv = tv {
+                    win?.makeFirstResponder(tv)
+                }
             }
         })
     }
@@ -1097,7 +1076,7 @@ public struct PaneView: View {
         if side == .left {
             if vm.comparisonResult.onlyLeft.contains(name) {
                 Text("Только слева")
-                    .font(.system(size: 9, weight: .bold))
+                    .font(.system(size: 10, weight: .bold))
                     .padding(.horizontal, 4)
                     .padding(.vertical, 1)
                     .background(Color.green.opacity(0.2))
@@ -1105,7 +1084,7 @@ public struct PaneView: View {
                     .cornerRadius(3)
             } else if vm.comparisonResult.different.contains(name) {
                 Text("Различается")
-                    .font(.system(size: 9, weight: .bold))
+                    .font(.system(size: 10, weight: .bold))
                     .padding(.horizontal, 4)
                     .padding(.vertical, 1)
                     .background(Color.orange.opacity(0.2))
@@ -1115,7 +1094,7 @@ public struct PaneView: View {
         } else {
             if vm.comparisonResult.onlyRight.contains(name) {
                 Text("Только справа")
-                    .font(.system(size: 9, weight: .bold))
+                    .font(.system(size: 10, weight: .bold))
                     .padding(.horizontal, 4)
                     .padding(.vertical, 1)
                     .background(Color.blue.opacity(0.2))
@@ -1123,7 +1102,7 @@ public struct PaneView: View {
                     .cornerRadius(3)
             } else if vm.comparisonResult.different.contains(name) {
                 Text("Различается")
-                    .font(.system(size: 9, weight: .bold))
+                    .font(.system(size: 10, weight: .bold))
                     .padding(.horizontal, 4)
                     .padding(.vertical, 1)
                     .background(Color.orange.opacity(0.2))
@@ -1164,6 +1143,62 @@ public struct PaneView: View {
     @ViewBuilder
     private func rowContextMenu(for item: FileItem) -> some View {
         let contextItems = vm.contextMenuItems(for: item, side: side)
+        let combinedTags = Array(Set(contextItems.flatMap { $0.tags }))
+        
+        let query = (side == .left ? vm.leftSearchQuery : vm.rightSearchQuery).trimmingCharacters(in: .whitespaces)
+        if vm.isSearchActive(for: side) && !query.isEmpty {
+            Button(action: {
+                vm.revealInFolder(item: item, side: side)
+            }) {
+                Label("Показать в папке", systemImage: "folder")
+            }
+            Divider()
+        }
+        
+        ControlGroup {
+            ForEach(FileTag.allTags) { tag in
+                let isSelected = combinedTags.contains(tag.id) || combinedTags.contains(tag.name)
+                Button(action: {
+                    vm.toggleTag(tag.id, for: contextItems, side: side)
+                }) {
+                    ZStack {
+                        Circle()
+                            .fill(tag.color)
+                            .frame(width: 9, height: 9)
+                        if isSelected {
+                            Circle()
+                                .stroke(tag.color, lineWidth: 1.2)
+                                .frame(width: 14, height: 14)
+                        }
+                    }
+                    .frame(width: 16, height: 16)
+                }
+                .help(tag.name)
+            }
+        }
+        ControlGroup {
+            Button(action: {
+                vm.share(items: contextItems, side: side, target: .telegram)
+            }) {
+                Image(nsImage: ShareIconDrawer.telegramImage(size: 16))
+            }
+            .help("Поделиться в Telegram")
+            
+            Button(action: {
+                vm.share(items: contextItems, side: side, target: .whatsapp)
+            }) {
+                Image(nsImage: ShareIconDrawer.whatsAppImage(size: 16))
+            }
+            .help("Поделиться в WhatsApp")
+            
+            Button(action: {
+                vm.share(items: contextItems, side: side, target: .gmail)
+            }) {
+                Image(nsImage: ShareIconDrawer.gmailImage(size: 16))
+            }
+            .help("Отправить через Gmail / Почту")
+        }
+        Divider()
         Button("Новая папка с выбранными объектами (\(contextItems.count))") {
             vm.prepareNewFolderWithSelection(item: item, side: side)
         }
@@ -1243,20 +1278,20 @@ public struct PaneView: View {
     }
     
     private func toggleSort(field: SortField) {
-        if side == .left {
-            if vm.leftSortField == field {
-                vm.leftSortAscending.toggle()
-            } else {
-                vm.leftSortField = field
-                vm.leftSortAscending = true
-            }
+        let currentField = (side == .left) ? vm.leftSortField : vm.rightSortField
+        let currentAsc = (side == .left) ? vm.leftSortAscending : vm.rightSortAscending
+        let newAsc: Bool
+        if currentField == field {
+            newAsc = !currentAsc
         } else {
-            if vm.rightSortField == field {
-                vm.rightSortAscending.toggle()
-            } else {
-                vm.rightSortField = field
-                vm.rightSortAscending = true
-            }
+            newAsc = (field == .size || field == .date) ? false : true
+        }
+        if side == .left {
+            vm.leftSortField = field
+            vm.leftSortAscending = newAsc
+        } else {
+            vm.rightSortField = field
+            vm.rightSortAscending = newAsc
         }
     }
     
@@ -1280,9 +1315,53 @@ public struct PaneView: View {
 public final class CustomRenameNSTextField: NSTextField {
     public var isDirectory: Bool = false
     
+    public override var isBezeled: Bool {
+        get { false }
+        set { }
+    }
+    
+    public static weak var activeInstance: CustomRenameNSTextField?
+
+    public override var isBordered: Bool {
+        get { false }
+        set { }
+    }
+    
+    public override var focusRingType: NSFocusRingType {
+        get { .none }
+        set { }
+    }
+    
+    public override func drawFocusRingMask() {}
+    
+    public override func becomeFirstResponder() -> Bool {
+        let result = super.becomeFirstResponder()
+        CustomRenameNSTextField.activeInstance = self
+        if let editor = self.currentEditor() as? NSTextView {
+            editor.focusRingType = .none
+            editor.drawsBackground = false
+            editor.backgroundColor = .clear
+        }
+        return result
+    }
+    
     public override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
         if let window = self.window {
+            // Поднимаем zPosition родительского NSTableRowView, чтобы всплывающая иконка не перекрывалась строкой выше
+            var curr: NSView? = self
+            while let v = curr {
+                v.wantsLayer = true
+                v.layer?.masksToBounds = false
+                if let rowView = v as? NSTableRowView {
+                    rowView.wantsLayer = true
+                    rowView.layer?.zPosition = 200
+                    rowView.layer?.masksToBounds = false
+                    break
+                }
+                curr = v.superview
+            }
+            
             DispatchQueue.main.async { [weak self] in
                 guard let self = self, self.window != nil else { return }
                 if self.currentEditor() == nil {
@@ -1293,8 +1372,32 @@ public final class CustomRenameNSTextField: NSTextField {
         }
     }
     
+    public override func viewWillMove(toWindow newWindow: NSWindow?) {
+        super.viewWillMove(toWindow: newWindow)
+        if newWindow == nil {
+            var curr: NSView? = self
+            while let v = curr {
+                if let rowView = v as? NSTableRowView {
+                    rowView.layer?.zPosition = 0
+                    break
+                }
+                curr = v.superview
+            }
+        }
+    }
+    
     public func selectBaseName() {
-        if let editor = self.currentEditor() {
+        CustomRenameNSTextField.activeInstance = self
+        if let editor = self.currentEditor() as? NSTextView {
+            editor.focusRingType = .none
+            editor.drawsBackground = false
+            editor.backgroundColor = .clear
+            editor.selectedTextAttributes = [
+                .backgroundColor: NSColor(red: 0x6c/255.0, green: 0x9d/255.0, blue: 0xcc/255.0, alpha: 1.0),
+                .foregroundColor: NSColor.white
+            ]
+            editor.insertionPointColor = NSColor(ConflictColors.nameText)
+            
             let name = self.stringValue
             if !self.isDirectory && name.contains(".") && !name.hasPrefix(".") {
                 let nsName = name as NSString
@@ -1314,6 +1417,153 @@ public final class CustomRenameNSTextField: NSTextField {
             return true
         }
         return super.performKeyEquivalent(with: event)
+    }
+}
+
+// MARK: - Inline Rename Helpers & Copy Fragment Button
+public enum InlineRenameHelper {
+    public static func baseName(for fullName: String, isDirectory: Bool) -> String {
+        if !isDirectory && fullName.contains(".") && !fullName.hasPrefix(".") {
+            let nsName = fullName as NSString
+            let ext = nsName.pathExtension
+            let baseLen = fullName.count - ext.count - 1
+            if baseLen > 0 {
+                return String(fullName.prefix(baseLen))
+            }
+        }
+        return fullName
+    }
+    
+    public static func textWidth(for text: String) -> CGFloat {
+        let font = NSFont.systemFont(ofSize: 13, weight: .regular)
+        let size = (text as NSString).size(withAttributes: [.font: font])
+        return ceil(size.width)
+    }
+    
+    public static func currentFragment(for fullName: String, isDirectory: Bool) -> String {
+        if let tf = CustomRenameNSTextField.activeInstance,
+           let editor = tf.currentEditor() as? NSTextView,
+           editor.selectedRange().length > 0 {
+            let range = editor.selectedRange()
+            let ns = (editor.string as NSString)
+            if range.location + range.length <= ns.length {
+                return ns.substring(with: range)
+            }
+        }
+        return baseName(for: fullName, isDirectory: isDirectory)
+    }
+}
+
+public final class CopyFragmentButton: NSButton {
+    private var trackingArea: NSTrackingArea?
+    private var isCopied: Bool = false
+    public var onCopy: (() -> Void)?
+    
+    public override var acceptsFirstResponder: Bool { false }
+    public override var canBecomeKeyView: Bool { false }
+    
+    public override init(frame frameRect: NSRect) {
+        super.init(frame: NSRect(x: 0, y: 0, width: 26, height: 26))
+        setup()
+    }
+    
+    public required init?(coder: NSCoder) {
+        super.init(coder: coder)
+        setup()
+    }
+    
+    private func setup() {
+        self.isBordered = false
+        self.bezelStyle = .regularSquare
+        self.refusesFirstResponder = true
+        self.toolTip = "Скопировать выделенный фрагмент"
+        self.wantsLayer = true
+        self.layer?.cornerRadius = 5.0
+        self.layer?.borderWidth = 1.2
+        self.layer?.borderColor = NSColor(white: 0.35, alpha: 1.0).cgColor
+        self.layer?.backgroundColor = NSColor.white.cgColor
+        self.layer?.shadowColor = NSColor.black.withAlphaComponent(0.20).cgColor
+        self.layer?.shadowOpacity = 1.0
+        self.layer?.shadowRadius = 2.0
+        self.layer?.shadowOffset = CGSize(width: 0, height: -1)
+        self.layer?.zPosition = 500
+        updateIcon()
+    }
+    
+    public func setCopiedState() {
+        self.isCopied = true
+        updateIcon()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak self] in
+            guard let self = self else { return }
+            self.isCopied = false
+            self.updateIcon()
+        }
+    }
+    
+    private func updateIcon(isHovered: Bool = false) {
+        let symbolName = isCopied ? "checkmark" : "doc.on.doc"
+        let tintColor: NSColor
+        if isCopied {
+            tintColor = .systemGreen
+        } else if isHovered {
+            tintColor = .black
+        } else {
+            tintColor = NSColor(white: 0.22, alpha: 1.0)
+        }
+        
+        let config = NSImage.SymbolConfiguration(pointSize: 13.5, weight: .semibold)
+            .applying(.init(paletteColors: [tintColor]))
+        if let img = NSImage(systemSymbolName: symbolName, accessibilityDescription: nil)?.withSymbolConfiguration(config) {
+            self.image = img
+        }
+    }
+    
+    public override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let ta = trackingArea {
+            removeTrackingArea(ta)
+        }
+        let ta = NSTrackingArea(rect: bounds, options: [.mouseEnteredAndExited, .activeInActiveApp, .cursorUpdate], owner: self, userInfo: nil)
+        addTrackingArea(ta)
+        self.trackingArea = ta
+    }
+    
+    public override func cursorUpdate(with event: NSEvent) {
+        NSCursor.pointingHand.set()
+    }
+    
+    public override func mouseEntered(with event: NSEvent) {
+        super.mouseEntered(with: event)
+        NSCursor.pointingHand.set()
+        updateIcon(isHovered: true)
+        self.layer?.borderColor = NSColor(white: 0.15, alpha: 1.0).cgColor
+    }
+    
+    public override func mouseExited(with event: NSEvent) {
+        super.mouseExited(with: event)
+        NSCursor.arrow.set()
+        updateIcon(isHovered: false)
+        self.layer?.borderColor = NSColor(white: 0.35, alpha: 1.0).cgColor
+    }
+    
+    public override func mouseDown(with event: NSEvent) {
+        onCopy?()
+        setCopiedState()
+    }
+}
+
+public struct CopyFragmentButtonView: NSViewRepresentable {
+    public let baseName: String
+    public let onCopy: () -> Void
+    
+    public func makeNSView(context: Context) -> CopyFragmentButton {
+        let btn = CopyFragmentButton(frame: NSRect(x: 0, y: 0, width: 26, height: 26))
+        btn.onCopy = onCopy
+        return btn
+    }
+    
+    public func updateNSView(_ nsView: CopyFragmentButton, context: Context) {
+        nsView.onCopy = onCopy
     }
 }
 
@@ -1338,21 +1588,35 @@ public struct InlineRenameTextField: NSViewRepresentable {
         let textField = CustomRenameNSTextField()
         textField.isDirectory = isDirectory
         textField.stringValue = text
-        textField.isBordered = true
-        textField.bezelStyle = .roundedBezel
-        textField.focusRingType = .exterior
-        textField.font = NSFont.systemFont(ofSize: 12)
+        textField.isBordered = false
+        textField.isBezeled = false
+        textField.bezelStyle = .squareBezel
+        textField.drawsBackground = false
+        textField.backgroundColor = .clear
+        textField.focusRingType = .none
+        textField.font = NSFont.systemFont(ofSize: 13, weight: .regular)
         textField.delegate = context.coordinator
         textField.isEditable = true
         textField.isSelectable = true
-        textField.drawsBackground = true
-        textField.backgroundColor = NSColor.white
-        textField.textColor = NSColor.black
+        textField.textColor = NSColor(ConflictColors.nameText)
+        if let cell = textField.cell as? NSTextFieldCell {
+            cell.isBezeled = false
+            cell.isBordered = false
+            cell.focusRingType = .none
+            cell.drawsBackground = false
+            cell.backgroundColor = .clear
+            cell.wraps = false
+            cell.isScrollable = true
+        }
+        textField.lineBreakMode = .byTruncatingTail
+        textField.maximumNumberOfLines = 1
         
         DispatchQueue.main.async {
             guard let window = textField.window else { return }
+            CustomRenameNSTextField.activeInstance = textField
             if textField.currentEditor() == nil {
                 window.makeFirstResponder(textField)
+                textField.selectText(nil)
                 textField.selectBaseName()
             }
         }
@@ -1400,6 +1664,9 @@ public struct InlineRenameTextField: NSViewRepresentable {
         }
         
         public func controlTextDidEndEditing(_ obj: Notification) {
+            if let tf = obj.object as? CustomRenameNSTextField, CustomRenameNSTextField.activeInstance === tf {
+                CustomRenameNSTextField.activeInstance = nil
+            }
             guard !isHandled else { return }
             guard Date().timeIntervalSince(createdAt) > 0.3 else { return }
             isHandled = true
@@ -1455,7 +1722,11 @@ extension NSTableRowView {
         }
         let activeSide = TableDoubleClickHandler.HandlerView.activePaneSide
         let activeTv = (activeSide == .left) ? TableDoubleClickHandler.HandlerView.leftTableView : TableDoubleClickHandler.HandlerView.rightTableView
-        return tv === activeTv
+        if tv === activeTv { return true }
+        if let vm = TableDoubleClickHandler.HandlerView.activeVM(for: activeSide), vm.isFileDiffActive {
+            return true
+        }
+        return false
     }
     
     @objc private func swizzled_drawSelection(in dirtyRect: NSRect) {
@@ -1558,7 +1829,59 @@ public struct TableDoubleClickHandler: NSViewRepresentable {
         self.onDoubleClick = onDoubleClick
     }
     
+    private static var hasSwizzledHeaderCentering = false
+    public static func installHeaderCellCenteringIfNeeded() {
+        guard !hasSwizzledHeaderCentering else { return }
+        hasSwizzledHeaderCentering = true
+        
+        let curFontSel = NSSelectorFromString("_currentFont")
+        if let origCurFontMethod = class_getInstanceMethod(NSTableHeaderCell.self, curFontSel) {
+            let fontBlock: @convention(block) (AnyObject) -> NSFont = { _ in
+                return NSFont.systemFont(ofSize: 12, weight: .regular)
+            }
+            let newCurFontImp = imp_implementationWithBlock(fontBlock)
+            method_setImplementation(origCurFontMethod, newCurFontImp)
+        }
+        
+        let sel = #selector(NSTableHeaderCell.drawInterior(withFrame:in:))
+        guard let origMethod = class_getInstanceMethod(NSTableHeaderCell.self, sel) else { return }
+        
+        typealias DrawInteriorIMP = @convention(c) (AnyObject, Selector, NSRect, NSView) -> Void
+        let origImp = unsafeBitCast(method_getImplementation(origMethod), to: DrawInteriorIMP.self)
+        
+        let block: @convention(block) (AnyObject, NSRect, NSView) -> Void = { obj, frame, view in
+            guard let cell = obj as? NSTableHeaderCell else { return }
+            if cell.font?.pointSize != 12 {
+                cell.font = NSFont.systemFont(ofSize: 12, weight: .regular)
+            }
+            if cell.stringValue == "Тип" && frame.width >= 40 {
+                let title = "Тип"
+                let font = cell.font ?? NSFont.systemFont(ofSize: 12, weight: .regular)
+                let color = NSColor.headerTextColor
+                let attrs: [NSAttributedString.Key: Any] = [
+                    .font: font,
+                    .foregroundColor: color
+                ]
+                let size = (title as NSString).size(withAttributes: attrs)
+                // Режим выравнивания по левому краю с отступом, совпадающим с расширениями в строках:
+                let leadingOffset: CGFloat = 11.5
+                let x = floor(frame.origin.x + leadingOffset)
+                // Сохранённый предыдущий режим (по центру колонки 58 pt):
+                // let colWidth = TableColumnLayoutEngine.fixedTypeWidth
+                // let x = floor(frame.origin.x + (colWidth - size.width) / 2.0)
+                let y = floor(frame.origin.y + (frame.size.height - size.height) / 2.0)
+                (title as NSString).draw(in: NSRect(x: x, y: y, width: size.width, height: size.height), withAttributes: attrs)
+            } else {
+                origImp(obj, sel, frame, view)
+            }
+        }
+        
+        let newImp = imp_implementationWithBlock(block)
+        method_setImplementation(origMethod, newImp)
+    }
+    
     public func makeNSView(context: Context) -> HandlerView {
+        Self.installHeaderCellCenteringIfNeeded()
         let view = HandlerView()
         view.side = side
         view.vm = vm
@@ -1572,7 +1895,15 @@ public struct TableDoubleClickHandler: NSViewRepresentable {
         nsView.vm = vm
         nsView.items = items
         nsView.onDoubleClick = onDoubleClick
+        if nsView.hookedTableView == nil {
+            nsView.hookTableView()
+        }
         if let tv = nsView.hookedTableView {
+            for col in tv.tableColumns {
+                if col.headerCell.font?.pointSize != 12 {
+                    col.headerCell.font = NSFont.systemFont(ofSize: 12, weight: .regular)
+                }
+            }
             if side == .left {
                 HandlerView.leftTableView = tv
                 HandlerView.leftVM = vm
@@ -1583,6 +1914,149 @@ public struct TableDoubleClickHandler: NSViewRepresentable {
         }
         if vm.activePane == side {
             HandlerView.setActiveSide(side)
+        }
+    }
+    
+    // MARK: - Table Column Layout Engine (Consensus Architecture G01-G05 + S03 + S01/N02)
+
+    public struct TableColumnLayoutEngine {
+        public struct Constraint {
+            public let min: CGFloat
+            public let max: CGFloat
+        }
+        
+        /// Фиксированная ширина колонки «Тип» (58 pt, заголовок строго по центру, расширения выровнены по левому краю)
+        public static let fixedTypeWidth: CGFloat = 58
+        
+        // Индексы колонок: 0 - Имя, 1 - Размер, 2 - Теги, 3 - Дата изменения, 4 - Тип
+        public static let constraints: [Constraint] = [
+            Constraint(min: 120, max: 4000),                      // 0: Имя
+            Constraint(min: 55,  max: 130),                       // 1: Размер
+            Constraint(min: 17,  max: 35),                        // 2: Теги
+            Constraint(min: 90,  max: 180),                       // 3: Дата изменения
+            Constraint(min: fixedTypeWidth, max: fixedTypeWidth)  // 4: Тип (закреплена к правому краю, неизменяемая)
+        ]
+        
+        public static func adjust(
+            columns: [NSTableColumn],
+            targetWidth: CGFloat,
+            draggedColumn: NSTableColumn? = nil
+        ) {
+            guard columns.count >= 5 else { return }
+            guard targetWidth >= 200 else { return }
+            
+            if let dragged = draggedColumn, let draggedIdx = columns.firstIndex(of: dragged) {
+                handleColumnDrag(columns: columns, targetWidth: targetWidth, draggedIdx: draggedIdx)
+            } else {
+                handlePaneResize(columns: columns, targetWidth: targetWidth)
+            }
+        }
+        
+        public static func handlePaneResize(columns: [NSTableColumn], targetWidth: CGFloat) {
+            // Колонка 4 («Тип») строго фиксирована
+            columns[4].width = fixedTypeWidth
+            
+            // Колонки 1..3 сохраняют свои пропорции (зажаты в лимиты)
+            for i in 1...3 {
+                let c = constraints[i]
+                columns[i].width = max(c.min, min(c.max, columns[i].width))
+            }
+            
+            var otherSum: CGFloat = fixedTypeWidth
+            for i in 1...3 {
+                otherSum += columns[i].width
+            }
+            
+            let targetName = targetWidth - otherSum
+            if targetName >= constraints[0].min {
+                columns[0].width = targetName
+            } else {
+                columns[0].width = constraints[0].min
+                var deficit = constraints[0].min - targetName
+                // Каскадное сжатие колонок справа налево (Дата 3, Размер 1, Теги 2)
+                let shrinkOrder = [3, 1, 2]
+                for idx in shrinkOrder {
+                    guard deficit > 0 else { break }
+                    let canReduce = max(0, columns[idx].width - constraints[idx].min)
+                    let take = min(deficit, canReduce)
+                    columns[idx].width -= take
+                    deficit -= take
+                }
+            }
+            
+            // Колонка 4 («Тип») ВСЕГДА строго fixedTypeWidth
+            columns[4].width = fixedTypeWidth
+            
+            let total = columns.map { $0.width }.reduce(0, +)
+            let residual = targetWidth - total
+            if abs(residual) > 0.001 {
+                columns[0].width += residual
+            }
+        }
+        
+        public static func handleColumnDrag(columns: [NSTableColumn], targetWidth: CGFloat, draggedIdx: Int) {
+            guard draggedIdx < columns.count else { return }
+            
+            // Если перетаскивается колонка 3 или 4 — колонка 4 неизменна и закреплена
+            if draggedIdx >= 3 {
+                columns[4].width = fixedTypeWidth
+                handlePaneResize(columns: columns, targetWidth: targetWidth)
+                return
+            }
+            
+            // draggedIdx < 3: перетаскивание разделителя 0 (Имя|Размер), 1 (Размер|Теги) или 2 (Теги|Дата)
+            columns[draggedIdx].width = max(constraints[draggedIdx].min, min(constraints[draggedIdx].max, columns[draggedIdx].width))
+            columns[4].width = fixedTypeWidth
+            
+            let currentSum = columns.map { $0.width }.reduce(0, +)
+            var delta = currentSum - targetWidth
+            
+            if delta > 0 {
+                // Пользователь расширил колонку: сжимаем соседей справа (до колонки 3 включительно)
+                for k in (draggedIdx + 1)...3 {
+                    guard delta > 0 else { break }
+                    let canShrink = max(0, columns[k].width - constraints[k].min)
+                    let take = min(delta, canShrink)
+                    columns[k].width -= take
+                    delta -= take
+                }
+                // Если соседи справа уперлись в минимум, пробуем сжать колонку 0 ("Имя")
+                if delta > 0 && draggedIdx != 0 {
+                    let canShrink0 = max(0, columns[0].width - constraints[0].min)
+                    let take0 = min(delta, canShrink0)
+                    columns[0].width -= take0
+                    delta -= take0
+                }
+                // Если все еще осталась дельта — откатываем draggedIdx обратно
+                if delta > 0 {
+                    columns[draggedIdx].width -= delta
+                    delta = 0
+                }
+            } else if delta < 0 {
+                // Пользователь сузил колонку: расширяем соседей справа (до колонки 3 включительно)
+                var needed = -delta
+                for k in (draggedIdx + 1)...3 {
+                    guard needed > 0 else { break }
+                    let canExpand = max(0, constraints[k].max - columns[k].width)
+                    let add = min(needed, canExpand)
+                    columns[k].width += add
+                    needed -= add
+                }
+                // Если соседи уперлись в максимум — отдаем остаток колонке 0 ("Имя")
+                if needed > 0 {
+                    columns[0].width += needed
+                    needed = 0
+                }
+            }
+            
+            // Колонка 4 («Тип») ВСЕГДА строго fixedTypeWidth
+            columns[4].width = fixedTypeWidth
+            
+            let finalSum = columns.map { $0.width }.reduce(0, +)
+            let residual = targetWidth - finalSum
+            if abs(residual) > 0.001 {
+                columns[0].width += residual
+            }
         }
     }
     
@@ -1610,15 +2084,55 @@ public struct TableDoubleClickHandler: NSViewRepresentable {
             rightTableView?.needsDisplay = true
         }
         
+        public static func ensureTableViewsDiscovered() {
+            guard let win = NSApplication.shared.keyWindow ?? NSApplication.shared.mainWindow,
+                  let contentView = win.contentView else { return }
+            
+            var tables: [NSTableView] = []
+            func findTables(in view: NSView) {
+                if let tv = view as? NSTableView {
+                    tables.append(tv)
+                }
+                for sub in view.subviews {
+                    findTables(in: sub)
+                }
+            }
+            findTables(in: contentView)
+            
+            // Сортируем таблицы слева направо по координате X в окне
+            tables.sort {
+                let rectA = $0.convert($0.bounds, to: nil)
+                let rectB = $1.convert($1.bounds, to: nil)
+                return rectA.origin.x < rectB.origin.x
+            }
+            
+            if tables.count >= 2 {
+                leftTableView = tables[0]
+                rightTableView = tables[1]
+            } else if tables.count == 1 {
+                let rect = tables[0].convert(tables[0].bounds, to: nil)
+                if rect.origin.x < (win.frame.width / 2.0) {
+                    leftTableView = tables[0]
+                } else {
+                    rightTableView = tables[0]
+                }
+            }
+        }
+        
         public static func focusAndScrollToItem(id: String, side: PaneSide) {
+            ensureTableViewsDiscovered()
             DispatchQueue.main.async {
+                ensureTableViewsDiscovered()
                 let tv = (side == .left) ? leftTableView : rightTableView
                 // Индекс строки таблицы — в порядке отображения (сортировка/фильтр), а не в сыром списке
                 let items = activeVM(for: side)?.displayItems(for: side) ?? []
                 guard let index = items.firstIndex(where: { $0.id == id || $0.path == id }) else { return }
                 tv?.selectRowIndexes(IndexSet(integer: index), byExtendingSelection: false)
                 tv?.scrollRowToVisible(index)
-                tv?.window?.makeFirstResponder(tv)
+                let win = tv?.window ?? NSApplication.shared.keyWindow ?? NSApplication.shared.mainWindow
+                if let tv = tv {
+                    win?.makeFirstResponder(tv)
+                }
             }
         }
         
@@ -1640,12 +2154,15 @@ public struct TableDoubleClickHandler: NSViewRepresentable {
         private var eventMonitor: Any?
         private var longPressWorkItem: DispatchWorkItem?
         private var mouseDownLocation: NSPoint = .zero
+        private var pendingSingleClickSelection: (id: String, side: PaneSide)? = nil
+        private var isAdjustingColumns = false
         
         deinit {
             longPressWorkItem?.cancel()
             if let monitor = eventMonitor {
                 NSEvent.removeMonitor(monitor)
             }
+            NotificationCenter.default.removeObserver(self)
         }
         
         public override func viewDidMoveToWindow() {
@@ -1662,13 +2179,36 @@ public struct TableDoubleClickHandler: NSViewRepresentable {
             super.layout()
             if hookedTableView == nil {
                 hookTableView()
+            } else {
+                if let tv = hookedTableView, tv.columnAutoresizingStyle != .noColumnAutoresizing {
+                    tv.columnAutoresizingStyle = .noColumnAutoresizing
+                }
+                adjustTableColumns(draggedColumn: nil)
             }
         }
         
         private func hookTableView() {
+            Self.ensureTableViewsDiscovered()
+            if side == .left, let tv = Self.leftTableView {
+                attach(to: tv)
+                return
+            }
+            if side == .right, let tv = Self.rightTableView {
+                attach(to: tv)
+                return
+            }
+            
             var current: NSView? = self
             while let v = current {
+                if v is NSSplitView || v.className.contains("SplitView") {
+                    break
+                }
                 if let tv = findTableView(in: v) {
+                    if (side == .right && tv === HandlerView.leftTableView) ||
+                       (side == .left && tv === HandlerView.rightTableView) {
+                        current = v.superview
+                        continue
+                    }
                     attach(to: tv)
                     return
                 }
@@ -1677,10 +2217,25 @@ public struct TableDoubleClickHandler: NSViewRepresentable {
         }
         
         private func findTableView(in view: NSView) -> NSTableView? {
-            if let tv = view as? NSTableView { return tv }
-            if let scroll = view as? NSScrollView, let tv = scroll.documentView as? NSTableView { return tv }
+            if view is NSSplitView || view.className.contains("SplitView") {
+                return nil
+            }
+            if let tv = view as? NSTableView {
+                if (side == .right && tv === HandlerView.leftTableView) ||
+                   (side == .left && tv === HandlerView.rightTableView) {
+                    return nil
+                }
+                return tv
+            }
+            if let scroll = view as? NSScrollView, let tv = scroll.documentView as? NSTableView {
+                if (side == .right && tv === HandlerView.leftTableView) ||
+                   (side == .left && tv === HandlerView.rightTableView) {
+                    return nil
+                }
+                return tv
+            }
             for sub in view.subviews {
-                if sub !== self {
+                if sub !== self && !(sub is NSSplitView) && !sub.className.contains("SplitView") {
                     if let tv = findTableView(in: sub) { return tv }
                 }
             }
@@ -1688,6 +2243,12 @@ public struct TableDoubleClickHandler: NSViewRepresentable {
         }
         
         private func attach(to tv: NSTableView) {
+            if side == .right && tv === HandlerView.leftTableView {
+                return
+            }
+            if side == .left && tv === HandlerView.rightTableView {
+                return
+            }
             guard hookedTableView !== tv else { return }
             hookedTableView = tv
             if side == .left {
@@ -1704,15 +2265,118 @@ public struct TableDoubleClickHandler: NSViewRepresentable {
             tv.doubleAction = #selector(onTableDoubleClick(_:))
             tv.allowsMultipleSelection = true
             tv.allowsEmptySelection = true
+            tv.allowsColumnReordering = false
+            if #available(macOS 11.0, *) {
+                tv.style = .plain
+            }
             tv.intercellSpacing = NSSize(width: 0, height: tv.intercellSpacing.height)
-            NotificationCenter.default.removeObserver(self, name: NSTableView.selectionDidChangeNotification, object: nil)
+            tv.columnAutoresizingStyle = .noColumnAutoresizing
+            tv.postsFrameChangedNotifications = true
+            tv.postsBoundsChangedNotifications = true
+            
+            if let scroll = tv.enclosingScrollView {
+                scroll.hasHorizontalScroller = false
+                scroll.horizontalScrollElasticity = .none
+                scroll.autohidesScrollers = true
+            }
+            
+            let cols = tv.tableColumns
+            for col in cols {
+                col.headerCell.font = NSFont.systemFont(ofSize: 12, weight: .regular)
+            }
+            if cols.count >= 5 {
+                cols[4].minWidth = TableColumnLayoutEngine.fixedTypeWidth
+                cols[4].maxWidth = TableColumnLayoutEngine.fixedTypeWidth
+                cols[4].width = TableColumnLayoutEngine.fixedTypeWidth
+                cols[4].resizingMask = []
+                tv.headerView?.needsDisplay = true
+            }
+            
+            NotificationCenter.default.removeObserver(self, name: NSTableView.selectionDidChangeNotification, object: tv)
             NotificationCenter.default.addObserver(
                 self,
                 selector: #selector(onTableSelectionDidChange(_:)),
                 name: NSTableView.selectionDidChangeNotification,
                 object: tv
             )
+            
+            NotificationCenter.default.removeObserver(self, name: NSView.frameDidChangeNotification, object: tv)
+            NotificationCenter.default.addObserver(
+                self,
+                selector: #selector(onTableFrameDidChange(_:)),
+                name: NSView.frameDidChangeNotification,
+                object: tv
+            )
+            
+            if let clipView = tv.enclosingScrollView?.contentView {
+                clipView.postsBoundsChangedNotifications = true
+                clipView.postsFrameChangedNotifications = true
+                NotificationCenter.default.removeObserver(self, name: NSView.boundsDidChangeNotification, object: clipView)
+                NotificationCenter.default.addObserver(
+                    self,
+                    selector: #selector(onTableFrameDidChange(_:)),
+                    name: NSView.boundsDidChangeNotification,
+                    object: clipView
+                )
+                NotificationCenter.default.removeObserver(self, name: NSView.frameDidChangeNotification, object: clipView)
+                NotificationCenter.default.addObserver(
+                    self,
+                    selector: #selector(onTableFrameDidChange(_:)),
+                    name: NSView.frameDidChangeNotification,
+                    object: clipView
+                )
+            }
+            
+            NotificationCenter.default.removeObserver(self, name: NSTableView.columnDidResizeNotification, object: tv)
+            NotificationCenter.default.addObserver(
+                self,
+                selector: #selector(onTableColumnDidResize(_:)),
+                name: NSTableView.columnDidResizeNotification,
+                object: tv
+            )
+            
+            adjustTableColumns()
             setupEventMonitor()
+        }
+        
+        @objc public func adjustTableColumns() {
+            adjustTableColumns(draggedColumn: nil)
+        }
+        
+        public func adjustTableColumns(draggedColumn: NSTableColumn?) {
+            guard !isAdjustingColumns else { return }
+            guard let tv = hookedTableView else { return }
+            let columns = tv.tableColumns
+            guard columns.count >= 5 else { return }
+            
+            let clipWidth = tv.enclosingScrollView?.contentView.bounds.width ?? tv.bounds.width
+            guard clipWidth >= 200 else { return }
+            
+            isAdjustingColumns = true
+            defer { isAdjustingColumns = false }
+            
+            let targetWidth = floor(clipWidth)
+            if columns[4].width != TableColumnLayoutEngine.fixedTypeWidth || columns[4].resizingMask != [] {
+                columns[4].minWidth = TableColumnLayoutEngine.fixedTypeWidth
+                columns[4].maxWidth = TableColumnLayoutEngine.fixedTypeWidth
+                columns[4].width = TableColumnLayoutEngine.fixedTypeWidth
+                columns[4].resizingMask = []
+                tv.headerView?.needsDisplay = true
+            }
+            TableColumnLayoutEngine.adjust(columns: columns, targetWidth: targetWidth, draggedColumn: draggedColumn)
+            
+            if abs(tv.frame.size.width - targetWidth) > 0.5 {
+                tv.setFrameSize(NSSize(width: targetWidth, height: tv.frame.height))
+            }
+        }
+        
+        @objc private func onTableFrameDidChange(_ notification: Notification) {
+            adjustTableColumns(draggedColumn: nil)
+        }
+        
+        @objc private func onTableColumnDidResize(_ notification: Notification) {
+            let draggedCol = notification.userInfo?["NSTableColumn"] as? NSTableColumn
+            adjustTableColumns(draggedColumn: draggedCol)
         }
         
         @objc private func onTableSelectionDidChange(_ notification: Notification) {
@@ -1749,6 +2413,9 @@ public struct TableDoubleClickHandler: NSViewRepresentable {
                 guard let self = self, let tv = self.hookedTableView, event.window == tv.window else {
                     return event
                 }
+                guard self.vm?.failedConnectionSide == nil else {
+                    return event
+                }
                 
                 // KeyDown handling
                 if event.type == .keyDown {
@@ -1780,6 +2447,9 @@ public struct TableDoubleClickHandler: NSViewRepresentable {
                     let firstResponder = tv.window?.firstResponder
                     let isFocused = (firstResponder === tv || ((firstResponder as? NSView)?.isDescendant(of: tv) ?? false) || !KeyCommandMonitor.isTextEditingResponder(firstResponder))
                     if isFocused {
+                        if KeyCommandMonitor.handleEvent(event) == nil {
+                            return nil
+                        }
                         // Return / Enter (KeyCodes 36: Return, 76: Enter)
                         if event.keyCode == 36 || event.keyCode == 76 {
                             print("DUAL_PANE: KeyDown Return/Enter on side \(self.side)")
@@ -1818,7 +2488,9 @@ public struct TableDoubleClickHandler: NSViewRepresentable {
                             return nil
                         }
                         // Tab (KeyCode 48) -> Switch Pane
-                        if event.keyCode == 48 && event.modifierFlags.intersection([.command, .option, .control, .shift]).isEmpty {
+                        let isTab = (event.keyCode == 48 || event.characters == "\t" || event.charactersIgnoringModifiers == "\t")
+                        let tabMods = event.modifierFlags.intersection([.command, .option, .control, .shift])
+                        if isTab && (tabMods.isEmpty || tabMods == .shift) {
                             self.vm?.toggleActivePane()
                             return nil
                         }
@@ -1874,15 +2546,30 @@ public struct TableDoubleClickHandler: NSViewRepresentable {
                 if event.type == .leftMouseUp {
                     self.longPressWorkItem?.cancel()
                     self.longPressWorkItem = nil
+                    if let pending = self.pendingSingleClickSelection, let vm = self.vm {
+                        if pending.side == .left {
+                            vm.leftSelection = [pending.id]
+                        } else {
+                            vm.rightSelection = [pending.id]
+                        }
+                    }
+                    self.pendingSingleClickSelection = nil
                     return event
                 }
                 
                 if event.type == .leftMouseDragged {
+                    self.pendingSingleClickSelection = nil
                     let currLoc = event.locationInWindow
                     let dist = hypot(currLoc.x - self.mouseDownLocation.x, currLoc.y - self.mouseDownLocation.y)
                     if dist > 4 {
                         self.longPressWorkItem?.cancel()
                         self.longPressWorkItem = nil
+                        
+                        // Если начался Drag & Drop выделенных файлов — гарантируем, что в NSPasteboard drag
+                        // записан полный список системных путей/URL для внешних приложений (Finder, Desktop, Telegram и т.д.)
+                        if let vm = self.vm, let payload = vm.currentDragPayload, payload.paths.count > 1 {
+                            vm.populateDragPasteboard(paths: payload.paths, payload: payload)
+                        }
                     }
                     return event
                 }
@@ -2004,10 +2691,19 @@ public struct TableDoubleClickHandler: NSViewRepresentable {
                                     vm.rightSelection = Set(selectedIds)
                                 }
                             } else {
-                                if self.side == .left {
-                                    vm.leftSelection = [item.id]
+                                let currentSelection = (self.side == .left) ? vm.leftSelection : vm.rightSelection
+                                if currentSelection.contains(item.id) || currentSelection.contains(item.path) {
+                                    // Элемент уже входит в текущее выделение (возможно множественное) ->
+                                    // НЕ сбрасываем выделение прямо сейчас, чтобы не ломать перетаскивание (Drag & Drop) нескольких файлов!
+                                    // Если перетаскивания не будет, одиночное выделение применится в .leftMouseUp.
+                                    self.pendingSingleClickSelection = (id: item.id, side: self.side)
                                 } else {
-                                    vm.rightSelection = [item.id]
+                                    self.pendingSingleClickSelection = nil
+                                    if self.side == .left {
+                                        vm.leftSelection = [item.id]
+                                    } else {
+                                        vm.rightSelection = [item.id]
+                                    }
                                 }
                             }
                         }
@@ -2032,16 +2728,18 @@ public struct TableDoubleClickHandler: NSViewRepresentable {
                         if vm.activePane != self.side {
                             vm.activePane = self.side
                         }
-                        if self.side == .left {
-                            if !vm.rightSelection.isEmpty {
-                                vm.rightSelection.removeAll()
+                        if !vm.isFileDiffActive {
+                            if self.side == .left {
+                                if !vm.rightSelection.isEmpty {
+                                    vm.rightSelection.removeAll()
+                                }
+                                HandlerView.rightTableView?.deselectAll(nil)
+                            } else {
+                                if !vm.leftSelection.isEmpty {
+                                    vm.leftSelection.removeAll()
+                                }
+                                HandlerView.leftTableView?.deselectAll(nil)
                             }
-                            HandlerView.rightTableView?.deselectAll(nil)
-                        } else {
-                            if !vm.leftSelection.isEmpty {
-                                vm.leftSelection.removeAll()
-                            }
-                            HandlerView.leftTableView?.deselectAll(nil)
                         }
                     }
                     
@@ -2078,6 +2776,16 @@ public struct TableDoubleClickHandler: NSViewRepresentable {
                             }
                         }
                     }
+                    
+                    if clickedRow >= 0 && clickedRow < self.items.count {
+                        let item = self.items[clickedRow]
+                        let contextItems = self.vm?.contextMenuItems(for: item, side: self.side) ?? [item]
+                        self.showRowContextMenu(for: item, contextItems: contextItems, with: event, in: tv)
+                        return nil
+                    } else if clickedRow < 0 {
+                        self.showEmptyAreaContextMenu(with: event, in: tv)
+                        return nil
+                    }
                 }
                 return event
             }
@@ -2091,7 +2799,347 @@ public struct TableDoubleClickHandler: NSViewRepresentable {
                 self?.onDoubleClick?(row)
             }
         }
+        
+        private func showRowContextMenu(for item: FileItem, contextItems: [FileItem], with event: NSEvent, in tv: NSTableView) {
+            guard let vm = self.vm else { return }
+            let side = self.side
+            let menu = NSMenu(title: "Context Menu")
+            
+            // 1. Верхний пункт меню: строка цветных кнопок тегов (Red, Orange, Yellow, Green, Blue, Grey)
+            let itemTags = item.tags.isEmpty ? TagsManager.shared.getTags(for: item) : item.tags
+            let tagMenuView = TagRowMenuView(currentTags: itemTags) { tagId in
+                vm.toggleTag(tagId, for: contextItems, side: side)
+            }
+            let tagMenuItem = NSMenuItem()
+            tagMenuItem.view = tagMenuView
+            menu.addItem(tagMenuItem)
+            
+            // 1.1. Строка быстрых действий «Поделиться» (Telegram, WhatsApp, Gmail)
+            let shareMenuView = ShareRowMenuView { target in
+                let point = tv.convert(event.locationInWindow, from: nil)
+                let row = tv.row(at: point)
+                let rect = row >= 0 ? tv.rect(ofRow: row) : .zero
+                vm.share(items: contextItems, side: side, target: target, sourceView: tv, rect: rect)
+            }
+            let shareMenuItem = NSMenuItem()
+            shareMenuItem.view = shareMenuView
+            menu.addItem(shareMenuItem)
+            
+            menu.addItem(NSMenuItem.separator())
+            
+            // 2. Стандартные действия контекстного меню
+            if item.isDirectory {
+                let openInNewTabItem = NSMenuItem(title: "Открыть в новой вкладке", action: #selector(menuActionOpenInNewTab(_:)), keyEquivalent: "")
+                openInNewTabItem.target = self
+                openInNewTabItem.representedObject = item
+                menu.addItem(openInNewTabItem)
+                menu.addItem(NSMenuItem.separator())
+            }
+            
+            let newFolderWithSelTitle = "Новая папка с выбранными объектами (\(contextItems.count))"
+            let newFolderWithSelItem = NSMenuItem(title: newFolderWithSelTitle, action: #selector(menuActionNewFolderWithSelection(_:)), keyEquivalent: "")
+            newFolderWithSelItem.target = self
+            newFolderWithSelItem.representedObject = item
+            menu.addItem(newFolderWithSelItem)
+            
+            let newFolderItem = NSMenuItem(title: "Новая папка", action: #selector(menuActionNewFolder(_:)), keyEquivalent: "")
+            newFolderItem.target = self
+            menu.addItem(newFolderItem)
+            
+            // Меню "Открыть с помощью..."
+            let openWithMenu = NSMenu(title: "Открыть с помощью...")
+            let apps = vm.getApplicationsForFile(item: item)
+            if apps.isEmpty {
+                let noAppsItem = NSMenuItem(title: "Нет ассоциированных программ", action: nil, keyEquivalent: "")
+                noAppsItem.isEnabled = false
+                openWithMenu.addItem(noAppsItem)
+            } else {
+                for appURL in apps {
+                    let appName = FileManager.default.displayName(atPath: appURL.path).replacingOccurrences(of: ".app", with: "")
+                    let appItem = NSMenuItem(title: appName, action: #selector(menuActionOpenWithApp(_:)), keyEquivalent: "")
+                    appItem.target = self
+                    appItem.representedObject = (item, appURL)
+                    if let icon = NSWorkspace.shared.icon(forFile: appURL.path) as NSImage? {
+                        icon.size = NSSize(width: 16, height: 16)
+                        appItem.image = icon
+                    }
+                    openWithMenu.addItem(appItem)
+                }
+            }
+            openWithMenu.addItem(NSMenuItem.separator())
+            let chooseAppItem = NSMenuItem(title: "Выбрать программу...", action: #selector(menuActionChooseCustomApp(_:)), keyEquivalent: "")
+            chooseAppItem.target = self
+            chooseAppItem.representedObject = item
+            openWithMenu.addItem(chooseAppItem)
+            
+            let openWithSubmenuItem = NSMenuItem(title: "Открыть с помощью...", action: nil, keyEquivalent: "")
+            openWithSubmenuItem.submenu = openWithMenu
+            menu.addItem(openWithSubmenuItem)
+            
+            menu.addItem(NSMenuItem.separator())
+            
+            let deleteItem = NSMenuItem(title: "Удалить (F8 / Delete)", action: #selector(menuActionDelete(_:)), keyEquivalent: "")
+            deleteItem.target = self
+            deleteItem.representedObject = item
+            menu.addItem(deleteItem)
+            
+            let copyItem = NSMenuItem(title: "Копировать (Cmd+C)", action: #selector(menuActionCopy(_:)), keyEquivalent: "")
+            copyItem.target = self
+            copyItem.representedObject = contextItems
+            menu.addItem(copyItem)
+            
+            let pasteItem = NSMenuItem(title: "Вставить (Cmd+V)", action: #selector(menuActionPaste(_:)), keyEquivalent: "")
+            pasteItem.target = self
+            pasteItem.isEnabled = vm.canPaste
+            menu.addItem(pasteItem)
+            
+            let duplicateItem = NSMenuItem(title: "Дублировать (Cmd+Shift+D)", action: #selector(menuActionDuplicate(_:)), keyEquivalent: "")
+            duplicateItem.target = self
+            duplicateItem.representedObject = item
+            menu.addItem(duplicateItem)
+            
+            menu.addItem(NSMenuItem.separator())
+            
+            let archiveItem = NSMenuItem(title: "Сжать в архив... (Alt+F5)", action: #selector(menuActionArchive(_:)), keyEquivalent: "")
+            archiveItem.target = self
+            archiveItem.representedObject = item
+            menu.addItem(archiveItem)
+            
+            let renameItem = NSMenuItem(title: "Переименовать (F2)", action: #selector(menuActionRename(_:)), keyEquivalent: "")
+            renameItem.target = self
+            renameItem.representedObject = item
+            menu.addItem(renameItem)
+            
+            let propItem = NSMenuItem(title: "Свойства (Cmd+I)", action: #selector(menuActionProperties(_:)), keyEquivalent: "")
+            propItem.target = self
+            propItem.representedObject = item
+            menu.addItem(propItem)
+            
+            menu.addItem(NSMenuItem.separator())
+            
+            let showHiddenItem = NSMenuItem(title: "Показывать скрытые файлы", action: #selector(menuActionToggleHidden(_:)), keyEquivalent: "")
+            showHiddenItem.target = self
+            let isHiddenActive = (side == .left) ? vm.leftShowHidden : vm.rightShowHidden
+            showHiddenItem.state = isHiddenActive ? .on : .off
+            menu.addItem(showHiddenItem)
+            
+            NSMenu.popUpContextMenu(menu, with: event, for: tv)
+        }
+        
+        private func showEmptyAreaContextMenu(with event: NSEvent, in tv: NSTableView) {
+            guard let vm = self.vm else { return }
+            let menu = NSMenu(title: "Empty Area Context Menu")
+            
+            let newFolderItem = NSMenuItem(title: "Новая папка", action: #selector(menuActionNewFolder(_:)), keyEquivalent: "")
+            newFolderItem.target = self
+            menu.addItem(newFolderItem)
+            
+            let pasteItem = NSMenuItem(title: "Вставить (Cmd+V)", action: #selector(menuActionPaste(_:)), keyEquivalent: "")
+            pasteItem.target = self
+            pasteItem.isEnabled = vm.canPaste
+            menu.addItem(pasteItem)
+            
+            menu.addItem(NSMenuItem.separator())
+            
+            let refreshItem = NSMenuItem(title: "Обновить (Cmd+R)", action: #selector(menuActionRefresh(_:)), keyEquivalent: "")
+            refreshItem.target = self
+            menu.addItem(refreshItem)
+            
+            let selectAllItem = NSMenuItem(title: "Выбрать всё (Cmd+A)", action: #selector(menuActionSelectAll(_:)), keyEquivalent: "")
+            selectAllItem.target = self
+            menu.addItem(selectAllItem)
+            
+            menu.addItem(NSMenuItem.separator())
+            
+            let showHiddenItem = NSMenuItem(title: "Показывать скрытые файлы", action: #selector(menuActionToggleHidden(_:)), keyEquivalent: "")
+            showHiddenItem.target = self
+            let isHiddenActive = (side == .left) ? vm.leftShowHidden : vm.rightShowHidden
+            showHiddenItem.state = isHiddenActive ? .on : .off
+            menu.addItem(showHiddenItem)
+            
+            NSMenu.popUpContextMenu(menu, with: event, for: tv)
+        }
+        
+        @objc private func menuActionNewFolderWithSelection(_ sender: NSMenuItem) {
+            guard let item = sender.representedObject as? FileItem, let vm = self.vm else { return }
+            vm.prepareNewFolderWithSelection(item: item, side: self.side)
+        }
+        
+        @objc private func menuActionOpenInNewTab(_ sender: NSMenuItem) {
+            guard let item = sender.representedObject as? FileItem, item.isDirectory else { return }
+            self.vm?.openFolderInNewTab(path: item.path, source: item.source, side: self.side)
+        }
+        
+        @objc private func menuActionNewFolder(_ sender: NSMenuItem) {
+            self.vm?.prepareNewFolder(side: self.side)
+        }
+        
+        @objc private func menuActionOpenWithApp(_ sender: NSMenuItem) {
+            guard let (item, appURL) = sender.representedObject as? (FileItem, URL) else { return }
+            self.vm?.openFile(item: item, withApplicationURL: appURL)
+        }
+        
+        @objc private func menuActionChooseCustomApp(_ sender: NSMenuItem) {
+            guard let item = sender.representedObject as? FileItem else { return }
+            self.vm?.chooseCustomApplicationAndOpen(item: item)
+        }
+        
+        @objc private func menuActionDelete(_ sender: NSMenuItem) {
+            guard let item = sender.representedObject as? FileItem, let vm = self.vm else { return }
+            vm.selectContextMenuItems(for: item, side: self.side)
+            vm.triggerDelete()
+        }
+        
+        @objc private func menuActionCopy(_ sender: NSMenuItem) {
+            guard let items = sender.representedObject as? [FileItem], let vm = self.vm else { return }
+            vm.copyToClipboard(items: items, side: self.side)
+        }
+        
+        @objc private func menuActionPaste(_ sender: NSMenuItem) {
+            self.vm?.pasteFromClipboard(targetSide: self.side)
+        }
+        
+        @objc private func menuActionDuplicate(_ sender: NSMenuItem) {
+            guard let item = sender.representedObject as? FileItem else { return }
+            self.vm?.duplicateItem(item: item, side: self.side)
+        }
+        
+        @objc private func menuActionArchive(_ sender: NSMenuItem) {
+            guard let item = sender.representedObject as? FileItem else { return }
+            self.vm?.triggerCreateArchive(item: item, side: self.side)
+        }
+        
+        @objc private func menuActionRename(_ sender: NSMenuItem) {
+            guard let item = sender.representedObject as? FileItem else { return }
+            self.vm?.triggerRename(item: item, side: self.side)
+        }
+        
+        @objc private func menuActionProperties(_ sender: NSMenuItem) {
+            guard let item = sender.representedObject as? FileItem else { return }
+            self.vm?.triggerProperties(item: item, side: self.side)
+        }
+        
+        @objc private func menuActionToggleHidden(_ sender: NSMenuItem) {
+            self.vm?.toggleShowHidden(side: self.side)
+        }
+        
+        @objc private func menuActionRefresh(_ sender: NSMenuItem) {
+            self.vm?.refreshPaneToActiveTab(side: self.side)
+        }
+        
+        @objc private func menuActionSelectAll(_ sender: NSMenuItem) {
+            self.vm?.selectAll(side: self.side)
+        }
     }
+}
+
+// MARK: - Контекстное меню: строка цветных кнопок тегов
+
+final class TagCircleButton: NSControl {
+    let tagDef: FileTag
+    let isTagSelected: Bool
+    let onClick: () -> Void
+    private var isHovered: Bool = false
+    
+    init(tag: FileTag, isSelected: Bool, onClick: @escaping () -> Void) {
+        self.tagDef = tag
+        self.isTagSelected = isSelected
+        self.onClick = onClick
+        super.init(frame: NSRect(x: 0, y: 0, width: 16, height: 16))
+        toolTip = tag.name
+        
+        let area = NSTrackingArea(rect: .zero, options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect], owner: self, userInfo: nil)
+        addTrackingArea(area)
+    }
+    
+    required init?(coder: NSCoder) { fatalError() }
+    
+    override var intrinsicContentSize: NSSize {
+        NSSize(width: 16, height: 16)
+    }
+    
+    override func mouseEntered(with event: NSEvent) {
+        isHovered = true
+        needsDisplay = true
+    }
+    
+    override func mouseExited(with event: NSEvent) {
+        isHovered = false
+        needsDisplay = true
+    }
+    
+    override func mouseUp(with event: NSEvent) {
+        let point = convert(event.locationInWindow, from: nil)
+        if bounds.contains(point) {
+            onClick()
+        }
+    }
+    
+    override func draw(_ dirtyRect: NSRect) {
+        super.draw(dirtyRect)
+        
+        // Диаметр круга 9pt — в точности как в левой боковой панели
+        let circleSize: CGFloat = 9
+        let rect = NSRect(
+            x: (bounds.width - circleSize) / 2,
+            y: (bounds.height - circleSize) / 2,
+            width: circleSize,
+            height: circleSize
+        )
+        let path = NSBezierPath(ovalIn: rect)
+        tagDef.nsColor.setFill()
+        path.fill()
+        
+        if isTagSelected {
+            let ringRect = rect.insetBy(dx: -2.5, dy: -2.5)
+            let ringPath = NSBezierPath(ovalIn: ringRect)
+            ringPath.lineWidth = 1.2
+            tagDef.nsColor.setStroke()
+            ringPath.stroke()
+        } else if isHovered {
+            let ringRect = rect.insetBy(dx: -2, dy: -2)
+            let ringPath = NSBezierPath(ovalIn: ringRect)
+            ringPath.lineWidth = 1
+            NSColor.secondaryLabelColor.withAlphaComponent(0.6).setStroke()
+            ringPath.stroke()
+        }
+    }
+}
+
+final class TagRowMenuView: NSView {
+    private let tags = FileTag.allTags
+    private var onSelectTag: ((String) -> Void)?
+    private var itemTags: Set<String> = []
+    
+    init(currentTags: [String], onSelectTag: @escaping (String) -> Void) {
+        self.itemTags = Set(currentTags.map { $0.lowercased() })
+        self.onSelectTag = onSelectTag
+        super.init(frame: NSRect(x: 0, y: 0, width: 190, height: 26))
+        
+        let stack = NSStackView()
+        stack.orientation = .horizontal
+        stack.alignment = .centerY
+        stack.spacing = 10
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(stack)
+        
+        NSLayoutConstraint.activate([
+            stack.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 14),
+            stack.centerYAnchor.constraint(equalTo: centerYAnchor),
+            stack.heightAnchor.constraint(equalToConstant: 20)
+        ])
+        
+        for tag in tags {
+            let isSelected = itemTags.contains(tag.id.lowercased()) || (tag.id == "Green" && itemTags.contains("greem"))
+            let btn = TagCircleButton(tag: tag, isSelected: isSelected) { [weak self] in
+                self?.enclosingMenuItem?.menu?.cancelTracking()
+                self?.onSelectTag?(tag.id)
+            }
+            stack.addArrangedSubview(btn)
+        }
+    }
+    
+    required init?(coder: NSCoder) { fatalError() }
 }
 
 public struct PaneTableDropDelegate: DropDelegate {
@@ -2270,7 +3318,6 @@ public struct PaneTableDropDelegate: DropDelegate {
                     Self.springLoadTimer = work
                     DispatchQueue.main.asyncAfter(deadline: .now() + 0.8, execute: work)
                 }
-                return
             } else {
                 // Наведение между файлами (или на обычный файл) -> синяя линия между файлами
                 Self.springLoadTimer?.cancel()
@@ -2281,7 +3328,6 @@ public struct PaneTableDropDelegate: DropDelegate {
                 vm.dragHoverSide = side
                 vm.dragHoverFolderId = nil
                 vm.dragInsertionIndex = insertRow
-                return
             }
         } else {
             // Пустая область ниже строк
@@ -2293,6 +3339,15 @@ public struct PaneTableDropDelegate: DropDelegate {
             vm.dragHoverSide = side
             vm.dragHoverFolderId = nil
             vm.dragInsertionIndex = insertRow
+        }
+        
+        // Гарантируем немедленную перерисовку всех строк AppKit NSTableView,
+        // чтобы снять подсветку с ранее подсвеченной папки и нарисовать только на текущей
+        if let tv = tv {
+            tv.enumerateAvailableRowViews { rowView, _ in
+                rowView.needsDisplay = true
+            }
+            tv.needsDisplay = true
         }
     }
 }
@@ -2329,34 +3384,232 @@ public struct TabReorderDropDelegate: DropDelegate {
     }
 }
 
+// MARK: - Кнопка закрепления / открепления вкладки
+public struct TabPinButton: View {
+    public let isPinned: Bool
+    public let action: () -> Void
+    @State private var isHovered: Bool = false
+    
+    public init(isPinned: Bool, action: @escaping () -> Void) {
+        self.isPinned = isPinned
+        self.action = action
+    }
+    
+    public var body: some View {
+        Button(action: action) {
+            Image(systemName: isPinned ? "pin.fill" : "pin")
+                .font(.system(size: 8.5))
+                .foregroundColor(
+                    isHovered
+                        ? .primary
+                        : (isPinned ? Color.secondary.opacity(0.85) : Color.secondary.opacity(0.65))
+                )
+                .frame(width: 14, height: 14)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .onHover { hovering in
+            isHovered = hovering
+        }
+        .help(isPinned ? "Открепить вкладку" : "Закрепить вкладку")
+    }
+}
+
+// MARK: - Современные минималистичные векторные кнопки дисков/источников
+
+// MARK: - Современные минималистичные векторные кнопки дисков/источников (Вариант 3: Подчеркивание)
+
+private let toolbarMacSvgString = """
+<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="black" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+  <rect x="4" y="5" width="16" height="11" rx="1.8"/>
+  <path d="M2 19h20"/>
+</svg>
+"""
+
+private let toolbarPhoneSvgString = """
+<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="black" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+    <rect x="5" y="3.2" width="14" height="17.6" rx="2" ry="2"></rect>
+    <circle cx="12" cy="17.2" r="1.3" fill="black" stroke="none"></circle>
+</svg>
+"""
+
+private func loadToolbarDriveIcon(named name: String) -> NSImage? {
+    if let bundlePath = Bundle.main.path(forResource: name, ofType: "svg"),
+       let img = NSImage(contentsOfFile: bundlePath) {
+        img.isTemplate = true
+        return img
+    }
+    if let bundlePath = Bundle.main.path(forResource: name, ofType: "png"),
+       let img = NSImage(contentsOfFile: bundlePath) {
+        img.isTemplate = true
+        return img
+    }
+    if let devImg = NSImage(contentsOfFile: "/Users/restart/Downloads/MacDroidCommander_Gemini/MacHost/Resources/\(name).svg") {
+        devImg.isTemplate = true
+        return devImg
+    }
+    if let devImg = NSImage(contentsOfFile: "/Users/restart/Downloads/MacDroidCommander_Gemini/MacHost/Resources/\(name).png") {
+        devImg.isTemplate = true
+        return devImg
+    }
+    let fallbackSvg = (name == "toolbar_mac") ? toolbarMacSvgString : toolbarPhoneSvgString
+    if let data = fallbackSvg.data(using: .utf8), let img = NSImage(data: data) {
+        img.isTemplate = true
+        return img
+    }
+    return nil
+}
+
+public struct MacToolbarIconView: View {
+    public var size: CGFloat = 20
+    
+    public init(size: CGFloat = 20) {
+        self.size = size
+    }
+    
+    public var body: some View {
+        if let img = loadToolbarDriveIcon(named: "toolbar_mac") {
+            Image(nsImage: img)
+                .renderingMode(.template)
+                .resizable()
+                .scaledToFit()
+                .frame(width: size, height: size)
+        } else {
+            Image(systemName: "laptopcomputer")
+                .font(.system(size: size * 0.85, weight: .regular))
+        }
+    }
+}
+
+public struct PhoneToolbarIconView: View {
+    public var size: CGFloat = 18.6
+    
+    public init(size: CGFloat = 18.6) {
+        self.size = size
+    }
+    
+    public var body: some View {
+        if let img = loadToolbarDriveIcon(named: "toolbar_phone") {
+            Image(nsImage: img)
+                .renderingMode(.template)
+                .resizable()
+                .scaledToFit()
+                .frame(width: size, height: size)
+        } else {
+            Image(systemName: "iphone")
+                .font(.system(size: size * 0.85, weight: .regular))
+        }
+    }
+}
+
+
+private let inactiveUnderlineColor = Color(nsColor: NSColor(name: nil, dynamicProvider: { appearance in
+    let isDark = appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+    return isDark
+        ? NSColor.white.withAlphaComponent(0.55 * 1.20) // 0.66 alpha white = на 20% светлее в тёмной теме
+        : NSColor.black.withAlphaComponent(0.50 * 0.80) // 0.40 alpha black = на 20% светлее в светлой теме
+}))
+
+/// Вариант 3: Кнопка источника с подчеркиванием снизу
+public struct DriveTabToolbarButton<Content: View>: View {
+    public let isActive: Bool
+    public let tooltip: String
+    public let action: () -> Void
+    public let content: () -> Content
+    
+    @State private var isHovered: Bool = false
+    
+    public init(
+        isActive: Bool,
+        tooltip: String,
+        action: @escaping () -> Void,
+        @ViewBuilder content: @escaping () -> Content
+    ) {
+        self.isActive = isActive
+        self.tooltip = tooltip
+        self.action = action
+        self.content = content
+    }
+    
+    private var iconColor: Color {
+        isActive
+            ? Color.primary
+            : (isHovered ? Color.primary.opacity(0.85) : Color.secondary)
+    }
+    
+    private var underlineColor: Color {
+        if isActive {
+            return Color.primary
+        } else if isHovered {
+            return Color.primary.opacity(0.68)
+        } else {
+            return inactiveUnderlineColor
+        }
+    }
+    
+    public var body: some View {
+        Button(action: action) {
+            VStack(spacing: 1.31) {
+                content()
+                    .frame(width: 20, height: 20)
+                
+                // Подчеркивание снизу, чуть шире иконки (22px).
+                // Под активной кнопкой — цвет контура иконки (primary).
+                // Под неактивной кнопкой — на 20% светлее.
+                RoundedRectangle(cornerRadius: 1)
+                    .fill(underlineColor)
+                    .frame(width: 22, height: 2)
+            }
+            .frame(width: 26, height: 27)
+            .background(Color.clear)
+            .foregroundColor(iconColor)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .onHover { hovering in
+            withAnimation(.easeInOut(duration: 0.2)) {
+                isHovered = hovering
+            }
+        }
+        .help(tooltip)
+    }
+}
+
 /// Индикатор состояния подключения телефона (Серый = отключен, Мигающий оранжевый = подключение, Салатовый = подключен)
 public struct PhoneConnectionIndicatorView: View {
     public let isConnected: Bool
     public let isConnecting: Bool
+    public let size: CGFloat
     
-    public init(isConnected: Bool, isConnecting: Bool) {
+    public init(isConnected: Bool, isConnecting: Bool, size: CGFloat = 7) {
         self.isConnected = isConnected
         self.isConnecting = isConnecting
+        self.size = size
     }
     
     public var body: some View {
         if isConnecting {
-            PulsingIndicatorCircle()
+            PulsingIndicatorCircle(size: size)
         } else {
             Circle()
                 .fill(isConnected ? Color(red: 0.35, green: 0.88, blue: 0.35) : Color(nsColor: .systemGray).opacity(0.5))
-                .frame(width: 7, height: 7)
+                .frame(width: size, height: size)
         }
     }
 }
 
 private struct PulsingIndicatorCircle: View {
+    let size: CGFloat
     @State private var isDimmed: Bool = false
+    
+    init(size: CGFloat = 7) {
+        self.size = size
+    }
     
     var body: some View {
         Circle()
             .fill(Color.orange)
-            .frame(width: 7, height: 7)
+            .frame(width: size, height: size)
             .opacity(isDimmed ? 0.2 : 1.0)
             .onAppear {
                 withAnimation(.easeInOut(duration: 0.5).repeatForever(autoreverses: true)) {
@@ -2652,3 +3905,34 @@ public struct TrackpadSwipeRefreshView: NSViewRepresentable {
         }
     }
 }
+
+// MARK: - Кнопка зеркального отражения панелей в подвале
+
+private struct PaneMirrorButton: View {
+    let arrow: String
+    let tooltip: String
+    let action: () -> Void
+    @State private var isHovered: Bool = false
+    
+    var body: some View {
+        Button(action: action) {
+            Text(arrow)
+                .font(.system(size: 14, weight: .regular))
+                .foregroundColor(isHovered ? .primary : Color(nsColor: .secondaryLabelColor))
+                .frame(width: 22, height: 18)
+                .background(
+                    RoundedRectangle(cornerRadius: 4, style: .continuous)
+                        .fill(isHovered ? Color(nsColor: .separatorColor).opacity(0.35) : Color.clear)
+                )
+                .contentShape(RoundedRectangle(cornerRadius: 4, style: .continuous))
+        }
+        .buttonStyle(.plain)
+        .onHover { hovering in
+            withAnimation(.easeInOut(duration: 0.12)) {
+                isHovered = hovering
+            }
+        }
+        .help(tooltip)
+    }
+}
+

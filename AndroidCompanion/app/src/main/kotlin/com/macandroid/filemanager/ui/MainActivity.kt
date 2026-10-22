@@ -2,6 +2,7 @@ package com.macandroid.filemanager.ui
 
 import android.app.Activity
 import android.app.ActivityManager
+import android.app.AlertDialog
 import android.content.ComponentName
 import android.content.Intent
 import android.content.pm.PackageManager
@@ -37,6 +38,9 @@ class MainActivity : Activity() {
 
     // Экземпляр EmbeddedServer для проверки статуса сопряжения и сброса ключа
     private val embeddedServer by lazy { EmbeddedServer(applicationContext) }
+
+    // Карточка предупреждения об отсутствии доступа к файлам
+    private lateinit var cardStorageWarning: LinearLayout
 
     // Текстовые поля статуса
     private lateinit var tvServerStatus: TextView
@@ -79,9 +83,16 @@ class MainActivity : Activity() {
     override fun onResume() {
         super.onResume()
 
-        // При возврате на экран (например, после выдачи разрешений) проверяем запуск службы и обновляем данные
-        if (hasStoragePermission() && !isServerRunning()) {
-            startDaemonService()
+        // При возврате на экран проверяем запуск службы и обновляем данные
+        if (hasStoragePermission()) {
+            if (!isServerRunning()) {
+                startDaemonService()
+            }
+            // Если доступ к файлам уже есть, проверяем уведомления для Android 13+
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+                checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+                requestPermissions(arrayOf(android.Manifest.permission.POST_NOTIFICATIONS), 1001)
+            }
         }
 
         refreshDisplay()
@@ -110,9 +121,43 @@ class MainActivity : Activity() {
             text = "Фоновый SFTP-сервер и управление сопряжением"
             textSize = 13f
             setTextColor(0xFF888888.toInt())
-            setPadding(0, dp(4), 0, dp(20))
+            setPadding(0, dp(4), 0, dp(16))
         }
         rootLayout.addView(tvSubheader)
+
+        // Верхний баннер-предупреждение, если нет доступа к файлам
+        cardStorageWarning = createCard().apply {
+            background = GradientDrawable().apply {
+                setColor(0xFF381414.toInt()) // Темно-красный акцент
+                cornerRadius = dp(12).toFloat()
+                setStroke(dp(2), 0xFFEF5350.toInt())
+            }
+            visibility = if (hasStoragePermission()) View.GONE else View.VISIBLE
+        }
+        val tvWarningTitle = TextView(this).apply {
+            text = "⚠️ ТРЕБУЕТСЯ ДОСТУП К ФАЙЛАМ"
+            textSize = 15f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(0xFFFF8A80.toInt())
+            setPadding(0, 0, 0, dp(4))
+        }
+        cardStorageWarning.addView(tvWarningTitle)
+
+        val tvWarningDesc = TextView(this).apply {
+            text = "Без разрешения «Доступ ко всем файлам» MacDroid Commander на Mac не видит папки и не может передавать файлы."
+            textSize = 13f
+            setTextColor(0xFFEEEEEE.toInt())
+            setPadding(0, 0, 0, dp(10))
+        }
+        cardStorageWarning.addView(tvWarningDesc)
+
+        val btnGrantStorageTop = createButton("Разрешить доступ ко всем файлам", 0xFFD32F2F.toInt()).apply {
+            setOnClickListener {
+                requestStoragePermission()
+            }
+        }
+        cardStorageWarning.addView(btnGrantStorageTop)
+        rootLayout.addView(cardStorageWarning)
 
         // Карточка 1: Статус сервера и сеть
         val cardServer = createCard()
@@ -295,16 +340,18 @@ class MainActivity : Activity() {
     }
 
     /**
-     * Первичная проверка прав доступа: MANAGE_EXTERNAL_STORAGE и POST_NOTIFICATIONS (Android 13+).
+     * Первичная проверка прав доступа: сначала MANAGE_EXTERNAL_STORAGE, затем уведомления и батарея.
      */
-    private fun checkInitialPermissions() {
+     private fun checkInitialPermissions() {
         if (!hasStoragePermission()) {
-            requestStoragePermission()
+            showStoragePermissionDialog()
+            return
         }
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             if (checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
                 requestPermissions(arrayOf(android.Manifest.permission.POST_NOTIFICATIONS), 1001)
+                return
             }
         }
 
@@ -312,6 +359,20 @@ class MainActivity : Activity() {
         if (!isBatteryOptimizationDisabled()) {
             openBatterySettings()
         }
+    }
+
+    /**
+     * Диалог с понятным объяснением необходимости доступа ко всем файлам
+     */
+    private fun showStoragePermissionDialog() {
+        AlertDialog.Builder(this)
+            .setTitle("Требуется доступ к файлам")
+            .setMessage("Для работы MacDroid Commander приложению необходим доступ ко всем файлам смартфона.\n\nНажмите «Разрешить», затем включите тумблер в открывшемся системном окне настроек.")
+            .setPositiveButton("Разрешить") { _, _ ->
+                requestStoragePermission()
+            }
+            .setNegativeButton("Позже", null)
+            .show()
     }
 
     /**
@@ -396,6 +457,7 @@ class MainActivity : Activity() {
 
         // 5. Разрешение на доступ ко всем файлам и метрики памяти
         val storageGranted = hasStoragePermission()
+        cardStorageWarning.visibility = if (storageGranted) View.GONE else View.VISIBLE
         if (storageGranted) {
             tvStorageStatus.text = "Разрешение All Files Access: Предоставлено ✓"
             tvStorageStatus.setTextColor(0xFF81C784.toInt())
@@ -532,18 +594,18 @@ class MainActivity : Activity() {
     }
 
     /**
-     * Проверка наличия разрешения MANAGE_EXTERNAL_STORAGE (Android 11+).
+     * Проверка наличия разрешения MANAGE_EXTERNAL_STORAGE (Android 11+) или READ_EXTERNAL_STORAGE (до Android 11).
      */
     private fun hasStoragePermission(): Boolean {
         return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
             Environment.isExternalStorageManager()
         } else {
-            true
+            checkSelfPermission(android.Manifest.permission.READ_EXTERNAL_STORAGE) == PackageManager.PERMISSION_GRANTED
         }
     }
 
     /**
-     * Запрос системного разрешения MANAGE_EXTERNAL_STORAGE.
+     * Запрос системного разрешения MANAGE_EXTERNAL_STORAGE или стандартных разрешений памяти.
      */
     private fun requestStoragePermission() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
@@ -553,9 +615,40 @@ class MainActivity : Activity() {
                 }
                 startActivity(intent)
             } catch (e: Exception) {
-                val fallbackIntent = Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION)
-                startActivity(fallbackIntent)
+                try {
+                    val fallbackIntent = Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION)
+                    startActivity(fallbackIntent)
+                } catch (e2: Exception) {
+                    Toast.makeText(
+                        this,
+                        "Включите «Доступ ко всем файлам» в Настройки -> Приложения -> Особые права",
+                        Toast.LENGTH_LONG
+                    ).show()
+                }
             }
+        } else {
+            requestPermissions(
+                arrayOf(
+                    android.Manifest.permission.READ_EXTERNAL_STORAGE,
+                    android.Manifest.permission.WRITE_EXTERNAL_STORAGE
+                ),
+                1002
+            )
+        }
+    }
+
+    override fun onRequestPermissionsResult(
+        requestCode: Int,
+        permissions: Array<out String>,
+        grantResults: IntArray
+    ) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == 1002) {
+            if (hasStoragePermission()) {
+                startDaemonService()
+                Toast.makeText(this, "✓ Доступ к файлам предоставлен", Toast.LENGTH_SHORT).show()
+            }
+            refreshDisplay()
         }
     }
 

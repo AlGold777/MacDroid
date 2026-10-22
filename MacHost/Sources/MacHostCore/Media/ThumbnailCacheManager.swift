@@ -2,6 +2,7 @@ import Foundation
 import AppKit
 import ImageIO
 import UniformTypeIdentifiers
+import CoreImage
 #if canImport(QuickLookThumbnailing)
 import QuickLookThumbnailing
 #endif
@@ -38,12 +39,27 @@ public final class ThumbnailCacheManager: @unchecked Sendable {
     }
     
     public static let throttleLiftedNotification = Notification.Name("ThumbnailCacheManager.throttleLifted")
+    public static let cacheClearedNotification = Notification.Name("ThumbnailCacheManager.cacheCleared")
     
     private init() {
         let paths = fileManager.urls(for: .cachesDirectory, in: .userDomainMask)
         cacheDir = paths[0].appendingPathComponent("com.macandroid.filemanager.thumbnails")
         try? fileManager.createDirectory(at: cacheDir, withIntermediateDirectories: true)
         memoryCache.totalCostLimit = 50 * 1024 * 1024 // 50 MB RAM limit
+    }
+    
+    /// Сброс кэша эскизов: полная очистка памяти и дисковой директории
+    public func clearCache() {
+        memoryCache.removeAllObjects()
+        if let files = try? fileManager.contentsOfDirectory(at: cacheDir, includingPropertiesForKeys: nil) {
+            for file in files {
+                try? fileManager.removeItem(at: file)
+            }
+        }
+        SSHTransportLog.write("THUMB_CACHE_CLEARED")
+        DispatchQueue.main.async {
+            NotificationCenter.default.post(name: Self.cacheClearedNotification, object: nil)
+        }
     }
     
     /// Ключ эскиза: путь + размер + mtime. Изменённый на телефоне файл с тем же путём
@@ -55,7 +71,14 @@ public final class ThumbnailCacheManager: @unchecked Sendable {
     /// Мгновенная проверка только RAM-кэша (безопасно вызывать из главного потока при прокрутке)
     public func memoryThumbnail(for item: FileItem) -> NSImage? {
         let nfcKey = Self.thumbnailKey(for: item).precomposedStringWithCanonicalMapping
-        return memoryCache.object(forKey: nfcKey as NSString)
+        if let cached = memoryCache.object(forKey: nfcKey as NSString) {
+            if Self.isCorruptedGrayFrame(cached) {
+                memoryCache.removeObject(forKey: nfcKey as NSString)
+                return nil
+            }
+            return cached
+        }
+        return nil
     }
     
     public func getThumbnail(for item: FileItem) -> NSImage? {
@@ -69,10 +92,18 @@ public final class ThumbnailCacheManager: @unchecked Sendable {
     public func getThumbnail(for key: String) -> NSImage? {
         let nfcKey = key.precomposedStringWithCanonicalMapping
         if let cached = memoryCache.object(forKey: nfcKey as NSString) {
-            return cached
+            if Self.isCorruptedGrayFrame(cached) {
+                memoryCache.removeObject(forKey: nfcKey as NSString)
+            } else {
+                return cached
+            }
         }
         let diskURL = cacheDir.appendingPathComponent(sanitizedKey(nfcKey))
         if let data = try? Data(contentsOf: diskURL), let img = NSImage(data: data) {
+            if Self.isCorruptedGrayFrame(img) {
+                try? fileManager.removeItem(at: diskURL)
+                return nil
+            }
             memoryCache.setObject(img, forKey: nfcKey as NSString, cost: Self.memoryCost(of: img))
             return img
         }
@@ -80,6 +111,10 @@ public final class ThumbnailCacheManager: @unchecked Sendable {
     }
     
     public func storeThumbnail(image: NSImage, for key: String) {
+        // Защита от записи поврежденных/серых кадров в кэш
+        if Self.isCorruptedGrayFrame(image) {
+            return
+        }
         let nfcKey = key.precomposedStringWithCanonicalMapping
         memoryCache.setObject(image, forKey: nfcKey as NSString, cost: Self.memoryCost(of: image))
         
@@ -114,12 +149,103 @@ public final class ThumbnailCacheManager: @unchecked Sendable {
         return data as Data
     }
     
+    /// Проверка кадра на битый/недодекодированный серый артефакт (truncated JPEG filler).
+    /// При обрыве JPEG Apple ImageIO / libjpeg заполняет оставшуюся часть MCU-блоков
+    /// плоским серым цветом (Y=128, Cb=128, Cr=128 -> sRGB ~128,128,128).
+    /// Если нижняя треть кадра залита таким серым цветом, кадр признается поврежденным.
+    public static func isCorruptedGrayFrame(_ image: NSImage) -> Bool {
+        guard let cg = image.cgImage(forProposedRect: nil, context: nil, hints: nil) else {
+            return false
+        }
+        return isCorruptedGrayFrame(cgImage: cg)
+    }
+    
+    public static func isCorruptedGrayFrame(cgImage: CGImage) -> Bool {
+        let width = cgImage.width
+        let height = cgImage.height
+        guard width >= 8, height >= 8 else { return false }
+        
+        let checkW = 32
+        let checkH = 32
+        var rawData = [UInt8](repeating: 0, count: checkW * checkH * 4)
+        let colorSpace = CGColorSpaceCreateDeviceRGB()
+        guard let ctx = CGContext(
+            data: &rawData,
+            width: checkW,
+            height: checkH,
+            bitsPerComponent: 8,
+            bytesPerRow: checkW * 4,
+            space: colorSpace,
+            bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue
+        ) else { return false }
+        
+        ctx.draw(cgImage, in: CGRect(x: 0, y: 0, width: checkW, height: checkH))
+        
+        // В CGContext (0,0) - нижний левый угол.
+        // Нижняя треть - строки 0..<10 (из 32).
+        let bottomRows = 10
+        let totalBottomPixels = checkW * bottomRows
+        var bottomGray = 0
+        var bottomUnique = Set<UInt32>()
+        
+        for y in 0..<bottomRows {
+            let rowOffset = y * checkW * 4
+            for x in 0..<checkW {
+                let p = rowOffset + x * 4
+                let r = Int(rawData[p])
+                let g = Int(rawData[p + 1])
+                let b = Int(rawData[p + 2])
+                
+                // Truncated JPEG gray padding: sRGB (126...130)
+                let isMidGray = abs(r - 128) <= 6 && abs(g - 128) <= 6 && abs(b - 128) <= 6 && abs(r - g) <= 3 && abs(g - b) <= 3
+                if isMidGray {
+                    bottomGray += 1
+                }
+                let colorKey = (UInt32(r) << 16) | (UInt32(g) << 8) | UInt32(b)
+                bottomUnique.insert(colorKey)
+            }
+        }
+        
+        // Верхняя треть (строки 22..<32)
+        let topRowsStart = checkH - bottomRows
+        var topGray = 0
+        var topUnique = Set<UInt32>()
+        
+        for y in topRowsStart..<checkH {
+            let rowOffset = y * checkW * 4
+            for x in 0..<checkW {
+                let p = rowOffset + x * 4
+                let r = Int(rawData[p])
+                let g = Int(rawData[p + 1])
+                let b = Int(rawData[p + 2])
+                
+                let isMidGray = abs(r - 128) <= 6 && abs(g - 128) <= 6 && abs(b - 128) <= 6 && abs(r - g) <= 3 && abs(g - b) <= 3
+                if isMidGray {
+                    topGray += 1
+                }
+                let colorKey = (UInt32(r) << 16) | (UInt32(g) << 8) | UInt32(b)
+                topUnique.insert(colorKey)
+            }
+        }
+        
+        let bottomGrayRatio = Double(bottomGray) / Double(totalBottomPixels)
+        let topGrayRatio = Double(topGray) / Double(totalBottomPixels)
+        
+        // Признак truncated JPEG: нижняя треть залита серым заполнителем libjpeg (>= 75%),
+        // в то время как верхняя часть содержит полезный кадр
+        if bottomGrayRatio >= 0.75 && (topGrayRatio < 0.60 || (topUnique.count >= 16 && bottomUnique.count <= 6)) {
+            return true
+        }
+        
+        return false
+    }
+    
     // MARK: - Modern 2026 Asynchronous Thumbnail Pipeline
     
     private let remoteQueue = RemoteThumbnailQueue()
     
     private static let supportedImageExtensions: Set<String> = [
-        "jpg", "jpeg", "png", "heic", "heif", "webp", "gif", "bmp", "tiff", "tif", "ico", "avif"
+        "jpg", "jpeg", "png", "heic", "heif", "webp", "gif", "bmp", "tiff", "tif", "ico", "avif", "dng"
     ]
     
     /// Асинхронно получает или генерирует миниатюру для элемента файла.
@@ -134,21 +260,28 @@ public final class ThumbnailCacheManager: @unchecked Sendable {
         let ext = URL(fileURLWithPath: item.name).pathExtension.lowercased()
         let isImage = Self.supportedImageExtensions.contains(ext)
         let maxPixel = max(targetSize.width, targetSize.height)
+        let startUptime = ProcessInfo.processInfo.systemUptime
         
         // 1. Проверяем кэш миниатюр (память и диск) — вне главного потока
         if let cached = getThumbnail(for: item) {
+            SSHTransportLog.write("THUMB_CACHE_HIT path=\(item.name)")
             return cached
         }
         
         // 2. Локальный файл на Mac
         if item.source == .localMac {
             let url = URL(fileURLWithPath: item.path)
-            guard FileManager.default.fileExists(atPath: item.path) else { return nil }
+            guard FileManager.default.fileExists(atPath: item.path) else {
+                SSHTransportLog.write("THUMB_SKIP reason=noLocalFile path=\(item.name)")
+                return nil
+            }
             
             // Быстрая генерация через ImageIO / CGImageSource
             if isImage, let downsampled = Self.createThumbnail(from: url, maxPixelSize: maxPixel) {
-                storeThumbnail(image: downsampled, for: item)
-                return downsampled
+                if !Self.isCorruptedGrayFrame(downsampled) {
+                    storeThumbnail(image: downsampled, for: item)
+                    return downsampled
+                }
             }
             
             // Для документов/PDF/видео: QuickLookThumbnailing
@@ -161,8 +294,10 @@ public final class ThumbnailCacheManager: @unchecked Sendable {
             )
             if let rep = try? await QLThumbnailGenerator.shared.generateBestRepresentation(for: request) {
                 let img = rep.nsImage
-                storeThumbnail(image: img, for: item)
-                return img
+                if !Self.isCorruptedGrayFrame(img) {
+                    storeThumbnail(image: img, for: item)
+                    return img
+                }
             }
             #endif
             
@@ -175,54 +310,105 @@ public final class ThumbnailCacheManager: @unchecked Sendable {
             return nil
         }
         
+        SSHTransportLog.write("THUMB_START path=\(item.name) size=\(item.size)")
+        
         // Если уже есть в локальном QuickLook кэше
         if let cachedLocalURL = QuickLookCacheManager.shared.isCached(for: item) {
-            if let img = Self.createThumbnail(from: cachedLocalURL, maxPixelSize: maxPixel) {
+            if let img = Self.createThumbnail(from: cachedLocalURL, maxPixelSize: maxPixel),
+               !Self.isCorruptedGrayFrame(img) {
                 storeThumbnail(image: img, for: item)
+                let elapsedMs = Int((ProcessInfo.processInfo.systemUptime - startUptime) * 1000)
+                SSHTransportLog.write("THUMB_DECODE ok w×h=\(Int(img.size.width))x\(Int(img.size.height)) path=\(item.name)")
+                SSHTransportLog.write("THUMB_DONE path=\(item.name) ms=\(elapsedMs)")
                 return img
             }
         }
         
         // Для файлов размером больше 60 МБ фоновую подгрузку эскиза пропускаем
-        guard item.size <= 60 * 1024 * 1024, let transport = transport else { return nil }
+        guard item.size <= 60 * 1024 * 1024 else {
+            SSHTransportLog.write("THUMB_SKIP reason=size path=\(item.name)")
+            return nil
+        }
+        guard let transport = transport else {
+            SSHTransportLog.write("THUMB_SKIP reason=noTransport path=\(item.name)")
+            return nil
+        }
         
         // QoS Transfer Arbiter: если активен трансфер файлов, приостанавливаем удалённые превью
-        guard !isThrottledDueToTransfer else { return nil }
+        guard !isThrottledDueToTransfer else {
+            SSHTransportLog.write("THUMB_SKIP reason=throttle path=\(item.name)")
+            return nil
+        }
         
         // Ограничиваем параллельные запросы к телефону. Очередь LIFO: первыми обслуживаются
         // только что показанные ячейки; ячейки, ушедшие с экрана (отменённые задачи), не ждут.
-        guard await remoteQueue.acquire() else { return nil }
+        guard await remoteQueue.acquire() else {
+            SSHTransportLog.write("THUMB_SKIP reason=cancelled path=\(item.name)")
+            return nil
+        }
         defer { Task { await remoteQueue.release() } }
-        guard !Task.isCancelled else { return nil }
+        guard !Task.isCancelled else {
+            SSHTransportLog.write("THUMB_SKIP reason=cancelled path=\(item.name)")
+            return nil
+        }
         
         // Оптимизация: сначала читаем первые 128 КБ. Фото JPEG со смартфонов содержат
         // готовый EXIF-эскиз в начале файла — берём именно его, не декодируя обрезанный кадр.
         let prefixLen = UInt32(min(item.size, 128 * 1024))
-        if prefixLen > 1024,
-           let prefixData = try? await transport.readChunk(remotePath: item.path, offset: 0, length: prefixLen) {
-            let isWholeFile = UInt64(prefixData.count) >= item.size
-            let fastImg = isWholeFile
-                ? Self.createThumbnail(from: prefixData, maxPixelSize: maxPixel)
-                : Self.embeddedThumbnail(from: prefixData, maxPixelSize: maxPixel)
-            if let fastImg = fastImg {
-                storeThumbnail(image: fastImg, for: item)
-                return fastImg
+        if prefixLen > 1024 {
+            do {
+                let prefixData = try await transport.readChunk(remotePath: item.path, offset: 0, length: prefixLen)
+                let isWholeFile = UInt64(prefixData.count) >= item.size
+                let hasExif = Self.exifThumbnailJPEG(from: prefixData) != nil
+                SSHTransportLog.write("THUMB_PREFIX path=\(item.name) bytes=\(prefixData.count) exif=\(hasExif ? "yes" : "no") isWhole=\(isWholeFile)")
+                
+                let fastImg: NSImage?
+                if isWholeFile {
+                    fastImg = Self.createThumbnail(from: prefixData, maxPixelSize: maxPixel)
+                } else {
+                    fastImg = Self.embeddedThumbnail(from: prefixData, maxPixelSize: maxPixel)
+                }
+                
+                if let fastImg = fastImg, !Self.isCorruptedGrayFrame(fastImg) {
+                    storeThumbnail(image: fastImg, for: item)
+                    let elapsedMs = Int((ProcessInfo.processInfo.systemUptime - startUptime) * 1000)
+                    SSHTransportLog.write("THUMB_DECODE ok w×h=\(Int(fastImg.size.width))x\(Int(fastImg.size.height)) path=\(item.name)")
+                    SSHTransportLog.write("THUMB_DONE path=\(item.name) ms=\(elapsedMs)")
+                    return fastImg
+                }
+            } catch {
+                SSHTransportLog.write("THUMB_PREFIX_ERR path=\(item.name) err=\(error.localizedDescription)")
             }
         }
         
-        guard !Task.isCancelled else { return nil }
+        guard !Task.isCancelled else {
+            SSHTransportLog.write("THUMB_SKIP reason=cancelled path=\(item.name)")
+            return nil
+        }
         
-        // Если префикса недостаточно (нет встроенного EXIF), скачиваем только если файл не огромный (до 15 МБ)
-        guard item.size <= 15 * 1024 * 1024 else { return nil }
+        // Если префикса недостаточно (HEIC, WebP, DNG, фото без встроенного EXIF),
+        // загружаем файл в фоне до 25 МБ
+        guard item.size <= 25 * 1024 * 1024 else {
+            SSHTransportLog.write("THUMB_SKIP reason=sizeAbove25MB path=\(item.name)")
+            return nil
+        }
         
+        SSHTransportLog.write("THUMB_FULL_DL_START path=\(item.name) size=\(item.size)")
         do {
             let localURL = try await QuickLookCacheManager.shared.fetchFile(item: item, transport: transport)
-            if let img = Self.createThumbnail(from: localURL, maxPixelSize: maxPixel) {
+            SSHTransportLog.write("THUMB_FULL_DL ok path=\(item.name)")
+            if let img = Self.createThumbnail(from: localURL, maxPixelSize: maxPixel),
+               !Self.isCorruptedGrayFrame(img) {
                 storeThumbnail(image: img, for: item)
+                let elapsedMs = Int((ProcessInfo.processInfo.systemUptime - startUptime) * 1000)
+                SSHTransportLog.write("THUMB_DECODE ok w×h=\(Int(img.size.width))x\(Int(img.size.height)) path=\(item.name)")
+                SSHTransportLog.write("THUMB_DONE path=\(item.name) ms=\(elapsedMs)")
                 return img
+            } else {
+                SSHTransportLog.write("THUMB_DECODE nil path=\(item.name)")
             }
         } catch {
-            // Ошибка загрузки эскиза с телефона - возвращаем nil (отобразится иконка типа)
+            SSHTransportLog.write("THUMB_FULL_DL err=\(error.localizedDescription) path=\(item.name)")
             return nil
         }
         
@@ -230,12 +416,10 @@ public final class ThumbnailCacheManager: @unchecked Sendable {
     }
     
     /// Встроенный EXIF-эскиз из неполных данных (префикса JPEG).
-    /// ImageIO при отсутствии встроенного эскиза молча декодирует сам (обрезанный) кадр —
-    /// получается картинка с серой нижней частью, которая навсегда осела бы в кэше.
-    /// Поэтому наличие эскиза сначала проверяется разбором EXIF (APP1 → IFD1), а сам
-    /// эскиз с учётом ориентации снимка отдаёт ImageIO.
+    /// ВАЖНО: Декодирование производится строго из выделенного thumbnail-JPEG байт-потока,
+    /// а не из усеченного основного кадра файла, что исключает появление серых полос/кадров.
     public static func embeddedThumbnail(from data: Data, maxPixelSize: CGFloat) -> NSImage? {
-        guard let thumbJPEG = exifThumbnailJPEG(from: data),
+        guard let (thumbJPEG, orientation) = exifThumbnailDataAndOrientation(from: data),
               let thumbSource = CGImageSourceCreateWithData(thumbJPEG as CFData, nil),
               let thumbProps = CGImageSourceCopyPropertiesAtIndex(thumbSource, 0, nil) as? [CFString: Any],
               let tw = thumbProps[kCGImagePropertyPixelWidth] as? Int,
@@ -243,26 +427,43 @@ public final class ThumbnailCacheManager: @unchecked Sendable {
             return nil
         }
         let thumbMax = max(tw, th)
-        // Слишком мелкий эскиз (меньше половины нужного размера) даст мыло — лучше скачать файл
-        guard CGFloat(thumbMax) * 2 >= min(maxPixelSize, 320) else { return nil }
+        // Принимаем эскиз если он хотя бы 80 px (быстрый эскиз для любого масштаба сетки)
+        guard thumbMax >= 80 else { return nil }
         
         let options: [CFString: Any] = [
             kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
             kCGImageSourceShouldCacheImmediately: true,
             kCGImageSourceThumbnailMaxPixelSize: maxPixelSize
         ]
-        guard let source = CGImageSourceCreateWithData(data as CFData, nil),
-              let cgImage = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary) else {
+        // Декодируем ИМЕННО из thumbSource (целостный thumbnail), а не из data
+        guard let cgImage = CGImageSourceCreateThumbnailAtIndex(thumbSource, 0, options as CFDictionary) else {
             return nil
         }
-        // Результат крупнее встроенного эскиза — значит ImageIO декодировал обрезанный кадр
-        guard max(cgImage.width, cgImage.height) <= thumbMax + 1 else { return nil }
-        return NSImage(cgImage: cgImage, size: NSSize(width: cgImage.width, height: cgImage.height))
+        
+        // Проверяем ориентацию: если thumbJPEG не имел встроенного тега ориентации,
+        // но ориентация была в IFD0 исходного файла (orientation 5..8 меняет местами ширину/высоту)
+        var finalCGImage = cgImage
+        let isSwapped = orientation >= 5 && orientation <= 8
+        let alreadySwapped = (isSwapped && finalCGImage.height > finalCGImage.width && tw >= th)
+        if orientation > 1 && !alreadySwapped {
+            let propOrientation = CGImagePropertyOrientation(rawValue: UInt32(orientation)) ?? .up
+            let ci = CIImage(cgImage: finalCGImage).oriented(propOrientation)
+            let ciContext = CIContext(options: nil)
+            if let oriented = ciContext.createCGImage(ci, from: ci.extent) {
+                finalCGImage = oriented
+            }
+        }
+        
+        let result = NSImage(cgImage: finalCGImage, size: NSSize(width: finalCGImage.width, height: finalCGImage.height))
+        if isCorruptedGrayFrame(result) {
+            return nil
+        }
+        return result
     }
     
-    /// Байты JPEG-эскиза из EXIF (IFD1: JPEGInterchangeFormat 0x0201 / Length 0x0202).
-    /// Nil, если данные — не JPEG, EXIF обрезан или эскиза нет.
-    public static func exifThumbnailJPEG(from data: Data) -> Data? {
+    /// Извлечение данных JPEG-эскиза и ориентации из структуры EXIF (APP1 -> IFD0 & IFD1).
+    public static func exifThumbnailDataAndOrientation(from data: Data) -> (data: Data, orientation: Int)? {
         let b = [UInt8](data)
         guard b.count > 12, b[0] == 0xFF, b[1] == 0xD8 else { return nil }
         
@@ -280,14 +481,19 @@ public final class ThumbnailCacheManager: @unchecked Sendable {
             if marker == 0xE1, segEnd - segStart >= 14,
                b[segStart] == 0x45, b[segStart + 1] == 0x78, b[segStart + 2] == 0x69, b[segStart + 3] == 0x66,
                b[segStart + 4] == 0, b[segStart + 5] == 0 { // "Exif\0\0"
-                return exifThumbnailBytes(in: b, tiffStart: segStart + 6, end: segEnd)
+                return exifThumbnailBytesAndOrientation(in: b, tiffStart: segStart + 6, end: segEnd)
             }
             pos = segEnd
         }
         return nil
     }
     
-    private static func exifThumbnailBytes(in b: [UInt8], tiffStart t: Int, end: Int) -> Data? {
+    /// Байты JPEG-эскиза из EXIF (IFD1: JPEGInterchangeFormat 0x0201 / Length 0x0202).
+    public static func exifThumbnailJPEG(from data: Data) -> Data? {
+        return exifThumbnailDataAndOrientation(from: data)?.data
+    }
+    
+    private static func exifThumbnailBytesAndOrientation(in b: [UInt8], tiffStart t: Int, end: Int) -> (data: Data, orientation: Int)? {
         guard end - t >= 8 else { return nil }
         let little: Bool
         if b[t] == 0x49 && b[t + 1] == 0x49 { little = true }
@@ -310,6 +516,17 @@ public final class ThumbnailCacheManager: @unchecked Sendable {
               let ifd1 = u32(t + ifd0 + 2 + count0 * 12), ifd1 > 0,
               let count1 = u16(t + ifd1), count1 > 0, count1 < 256 else { return nil }
         
+        var orientation = 1
+        for i in 0..<count0 {
+            let e = t + ifd0 + 2 + i * 12
+            guard let tag = u16(e) else { continue }
+            if tag == 0x0112 {
+                if let val = u16(e + 8), val >= 1 && val <= 8 {
+                    orientation = val
+                }
+            }
+        }
+        
         var jpegOffset: Int?
         var jpegLength: Int?
         for i in 0..<count1 {
@@ -322,7 +539,7 @@ public final class ThumbnailCacheManager: @unchecked Sendable {
         let lo = t + off
         let hi = lo + len
         guard lo >= t, hi <= end, b[lo] == 0xFF, b[lo + 1] == 0xD8 else { return nil }
-        return Data(b[lo..<hi])
+        return (Data(b[lo..<hi]), orientation)
     }
     
     public static func createThumbnail(from data: Data, maxPixelSize: CGFloat) -> NSImage? {

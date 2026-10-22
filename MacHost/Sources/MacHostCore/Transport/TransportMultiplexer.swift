@@ -138,30 +138,44 @@ public final class TransportMultiplexer: @unchecked Sendable {
         let (_, fileHandle) = try packetEngine.parseHandleResponse(data: openPayload)
         
         var resultData = Data()
+        resultData.reserveCapacity(Int(length))
         var readError: Error?
+        let maxChunk = UInt32(min(UInt64(64 * 1024), coordinator.serverLimits?.maxReadLen ?? UInt64(64 * 1024)))
         
-        let readReqId = channel.allocateRequestId()
-        let readPacket = packetEngine.createReadPacket(requestId: readReqId, handle: fileHandle, offset: offset, length: length)
-        do {
-            let (readRespType, readPayload) = try await channel.sendRequest(packet: readPacket, requestId: readReqId)
-            if readRespType == .data {
-                let (_, chunkData) = try packetEngine.parseDataResponse(data: readPayload)
-                resultData = chunkData
-            } else if readRespType == .status {
-                let (_, code, _) = try packetEngine.parseStatusResponse(data: readPayload)
-                if code != .eof {
+        while resultData.count < Int(length) {
+            if Task.isCancelled { break }
+            let cursor = offset + UInt64(resultData.count)
+            let remaining = UInt32(Int(length) - resultData.count)
+            let toRead = min(remaining, maxChunk)
+            let readReqId = channel.allocateRequestId()
+            let readPacket = packetEngine.createReadPacket(requestId: readReqId, handle: fileHandle, offset: cursor, length: toRead)
+            do {
+                let (readRespType, readPayload) = try await channel.sendRequest(packet: readPacket, requestId: readReqId, timeoutSeconds: 15)
+                if readRespType == .data {
+                    let (_, chunkData) = try packetEngine.parseDataResponse(data: readPayload)
+                    guard !chunkData.isEmpty else { break }
+                    resultData.append(chunkData)
+                } else if readRespType == .status {
+                    let (_, code, _) = try packetEngine.parseStatusResponse(data: readPayload)
+                    if code == .eof {
+                        break
+                    }
                     readError = NSError(domain: "TransportMultiplexer", code: Int(code.rawValue), userInfo: [NSLocalizedDescriptionKey: "SFTP read chunk error code \(code.rawValue)"])
+                    break
+                } else {
+                    break
                 }
+            } catch {
+                readError = error
+                break
             }
-        } catch {
-            readError = error
         }
         
         let closeReqId = channel.allocateRequestId()
         let closePacket = packetEngine.createClosePacket(requestId: closeReqId, handle: fileHandle)
         _ = try? await channel.sendRequest(packet: closePacket, requestId: closeReqId)
         
-        if let err = readError {
+        if let err = readError, resultData.isEmpty {
             throw err
         }
         return resultData

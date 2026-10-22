@@ -48,7 +48,7 @@ public struct TransferProgressModalView: View {
                 VStack(spacing: 12) {
                     Image(systemName: "checkmark.circle.fill")
                         .font(.system(size: 40))
-                        .foregroundColor(.green)
+                        .foregroundColor(.accentColor)
                     
                     Text("Готово!")
                         .font(.headline)
@@ -60,7 +60,7 @@ public struct TransferProgressModalView: View {
                     
                     ProgressView(value: 1.0, total: 1.0)
                         .progressViewStyle(.linear)
-                        .tint(.green)
+                        .tint(.accentColor)
                         .frame(width: 340)
                 }
                 .frame(width: 340)

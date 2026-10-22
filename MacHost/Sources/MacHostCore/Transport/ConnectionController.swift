@@ -168,7 +168,16 @@ public final class ConnectionController: ObservableObject {
             devName = PhoneConnectionManager.shared.deviceNameForHost("127.0.0.1") ?? "Android Device"
         case .lan(let h, _, _):
             deviceId = nil
-            devName = DeviceRegistry.shared.device(matchingHost: h)?.name ?? "Телефон Android"
+            let normHost = ConnectionHostAddress.normalized(h)
+            if let found = DiscoveryService.shared.discoveredDevices.first(where: { ConnectionHostAddress.normalized($0.host) == normHost }), !found.name.isEmpty {
+                devName = found.name
+            } else if let dev = DeviceRegistry.shared.device(matchingHost: normHost), dev.name != "Телефон Android", dev.name != "Android", !dev.name.isEmpty {
+                devName = dev.name
+            } else if let name = PhoneConnectionManager.shared.deviceNameForHost(normHost), name != "Телефон Android", name != "Android", !name.isEmpty {
+                devName = name
+            } else {
+                devName = "Телефон Android"
+            }
         }
         
         let reachable = await Task.detached(priority: .userInitiated) {
@@ -192,7 +201,8 @@ public final class ConnectionController: ObservableObject {
                 deviceId: deviceId,
                 devName: devName,
                 viewModel: viewModel,
-                attemptId: attemptId
+                attemptId: attemptId,
+                isExplicit: isExplicit
             )
             guard isAttemptValid(attemptId) else { return false }
             
@@ -246,7 +256,8 @@ public final class ConnectionController: ObservableObject {
         deviceId: String?,
         devName: String,
         viewModel: DualPaneViewModel,
-        attemptId: UUID
+        attemptId: UUID,
+        isExplicit: Bool = false
     ) async throws -> (fingerprint: String, isMigrated: Bool) {
         guard isAttemptValid(attemptId) else {
             throw NSError(domain: "ConnectionController", code: -1, userInfo: [NSLocalizedDescriptionKey: "Attempt cancelled"])
@@ -278,8 +289,9 @@ public final class ConnectionController: ObservableObject {
             fingerprint: fp
         )
         if case .mismatchWarning(let expected, let actual) = keyStatus {
-            if HostKeyStore.isLegacyMockFingerprint(expected) {
-                // Если старый сохраненный ключ был устаревшим моком из ранних сборок, выполняем автомиграцию на реальный отпечаток
+            if HostKeyStore.isLegacyMockFingerprint(expected) || isExplicit {
+                // Если старый сохраненный ключ был устаревшим моком или пользователь явно нажал "Подключить"
+                // (например, после обновления/переустановки APK на телефоне, когда ключ хоста изменился):
                 HostKeyStore.shared.resetHostKey(host: host, port: Int(port), deviceId: deviceId)
                 _ = HostKeyStore.shared.verifyOrPin(host: host, port: Int(port), deviceId: deviceId, fingerprint: fp)
             } else {

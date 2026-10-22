@@ -98,6 +98,7 @@ public final class JobOrchestrator: @unchecked Sendable {
         itemId: String,
         remotePath: String,
         localTargetDir: URL,
+        destinationFileName: String? = nil,
         strategy: ConflictResolutionStrategy = .overwrite,
         progress: @escaping @Sendable (Double) -> Void
     ) async throws -> TransferExecutionResult {
@@ -107,6 +108,7 @@ public final class JobOrchestrator: @unchecked Sendable {
             itemId: itemId,
             remotePath: remotePath,
             localTargetDir: localTargetDir,
+            destinationFileName: destinationFileName,
             strategy: strategy,
             progress: progress
         )
@@ -118,6 +120,7 @@ public final class JobOrchestrator: @unchecked Sendable {
         itemId: String,
         remotePath: String,
         localTargetDir: URL,
+        destinationFileName: String? = nil,
         strategy: ConflictResolutionStrategy = .overwrite,
         progress: @escaping @Sendable (Double) -> Void
     ) async throws -> TransferExecutionResult {
@@ -127,6 +130,7 @@ public final class JobOrchestrator: @unchecked Sendable {
             itemId: itemId,
             remotePath: remotePath,
             localTargetDir: localTargetDir,
+            destinationFileName: destinationFileName,
             strategy: strategy,
             progress: progress
         )
@@ -138,6 +142,7 @@ public final class JobOrchestrator: @unchecked Sendable {
         itemId: String,
         remotePath: String,
         localTargetDir: URL,
+        destinationFileName: String? = nil,
         strategy: ConflictResolutionStrategy,
         progress: @escaping @Sendable (Double) -> Void
     ) async throws -> TransferExecutionResult {
@@ -161,7 +166,7 @@ public final class JobOrchestrator: @unchecked Sendable {
             throw JobOrchestratorError.insufficientSpace(required: requiredWithMargin, available: space.free)
         }
         
-        var name = URL(fileURLWithPath: remotePath).lastPathComponent.precomposedStringWithCanonicalMapping
+        var name = (destinationFileName ?? URL(fileURLWithPath: remotePath).lastPathComponent).precomposedStringWithCanonicalMapping
         var finalURL = localTargetDir.appendingPathComponent(name)
         
         // Обработка конфликтов при существовании целевого файла
@@ -189,12 +194,12 @@ public final class JobOrchestrator: @unchecked Sendable {
                 let base = finalURL.deletingPathExtension().lastPathComponent
                 var counter = 1
                 while FileManager.default.fileExists(atPath: finalURL.path) {
-                    let newName = ext.isEmpty ? "\(base)_\(counter)" : "\(base)_\(counter).\(ext)"
+                    let newName = ext.isEmpty ? "\(base)-\(counter)" : "\(base)-\(counter).\(ext)"
                     name = newName
                     finalURL = localTargetDir.appendingPathComponent(newName)
                     counter += 1
                 }
-            case .overwrite:
+            case .customRename, .overwrite:
                 break
             }
         }
@@ -447,6 +452,7 @@ public final class JobOrchestrator: @unchecked Sendable {
         itemId: String,
         localSourceURL: URL,
         remoteTargetDir: String,
+        destinationFileName: String? = nil,
         strategy: ConflictResolutionStrategy = .overwrite,
         progress: @escaping @Sendable (Double) -> Void
     ) async throws -> TransferExecutionResult {
@@ -456,6 +462,7 @@ public final class JobOrchestrator: @unchecked Sendable {
             itemId: itemId,
             localSourceURL: localSourceURL,
             remoteTargetDir: remoteTargetDir,
+            destinationFileName: destinationFileName,
             strategy: strategy,
             progress: progress
         )
@@ -467,6 +474,7 @@ public final class JobOrchestrator: @unchecked Sendable {
         itemId: String,
         localSourceURL: URL,
         remoteTargetDir: String,
+        destinationFileName: String? = nil,
         strategy: ConflictResolutionStrategy = .overwrite,
         progress: @escaping @Sendable (Double) -> Void
     ) async throws -> TransferExecutionResult {
@@ -476,6 +484,7 @@ public final class JobOrchestrator: @unchecked Sendable {
             itemId: itemId,
             localSourceURL: localSourceURL,
             remoteTargetDir: remoteTargetDir,
+            destinationFileName: destinationFileName,
             strategy: strategy,
             progress: progress
         )
@@ -487,6 +496,7 @@ public final class JobOrchestrator: @unchecked Sendable {
         itemId: String,
         localSourceURL: URL,
         remoteTargetDir: String,
+        destinationFileName: String? = nil,
         strategy: ConflictResolutionStrategy,
         progress: @escaping @Sendable (Double) -> Void
     ) async throws -> TransferExecutionResult {
@@ -500,7 +510,7 @@ public final class JobOrchestrator: @unchecked Sendable {
         let mtime = Int64((try? localSourceURL.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate?.timeIntervalSince1970) ?? Date().timeIntervalSince1970)
         let reqHash = "\(localSourceURL.path):\(fileSize):\(mtime)"
         
-        var fileName = localSourceURL.lastPathComponent.precomposedStringWithCanonicalMapping
+        var fileName = (destinationFileName ?? localSourceURL.lastPathComponent).precomposedStringWithCanonicalMapping
         var remoteFinalPath = (remoteTargetDir as NSString).appendingPathComponent(fileName).precomposedStringWithCanonicalMapping
         
         // Проверка конфликтов на удалённом устройстве (только если стратегия не .overwrite)
@@ -524,12 +534,12 @@ public final class JobOrchestrator: @unchecked Sendable {
                 let base = (fileName as NSString).deletingPathExtension
                 var counter = 1
                 while (try? await transport.prepareRead(actionId: actionId, path: remoteFinalPath)) != nil {
-                    let newName = ext.isEmpty ? "\(base)_\(counter)" : "\(base)_\(counter).\(ext)"
+                    let newName = ext.isEmpty ? "\(base)-\(counter)" : "\(base)-\(counter).\(ext)"
                     fileName = newName
                     remoteFinalPath = (remoteTargetDir as NSString).appendingPathComponent(newName).precomposedStringWithCanonicalMapping
                     counter += 1
                 }
-            case .overwrite:
+            case .customRename, .overwrite:
                 break
             }
         }
@@ -736,10 +746,11 @@ public final class JobOrchestrator: @unchecked Sendable {
         itemId: String,
         localSourceURL: URL,
         localTargetDir: URL,
+        destinationFileName: String? = nil,
         strategy: ConflictResolutionStrategy = .overwrite,
         progress: @escaping @Sendable (Double) -> Void
     ) async throws -> TransferExecutionResult {
-        let name = localSourceURL.lastPathComponent.precomposedStringWithCanonicalMapping
+        let name = (destinationFileName ?? localSourceURL.lastPathComponent).precomposedStringWithCanonicalMapping
         var finalURL = localTargetDir.appendingPathComponent(name)
         
         // Проверка конфликтов для Mac-to-Mac
@@ -771,11 +782,11 @@ public final class JobOrchestrator: @unchecked Sendable {
                 let base = finalURL.deletingPathExtension().lastPathComponent
                 var counter = 1
                 while FileManager.default.fileExists(atPath: finalURL.path) {
-                    let newName = ext.isEmpty ? "\(base)_\(counter)" : "\(base)_\(counter).\(ext)"
+                    let newName = ext.isEmpty ? "\(base)-\(counter)" : "\(base)-\(counter).\(ext)"
                     finalURL = localTargetDir.appendingPathComponent(newName)
                     counter += 1
                 }
-            case .overwrite:
+            case .customRename, .overwrite:
                 break
             }
         }
@@ -811,10 +822,11 @@ public final class JobOrchestrator: @unchecked Sendable {
         itemId: String,
         localSourceURL: URL,
         localTargetDir: URL,
+        destinationFileName: String? = nil,
         strategy: ConflictResolutionStrategy = .overwrite,
         progress: @escaping @Sendable (Double) -> Void
     ) async throws -> TransferExecutionResult {
-        let name = localSourceURL.lastPathComponent.precomposedStringWithCanonicalMapping
+        let name = (destinationFileName ?? localSourceURL.lastPathComponent).precomposedStringWithCanonicalMapping
         var finalURL = localTargetDir.appendingPathComponent(name)
         
         // Проверка конфликтов для Mac-to-Mac Move
@@ -846,11 +858,11 @@ public final class JobOrchestrator: @unchecked Sendable {
                 let base = finalURL.deletingPathExtension().lastPathComponent
                 var counter = 1
                 while FileManager.default.fileExists(atPath: finalURL.path) {
-                    let newName = ext.isEmpty ? "\(base)_\(counter)" : "\(base)_\(counter).\(ext)"
+                    let newName = ext.isEmpty ? "\(base)-\(counter)" : "\(base)-\(counter).\(ext)"
                     finalURL = localTargetDir.appendingPathComponent(newName)
                     counter += 1
                 }
-            case .overwrite:
+            case .customRename, .overwrite:
                 break
             }
         }

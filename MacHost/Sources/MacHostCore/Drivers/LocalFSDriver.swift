@@ -20,7 +20,7 @@ public final class LocalFSDriver: FileSystemDriver, @unchecked Sendable {
     
     public func listDirectory(at path: String) async throws -> [FileItem] {
         let url = URL(fileURLWithPath: path)
-        let keys: Set<URLResourceKey> = [.fileSizeKey, .contentModificationDateKey, .isDirectoryKey, .isHiddenKey]
+        let keys: Set<URLResourceKey> = [.fileSizeKey, .contentModificationDateKey, .creationDateKey, .isDirectoryKey, .isHiddenKey, .tagNamesKey]
         
         let contents = try FileManager.default.contentsOfDirectory(
             at: url,
@@ -35,6 +35,8 @@ public final class LocalFSDriver: FileSystemDriver, @unchecked Sendable {
             let isDir = vals.isDirectory ?? false
             let size = UInt64(vals.fileSize ?? 0)
             let mtime = vals.contentModificationDate?.timeIntervalSince1970 ?? 0
+            let creationDate = vals.creationDate?.timeIntervalSince1970
+            let tags = vals.tagNames ?? []
             let name = itemURL.lastPathComponent.precomposedStringWithCanonicalMapping
             
             return FileItem(
@@ -44,7 +46,9 @@ public final class LocalFSDriver: FileSystemDriver, @unchecked Sendable {
                 size: isDir ? 0 : size,
                 mtime: mtime,
                 isDirectory: isDir,
-                source: .localMac
+                source: .localMac,
+                creationDate: creationDate,
+                tags: tags
             )
         }
     }
@@ -80,7 +84,9 @@ public final class LocalFSDriver: FileSystemDriver, @unchecked Sendable {
         let destURL = URL(fileURLWithPath: destinationPath)
         let fm = FileManager.default
         
-        guard fm.fileExists(atPath: sourceURL.path) else {
+        var statBuf = stat()
+        let sourceExists = lstat(sourcePath, &statBuf) == 0 || fm.fileExists(atPath: sourceURL.path)
+        guard sourceExists else {
             throw LocalFSDriverError.itemNotFound(path: sourcePath)
         }
         
@@ -88,7 +94,8 @@ public final class LocalFSDriver: FileSystemDriver, @unchecked Sendable {
             return
         }
         
-        if fm.fileExists(atPath: destURL.path) {
+        let destExists = lstat(destinationPath, &statBuf) == 0 || fm.fileExists(atPath: destURL.path)
+        if destExists {
             // Создаем временный бэкап существующего файла назначения рядом
             let backupURL = destURL.deletingLastPathComponent().appendingPathComponent(".\(destURL.lastPathComponent).bak.\(UUID().uuidString)")
             try fm.moveItem(at: destURL, to: backupURL)
