@@ -3445,14 +3445,6 @@ private func loadToolbarDriveIcon(named name: String) -> NSImage? {
         img.isTemplate = true
         return img
     }
-    if let devImg = NSImage(contentsOfFile: "/Users/restart/Downloads/MacDroidCommander_Gemini/MacHost/Resources/\(name).svg") {
-        devImg.isTemplate = true
-        return devImg
-    }
-    if let devImg = NSImage(contentsOfFile: "/Users/restart/Downloads/MacDroidCommander_Gemini/MacHost/Resources/\(name).png") {
-        devImg.isTemplate = true
-        return devImg
-    }
     let fallbackSvg = (name == "toolbar_mac") ? toolbarMacSvgString : toolbarPhoneSvgString
     if let data = fallbackSvg.data(using: .utf8), let img = NSImage(data: data) {
         img.isTemplate = true

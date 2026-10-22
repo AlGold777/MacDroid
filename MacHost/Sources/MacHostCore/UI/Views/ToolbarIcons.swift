@@ -329,14 +329,6 @@ private let comparePanesTemplateImage: NSImage? = {
         img.isTemplate = true
         return img
     }
-    if let devImg = NSImage(contentsOfFile: "/Users/restart/Downloads/MacDroidCommander_Gemini/MacHost/Resources/toolbar_compare_panes.svg") {
-        devImg.isTemplate = true
-        return devImg
-    }
-    if let devImg = NSImage(contentsOfFile: "/Users/restart/Downloads/MacDroidCommander_Gemini/MacHost/Resources/toolbar_compare_panes.png") {
-        devImg.isTemplate = true
-        return devImg
-    }
     if let data = comparePanesSvgString.data(using: .utf8),
        let img = NSImage(data: data) {
         img.isTemplate = true
