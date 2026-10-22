@@ -2,6 +2,181 @@ import SwiftUI
 import UniformTypeIdentifiers
 import AppKit
 
+// MARK: - Чёткий современный слайдер с тёмно-серой шкалой и контуром
+
+public struct CrispModernSlider: View {
+    @Binding public var value: Double
+    public let range: ClosedRange<Double>
+    public let step: Double
+    
+    @State private var isHovered: Bool = false
+    @State private var isDragging: Bool = false
+    
+    public init(value: Binding<Double>, in range: ClosedRange<Double>, step: Double = 1) {
+        self._value = value
+        self.range = range
+        self.step = step
+    }
+    
+    private var trackColor: Color {
+        Color(nsColor: NSColor(name: nil, dynamicProvider: { appearance in
+            let isDark = appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+            return isDark ? NSColor(white: 0.48, alpha: 1.0) : NSColor(white: 0.32, alpha: 1.0)
+        }))
+    }
+    
+    private var thumbBorderColor: Color {
+        Color(nsColor: NSColor(name: nil, dynamicProvider: { appearance in
+            let isDark = appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+            return isDark ? NSColor(white: 0.65, alpha: 1.0) : NSColor(white: 0.28, alpha: 1.0)
+        }))
+    }
+    
+    private var thumbFillColor: Color {
+        Color(nsColor: NSColor(name: nil, dynamicProvider: { appearance in
+            let isDark = appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+            return isDark ? NSColor(white: 0.22, alpha: 1.0) : NSColor(white: 0.98, alpha: 1.0)
+        }))
+    }
+    
+    public var body: some View {
+        GeometryReader { geo in
+            let thumbDiameter: CGFloat = 13
+            let width = max(1, geo.size.width - thumbDiameter)
+            let span = max(0.001, range.upperBound - range.lowerBound)
+            let rawFraction = (value - range.lowerBound) / span
+            let fraction = max(0, min(1, CGFloat(rawFraction)))
+            let thumbOffset = fraction * width
+            
+            ZStack(alignment: .leading) {
+                // Тёмно-серая неразмытая чёткая линия (шкала 2px)
+                Rectangle()
+                    .fill(trackColor)
+                    .frame(height: 2)
+                    .padding(.horizontal, thumbDiameter / 2)
+                
+                // Ползунок с тёмно-серым чётким контуром
+                Circle()
+                    .fill(thumbFillColor)
+                    .frame(width: thumbDiameter, height: thumbDiameter)
+                    .overlay(
+                        Circle()
+                            .strokeBorder(thumbBorderColor, lineWidth: 1.5)
+                    )
+                    .shadow(color: .black.opacity(isDragging ? 0.3 : 0.18), radius: isDragging ? 2.5 : 1.5, x: 0, y: 1)
+                    .offset(x: thumbOffset)
+            }
+            .frame(height: geo.size.height)
+            .contentShape(Rectangle())
+            .onHover { hovering in
+                self.isHovered = hovering
+            }
+            .gesture(
+                DragGesture(minimumDistance: 0)
+                    .onChanged { gesture in
+                        self.isDragging = true
+                        updateValue(from: gesture.location.x, trackWidth: width, thumbDiameter: thumbDiameter)
+                    }
+                    .onEnded { _ in
+                        self.isDragging = false
+                    }
+            )
+        }
+        .frame(height: 16)
+    }
+    
+    private func updateValue(from touchX: CGFloat, trackWidth: CGFloat, thumbDiameter: CGFloat) {
+        guard trackWidth > 0 else { return }
+        let adjustedX = touchX - (thumbDiameter / 2)
+        let fraction = max(0, min(1, adjustedX / trackWidth))
+        var newValue = range.lowerBound + Double(fraction) * (range.upperBound - range.lowerBound)
+        if step > 0 {
+            let steps = round((newValue - range.lowerBound) / step)
+            newValue = range.lowerBound + (steps * step)
+        }
+        newValue = max(range.lowerBound, min(range.upperBound, newValue))
+        if newValue != value {
+            value = newValue
+        }
+    }
+}
+
+// MARK: - Современный компактный элемент управления слайдером с бейджем и сбросом
+
+public struct ModernGridSliderControl: View {
+    public let icon: String
+    @Binding public var value: Double
+    public let range: ClosedRange<Double>
+    public let step: Double
+    public let defaultValue: Double
+    public let displayFormat: (Double) -> String
+    public let helpText: String
+    
+    public init(
+        icon: String,
+        value: Binding<Double>,
+        range: ClosedRange<Double>,
+        step: Double,
+        defaultValue: Double,
+        displayFormat: @escaping (Double) -> String,
+        helpText: String
+    ) {
+        self.icon = icon
+        self._value = value
+        self.range = range
+        self.step = step
+        self.defaultValue = defaultValue
+        self.displayFormat = displayFormat
+        self.helpText = helpText
+    }
+    
+    public var body: some View {
+        HStack(spacing: 5) {
+            Image(systemName: icon)
+                .font(.system(size: 10, weight: .medium))
+                .foregroundColor(.secondary)
+            
+            CrispModernSlider(value: $value, in: range, step: step)
+                .frame(width: 82)
+            
+            Text(displayFormat(value))
+                .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                .foregroundColor(.primary.opacity(0.85))
+                .padding(.horizontal, 4)
+                .padding(.vertical, 1.5)
+                .background(
+                    RoundedRectangle(cornerRadius: 3.5)
+                        .fill(Color(nsColor: .controlBackgroundColor).opacity(0.8))
+                )
+            
+            if Int(value) != Int(defaultValue) {
+                Button(action: {
+                    withAnimation(.easeInOut(duration: 0.15)) {
+                        value = defaultValue
+                    }
+                }) {
+                    Image(systemName: "arrow.counterclockwise")
+                        .font(.system(size: 9, weight: .semibold))
+                        .foregroundColor(.secondary)
+                }
+                .buttonStyle(.plain)
+                .help("Сбросить на значение по умолчанию (\(Int(defaultValue)) px)")
+            }
+        }
+        .padding(.horizontal, 6)
+        .padding(.vertical, 2.5)
+        .background(
+            RoundedRectangle(cornerRadius: 5)
+                .fill(Color(nsColor: .controlColor).opacity(0.22))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 5)
+                .strokeBorder(Color.primary.opacity(0.06), lineWidth: 1)
+        )
+        .help(helpText)
+    }
+}
+
 // MARK: - Строка настроек режима сетки (вместо заголовков столбцов таблицы)
 
 public struct GridSettingsBarView: View {
@@ -52,10 +227,18 @@ public struct GridSettingsBarView: View {
             Menu {
                 ForEach(SortField.allCases, id: \.self) { field in
                     Button(action: {
+                        let cur = (side == .left ? vm.leftSortField : vm.rightSortField)
+                        let defaultAsc = (field == .size || field == .date) ? false : true
                         if side == .left {
                             vm.leftSortField = field
+                            if cur != field {
+                                vm.leftSortAscending = defaultAsc
+                            }
                         } else {
                             vm.rightSortField = field
+                            if cur != field {
+                                vm.rightSortAscending = defaultAsc
+                            }
                         }
                     }) {
                         HStack {
@@ -103,7 +286,7 @@ public struct GridSettingsBarView: View {
                     Image(systemName: "arrow.up.arrow.down")
                         .font(.system(size: 10, weight: .semibold))
                     Text("\(currentSortField.rawValue) \(isSortAscending ? "↑" : "↓")")
-                        .font(.system(size: 11, weight: .medium))
+                        .font(.system(size: 12, weight: .medium))
                     Image(systemName: "chevron.down")
                         .font(.system(size: 8, weight: .medium))
                         .foregroundColor(.secondary)
@@ -119,80 +302,111 @@ public struct GridSettingsBarView: View {
             
             // 2. Индикатор объектов
             let itemsCount = vm.displayItems(for: side).count
-            Text("\(itemsCount) объектов")
-                .font(.system(size: 11))
+            Text("\(itemsCount) obj")
+                .font(.system(size: 12))
                 .foregroundColor(.secondary)
             
             Spacer()
             
-            // 3. Регулировка масштаба эскизов (Слайдер размера)
-            HStack(spacing: 5) {
-                Image(systemName: "photo")
-                    .font(.system(size: 9))
+            // Кнопка «на весь экран» (ровно посередине между счётчиком и ползунком)
+            Button(action: {
+                vm.openFullscreenGrid(side: side)
+            }) {
+                Image(systemName: "arrow.up.left.and.arrow.down.right")
+                    .font(.system(size: 10, weight: .medium))
                     .foregroundColor(.secondary)
-                
-                Slider(value: thumbnailSizeBinding, in: 64...256, step: 8)
-                    .frame(width: 80)
-                    .controlSize(.mini)
-                    .help("Размер эскизов: \(Int(thumbnailSizeBinding.wrappedValue)) px")
-                
-                Image(systemName: "photo.fill")
-                    .font(.system(size: 11))
-                    .foregroundColor(.secondary)
-                
-                // Кнопка быстрого возврата к 120 px
-                if Int(thumbnailSizeBinding.wrappedValue) != 120 {
-                    Button(action: {
-                        thumbnailSizeBinding.wrappedValue = 120
-                    }) {
-                        Image(systemName: "arrow.counterclockwise")
-                            .font(.system(size: 9))
-                            .foregroundColor(.secondary)
-                    }
-                    .buttonStyle(.plain)
-                    .help("Сбросить размер на 120 px")
-                }
+                    .padding(.horizontal, 5)
+                    .padding(.vertical, 4)
+                    .background(
+                        RoundedRectangle(cornerRadius: 5)
+                            .fill(Color(nsColor: .controlColor).opacity(0.22))
+                    )
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 5)
+                            .strokeBorder(Color.primary.opacity(0.06), lineWidth: 1)
+                    )
             }
+            .buttonStyle(.plain)
+            .help("На весь экран")
+            
+            Spacer()
+            
+            // 3. Регулировка масштаба эскизов (Слайдер размера)
+            ModernGridSliderControl(
+                icon: "photo",
+                value: thumbnailSizeBinding,
+                range: 64...256,
+                step: 8,
+                defaultValue: 120,
+                displayFormat: { "\(Int($0)) px" },
+                helpText: "Размер эскизов: \(Int(thumbnailSizeBinding.wrappedValue)) px"
+            )
             
             Divider()
                 .frame(height: 14)
                 .padding(.horizontal, 2)
             
             // 4. Регулировка расстояния между эскизами (Слайдер интервала до мин. 1 мм)
-            HStack(spacing: 5) {
-                Image(systemName: "arrow.left.and.line.vertical.and.arrow.right")
-                    .font(.system(size: 9))
+            ModernGridSliderControl(
+                icon: "arrow.left.and.line.vertical.and.arrow.right",
+                value: gridSpacingBinding,
+                range: 1...32,
+                step: 1,
+                defaultValue: 3,
+                displayFormat: { $0 <= 3 ? "\(Int($0)) px (≈1 мм)" : "\(Int($0)) px" },
+                helpText: "Расстояние между эскизами: \(Int(gridSpacingBinding.wrappedValue)) px (мин. 1-3 px ≈ 1 мм)"
+            )
+            
+            Divider()
+                .frame(height: 14)
+                .padding(.horizontal, 2)
+            
+            Button(action: {
+                ThumbnailCacheManager.shared.clearCache()
+            }) {
+                Image(systemName: "arrow.triangle.2.circlepath")
+                    .font(.system(size: 10, weight: .medium))
                     .foregroundColor(.secondary)
-                
-                Slider(value: gridSpacingBinding, in: 1...32, step: 1)
-                    .frame(width: 75)
-                    .controlSize(.mini)
-                    .help("Расстояние между эскизами: \(Int(gridSpacingBinding.wrappedValue)) px (мин. 1-3 px ≈ 1 мм)")
-                
-                let spacingVal = Int(gridSpacingBinding.wrappedValue)
-                Text(spacingVal <= 3 ? "\(spacingVal) px (~1 мм)" : "\(spacingVal) px")
-                    .font(.system(size: 10, design: .monospaced))
-                    .foregroundColor(.secondary)
-                    .frame(width: spacingVal <= 3 ? 66 : 32, alignment: .leading)
-                
-                // Кнопка быстрого возврата к 10 px
-                if Int(gridSpacingBinding.wrappedValue) != 10 {
-                    Button(action: {
-                        gridSpacingBinding.wrappedValue = 10
-                    }) {
-                        Image(systemName: "arrow.counterclockwise")
-                            .font(.system(size: 9))
-                            .foregroundColor(.secondary)
-                    }
-                    .buttonStyle(.plain)
-                    .help("Сбросить интервал на 10 px")
-                }
+                    .padding(.horizontal, 5)
+                    .padding(.vertical, 4)
+                    .background(
+                        RoundedRectangle(cornerRadius: 5)
+                            .fill(Color(nsColor: .controlColor).opacity(0.22))
+                    )
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 5)
+                            .strokeBorder(Color.primary.opacity(0.06), lineWidth: 1)
+                    )
             }
+            .buttonStyle(.plain)
+            .help("Сбросить кэш эскизов (очистить память и диск)")
         }
         .padding(.horizontal, 8)
         .padding(.vertical, 3)
-        .frame(height: 26)
+        .frame(height: 28)
         .background(Color(nsColor: .controlBackgroundColor).opacity(0.4))
+    }
+}
+
+// MARK: - Вспомогательное расширение для условного включения перетаскивания файлов
+
+private extension View {
+    @ViewBuilder
+    func enableDragIf(_ condition: Bool, provider: @escaping () -> NSItemProvider) -> some View {
+        if condition {
+            self.onDrag(provider, preview: { Color.clear.frame(width: 1, height: 1) })
+        } else {
+            self
+        }
+    }
+}
+
+// MARK: - Отслеживание позиций ячеек сетки для выделения рамкой
+
+public struct CellFramePreferenceKey: PreferenceKey {
+    public static var defaultValue: [String: CGRect] = [:]
+    public static func reduce(value: inout [String: CGRect], nextValue: () -> [String: CGRect]) {
+        value.merge(nextValue(), uniquingKeysWith: { $1 })
     }
 }
 
@@ -203,6 +417,9 @@ public struct FileGridPaneView: View {
     public let side: PaneSide
     
     @State private var isDropTarget: Bool = false
+    @State private var marqueeRect: CGRect? = nil
+    @State private var selectionAnchorId: String? = nil
+    @State private var cellFrames: [String: CGRect] = [:]
     
     public init(side: PaneSide) {
         self.side = side
@@ -235,146 +452,143 @@ public struct FileGridPaneView: View {
     }
     
     public var body: some View {
-        ScrollView {
-            if items.isEmpty {
-                VStack(spacing: 12) {
-                    Spacer(minLength: 40)
-                    Image(systemName: "folder.badge.questionmark")
-                        .font(.system(size: 48))
-                        .foregroundColor(.secondary.opacity(0.6))
-                    Text("Папка пуста")
-                        .font(.system(size: 14, weight: .medium))
-                        .foregroundColor(.secondary)
-                    Spacer(minLength: 40)
-                }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .contentShape(Rectangle())
-                .onTapGesture {
-                    clearSelection()
-                }
-            } else {
-                let pad = Self.cellPadding(for: gridSpacing)
-                let cellWidth = thumbnailSize + (pad * 2)
-                let columns = [
-                    GridItem(.adaptive(minimum: cellWidth, maximum: cellWidth), spacing: gridSpacing, alignment: .top)
-                ]
-                
-                LazyVGrid(columns: columns, spacing: gridSpacing) {
-                    ForEach(items) { item in
-                        let isSelected = selection.contains(item.id) || selection.contains(item.path)
-                        
-                        FileGridCell(
-                            item: item,
-                            side: side,
-                            size: thumbnailSize,
-                            spacing: gridSpacing,
-                            isSelected: isSelected
-                        )
-                        .contentShape(Rectangle())
-                        .onTapGesture {
-                            handleCellTap(item: item)
-                        }
-                        .simultaneousGesture(TapGesture(count: 2).onEnded {
-                            handleCellDoubleTap(item: item)
-                        })
-                        .onDrag {
-                            vm.createDragItemProvider(for: item, side: side)
+        ScrollViewReader { scrollProxy in
+            ScrollView {
+                if items.isEmpty {
+                    VStack(spacing: 12) {
+                        Spacer(minLength: 40)
+                        Image(systemName: "folder.badge.questionmark")
+                            .font(.system(size: 48))
+                            .foregroundColor(.secondary.opacity(0.6))
+                        Text("Папка пуста")
+                            .font(.system(size: 14, weight: .medium))
+                            .foregroundColor(.secondary)
+                        Spacer(minLength: 40)
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .contentShape(Rectangle())
+                    .onTapGesture {
+                        clearSelection()
+                    }
+                } else {
+                    let pad = Self.cellPadding(for: gridSpacing)
+                    let cellWidth = thumbnailSize + (pad * 2)
+                    let columns = [
+                        GridItem(.adaptive(minimum: cellWidth, maximum: cellWidth), spacing: gridSpacing, alignment: .top)
+                    ]
+                    
+                    LazyVGrid(columns: columns, spacing: gridSpacing) {
+                        ForEach(items) { item in
+                            let isSelected = selection.contains(item.id) || selection.contains(item.path)
+                            let flags = NSEvent.modifierFlags
+                            let isModHeld = flags.contains(.shift) || flags.contains(.control) || flags.contains(.command)
+                            let canDrag = isSelected && !isModHeld
+                            
+                            FileGridCell(
+                                item: item,
+                                side: side,
+                                size: thumbnailSize,
+                                spacing: gridSpacing,
+                                isSelected: isSelected,
+                                canDrag: canDrag,
+                                onTap: {
+                                    handleCellTap(item: item)
+                                },
+                                onDoubleTap: {
+                                    handleCellDoubleTap(item: item)
+                                },
+                                onToggleSelection: {
+                                    toggleItemSelection(item: item)
+                                }
+                            )
+                            .id(item.id)
                         }
                     }
+                    .padding(gridSpacing)
+                    
+                    // Свободное пространство снизу сетки для сброса выделения кликом
+                    Color.clear
+                        .frame(maxWidth: .infinity, minHeight: 80)
+                        .contentShape(Rectangle())
+                        .onTapGesture {
+                            clearSelection()
+                        }
                 }
-                .padding(gridSpacing)
-                .contentShape(Rectangle())
-                .onTapGesture {
-                    clearSelection()
+            }
+            .contentShape(Rectangle())
+            .coordinateSpace(name: "FileGridCoordinateSpace_\(side)")
+            .contextMenu {
+                emptyGridContextMenu
+            }
+            .onPreferenceChange(CellFramePreferenceKey.self) { frames in
+                self.cellFrames = frames
+            }
+            .background(Color(nsColor: .controlBackgroundColor).opacity(0.1))
+            .background(
+                GridKeyHandler(
+                    side: side,
+                    vm: vm,
+                    items: items,
+                    cellFrames: cellFrames,
+                    onNavigateOffset: { offset in
+                        navigateSelection(offset: offset)
+                    },
+                    onNavigateRow: { direction in
+                        navigateSelectionRow(direction: direction)
+                    },
+                    onMarqueeChanged: { rect in
+                        self.marqueeRect = rect
+                    }
+                )
+            )
+            .overlay(
+                Group {
+                    if let rect = marqueeRect, rect.width > 2 && rect.height > 2 {
+                        Rectangle()
+                            .fill(Color.accentColor.opacity(0.18))
+                            .overlay(
+                                Rectangle()
+                                    .stroke(Color.accentColor, lineWidth: 1)
+                            )
+                            .frame(width: rect.width, height: rect.height)
+                            .position(x: rect.midX, y: rect.midY)
+                            .allowsHitTesting(false)
+                    }
                 }
-            }
+            )
+            .onDrop(of: [DualPaneViewModel.dragUTType, UTType.fileURL.identifier, UTType.utf8PlainText.identifier], delegate: FileGridDropDelegate(side: side, vm: vm, items: items))
+            .simultaneousGesture(TapGesture().onEnded {
+                if vm.activePane != side {
+                    vm.activePane = side
+                }
+            })
         }
-        .background(Color(nsColor: .controlBackgroundColor).opacity(0.1))
-        .onDrop(of: [DualPaneViewModel.dragUTType, UTType.fileURL.identifier, UTType.utf8PlainText.identifier], delegate: FileGridDropDelegate(side: side, vm: vm, items: items))
-        // Клавиатурные команды для сетки
-        .onKeyPress(KeyEquivalent(Character(UnicodeScalar(NSF2FunctionKey)!)), phases: .down) { press in
-            if KeyCommandMonitor.isTextEditingActive(in: vm) {
-                return .ignored
+    }
+    
+    private func toggleItemSelection(item: FileItem) {
+        if vm.activePane != side { vm.activePane = side }
+        selectionAnchorId = item.id
+        if side == .left {
+            if vm.leftSelection.contains(item.id) || vm.leftSelection.contains(item.path) {
+                vm.leftSelection.remove(item.id)
+                vm.leftSelection.remove(item.path)
+            } else {
+                vm.leftSelection.insert(item.id)
             }
-            if press.modifiers.isEmpty {
-                vm.triggerRename(side: side)
-                return .handled
+            vm.rightSelection.removeAll()
+        } else {
+            if vm.rightSelection.contains(item.id) || vm.rightSelection.contains(item.path) {
+                vm.rightSelection.remove(item.id)
+                vm.rightSelection.remove(item.path)
+            } else {
+                vm.rightSelection.insert(item.id)
             }
-            return .ignored
+            vm.leftSelection.removeAll()
         }
-        .onKeyPress(KeyEquivalent("a"), phases: .down) { press in
-            if KeyCommandMonitor.isTextEditingActive(in: vm) {
-                return .ignored
-            }
-            if press.modifiers.contains(.control) || press.modifiers.contains(.command) {
-                vm.selectAll(side: side)
-                return .handled
-            }
-            return .ignored
-        }
-        .onKeyPress(.space, phases: .down) { press in
-            if KeyCommandMonitor.isTextEditingActive(in: vm) {
-                return .ignored
-            }
-            if press.modifiers.isEmpty {
-                vm.triggerQuickLook(preferNativeQuickLook: true)
-                return .handled
-            }
-            return .ignored
-        }
-        .onKeyPress(.return, phases: .down) { _ in
-            if KeyCommandMonitor.isTextEditingActive(in: vm) {
-                return .ignored
-            }
-            vm.openSelected()
-            return .handled
-        }
-        .onKeyPress(.delete, phases: .down) { press in
-            if KeyCommandMonitor.isTextEditingActive(in: vm) {
-                return .ignored
-            }
-            if press.modifiers.isEmpty {
-                vm.navigateUp(side: side)
-                return .handled
-            }
-            return .ignored
-        }
-        .onKeyPress(.leftArrow, phases: .down) { _ in
-            if KeyCommandMonitor.isTextEditingActive(in: vm) {
-                return .ignored
-            }
-            navigateSelection(offset: -1)
-            return .handled
-        }
-        .onKeyPress(.rightArrow, phases: .down) { _ in
-            if KeyCommandMonitor.isTextEditingActive(in: vm) {
-                return .ignored
-            }
-            navigateSelection(offset: 1)
-            return .handled
-        }
-        .onKeyPress(.upArrow, phases: .down) { _ in
-            if KeyCommandMonitor.isTextEditingActive(in: vm) {
-                return .ignored
-            }
-            navigateSelectionRow(direction: -1)
-            return .handled
-        }
-        .onKeyPress(.downArrow, phases: .down) { _ in
-            if KeyCommandMonitor.isTextEditingActive(in: vm) {
-                return .ignored
-            }
-            navigateSelectionRow(direction: 1)
-            return .handled
-        }
-        .simultaneousGesture(TapGesture().onEnded {
-            if vm.activePane != side {
-                vm.activePane = side
-            }
-        })
     }
     
     private func clearSelection() {
+        selectionAnchorId = nil
         if vm.activePane != side { vm.activePane = side }
         if side == .left {
             vm.leftSelection.removeAll()
@@ -388,11 +602,13 @@ public struct FileGridPaneView: View {
     private func handleCellTap(item: FileItem) {
         if vm.activePane != side { vm.activePane = side }
         
-        let isCmdPressed = NSEvent.modifierFlags.contains(.command)
-        let isShiftPressed = NSEvent.modifierFlags.contains(.shift)
+        let flags = NSEvent.modifierFlags
+        let isToggle = flags.contains(.command) || flags.contains(.control)
+        let isShift = flags.contains(.shift)
         
-        if isCmdPressed {
-            // Мультивыбор с Cmd
+        if isToggle {
+            // Мультивыбор с Cmd или Ctrl
+            selectionAnchorId = item.id
             if side == .left {
                 if vm.leftSelection.contains(item.id) || vm.leftSelection.contains(item.path) {
                     vm.leftSelection.remove(item.id)
@@ -410,12 +626,12 @@ public struct FileGridPaneView: View {
                 }
                 vm.leftSelection.removeAll()
             }
-        } else if isShiftPressed {
-            // Диапазон с Shift
+        } else if isShift {
+            // Диапазон с Shift: используем стабильный сохранённый якорь
             let currentItems = items
-            if let firstSelId = selection.first,
-               let startIdx = currentItems.firstIndex(where: { $0.id == firstSelId || $0.path == firstSelId }),
-               let endIdx = currentItems.firstIndex(where: { $0.id == item.id }) {
+            let anchor = selectionAnchorId ?? selection.first ?? item.id
+            if let startIdx = currentItems.firstIndex(where: { $0.id == anchor || $0.path == anchor }),
+               let endIdx = currentItems.firstIndex(where: { $0.id == item.id || $0.path == item.id }) {
                 let range = min(startIdx, endIdx)...max(startIdx, endIdx)
                 let idsToSelect = Set(currentItems[range].map { $0.id })
                 if side == .left {
@@ -426,10 +642,12 @@ public struct FileGridPaneView: View {
                     vm.leftSelection.removeAll()
                 }
             } else {
+                selectionAnchorId = item.id
                 selectSingle(item: item)
             }
         } else {
             // Одиночный выбор
+            selectionAnchorId = item.id
             selectSingle(item: item)
         }
     }
@@ -482,6 +700,409 @@ public struct FileGridPaneView: View {
         let rowStride = max(1, Int(400 / thumbnailSize))
         navigateSelection(offset: direction * rowStride)
     }
+
+    @ViewBuilder
+    private var emptyGridContextMenu: some View {
+        Button("Новая папка") { vm.prepareNewFolder(side: side) }
+        Button("Вставить (Cmd+V)") { vm.pasteFromClipboard(targetSide: side) }
+            .disabled(!vm.canPaste)
+        Button("Выделить всё (Cmd+A)") { vm.selectAll(side: side) }
+        Divider()
+        Button("Обновить (Cmd+R)") { vm.refreshPaneToActiveTab(side: side) }
+        Toggle("Показывать скрытые файлы", isOn: Binding(
+            get: { side == .left ? vm.leftShowHidden : vm.rightShowHidden },
+            set: { newValue in
+                let showHidden = side == .left ? vm.leftShowHidden : vm.rightShowHidden
+                if newValue != showHidden { vm.toggleShowHidden(side: side) }
+            }
+        ))
+        Divider()
+        Button("Скопировать путь к папке") {
+            let path = side == .left ? vm.leftPath : vm.rightPath
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(path, forType: .string)
+        }
+        Button("Свойства (Cmd+I)") { vm.triggerProperties(side: side) }
+        Divider()
+        Button("Сбросить кэш эскизов") {
+            ThumbnailCacheManager.shared.clearCache()
+        }
+    }
+}
+
+// MARK: - Обработчик клавиатурных и мышиных событий для сетки (Quick Look, навигация, операции, выделение рамкой)
+
+public struct GridKeyHandler: NSViewRepresentable {
+    public let side: PaneSide
+    public let vm: DualPaneViewModel
+    public let items: [FileItem]
+    public let cellFrames: [String: CGRect]
+    public let onNavigateOffset: (Int) -> Void
+    public let onNavigateRow: (Int) -> Void
+    public let onMarqueeChanged: ((CGRect?) -> Void)?
+    
+    public init(
+        side: PaneSide,
+        vm: DualPaneViewModel,
+        items: [FileItem],
+        cellFrames: [String: CGRect],
+        onNavigateOffset: @escaping (Int) -> Void,
+        onNavigateRow: @escaping (Int) -> Void,
+        onMarqueeChanged: ((CGRect?) -> Void)? = nil
+    ) {
+        self.side = side
+        self.vm = vm
+        self.items = items
+        self.cellFrames = cellFrames
+        self.onNavigateOffset = onNavigateOffset
+        self.onNavigateRow = onNavigateRow
+        self.onMarqueeChanged = onMarqueeChanged
+    }
+    
+    public func makeNSView(context: Context) -> GridKeyHandlerView {
+        let view = GridKeyHandlerView()
+        view.side = side
+        view.vm = vm
+        view.items = items
+        view.cellFrames = cellFrames
+        view.onNavigateOffset = onNavigateOffset
+        view.onNavigateRow = onNavigateRow
+        view.onMarqueeChanged = onMarqueeChanged
+        return view
+    }
+    
+    public func updateNSView(_ nsView: GridKeyHandlerView, context: Context) {
+        nsView.side = side
+        nsView.vm = vm
+        nsView.items = items
+        nsView.cellFrames = cellFrames
+        nsView.onNavigateOffset = onNavigateOffset
+        nsView.onNavigateRow = onNavigateRow
+        nsView.onMarqueeChanged = onMarqueeChanged
+    }
+    
+    public final class GridKeyHandlerView: NSView {
+        public override var isFlipped: Bool { true }
+        var side: PaneSide = .left
+        weak var vm: DualPaneViewModel?
+        var items: [FileItem] = []
+        var cellFrames: [String: CGRect] = [:]
+        var onNavigateOffset: ((Int) -> Void)?
+        var onNavigateRow: ((Int) -> Void)?
+        var onMarqueeChanged: ((CGRect?) -> Void)?
+        
+        private var eventMonitor: Any?
+        private var mouseMonitor: Any?
+        private var isDraggingSelection: Bool = false
+        private var didClickOnItem: Bool = false
+        private var dragStartWindowPoint: CGPoint = .zero
+        private var preDragSelection: Set<String> = []
+        
+        public override func hitTest(_ point: NSPoint) -> NSView? {
+            return nil
+        }
+        
+        deinit {
+            if let monitor = eventMonitor {
+                NSEvent.removeMonitor(monitor)
+            }
+            if let mMonitor = mouseMonitor {
+                NSEvent.removeMonitor(mMonitor)
+            }
+        }
+        
+        public override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            if window != nil {
+                setupMonitor()
+            } else {
+                removeMonitor()
+            }
+        }
+        
+        public override func viewWillMove(toWindow newWindow: NSWindow?) {
+            super.viewWillMove(toWindow: newWindow)
+            if newWindow == nil {
+                removeMonitor()
+            }
+        }
+        
+        private func removeMonitor() {
+            if let monitor = eventMonitor {
+                NSEvent.removeMonitor(monitor)
+                eventMonitor = nil
+            }
+            if let mMonitor = mouseMonitor {
+                NSEvent.removeMonitor(mMonitor)
+                mouseMonitor = nil
+            }
+        }
+        
+        private func setupMonitor() {
+            guard eventMonitor == nil else { return }
+            eventMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+                guard let self = self, let win = self.window, event.window === win else {
+                    return event
+                }
+                guard let vm = self.vm else { return event }
+                
+                // 1. Не перехватываем ввод, если активно редактирование текста
+                if let firstResponder = win.firstResponder, KeyCommandMonitor.isTextEditingResponder(firstResponder) {
+                    if KeyCommandMonitor.handleEvent(event, targetResponder: firstResponder) == nil {
+                        return nil
+                    }
+                    return event
+                }
+                if KeyCommandMonitor.isTextEditingActive(in: vm) {
+                    return event
+                }
+                
+                // 2. Обрабатываем только для активной панели
+                guard vm.activePane == self.side else {
+                    return event
+                }
+                
+                if KeyCommandMonitor.handleEvent(event) == nil {
+                    return nil
+                }
+                
+                let modifiers = event.modifierFlags.intersection([.command, .option, .control, .shift])
+                
+                // Пробел (KeyCode 49) без модификаторов -> Быстрый просмотр (Quick Look) / размер папки
+                if event.keyCode == 49 && modifiers.isEmpty {
+                    print("DUAL_PANE: KeyDown Space in Grid on side \(self.side)")
+                    self.ensureSelectionBeforeQuickLook()
+                    vm.triggerQuickLook(preferNativeQuickLook: true)
+                    return nil
+                }
+                
+                // F3 (KeyCode 99) без модификаторов -> Быстрый просмотр (Quick Look)
+                if event.keyCode == 99 && modifiers.isEmpty {
+                    print("DUAL_PANE: KeyDown F3 in Grid on side \(self.side)")
+                    self.ensureSelectionBeforeQuickLook()
+                    vm.triggerQuickLook(preferNativeQuickLook: true)
+                    return nil
+                }
+                
+                // Return / Enter (36 / 76)
+                if (event.keyCode == 36 || event.keyCode == 76) && modifiers.isEmpty {
+                    vm.openSelected()
+                    return nil
+                }
+                
+                // Delete / Forward Delete / Cmd+Delete (KeyCode 51, 117)
+                if event.keyCode == 51 || event.keyCode == 117 {
+                    if modifiers.isEmpty || modifiers == .command {
+                        vm.triggerDelete()
+                        return nil
+                    }
+                }
+                // F8 (KeyCode 100) -> Удалить
+                if event.keyCode == 100 && modifiers.isEmpty {
+                    vm.triggerDelete()
+                    return nil
+                }
+                
+                // Tab (KeyCode 48) -> Смена панели (Tab или Shift+Tab)
+                let isTab = (event.keyCode == 48 || event.characters == "\t" || event.charactersIgnoringModifiers == "\t")
+                if isTab && (modifiers.isEmpty || modifiers == .shift) {
+                    vm.toggleActivePane()
+                    return nil
+                }
+                
+                // F2 (KeyCode 120) -> Переименовать
+                if event.keyCode == 120 && modifiers.isEmpty {
+                    vm.triggerRename(side: self.side)
+                    return nil
+                }
+                
+                // F5 (KeyCode 96) -> Копировать / Alt+F5 Создать архив
+                if event.keyCode == 96 {
+                    if modifiers == .option {
+                        vm.triggerCreateArchive()
+                    } else if modifiers.isEmpty {
+                        vm.triggerCopy()
+                    }
+                    return nil
+                }
+                
+                // F6 (KeyCode 97) -> Переместить
+                if event.keyCode == 97 && modifiers.isEmpty {
+                    vm.triggerMove()
+                    return nil
+                }
+                
+                // F7 (KeyCode 98) -> Новая папка
+                if event.keyCode == 98 && modifiers.isEmpty {
+                    vm.prepareNewFolder()
+                    return nil
+                }
+                
+                // Cmd+A / Ctrl+A -> Выделить все
+                if (event.keyCode == 0 || event.charactersIgnoringModifiers?.lowercased() == "a") && (modifiers == .command || modifiers == .control) {
+                    vm.selectAll(side: self.side)
+                    return nil
+                }
+                
+                // Ctrl+T / Cmd+T (KeyCode 17 or "t" / "е" / \u{14}) -> Новая вкладка
+                let isCtrl = modifiers.contains(.control) && !modifiers.contains(.command) && !modifiers.contains(.option)
+                let hasCommand = modifiers.contains(.command) && !modifiers.contains(.option)
+                let isCtrlOrCmd = isCtrl || hasCommand
+                let chars = event.characters?.lowercased()
+                let charsNoMods = event.charactersIgnoringModifiers?.lowercased()
+                if isCtrlOrCmd && (event.keyCode == 17 || chars == "\u{14}" || chars == "t" || chars == "е" || charsNoMods == "\u{14}" || charsNoMods == "t" || charsNoMods == "е") {
+                    vm.addTab(side: self.side)
+                    return nil
+                }
+                // Ctrl+R / Cmd+R (KeyCode 15 or "r" / "к" / \u{12}) -> Обновление активного tab
+                if isCtrlOrCmd && (event.keyCode == 15 || chars == "\u{12}" || chars == "r" || chars == "к" || charsNoMods == "\u{12}" || charsNoMods == "r" || charsNoMods == "к") {
+                    vm.refreshPaneToActiveTab(side: self.side)
+                    return nil
+                }
+                
+                // Cmd+Up Arrow (KeyCode 126 with .command) -> Наверх (родительская папка)
+                if event.keyCode == 126 && modifiers == .command {
+                    vm.navigateUp(side: self.side)
+                    return nil
+                }
+                
+                // Стрелка влево (123)
+                if event.keyCode == 123 && modifiers.isEmpty {
+                    self.onNavigateOffset?(-1)
+                    return nil
+                }
+                // Стрелка вправо (124)
+                if event.keyCode == 124 && modifiers.isEmpty {
+                    self.onNavigateOffset?(1)
+                    return nil
+                }
+                // Стрелка вверх (126)
+                if event.keyCode == 126 && modifiers.isEmpty {
+                    self.onNavigateRow?(-1)
+                    return nil
+                }
+                // Стрелка вниз (125)
+                if event.keyCode == 125 && modifiers.isEmpty {
+                    self.onNavigateRow?(1)
+                    return nil
+                }
+                
+                return event
+            }
+            
+            guard mouseMonitor == nil else { return }
+            mouseMonitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown, .leftMouseDragged, .leftMouseUp]) { [weak self] event in
+                guard let self = self, let win = self.window, event.window === win else {
+                    return event
+                }
+                guard let vm = self.vm else { return event }
+                guard vm.failedConnectionSide == nil else { return event }
+                
+                let locInSelf = self.convert(event.locationInWindow, from: nil)
+                let isInside = self.bounds.contains(locInSelf)
+                
+                switch event.type {
+                case .leftMouseDown:
+                    if isInside {
+                        if vm.activePane != self.side {
+                            vm.activePane = self.side
+                        }
+                        self.dragStartWindowPoint = event.locationInWindow
+                        self.isDraggingSelection = false
+                        self.preDragSelection = (self.side == .left ? vm.leftSelection : vm.rightSelection)
+                        
+                        let currentSel = (self.side == .left ? vm.leftSelection : vm.rightSelection)
+                        self.didClickOnItem = self.cellFrames.contains { (id, frame) in
+                            currentSel.contains(id) && frame.contains(locInSelf)
+                        }
+                    }
+                    return event
+                    
+                case .leftMouseDragged:
+                    guard isInside || self.isDraggingSelection else { return event }
+                    guard !self.didClickOnItem else { return event }
+                    let dist = hypot(event.locationInWindow.x - self.dragStartWindowPoint.x,
+                                     event.locationInWindow.y - self.dragStartWindowPoint.y)
+                    guard dist > 4 else { return event }
+                    
+                    self.isDraggingSelection = true
+                    
+                    // Координаты рамки выделения относительно этого контейнера
+                    let startPtInSelf = self.convert(self.dragStartWindowPoint, from: nil)
+                    let currPtInSelf = locInSelf
+                    let marqueeInSelf = CGRect(
+                        x: min(startPtInSelf.x, currPtInSelf.x),
+                        y: min(startPtInSelf.y, currPtInSelf.y),
+                        width: max(1, abs(currPtInSelf.x - startPtInSelf.x)),
+                        height: max(1, abs(currPtInSelf.y - startPtInSelf.y))
+                    )
+                    self.onMarqueeChanged?(marqueeInSelf)
+                    
+                    // Поиск всех ячеек, пересекающих рамку выделения или находящихся под курсором
+                    var hitIds: Set<String> = []
+                    for (id, frame) in self.cellFrames {
+                        if marqueeInSelf.intersects(frame) || frame.contains(currPtInSelf) {
+                            hitIds.insert(id)
+                        }
+                    }
+                    
+                    let flags = event.modifierFlags
+                    if flags.contains(.option) {
+                        var updated = self.preDragSelection
+                        updated.subtract(hitIds)
+                        if self.side == .left {
+                            vm.leftSelection = updated
+                        } else {
+                            vm.rightSelection = updated
+                        }
+                    } else if flags.contains(.shift) || flags.contains(.command) || flags.contains(.control) {
+                        let updated = self.preDragSelection.union(hitIds)
+                        if self.side == .left {
+                            vm.leftSelection = updated
+                            vm.rightSelection.removeAll()
+                        } else {
+                            vm.rightSelection = updated
+                            vm.leftSelection.removeAll()
+                        }
+                    } else {
+                        if self.side == .left {
+                            vm.leftSelection = hitIds
+                            vm.rightSelection.removeAll()
+                        } else {
+                            vm.rightSelection = hitIds
+                            vm.leftSelection.removeAll()
+                        }
+                    }
+                    return event
+                    
+                case .leftMouseUp:
+                    if self.isDraggingSelection {
+                        self.isDraggingSelection = false
+                        self.onMarqueeChanged?(nil)
+                        return nil
+                    }
+                    return event
+                    
+                default:
+                    return event
+                }
+            }
+        }
+        
+        private func ensureSelectionBeforeQuickLook() {
+            guard let vm = vm else { return }
+            let sel = (side == .left) ? vm.leftSelection : vm.rightSelection
+            if sel.isEmpty, let firstItem = items.first {
+                if side == .left {
+                    vm.leftSelection = [firstItem.id]
+                    vm.rightSelection.removeAll()
+                } else {
+                    vm.rightSelection = [firstItem.id]
+                    vm.leftSelection.removeAll()
+                }
+            }
+        }
+    }
 }
 
 // MARK: - Карточка элемента в сетке (FileGridCell)
@@ -493,18 +1114,36 @@ public struct FileGridCell: View {
     public let size: CGFloat
     public let spacing: CGFloat
     public let isSelected: Bool
+    public let canDrag: Bool
+    public var onTap: (() -> Void)?
+    public var onDoubleTap: (() -> Void)?
+    public var onToggleSelection: (() -> Void)?
     
     @State private var thumbnail: NSImage? = nil
     @State private var isLoading: Bool = false
     @State private var isHovered: Bool = false
     @State private var thumbnailReloadToken: Int = 0
     
-    public init(item: FileItem, side: PaneSide, size: CGFloat, spacing: CGFloat = 10, isSelected: Bool) {
+    public init(
+        item: FileItem,
+        side: PaneSide,
+        size: CGFloat,
+        spacing: CGFloat = 10,
+        isSelected: Bool,
+        canDrag: Bool = false,
+        onTap: (() -> Void)? = nil,
+        onDoubleTap: (() -> Void)? = nil,
+        onToggleSelection: (() -> Void)? = nil
+    ) {
         self.item = item
         self.side = side
         self.size = size
         self.spacing = spacing
         self.isSelected = isSelected
+        self.canDrag = canDrag
+        self.onTap = onTap
+        self.onDoubleTap = onDoubleTap
+        self.onToggleSelection = onToggleSelection
     }
     
     public var body: some View {
@@ -514,92 +1153,160 @@ public struct FileGridCell: View {
         
         VStack(spacing: spacing <= 3 ? 2 : 4) {
             // 1. Контейнер миниатюры
-            ZStack {
-                RoundedRectangle(cornerRadius: cornerRad)
-                    .fill(Color(nsColor: .windowBackgroundColor).opacity(0.7))
-                
-                if item.isDirectory {
-                    Image(systemName: "folder.fill")
-                        .font(.system(size: size * 0.44))
-                        .foregroundColor(.yellow)
-                        .shadow(color: .black.opacity(0.15), radius: 2, x: 0, y: 1)
-                } else if let img = thumbnail {
-                    Image(nsImage: img)
-                        .resizable()
-                        .aspectRatio(contentMode: .fit)
-                        .frame(maxWidth: size - (imgInset * 2), maxHeight: size - (imgInset * 2))
-                        .cornerRadius(spacing <= 3 ? 2 : 4)
-                        .shadow(color: .black.opacity(0.12), radius: 2, x: 0, y: 1)
-                } else if isLoading {
-                    ProgressView()
-                        .controlSize(.small)
-                } else {
-                    Image(systemName: fileIconName(for: item.name))
-                        .font(.system(size: size * 0.38))
-                        .foregroundColor(.blue)
-                }
-                
-                // Бейдж сравнения (если сравнение активно)
-                if vm.isComparing {
-                    VStack {
-                        HStack {
-                            Spacer()
-                            gridComparisonBadge(for: item.name)
-                        }
-                        Spacer()
+            ZStack(alignment: .bottomTrailing) {
+                // Основной блок миниатюры (фон + иконка/картинка)
+                ZStack {
+                    RoundedRectangle(cornerRadius: cornerRad)
+                        .fill(Color(nsColor: .windowBackgroundColor).opacity(0.7))
+                    
+                    if item.isDirectory {
+                        Image(systemName: "folder.fill")
+                            .font(.system(size: size * 0.44))
+                            .foregroundColor(.yellow)
+                            .shadow(color: .black.opacity(0.15), radius: 2, x: 0, y: 1)
+                    } else if let img = thumbnail {
+                        Image(nsImage: img)
+                            .resizable()
+                            .aspectRatio(contentMode: .fit)
+                            .frame(maxWidth: size - (imgInset * 2), maxHeight: size - (imgInset * 2))
+                            .cornerRadius(spacing <= 3 ? 2 : 4)
+                            .shadow(color: .black.opacity(0.12), radius: 2, x: 0, y: 1)
+                    } else if isLoading {
+                        ProgressView()
+                            .controlSize(.small)
+                    } else {
+                        FileItemIconView(isDirectory: false, fileName: item.name, size: size * 0.40)
                     }
-                    .padding(spacing <= 3 ? 2 : 4)
                 }
+                .frame(width: size, height: size)
+                .contentShape(Rectangle())
+                .enableDragIf(canDrag) {
+                    vm.createDragItemProvider(for: item, side: side)
+                }
+                .onTapGesture {
+                    onTap?()
+                }
+                .simultaneousGesture(TapGesture(count: 2).onEnded {
+                    onDoubleTap?()
+                })
+                
+                // Чекбокс / кружочек выделения справа снизу
+                let checkboxSize: CGFloat = min(22, max(16, size * 0.16))
+                let currentSel = (side == .left ? vm.leftSelection : vm.rightSelection)
+                let hasAnySel = !currentSel.isEmpty
+                
+                Button(action: {
+                    onToggleSelection?()
+                }) {
+                    ZStack {
+                        if isSelected {
+                            Circle()
+                                .fill(Color.accentColor)
+                                .frame(width: checkboxSize, height: checkboxSize)
+                                .shadow(color: .black.opacity(0.35), radius: 2, x: 0, y: 1)
+                            
+                            Image(systemName: "checkmark")
+                                .font(.system(size: checkboxSize * 0.52, weight: .bold))
+                                .foregroundColor(.white)
+                        } else {
+                            Circle()
+                                .fill(Color.white.opacity(0.92))
+                                .frame(width: checkboxSize, height: checkboxSize)
+                                .shadow(color: .black.opacity(0.25), radius: 2, x: 0, y: 1)
+                            
+                            Circle()
+                                .strokeBorder(Color.accentColor, lineWidth: 1.8)
+                                .frame(width: checkboxSize, height: checkboxSize)
+                        }
+                    }
+                    .frame(width: checkboxSize, height: checkboxSize)
+                    .contentShape(Circle())
+                }
+                .buttonStyle(.plain)
+                .opacity(isSelected ? 1.0 : (isHovered || hasAnySel ? 1.0 : 0.35))
+                .help(isSelected ? "Снять выделение" : "Выделить")
+                .padding(spacing <= 3 ? 3 : 5)
             }
             .frame(width: size, height: size)
             
-            // 2. Имя файла / папки
-            if vm.editingItemId == item.id && vm.editingItemSide == side {
-                InlineRenameTextField(
-                    text: $vm.editingItemName,
-                    isDirectory: item.isDirectory,
-                    onCommit: {
-                        vm.commitInlineRename(item: item, side: side)
-                    },
-                    onCancel: {
-                        vm.cancelInlineRename()
+            // 2 & 3. Имя файла / папки и метаданные (размер)
+            VStack(spacing: 1) {
+                if vm.editingItemId == item.id && vm.editingItemSide == side {
+                    let baseName = InlineRenameHelper.baseName(for: vm.editingItemName, isDirectory: item.isDirectory)
+                    let baseNameWidth = InlineRenameHelper.textWidth(for: baseName)
+                    
+                    HStack(spacing: 0) {
+                        InlineRenameTextField(
+                            text: $vm.editingItemName,
+                            isDirectory: item.isDirectory,
+                            onCommit: {
+                                vm.commitInlineRename(item: item, side: side)
+                            },
+                            onCancel: {
+                                vm.cancelInlineRename()
+                            }
+                        )
+                        .frame(height: 18)
                     }
-                )
-                .frame(width: size, height: 26)
-            } else {
-                Text(item.name)
-                    .font(.system(size: spacing <= 3 ? 10 : 11, weight: isSelected ? .semibold : .regular))
-                    .foregroundColor(isSelected ? .accentColor : .primary)
-                    .lineLimit(2)
-                    .multilineTextAlignment(.center)
-                    .truncationMode(.middle)
-                    .frame(width: size, height: spacing <= 3 ? 24 : 26, alignment: .top)
-                    .onLongPressGesture(minimumDuration: 0.55) {
-                        if vm.activePane != side { vm.activePane = side }
-                        if side == .left {
-                            vm.leftSelection = [item.id]
-                        } else {
-                            vm.rightSelection = [item.id]
+                    .padding(.vertical, 2)
+                    .padding(.horizontal, 5)
+                    .background(ConflictColors.renameInputBg)
+                    .cornerRadius(4)
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 4)
+                            .stroke(ConflictColors.inputFocusBorder, lineWidth: 1)
+                    )
+                    .overlay(alignment: .topLeading) {
+                        CopyFragmentButtonView(baseName: baseName) {
+                            let fragment = InlineRenameHelper.currentFragment(for: vm.editingItemName, isDirectory: item.isDirectory)
+                            NSPasteboard.general.clearContents()
+                            NSPasteboard.general.setString(fragment, forType: .string)
+                            vm.statusMessage = "Скопирован фрагмент: \(fragment)"
                         }
-                        vm.triggerRename(item: item, side: side)
+                        .frame(width: 26, height: 26)
+                        .offset(x: min(max(10, 5 + baseNameWidth + 6), size - 28), y: -14)
                     }
-            }
-            
-            // 3. Дополнительные метаданные (размер)
-            Group {
-                if item.isDirectory {
-                    if let folderSize = vm.calculatedFolderSizes[item.path] {
-                        Text(formatBytes(folderSize))
-                    } else {
-                        Text("<ПАПКА>")
-                    }
+                    .zIndex(100)
+                    .frame(maxWidth: size)
                 } else {
-                    Text(formatBytes(item.size))
+                    Text(item.name)
+                        .font(.system(size: spacing <= 3 ? 11 : 12, weight: isSelected ? .semibold : .regular))
+                        .foregroundColor(isSelected ? .accentColor : .primary)
+                        .lineLimit(2)
+                        .multilineTextAlignment(.center)
+                        .truncationMode(.middle)
+                        .frame(width: size)
+                        .onLongPressGesture(minimumDuration: 0.69) {
+                            if vm.activePane != side { vm.activePane = side }
+                            if side == .left {
+                                vm.leftSelection = [item.id]
+                            } else {
+                                vm.rightSelection = [item.id]
+                            }
+                            vm.triggerRename(item: item, side: side)
+                        }
                 }
+                
+                Group {
+                    if item.isDirectory {
+                        if let folderSize = vm.calculatedFolderSizes[item.path] {
+                            Text(formatBytes(folderSize))
+                        } else {
+                            Text("")
+                        }
+                    } else {
+                        Text(formatBytes(item.size))
+                    }
+                }
+                .font(.system(size: spacing <= 3 ? 9 : 10, design: .monospaced))
+                .foregroundColor(.secondary)
+                .lineLimit(1)
             }
-            .font(.system(size: spacing <= 3 ? 8 : 9, design: .monospaced))
-            .foregroundColor(.secondary)
-            .lineLimit(1)
+            .frame(width: size, height: spacing <= 3 ? 30 : 34, alignment: .top)
+            .contentShape(Rectangle())
+            .onTapGesture {
+                onTap?()
+            }
         }
         .padding(pad)
         .background(
@@ -613,11 +1320,24 @@ public struct FileGridCell: View {
         .onHover { hovering in
             self.isHovered = hovering
         }
+        .background(
+            GeometryReader { geo in
+                Color.clear.preference(
+                    key: CellFramePreferenceKey.self,
+                    value: [item.id: geo.frame(in: .named("FileGridCoordinateSpace_\(side)"))]
+                )
+            }
+        )
         .onDrop(of: [DualPaneViewModel.dragUTType, UTType.fileURL.identifier, UTType.utf8PlainText.identifier], isTargeted: Binding(
             get: { isDragHoverFolder },
             set: { onFolderTargetChanged($0) }
         )) { providers in
             onFolderDrop(providers: providers)
+        }
+        .onAppear {
+            if thumbnail == nil && !item.isDirectory {
+                thumbnailReloadToken &+= 1
+            }
         }
         .task(id: "\(ThumbnailCacheManager.thumbnailKey(for: item))#\(thumbnailReloadToken)") {
             await loadThumbnailAsync()
@@ -628,6 +1348,13 @@ public struct FileGridCell: View {
                 thumbnailReloadToken &+= 1
             }
         }
+        .onReceive(NotificationCenter.default.publisher(for: ThumbnailCacheManager.cacheClearedNotification)) { _ in
+            self.thumbnail = nil
+            if !item.isDirectory {
+                thumbnailReloadToken &+= 1
+            }
+        }
+        .contentShape(Rectangle())
         .contextMenu {
             gridContextMenu(for: item)
         }
@@ -637,13 +1364,20 @@ public struct FileGridCell: View {
         vm.dragHoverSide == side && vm.dragHoverFolderId == item.id
     }
     
+    private var isMissingInOpposite: Bool {
+        guard vm.isComparing else { return false }
+        return (side == .left ? vm.comparisonResult.onlyLeft : vm.comparisonResult.onlyRight).contains(item.name)
+    }
+    
     private var cellBackgroundFill: Color {
         if vm.editingItemId == item.id && vm.editingItemSide == side {
             return Color.clear
         } else if isDragHoverFolder {
             return Color.accentColor.opacity(0.35)
         } else if isSelected {
-            return Color.accentColor.opacity(0.18)
+            return isMissingInOpposite ? Color.red.opacity(0.24) : Color.accentColor.opacity(0.18)
+        } else if isMissingInOpposite {
+            return Color.red.opacity(0.16)
         } else if isHovered {
             return Color.secondary.opacity(0.08)
         } else {
@@ -655,7 +1389,9 @@ public struct FileGridCell: View {
         if vm.editingItemId == item.id && vm.editingItemSide == side {
             return Color.clear
         } else if isDragHoverFolder || isSelected {
-            return Color.accentColor
+            return isMissingInOpposite ? Color.red.opacity(0.8) : Color.accentColor
+        } else if isMissingInOpposite {
+            return Color.red.opacity(0.35)
         } else if isHovered {
             return Color.secondary.opacity(0.3)
         } else {
@@ -713,16 +1449,21 @@ public struct FileGridCell: View {
         if item.isDirectory { return }
         
         let ext = URL(fileURLWithPath: item.name).pathExtension.lowercased()
-        let imageExts: Set<String> = ["jpg", "jpeg", "png", "heic", "heif", "webp", "gif", "bmp", "tiff", "tif", "ico", "avif"]
+        let imageExts: Set<String> = ["jpg", "jpeg", "png", "heic", "heif", "webp", "gif", "bmp", "tiff", "tif", "ico", "avif", "dng"]
         guard imageExts.contains(ext) else { return }
         
         // Только RAM-кэш в главном потоке; чтение с диска и генерация — в фоне
         if let cached = ThumbnailCacheManager.shared.memoryThumbnail(for: item) {
             self.thumbnail = cached
+            self.isLoading = false
             return
         }
         
         self.isLoading = true
+        defer {
+            self.isLoading = false
+        }
+        
         let img = await ThumbnailCacheManager.shared.loadThumbnail(
             for: item,
             targetSize: CGSize(width: size * 2, height: size * 2),
@@ -731,7 +1472,6 @@ public struct FileGridCell: View {
         // Ячейка ушла с экрана или сменила файл — результат не применяем
         guard !Task.isCancelled else { return }
         self.thumbnail = img
-        self.isLoading = false
     }
     
     private func fileIconName(for name: String) -> String {
@@ -752,25 +1492,53 @@ public struct FileGridCell: View {
     }
     
     @ViewBuilder
-    private func gridComparisonBadge(for name: String) -> some View {
-        if side == .left {
-            if vm.comparisonResult.onlyLeft.contains(name) {
-                Circle().fill(Color.green).frame(width: 8, height: 8)
-            } else if vm.comparisonResult.different.contains(name) {
-                Circle().fill(Color.orange).frame(width: 8, height: 8)
-            }
-        } else {
-            if vm.comparisonResult.onlyRight.contains(name) {
-                Circle().fill(Color.blue).frame(width: 8, height: 8)
-            } else if vm.comparisonResult.different.contains(name) {
-                Circle().fill(Color.orange).frame(width: 8, height: 8)
-            }
-        }
-    }
-    
-    @ViewBuilder
     private func gridContextMenu(for item: FileItem) -> some View {
         let contextItems = vm.contextMenuItems(for: item, side: side)
+        let combinedTags = Array(Set(contextItems.flatMap { $0.tags }))
+        ControlGroup {
+            ForEach(FileTag.allTags) { tag in
+                let isSelected = combinedTags.contains(tag.id) || combinedTags.contains(tag.name)
+                Button(action: {
+                    vm.toggleTag(tag.id, for: contextItems, side: side)
+                }) {
+                    ZStack {
+                        Circle()
+                            .fill(tag.color)
+                            .frame(width: 9, height: 9)
+                        if isSelected {
+                            Circle()
+                                .stroke(tag.color, lineWidth: 1.2)
+                                .frame(width: 14, height: 14)
+                        }
+                    }
+                    .frame(width: 16, height: 16)
+                }
+                .help(tag.name)
+            }
+        }
+        ControlGroup {
+            Button(action: {
+                vm.share(items: contextItems, side: side, target: .telegram)
+            }) {
+                Image(nsImage: ShareIconDrawer.telegramImage(size: 16))
+            }
+            .help("Поделиться в Telegram")
+            
+            Button(action: {
+                vm.share(items: contextItems, side: side, target: .whatsapp)
+            }) {
+                Image(nsImage: ShareIconDrawer.whatsAppImage(size: 16))
+            }
+            .help("Поделиться в WhatsApp")
+            
+            Button(action: {
+                vm.share(items: contextItems, side: side, target: .gmail)
+            }) {
+                Image(nsImage: ShareIconDrawer.gmailImage(size: 16))
+            }
+            .help("Отправить через Gmail / Почту")
+        }
+        Divider()
         Button("Новая папка с выбранными объектами (\(contextItems.count))") {
             vm.prepareNewFolderWithSelection(item: item, side: side)
         }
@@ -814,6 +1582,12 @@ public struct FileGridCell: View {
                 if newValue != showHidden { vm.toggleShowHidden(side: side) }
             }
         ))
+        
+        Divider()
+        
+        Button("Сбросить кэш эскизов") {
+            ThumbnailCacheManager.shared.clearCache()
+        }
     }
 }
 

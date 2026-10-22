@@ -19,7 +19,18 @@ public struct RenameModalView: View {
             }
             
             TextField("Новое имя", text: $vm.renameNewName)
-                .textFieldStyle(.roundedBorder)
+                .textFieldStyle(.plain)
+                .focusEffectDisabled()
+                .font(.system(size: 14, weight: .regular))
+                .foregroundColor(ConflictColors.nameText)
+                .padding(.vertical, 2)
+                .padding(.horizontal, 5)
+                .background(ConflictColors.renameInputBg)
+                .cornerRadius(4)
+                .overlay(
+                    RoundedRectangle(cornerRadius: 4)
+                        .stroke(ConflictColors.inputFocusBorder, lineWidth: 1)
+                )
                 .frame(width: 300)
             
             HStack(spacing: 12) {

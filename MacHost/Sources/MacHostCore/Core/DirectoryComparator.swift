@@ -29,6 +29,33 @@ public struct PanelTab: Identifiable, Sendable, Codable {
     }
 }
 
+public enum TabImportMode: Sendable {
+    case replace
+    case append
+}
+
+public struct TabsExportData: Codable, Sendable {
+    public var version: Int
+    public var leftTabs: [PanelTab]
+    public var rightTabs: [PanelTab]
+    public var leftActiveTabId: UUID?
+    public var rightActiveTabId: UUID?
+    
+    public init(
+        leftTabs: [PanelTab],
+        rightTabs: [PanelTab],
+        leftActiveTabId: UUID? = nil,
+        rightActiveTabId: UUID? = nil,
+        version: Int = 1
+    ) {
+        self.version = version
+        self.leftTabs = leftTabs
+        self.rightTabs = rightTabs
+        self.leftActiveTabId = leftActiveTabId
+        self.rightActiveTabId = rightActiveTabId
+    }
+}
+
 public struct DirectoryComparisonResult: Sendable {
     public let onlyLeft: Set<String>
     public let onlyRight: Set<String>

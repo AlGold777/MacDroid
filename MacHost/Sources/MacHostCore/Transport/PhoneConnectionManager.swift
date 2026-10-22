@@ -32,10 +32,31 @@ public final class PhoneConnectionManager: @unchecked Sendable {
     
     public func registerDevice(host: String, name: String) {
         lock.lock()
-        defer { lock.unlock() }
+        let normHost = ConnectionHostAddress.normalized(host)
         deviceNamesByHost[host] = name
-        if !discoveredIps.contains(host) {
-            discoveredIps.insert(host, at: 0)
+        deviceNamesByHost[normHost] = name
+        if !discoveredIps.contains(normHost) {
+            discoveredIps.insert(normHost, at: 0)
+        }
+        lock.unlock()
+        
+        if name != "Телефон Android" && name != "Android" && !name.isEmpty {
+            DeviceRegistry.shared.updateDeviceName(matchingHost: normHost, name: name)
+            if let data = UserDefaults.standard.data(forKey: "phoneConnectionHistory"),
+               var history = try? JSONDecoder().decode([SavedConnection].self, from: data) {
+                var changed = false
+                for i in 0..<history.count {
+                    if ConnectionHostAddress.normalized(history[i].host) == normHost {
+                        if history[i].name == "Телефон Android" || history[i].name == "Android" || history[i].name.isEmpty {
+                            history[i] = SavedConnection(name: name, host: history[i].host, port: history[i].port, date: history[i].date)
+                            changed = true
+                        }
+                    }
+                }
+                if changed, let encoded = try? JSONEncoder().encode(history) {
+                    UserDefaults.standard.set(encoded, forKey: "phoneConnectionHistory")
+                }
+            }
         }
     }
     
@@ -117,6 +138,8 @@ public final class PhoneConnectionManager: @unchecked Sendable {
         
         // 3. В рабочей директории сборки
         let candidates = [
+            "Resources/app-debug.apk",
+            "MacHost/Resources/app-debug.apk",
             "build/MacDroid Commander.app/Contents/Resources/app-debug.apk",
             "AndroidCompanion/app/build/outputs/apk/debug/app-debug.apk",
             "../AndroidCompanion/app/build/outputs/apk/debug/app-debug.apk"
@@ -762,13 +785,8 @@ public final class PhoneConnectionManager: @unchecked Sendable {
         fetchHostKeyObservation(host: host, port: port)?.fingerprint
     }
     
-    /// Быстрая проверка доступности сетевого порта хоста (для проверки Wi-Fi связи)
+    /// Быстрая неблокирующая проверка доступности сетевого порта хоста (для проверки Wi-Fi связи)
     public func isHostPortReachable(host: String, port: UInt16, timeoutSeconds: Int = 1) -> Bool {
-        let (status, _) = runCommand(
-            executable: "/usr/bin/nc",
-            arguments: ["-zv", "-G", String(timeoutSeconds), "--", host, String(port)],
-            timeoutSeconds: TimeInterval(timeoutSeconds + 2)
-        )
-        return status == 0
+        return NetworkPortReachability.isPortOpen(host: host, port: port, timeoutMs: timeoutSeconds * 1000)
     }
 }

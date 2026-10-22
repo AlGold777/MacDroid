@@ -75,7 +75,24 @@ public final class DeviceRegistry: @unchecked Sendable {
     public func device(matchingHost host: String) -> TrustedDevice? {
         lock.lock()
         defer { lock.unlock() }
-        return devices.values.first(where: { $0.lastKnownHost == host })
+        let norm = ConnectionHostAddress.normalized(host)
+        return devices.values.first(where: { ConnectionHostAddress.normalized($0.lastKnownHost) == norm })
+    }
+    
+    public func updateDeviceName(matchingHost host: String, name: String) {
+        guard name != "Телефон Android" && name != "Android" && !name.isEmpty else { return }
+        lock.lock()
+        defer { lock.unlock() }
+        let norm = ConnectionHostAddress.normalized(host)
+        for (id, var dev) in devices {
+            if ConnectionHostAddress.normalized(dev.lastKnownHost) == norm {
+                if dev.name == "Телефон Android" || dev.name == "Android" || dev.name.isEmpty {
+                    dev.name = name
+                    devices[id] = dev
+                    saveUnderLock()
+                }
+            }
+        }
     }
     
     /// Регистрация или обновление устройства с сохранением идентичности при смене сетевого адреса
@@ -100,7 +117,9 @@ public final class DeviceRegistry: @unchecked Sendable {
         }
         
         if var existing = devices[effectiveId] {
-            existing.name = name
+            if name != "Телефон Android" && name != "Android" && !name.isEmpty {
+                existing.name = name
+            }
             existing.lastKnownHost = host
             existing.lastKnownPort = port
             existing.lastSeenDate = Date()

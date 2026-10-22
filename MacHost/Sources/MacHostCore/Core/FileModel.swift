@@ -38,6 +38,8 @@ public struct FileItem: Identifiable, Hashable, Sendable, Codable {
     public let mtime: Double
     public let isDirectory: Bool
     public let source: FileSource
+    public let creationDate: Double?
+    public var tags: [String]
     
     public init(
         id: String,
@@ -46,7 +48,9 @@ public struct FileItem: Identifiable, Hashable, Sendable, Codable {
         size: UInt64,
         mtime: Double,
         isDirectory: Bool,
-        source: FileSource = .localMac
+        source: FileSource = .localMac,
+        creationDate: Double? = nil,
+        tags: [String] = []
     ) {
         self.id = id
         // Гарантируем каноническую нормализацию Unicode (NFC)
@@ -57,6 +61,35 @@ public struct FileItem: Identifiable, Hashable, Sendable, Codable {
         self.mtime = mtime
         self.isDirectory = isDirectory
         self.source = source
+        self.creationDate = creationDate
+        self.tags = tags
+    }
+    
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.id = try container.decode(String.self, forKey: .id)
+        let rawName = try container.decode(String.self, forKey: .name)
+        self.name = rawName.utf8.allSatisfy({ $0 < 128 }) ? rawName : rawName.precomposedStringWithCanonicalMapping
+        let rawPath = try container.decode(String.self, forKey: .path)
+        self.path = rawPath.utf8.allSatisfy({ $0 < 128 }) ? rawPath : rawPath.precomposedStringWithCanonicalMapping
+        self.size = try container.decode(UInt64.self, forKey: .size)
+        self.mtime = try container.decode(Double.self, forKey: .mtime)
+        self.isDirectory = try container.decode(Bool.self, forKey: .isDirectory)
+        self.source = try container.decodeIfPresent(FileSource.self, forKey: .source) ?? .localMac
+        self.creationDate = try container.decodeIfPresent(Double.self, forKey: .creationDate)
+        self.tags = try container.decodeIfPresent([String].self, forKey: .tags) ?? []
+    }
+    
+    public var fileType: String {
+        if isDirectory {
+            return ""
+        }
+        let ext = (name as NSString).pathExtension
+        return ext.lowercased()
+    }
+    
+    public var tagSortKey: String {
+        return tags.first ?? ""
     }
 }
 

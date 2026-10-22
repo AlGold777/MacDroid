@@ -136,6 +136,18 @@ public final class TransferQueueManager: ObservableObject {
         return true
     }
 
+    public func enqueueTasks(_ newTasks: [TransferTask]) {
+        guard !newTasks.isEmpty else { return }
+        objectWillChange.send()
+        tasks.reserveCapacity(tasks.count + newTasks.count)
+        taskIndex.reserveCapacity(taskIndex.count + newTasks.count)
+        let baseIndex = tasks.count
+        for (i, task) in newTasks.enumerated() {
+            taskIndex[task.id] = baseIndex + i
+        }
+        tasks.append(contentsOf: newTasks)
+    }
+    
     public func pauseTask(id: UUID) {
         if let idx = indexOf(id), transition(idx, to: .paused) {
             tasks[idx].speed = 0
@@ -209,6 +221,15 @@ public final class TransferQueueManager: ObservableObject {
         lastProgressUpdate[id] = now
         
         if let idx = indexOf(id) {
+            let oldProgress = tasks[idx].progress
+            let oldStatus = tasks[idx].status
+            let newStatus: TransferTaskStatus = isCompletion ? .completed : (tasks[idx].status == .queued ? .running : tasks[idx].status)
+            
+            // Предотвращаем лишние перерисовки SwiftUI, если прогресс практически не изменился
+            if !isCompletion && abs(oldProgress - progress) < 0.005 && oldStatus == newStatus {
+                return
+            }
+            
             tasks[idx].progress = progress
             tasks[idx].bytesTransferred = bytesTransferred
             tasks[idx].speed = speed

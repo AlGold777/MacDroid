@@ -168,7 +168,16 @@ public final class ConnectionController: ObservableObject {
             devName = PhoneConnectionManager.shared.deviceNameForHost("127.0.0.1") ?? "Android Device"
         case .lan(let h, _, _):
             deviceId = nil
-            devName = DeviceRegistry.shared.device(matchingHost: h)?.name ?? "Телефон Android"
+            let normHost = ConnectionHostAddress.normalized(h)
+            if let found = DiscoveryService.shared.discoveredDevices.first(where: { ConnectionHostAddress.normalized($0.host) == normHost }), !found.name.isEmpty {
+                devName = found.name
+            } else if let dev = DeviceRegistry.shared.device(matchingHost: normHost), dev.name != "Телефон Android", dev.name != "Android", !dev.name.isEmpty {
+                devName = dev.name
+            } else if let name = PhoneConnectionManager.shared.deviceNameForHost(normHost), name != "Телефон Android", name != "Android", !name.isEmpty {
+                devName = name
+            } else {
+                devName = "Телефон Android"
+            }
         }
         
         // W9: отменённая попытка не запускает новые сетевые пробы (nc/ssh-keyscan).
@@ -195,7 +204,8 @@ public final class ConnectionController: ObservableObject {
                 deviceId: deviceId,
                 devName: devName,
                 viewModel: viewModel,
-                attemptId: attemptId
+                attemptId: attemptId,
+                isExplicit: isExplicit
             )
             guard isAttemptValid(attemptId) else { return false }
 
@@ -249,7 +259,10 @@ public final class ConnectionController: ObservableObject {
         deviceId: String?,
         devName: String,
         viewModel: DualPaneViewModel,
-        attemptId: UUID
+        attemptId: UUID,
+        // Явное подключение пользователем НЕ ослабляет проверку закреплённого ключа: при смене ключа хоста
+        // нужен осознанный «Сбросить ключ» с показом старого и нового отпечатков (peer-review W4/W5).
+        isExplicit: Bool = false
     ) async throws -> (fingerprint: String, isMigrated: Bool, pinKey: String) {
         guard isAttemptValid(attemptId) else {
             throw NSError(domain: "ConnectionController", code: -1, userInfo: [NSLocalizedDescriptionKey: "Attempt cancelled"])

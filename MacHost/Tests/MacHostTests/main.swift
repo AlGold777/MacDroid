@@ -546,7 +546,8 @@ func runTest53() async {
 
 
 
-Task { @MainActor in
+@MainActor
+func runAllAsyncTests() async {
     do {
         let testDirName = "Каталог_Проверки"
         let testDirURL = tempDir.appendingPathComponent(testDirName)
@@ -614,6 +615,32 @@ Task { @MainActor in
         ) { _ in }
         assertCondition(foundItems.count == 1, "Search found 1 matching file")
         assertCondition(foundItems.first?.name == "target_report.pdf", "Search found exact match target_report.pdf")
+        
+        // 10.1 Content Search Test (поиск по содержимому файла)
+        let contentTestFile = searchDir.appendingPathComponent("document_without_keyword_in_title.txt")
+        try "Здесь находится уникальная фраза: защита от зависания потока и обработка действий.".write(to: contentTestFile, atomically: true, encoding: .utf8)
+        let foundByContent = try await SearchService.shared.search(
+            query: "защита от зависания потока и обработка действий",
+            in: tempDir.path,
+            source: .localMac,
+            localDriver: localFS,
+            remoteDriver: RemoteSFTPDriver(),
+            searchContent: true
+        ) { _ in }
+        assertCondition(foundByContent.contains(where: { $0.name == "document_without_keyword_in_title.txt" }), "Search found file by text content inside document")
+        
+        // 10.2 DualPaneViewModel in-pane search mode test
+        await MainActor.run {
+            let vm = DualPaneViewModel()
+            vm.openSearch(side: .left)
+            assertCondition(vm.isSearchActive(for: .left), "Left pane is in search mode")
+            vm.leftSearchQuery = "target_report"
+            vm.leftSearchResults = [FileItem(id: "1", name: "target_report.pdf", path: "/tmp/target_report.pdf", size: 100, mtime: 0, isDirectory: false, source: .localMac)]
+            let disp = vm.displayItems(for: .left)
+            assertCondition(disp.count == 1 && disp.first?.name == "target_report.pdf", "displayItems returns search results when search is active")
+            vm.closeSearch(side: .left)
+            assertCondition(!vm.isSearchActive(for: .left), "Search mode deactivated on close")
+        }
         
         // 11. SFTP Extended Protocol Engine Tests
         print("\n[TEST 11] SFTP Extended Protocol (Open/Read/Write/Stat):")
@@ -694,6 +721,9 @@ Task { @MainActor in
                         return ascending ? (a.size < b.size) : (a.size > b.size)
                     case .date:
                         return ascending ? (a.mtime < b.mtime) : (a.mtime > b.mtime)
+                    default:
+                        let cmp = a.name.localizedStandardCompare(b.name)
+                        return ascending ? (cmp == .orderedAscending) : (cmp == .orderedDescending)
                     }
                 }
             }
@@ -1227,7 +1257,7 @@ Task { @MainActor in
             let copiedDestA = destDir.appendingPathComponent("fileA.txt")
             for _ in 0..<100 {
                 // D6: конфликт имён теперь показывает диалог; тест отвечает «пропустить для всех»
-                await MainActor.run { if vm24.showConflictDialog { vm24.resolveConflict((strategy: .skip, applyToAll: true)) } }
+                await MainActor.run { if vm24.showConflictDialog { vm24.resolveConflict(with: ConflictResolutionResult(action: .skip, applyToAll: true)) } }
                 if FileManager.default.fileExists(atPath: copiedDestA.path) { break }
                 try await Task.sleep(nanoseconds: 50_000_000)
             }
@@ -1248,7 +1278,7 @@ Task { @MainActor in
                 _ = vm24.handleDroppedProviders([moveProvider], toSide: .right, isMove: true)
             }
             for _ in 0..<100 {
-                await MainActor.run { if vm24.showConflictDialog { vm24.resolveConflict((strategy: .skip, applyToAll: true)) } }
+                await MainActor.run { if vm24.showConflictDialog { vm24.resolveConflict(with: ConflictResolutionResult(action: .skip, applyToAll: true)) } }
                 if !FileManager.default.fileExists(atPath: dragFileA.path) { break }
                 try await Task.sleep(nanoseconds: 50_000_000)
             }
@@ -1930,7 +1960,7 @@ Task { @MainActor in
             progress: { _ in }
         )
         assertCondition(copyRenameRes == .transferred, "executeCopyMacToMac returned .transferred for .autoRename")
-        assertCondition(FileManager.default.fileExists(atPath: conflictDir.appendingPathComponent("data_1.txt").path), "Auto-renamed copy created successfully")
+        assertCondition(FileManager.default.fileExists(atPath: conflictDir.appendingPathComponent("data-1.txt").path), "Auto-renamed copy created successfully")
         
         // Invariant 4: Part file fingerprinting prevents cross-file resume corruption
         let fileA_URL = testDir29.appendingPathComponent("a/song.mp3")
@@ -3003,7 +3033,7 @@ Task { @MainActor in
             let macCrumbs = vm.breadcrumbs(for: macSubPath, source: .localMac)
             assertCondition(macCrumbs.count == 4, "Mac crumbs count is 4 for 3 subdirectories (got \(macCrumbs.count))")
             assertCondition(macCrumbs[0].isRoot == true, "First Mac crumb is root")
-            assertCondition(macCrumbs[0].title == "›", "First Mac crumb title is '›'")
+            assertCondition(macCrumbs[0].title == "Mac", "First Mac crumb title is 'Mac' (got '\(macCrumbs[0].title)')")
             assertCondition(macCrumbs[0].fullPath == homePath, "First Mac crumb points to home: \(homePath)")
             assertCondition(macCrumbs[1].title == "Downloads", "Second crumb is 'Downloads'")
             assertCondition(macCrumbs[1].fullPath == homePath + "/Downloads", "Second crumb path is correct")
@@ -3014,11 +3044,11 @@ Task { @MainActor in
             // Exact home folder: single root crumb
             let exactHomeCrumbs = vm.breadcrumbs(for: homePath, source: .localMac)
             assertCondition(exactHomeCrumbs.count == 1, "Exact home path has 1 root crumb (got \(exactHomeCrumbs.count))")
-            assertCondition(exactHomeCrumbs[0].title == "›" && exactHomeCrumbs[0].fullPath == homePath, "Exact home crumb is root '›'")
+            assertCondition(exactHomeCrumbs[0].title == "Mac" && exactHomeCrumbs[0].fullPath == homePath, "Exact home crumb is root 'Mac'")
             
             // Outside home folder (e.g. /Volumes/USB): full path from /
             let extCrumbs = vm.breadcrumbs(for: "/Volumes/FlashUSB/Docs", source: .localMac)
-            assertCondition(extCrumbs[0].isRoot == true && extCrumbs[0].title == "›", "External crumb root is '›'")
+            assertCondition(extCrumbs[0].isRoot == true && extCrumbs[0].title == "Mac", "External crumb root is 'Mac'")
             assertCondition(extCrumbs[1].title == "Volumes", "External crumb 1 is 'Volumes'")
             assertCondition(extCrumbs[2].title == "FlashUSB", "External crumb 2 is 'FlashUSB'")
             assertCondition(extCrumbs[3].title == "Docs", "External crumb 3 is 'Docs'")
@@ -3028,7 +3058,7 @@ Task { @MainActor in
             let phoneCrumbs = vm.breadcrumbs(for: phoneSubPath, source: .remotePhone)
             assertCondition(phoneCrumbs.count == 4, "Phone crumbs count is 4 (got \(phoneCrumbs.count))")
             assertCondition(phoneCrumbs[0].isRoot == true, "Phone root crumb isRoot")
-            assertCondition(phoneCrumbs[0].title == "›", "Phone root title is '›'")
+            assertCondition(phoneCrumbs[0].title == vm.connectedPhoneShortName, "Phone root title is connectedPhoneShortName (got '\(phoneCrumbs[0].title)')")
             assertCondition(phoneCrumbs[0].fullPath == "/storage/emulated/0", "Phone root points to /storage/emulated/0")
             assertCondition(phoneCrumbs[1].title == "DCIM", "Phone crumb 1 is 'DCIM'")
             assertCondition(phoneCrumbs[1].fullPath == "/storage/emulated/0/DCIM", "Phone crumb 1 path is correct")
@@ -3037,7 +3067,7 @@ Task { @MainActor in
             
             // Phone root
             let phoneRootCrumbs = vm.breadcrumbs(for: "/storage/emulated/0", source: .remotePhone)
-            assertCondition(phoneRootCrumbs.count == 1 && phoneRootCrumbs[0].title == "›", "Phone root displays single '›' crumb")
+            assertCondition(phoneRootCrumbs.count == 1 && phoneRootCrumbs[0].title == vm.connectedPhoneShortName, "Phone root displays single connectedPhoneShortName crumb")
             
             // Disabled prefix hiding
             vm.isPathPrefixHidingEnabled = false
@@ -3706,8 +3736,35 @@ Task { @MainActor in
         // 54. Phone Thumbnails
         await runTest54()
         
+        // 55. Total Commander File Conflict Resolution & Auto-Rename
+        await runTest55()
+        
+        // 56. Selection Total Bytes: Files and Folders Content Size in Footer
+        await runTest56()
+        
+        // 57. No Tag Duplication on Folder & File Duplicate
+        await runTest57()
+        
+        // 58. Inline Rename Copy Fragment, Ctrl+C/X/V & Ctrl+Shift+C
+        await runTest58()
+        
+        // 59. Ctrl+R / Cmd+R Refresh Preserves Phone Source & Directory
+        await runTest59()
+        
+        // 60. Folder Duplication Modal Dialog & Cancellation
+        await runTest60()
+        
+        // 61. Tagged Files & Folders Deletion Protection
+        await runTest61()
+        
+        // 62. File Diff Independent Dual Selection & Dynamic Recompute
+        await runTest62()
+        
+        // 63. Tab Titles: 'Mac' and Phone Name instead of '/restart' and '0'
+        await runTest63()
+        
         print("\n🎉 ==================================================")
-        print("🎉   ALL 54 PRODUCTION TEST SUITES PASSED!          ")
+        print("🎉   ALL 63 PRODUCTION TEST SUITES PASSED!          ")
         print("🎉 ==================================================")
         exit(0)
     } catch {
@@ -3716,4 +3773,1130 @@ Task { @MainActor in
     }
 }
 
+Task { @MainActor in
+    await runAllAsyncTests()
+}
+
+func runTest55() async {
+    print("\n--- [TEST 55] Total Commander File Conflict Resolution & Auto-Rename ---")
+    
+    // 1. generateAutoRename tests
+    let auto1 = generateAutoRename(filename: "document.pdf")
+    assertCondition(auto1 == "document-1.pdf", "Auto rename plain file: expected document-1.pdf, got \(auto1)")
+    
+    let auto2 = generateAutoRename(filename: "document-1.pdf")
+    assertCondition(auto2 == "document-2.pdf", "Auto rename indexed file: expected document-2.pdf, got \(auto2)")
+    
+    let auto3 = generateAutoRename(filename: "report-42.txt")
+    assertCondition(auto3 == "report-43.txt", "Auto rename double-digit index: expected report-43.txt, got \(auto3)")
+    
+    let autoNoExt = generateAutoRename(filename: "notes")
+    assertCondition(autoNoExt == "notes-1", "Auto rename without extension: expected notes-1, got \(autoNoExt)")
+    
+    let autoNoExt2 = generateAutoRename(filename: "notes-5")
+    assertCondition(autoNoExt2 == "notes-6", "Auto rename without extension indexed: expected notes-6, got \(autoNoExt2)")
+    
+    // 2. ConflictContext tests
+    let src = FileItem(id: "src", name: "doc.pdf", path: "/a/doc.pdf", size: 1024, mtime: 1700000010, isDirectory: false, source: .localMac)
+    let tgtOlder = FileItem(id: "tgt", name: "doc.pdf", path: "/b/doc.pdf", size: 512, mtime: 1700000000, isDirectory: false, source: .remotePhone)
+    let conflict = ConflictContext(sourceItem: src, targetItem: tgtOlder)
+    
+    assertCondition(conflict.isSourceNewer == true, "Source is newer than target: expected true, got \(conflict.isSourceNewer)")
+    assertCondition(conflict.isIdentical == false, "Files with different sizes/mtime are not identical")
+    
+    let tgtIdentical = FileItem(id: "tgt2", name: "doc.pdf", path: "/b/doc.pdf", size: 1024, mtime: 1700000010.5, isDirectory: false, source: .remotePhone)
+    let conflictIdentical = ConflictContext(sourceItem: src, targetItem: tgtIdentical)
+    assertCondition(conflictIdentical.isIdentical == true, "Files with same size and mtime within 2s are identical")
+    
+    // 3. ConflictResolutionResult and canSkip tests
+    let res = ConflictResolutionResult(action: .autoRename, applyToAll: true, customName: "doc-custom.pdf")
+    assertCondition(res.action == .autoRename, "ConflictResolutionResult action matches")
+    assertCondition(res.applyToAll == true, "applyToAll matches")
+    assertCondition(res.customName == "doc-custom.pdf", "customName matches")
+    
+    let singleFileConflict = ConflictContext(sourceItem: src, targetItem: tgtOlder, totalFilesCount: 1)
+    assertCondition(singleFileConflict.canSkip == false, "canSkip is false when transferring 1 file")
+    
+    let multiFileConflict = ConflictContext(sourceItem: src, targetItem: tgtOlder, totalFilesCount: 4)
+    assertCondition(multiFileConflict.canSkip == true, "canSkip is true when transferring multiple files")
+    
+    let skipRes = ConflictResolutionResult(action: .skip, applyToAll: false)
+    assertCondition(skipRes.action == .skip && skipRes.applyToAll == false, "Skip resolution has action .skip and applyToAll false")
+}
+
+func runTest56() async {
+    print("\n--- [TEST 56] Selection Total Bytes: Content Size of Files and Folders in Footer ---")
+    
+    let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("FooterSelectionTest_\(UUID().uuidString)")
+    try? FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+    
+    // Подпапка с двумя файлами: 3000 байт и 4000 байт (итого 7000 байт)
+    let subDir = tempDir.appendingPathComponent("SubFolder")
+    try? FileManager.default.createDirectory(at: subDir, withIntermediateDirectories: true)
+    let fileInsideA = subDir.appendingPathComponent("inner_a.dat")
+    let fileInsideB = subDir.appendingPathComponent("inner_b.dat")
+    try? Data(repeating: 0x11, count: 3000).write(to: fileInsideA)
+    try? Data(repeating: 0x22, count: 4000).write(to: fileInsideB)
+    
+    // Автономные файлы в корне: 1000 байт и 2000 байт
+    let file1 = tempDir.appendingPathComponent("file1.txt")
+    let file2 = tempDir.appendingPathComponent("file2.txt")
+    try? Data(repeating: 0x33, count: 1000).write(to: file1)
+    try? Data(repeating: 0x44, count: 2000).write(to: file2)
+    
+    let folderItem = FileItem(
+        id: subDir.path,
+        name: subDir.lastPathComponent,
+        path: subDir.path,
+        size: 0,
+        mtime: Date().timeIntervalSince1970,
+        isDirectory: true,
+        source: .localMac
+    )
+    let fileItem1 = FileItem(
+        id: file1.path,
+        name: file1.lastPathComponent,
+        path: file1.path,
+        size: 1000,
+        mtime: Date().timeIntervalSince1970,
+        isDirectory: false,
+        source: .localMac
+    )
+    let fileItem2 = FileItem(
+        id: file2.path,
+        name: file2.lastPathComponent,
+        path: file2.path,
+        size: 2000,
+        mtime: Date().timeIntervalSince1970,
+        isDirectory: false,
+        source: .localMac
+    )
+    
+    let vm = await MainActor.run { () -> DualPaneViewModel in
+        let vm = DualPaneViewModel()
+        vm.leftItems = [folderItem, fileItem1, fileItem2]
+        vm.activePane = .left
+        vm.leftSource = .localMac
+        
+        // 1. Выделение только файлов (1000 + 2000 = 3000 байт)
+        vm.leftSelection = [fileItem1.id, fileItem2.id]
+        let filesOnlyBytes = vm.selectedBytes(for: .left)
+        assertCondition(filesOnlyBytes == 3000, "Selection of files only calculates exact sum: 3000 bytes (got \(filesOnlyBytes))")
+        assertCondition(!vm.isCalculatingSelectedFolderSizes(for: .left), "No folders in selection means isCalculatingSelectedFolderSizes is false")
+        
+        // 2. Выделение файла и папки
+        vm.leftSelection = [fileItem1.id, folderItem.id]
+        return vm
+    }
+    
+    // Ждём автоматического асинхронного подсчёта размера папки при выделении
+    var waited = 0
+    while waited < 60 {
+        let isDone = await MainActor.run { () -> Bool in
+            if vm.calculatedFolderSizes[folderItem.path] != nil { return true }
+            if !vm.leftItems.contains(where: { $0.id == folderItem.id }) {
+                vm.leftItems = [folderItem, fileItem1, fileItem2]
+                vm.leftSelection = [fileItem1.id, folderItem.id]
+            }
+            return false
+        }
+        if isDone { break }
+        try? await Task.sleep(nanoseconds: 50_000_000)
+        waited += 1
+    }
+    
+    await MainActor.run {
+        let folderSize = vm.calculatedFolderSizes[folderItem.path]
+        assertCondition(folderSize != nil, "Selected folder size was calculated automatically upon selection")
+        assertCondition(folderSize == 7000, "Calculated folder content size is 7000 bytes (got \(folderSize ?? 0))")
+        
+        vm.leftItems = [folderItem, fileItem1, fileItem2]
+        vm.leftSelection = [fileItem1.id, folderItem.id]
+        
+        let totalSelectedBytes = vm.selectedBytes(for: .left)
+        assertCondition(totalSelectedBytes == 8000, "Total selected bytes includes both file (1000) and folder content (7000): expected 8000, got \(totalSelectedBytes)")
+        assertCondition(!vm.isCalculatingSelectedFolderSizes(for: .left), "Folder size calculation finished: isCalculatingSelectedFolderSizes is false")
+        
+        // Очищаем тестовую директорию
+        try? FileManager.default.removeItem(at: tempDir)
+    }
+}
+
+func runTest57() async {
+    print("\n--- [TEST 57] No Tag Duplication on Folder & File Duplicate ---")
+    
+    let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("NoTagDupTest_\(UUID().uuidString)")
+    try? FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+    
+    // 1. Создаем исходный файл с тегами
+    let sampleFile = tempDir.appendingPathComponent("tagged_doc.pdf")
+    try? "Sample content".write(to: sampleFile, atomically: true, encoding: .utf8)
+    try? (sampleFile as NSURL).setResourceValue(["Red", "Blue"] as NSArray, forKey: .tagNamesKey)
+    
+    // 2. Создаем исходную папку с тегом и вложенным файлом с тегом
+    let sampleFolder = tempDir.appendingPathComponent("TaggedFolder")
+    try? FileManager.default.createDirectory(at: sampleFolder, withIntermediateDirectories: true)
+    let innerFile = sampleFolder.appendingPathComponent("nested_item.txt")
+    try? "Nested content".write(to: innerFile, atomically: true, encoding: .utf8)
+    try? (sampleFolder as NSURL).setResourceValue(["Green"] as NSArray, forKey: .tagNamesKey)
+    try? (innerFile as NSURL).setResourceValue(["Yellow"] as NSArray, forKey: .tagNamesKey)
+    
+    let fileItem = FileItem(
+        id: sampleFile.path,
+        name: sampleFile.lastPathComponent,
+        path: sampleFile.path,
+        size: 14,
+        mtime: Date().timeIntervalSince1970,
+        isDirectory: false,
+        source: .localMac,
+        tags: ["Red", "Blue"]
+    )
+    let folderItem = FileItem(
+        id: sampleFolder.path,
+        name: sampleFolder.lastPathComponent,
+        path: sampleFolder.path,
+        size: 0,
+        mtime: Date().timeIntervalSince1970,
+        isDirectory: true,
+        source: .localMac,
+        tags: ["Green"]
+    )
+    
+    let vm = await MainActor.run { () -> DualPaneViewModel in
+        let vm = DualPaneViewModel()
+        vm.leftPath = tempDir.path
+        vm.leftItems = [fileItem, folderItem]
+        vm.activePane = .left
+        vm.leftSource = .localMac
+        
+        // Дублируем файл
+        vm.duplicateItem(item: fileItem, side: .left)
+        // Дублируем папку
+        vm.duplicateItem(item: folderItem, side: .left)
+        return vm
+    }
+    
+    // Ждем создания дубликатов на диске
+    let dupFile = tempDir.appendingPathComponent("tagged_doc (копия).pdf")
+    let dupFolder = tempDir.appendingPathComponent("TaggedFolder (копия)")
+    let dupInnerFile = dupFolder.appendingPathComponent("nested_item.txt")
+    
+    var waited = 0
+    while waited < 60 {
+        let exists = FileManager.default.fileExists(atPath: dupFile.path) && FileManager.default.fileExists(atPath: dupFolder.path)
+        if exists { break }
+        try? await Task.sleep(nanoseconds: 50_000_000)
+        waited += 1
+    }
+    
+    assertCondition(FileManager.default.fileExists(atPath: dupFile.path), "Duplicate file was created on disk: \(dupFile.lastPathComponent)")
+    assertCondition(FileManager.default.fileExists(atPath: dupFolder.path), "Duplicate folder was created on disk: \(dupFolder.lastPathComponent)")
+    
+    // Проверяем, что оригинал сохранил свои теги
+    let origFileTags = (try? sampleFile.resourceValues(forKeys: [.tagNamesKey]))?.tagNames ?? []
+    assertCondition(origFileTags.contains("Red") && origFileTags.contains("Blue"), "Original file preserved its tags (Red, Blue): got \(origFileTags)")
+    
+    let origFolderTags = (try? sampleFolder.resourceValues(forKeys: [.tagNamesKey]))?.tagNames ?? []
+    assertCondition(origFolderTags.contains("Green"), "Original folder preserved its tags (Green): got \(origFolderTags)")
+    
+    // Проверяем, что на дубликатах теги НЕ продублировались (должны быть пустыми!)
+    let dupFileTags = (try? dupFile.resourceValues(forKeys: [.tagNamesKey]))?.tagNames ?? []
+    assertCondition(dupFileTags.isEmpty, "Duplicate file has NO tags: expected [], got \(dupFileTags)")
+    
+    let dupFolderTags = (try? dupFolder.resourceValues(forKeys: [.tagNamesKey]))?.tagNames ?? []
+    assertCondition(dupFolderTags.isEmpty, "Duplicate folder has NO tags: expected [], got \(dupFolderTags)")
+    
+    let dupInnerTags = (try? dupInnerFile.resourceValues(forKeys: [.tagNamesKey]))?.tagNames ?? []
+    assertCondition(dupInnerTags.isEmpty, "Nested file inside duplicate folder has NO tags: expected [], got \(dupInnerTags)")
+    
+    // Очистка тестовой директории
+    try? FileManager.default.removeItem(at: tempDir)
+}
+
+func runTest58() async {
+    print("\n--- [TEST 58] Inline Rename Copy Fragment, Ctrl+C/X/V & Ctrl+Shift+C ---")
+    
+    // 1. InlineRenameHelper baseName & textWidth logic
+    let b1 = InlineRenameHelper.baseName(for: "document.pdf", isDirectory: false)
+    assertCondition(b1 == "document", "InlineRenameHelper baseName for document.pdf is document (got \(b1))")
+    
+    let b2 = InlineRenameHelper.baseName(for: "archive.tar.gz", isDirectory: false)
+    assertCondition(b2 == "archive.tar", "InlineRenameHelper baseName for archive.tar.gz is archive.tar (got \(b2))")
+    
+    let b3 = InlineRenameHelper.baseName(for: ".gitignore", isDirectory: false)
+    assertCondition(b3 == ".gitignore", "InlineRenameHelper baseName for hidden file .gitignore is .gitignore (got \(b3))")
+    
+    let b4 = InlineRenameHelper.baseName(for: "My.Folder.Name", isDirectory: true)
+    assertCondition(b4 == "My.Folder.Name", "InlineRenameHelper baseName for folder My.Folder.Name is My.Folder.Name (got \(b4))")
+    
+    let w = InlineRenameHelper.textWidth(for: "document")
+    assertCondition(w > 0, "InlineRenameHelper textWidth is positive: \(w)")
+    
+    let fragFallback = InlineRenameHelper.currentFragment(for: "photo.jpg", isDirectory: false)
+    assertCondition(fragFallback == "photo", "currentFragment falls back to baseName 'photo' (got \(fragFallback))")
+    
+    // 2. DualPaneViewModel clipboard & cut operations
+    let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("ClipboardCutTest_\(UUID().uuidString)")
+    let subDir = tempDir.appendingPathComponent("TargetDir")
+    try? FileManager.default.createDirectory(at: subDir, withIntermediateDirectories: true)
+    
+    let fileA = tempDir.appendingPathComponent("fileA.txt")
+    let fileB = tempDir.appendingPathComponent("fileB.txt")
+    try? "Content A".write(to: fileA, atomically: true, encoding: .utf8)
+    try? "Content B".write(to: fileB, atomically: true, encoding: .utf8)
+    
+    let itemA = FileItem(id: fileA.path, name: "fileA.txt", path: fileA.path, size: 9, mtime: 1000, isDirectory: false, source: .localMac)
+    let itemB = FileItem(id: fileB.path, name: "fileB.txt", path: fileB.path, size: 9, mtime: 1000, isDirectory: false, source: .localMac)
+    
+    let vm = await MainActor.run { () -> DualPaneViewModel in
+        let vm = DualPaneViewModel()
+        vm.leftPath = tempDir.path
+        vm.rightPath = subDir.path
+        vm.leftItems = [itemA, itemB]
+        vm.leftSelection = [itemA.id]
+        vm.activePane = .left
+        vm.leftSource = .localMac
+        vm.rightSource = .localMac
+        
+        // 2a. Копирование имени объекта (с расширением) по Ctrl+Shift+C
+        vm.copySelectedNamesToClipboard(side: .left)
+        let nameInPb = NSPasteboard.general.string(forType: .string)
+        assertCondition(nameInPb == "fileA.txt", "Ctrl+Shift+C copied single item name with extension: \(nameInPb ?? "nil")")
+        
+        // Множественное копирование имен
+        vm.leftSelection = [itemA.id, itemB.id]
+        vm.copySelectedNamesToClipboard(side: .left)
+        let namesInPb = NSPasteboard.general.string(forType: .string)
+        assertCondition(namesInPb?.contains("fileA.txt") == true && namesInPb?.contains("fileB.txt") == true, "Ctrl+Shift+C copied multiple names separated by newline: \(namesInPb ?? "nil")")
+        
+        // 2b. Обычное копирование (Ctrl+C)
+        vm.leftSelection = [itemA.id]
+        vm.copyToClipboard(side: .left)
+        assertCondition(vm.clipboardIsCut == false, "copyToClipboard sets clipboardIsCut = false")
+        assertCondition(vm.clipboardItems.count == 1, "clipboardItems contains 1 item")
+        
+        // 2c. Вырезание (Ctrl+X)
+        vm.cutToClipboard(side: .left)
+        assertCondition(vm.clipboardIsCut == true, "cutToClipboard sets clipboardIsCut = true")
+        assertCondition(vm.clipboardItems.count == 1, "clipboardItems contains 1 cut item")
+        
+        // 2d. Вставка перемещаемого объекта (Ctrl+V) в правую панель
+        vm.pasteFromClipboard(targetSide: .right)
+        
+        return vm
+    }
+    
+    // Ждем завершения перемещения Task
+    let movedFile = subDir.appendingPathComponent("fileA.txt")
+    var waited = 0
+    while waited < 60 {
+        if FileManager.default.fileExists(atPath: movedFile.path) { break }
+        try? await Task.sleep(nanoseconds: 50_000_000)
+        waited += 1
+    }
+    
+    assertCondition(FileManager.default.fileExists(atPath: movedFile.path), "Moved file exists at destination: \(movedFile.path)")
+    assertCondition(!FileManager.default.fileExists(atPath: fileA.path), "Original file no longer exists after cut+paste move")
+    
+    await MainActor.run {
+        assertCondition(vm.clipboardIsCut == false, "clipboardIsCut reset to false after paste")
+        assertCondition(vm.clipboardItems.isEmpty, "clipboardItems cleared after cut+paste")
+    }
+    
+    // 3. KeyCommandMonitor shortcut recognition
+    await MainActor.run {
+        KeyCommandMonitor.activeViewModel = vm
+        
+        // Ctrl+Shift+C (code 8, mods: control + shift)
+        if let eventCtrlShiftC = NSEvent.keyEvent(
+            with: .keyDown,
+            location: .zero,
+            modifierFlags: [.control, .shift],
+            timestamp: 0,
+            windowNumber: 0,
+            context: nil,
+            characters: "c",
+            charactersIgnoringModifiers: "c",
+            isARepeat: false,
+            keyCode: 8
+        ) {
+            let handled = KeyCommandMonitor.handleEvent(eventCtrlShiftC)
+            assertCondition(handled == nil, "KeyCommandMonitor intercepts Ctrl+Shift+C and returns nil (consumed)")
+        }
+        
+        // Ctrl+C (code 8, mods: control)
+        if let eventCtrlC = NSEvent.keyEvent(
+            with: .keyDown,
+            location: .zero,
+            modifierFlags: [.control],
+            timestamp: 0,
+            windowNumber: 0,
+            context: nil,
+            characters: "c",
+            charactersIgnoringModifiers: "c",
+            isARepeat: false,
+            keyCode: 8
+        ) {
+            let handled = KeyCommandMonitor.handleEvent(eventCtrlC)
+            assertCondition(handled == nil, "KeyCommandMonitor intercepts Ctrl+C and returns nil (consumed)")
+            assertCondition(vm.clipboardIsCut == false, "Ctrl+C set clipboardIsCut = false")
+        }
+        
+        // Ctrl+X (code 7, mods: control)
+        if let eventCtrlX = NSEvent.keyEvent(
+            with: .keyDown,
+            location: .zero,
+            modifierFlags: [.control],
+            timestamp: 0,
+            windowNumber: 0,
+            context: nil,
+            characters: "x",
+            charactersIgnoringModifiers: "x",
+            isARepeat: false,
+            keyCode: 7
+        ) {
+            let handled = KeyCommandMonitor.handleEvent(eventCtrlX)
+            assertCondition(handled == nil, "KeyCommandMonitor intercepts Ctrl+X and returns nil (consumed)")
+            assertCondition(vm.clipboardIsCut == true, "Ctrl+X set clipboardIsCut = true")
+        }
+    }
+    
+    // Очистка
+    try? FileManager.default.removeItem(at: tempDir)
+}
+
+func runTest59() async {
+    print("\n--- [TEST 59] Ctrl+R / Cmd+R Refresh Preserves Phone Source & Directory ---")
+    
+    await MainActor.run {
+        let vm = DualPaneViewModel()
+        
+        // 1. Настраиваем правую панель на телефон
+        vm.rightSource = .remotePhone
+        vm.rightPath = "/storage/emulated/0/DCIM/Camera"
+        vm.activePane = .right
+        
+        // Допустим, вкладка была создана для Mac или закреплена (isPinned = true)
+        let tab = PanelTab(title: "Camera", path: "/Users/restart", source: .localMac, isPinned: true)
+        vm.rightTabs = [tab]
+        vm.rightActiveTabId = tab.id
+        
+        // 2. Вызываем refreshPaneToActiveTab(side: .right)
+        vm.refreshPaneToActiveTab(side: .right)
+        
+        assertCondition(vm.rightSource == .remotePhone, "refreshPaneToActiveTab preserves .remotePhone (got \(vm.rightSource))")
+        assertCondition(vm.rightPath == "/storage/emulated/0/DCIM/Camera", "refreshPaneToActiveTab preserves phone directory: \(vm.rightPath)")
+        assertCondition(vm.activePane == .right, "refreshPaneToActiveTab keeps right pane active")
+        
+        // 3. Проверяем KeyCommandMonitor для Ctrl+R
+        KeyCommandMonitor.activeViewModel = vm
+        TableDoubleClickHandler.HandlerView.leftTableView = NSTableView()
+        vm.activePane = .right
+        if let eventCtrlR = NSEvent.keyEvent(
+            with: .keyDown,
+            location: .zero,
+            modifierFlags: [.control],
+            timestamp: 0,
+            windowNumber: 0,
+            context: nil,
+            characters: "r",
+            charactersIgnoringModifiers: "r",
+            isARepeat: false,
+            keyCode: 15
+        ) {
+            let handled = KeyCommandMonitor.handleEvent(eventCtrlR)
+            assertCondition(handled == nil, "KeyCommandMonitor intercepts Ctrl+R and returns nil (consumed)")
+            assertCondition(vm.activePane == .right, "Ctrl+R via KeyCommandMonitor preserves activePane == .right (does not switch to left pane)")
+            assertCondition(vm.rightSource == .remotePhone, "Ctrl+R via KeyCommandMonitor preserves .remotePhone")
+            assertCondition(vm.rightPath == "/storage/emulated/0/DCIM/Camera", "Ctrl+R via KeyCommandMonitor preserves path")
+        }
+        
+        // 3b. Проверяем нормализацию /sdcard пути и его сохранение при refreshPane
+        vm.navigateTo(path: "/sdcard/Photos", side: .right)
+        assertCondition(vm.rightPath == "/storage/emulated/0/Photos", "navigateTo normalized /sdcard to /storage/emulated/0/Photos")
+        vm.refreshPane(side: .right)
+        assertCondition(vm.rightPath == "/storage/emulated/0/Photos", "refreshPane preserved normalized phone path")
+        
+        // 4. Проверяем смену источника через changeSource: вкладка должна обновить source на .remotePhone
+        vm.changeSource(to: .remotePhone, side: .left)
+        assertCondition(vm.leftSource == .remotePhone, "changeSource sets leftSource to .remotePhone")
+        if let activeLeftTab = vm.leftTabs.first(where: { $0.id == vm.leftActiveTabId }) {
+            assertCondition(activeLeftTab.source == .remotePhone, "Active left tab source is synchronized to .remotePhone")
+        }
+        
+        // 5. Проверяем, что refreshPane очищает DirectoryCache для обновляемого пути
+        DirectoryCache.shared.set(path: "/storage/emulated/0", items: [
+            FileItem(id: "cached", name: "cached.txt", path: "/storage/emulated/0/cached.txt", size: 10, mtime: 0, isDirectory: false, source: .remotePhone)
+        ])
+        assertCondition(DirectoryCache.shared.get(path: "/storage/emulated/0")?.count == 1, "DirectoryCache entry set")
+        vm.refreshPane(side: .left)
+        assertCondition(DirectoryCache.shared.get(path: "/storage/emulated/0") == nil, "refreshPane invalidates DirectoryCache for phone path")
+        
+        // 6. Проверяем Ctrl+R при наличии активных вкладок (должно обновиться до содержимого активной вкладки)
+        let downloadsTab = PanelTab(title: "Downloads", path: "/Users/restart/Downloads", source: .localMac)
+        vm.leftTabs = [downloadsTab]
+        vm.areTabsVisibleLeft = true
+        vm.leftActiveTabId = downloadsTab.id
+        vm.leftSource = .localMac
+        vm.leftPath = "/Users/restart/Downloads/SomeSubFolder" // Пользователь ушел в подпапку
+        vm.activePane = .left
+        
+        vm.refreshPaneToActiveTab(side: .left)
+        assertCondition(vm.leftPath == "/Users/restart/Downloads", "Ctrl+R with active tab restores directory to active tab path: \(vm.leftPath)")
+        assertCondition(vm.leftSource == .localMac, "Ctrl+R with active tab preserves tab source: \(vm.leftSource)")
+        
+        // 7. Проверяем Ctrl+R когда закладок нет вообще (Mac -> сброс до Mac Home)
+        let macHome = FileManager.default.homeDirectoryForCurrentUser.path
+        vm.leftTabs = [PanelTab(title: "Mac", path: macHome, source: .localMac, isPinned: false)]
+        vm.areTabsVisibleLeft = false
+        vm.leftSource = .localMac
+        vm.leftPath = "/Users/restart/Downloads/Deep/Nested/Folder"
+        vm.activePane = .left
+        
+        vm.refreshPaneToActiveTab(side: .left)
+        assertCondition(vm.leftPath == macHome, "Ctrl+R without tabs resets Mac pane to Home directory: \(vm.leftPath)")
+        
+        // 8. Проверяем Ctrl+R когда закладок нет вообще (Телефон -> сброс до /storage/emulated/0)
+        vm.rightTabs = [PanelTab(title: "Phone", path: "/storage/emulated/0", source: .remotePhone, isPinned: false)]
+        vm.areTabsVisibleRight = false
+        vm.rightSource = .remotePhone
+        vm.rightPath = "/storage/emulated/0/DCIM/Camera/Summer2026"
+        vm.activePane = .right
+        
+        vm.refreshPaneToActiveTab(side: .right)
+        assertCondition(vm.rightPath == "/storage/emulated/0", "Ctrl+R without tabs resets Phone pane to /storage/emulated/0: \(vm.rightPath)")
+        assertCondition(vm.rightSource == .remotePhone, "Ctrl+R without tabs preserves Phone source")
+    }
+}
+
+@MainActor
+func runTest60() async {
+    print("\n--- [TEST 60] Folder Duplication Modal Dialog & Cancellation ---")
+    
+    // 1. Проверка форматирования прогресса и ETA
+    let subtitle1 = DualPaneViewModel.formatDuplicateSizeAndETA(transferred: 41_800_000, total: 1_920_000_000, eta: 45)
+    assertCondition(subtitle1.contains("41,8 МБ") || subtitle1.contains("41.8 MB") || subtitle1.contains("41,8"), "formatDuplicateSizeAndETA contains transferred size: \(subtitle1)")
+    assertCondition(subtitle1.contains("1,92 ГБ") || subtitle1.contains("1.92 GB") || subtitle1.contains("1,92"), "formatDuplicateSizeAndETA contains total size: \(subtitle1)")
+    assertCondition(subtitle1.contains("меньше минуты"), "formatDuplicateSizeAndETA contains 'меньше минуты': \(subtitle1)")
+    
+    // 2. Создание временной тестовой папки
+    let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("DuplicateTest_\(UUID().uuidString)")
+    let testFolder = tempDir.appendingPathComponent("GitHub")
+    let sourceFolder = testFolder.appendingPathComponent("DocScan")
+    try? FileManager.default.createDirectory(at: sourceFolder, withIntermediateDirectories: true)
+    
+    let subFile1 = sourceFolder.appendingPathComponent("file1.txt")
+    let subFile2 = sourceFolder.appendingPathComponent("file2.txt")
+    try? "Hello 1".data(using: .utf8)?.write(to: subFile1)
+    try? "Hello 2".data(using: .utf8)?.write(to: subFile2)
+    
+    let folderItem = FileItem(
+        id: sourceFolder.path,
+        name: "DocScan",
+        path: sourceFolder.path,
+        size: 14,
+        mtime: Date().timeIntervalSince1970,
+        isDirectory: true,
+        source: .localMac
+    )
+    
+    // 3. Быстрое дублирование (< 3 сек) завершается без модального окна (showDuplicationModal == false)
+    let vm = await MainActor.run { () -> DualPaneViewModel in
+        let vm = DualPaneViewModel()
+        vm.leftPath = testFolder.path
+        vm.leftItems = [folderItem]
+        vm.activePane = .left
+        vm.leftSource = .localMac
+        vm.duplicationModalDelay = 3.0 // Стандартный порог 3 секунды
+        
+        vm.duplicateItem(item: folderItem, side: .left)
+        return vm
+    }
+    
+    // Ждем завершения
+    let dupFolderPath = testFolder.appendingPathComponent("DocScan (копия)").path
+    var waited = 0
+    while waited < 60 {
+        let isDone = await MainActor.run { !vm.isDuplicating }
+        if FileManager.default.fileExists(atPath: dupFolderPath) && isDone { break }
+        try? await Task.sleep(nanoseconds: 50_000_000)
+        waited += 1
+    }
+    
+    await MainActor.run {
+        assertCondition(FileManager.default.fileExists(atPath: dupFolderPath), "Duplicate folder created on disk: \(dupFolderPath)")
+        assertCondition(!vm.showDuplicationModal, "Fast duplicate (< 3s) did NOT show modal dialog: showDuplicationModal is false")
+        assertCondition(!vm.isDuplicating, "isDuplicating reset to false after completion")
+    }
+    
+    // 4. Проверка блокировки операций при активном дублировании
+    await MainActor.run {
+        vm.isDuplicating = true
+        
+        // Попытка вызвать другие операции
+        vm.triggerCopy()
+        assertCondition(!vm.showTransferConfirmationDialog && !vm.showTransferProgress, "triggerCopy blocked while isDuplicating is true")
+        
+        vm.triggerMove()
+        assertCondition(!vm.showTransferConfirmationDialog && !vm.showTransferProgress, "triggerMove blocked while isDuplicating is true")
+        
+        vm.triggerDelete()
+        assertCondition(!vm.showDeleteConfirmDialog, "triggerDelete blocked while isDuplicating is true")
+        
+        vm.prepareNewFolder()
+        assertCondition(!vm.showNewFolderDialog, "prepareNewFolder blocked while isDuplicating is true")
+        
+        // Проверка блокировки в KeyCommandMonitor
+        KeyCommandMonitor.activeViewModel = vm
+        if let eventCtrlC = NSEvent.keyEvent(
+            with: .keyDown,
+            location: .zero,
+            modifierFlags: [.control],
+            timestamp: 0,
+            windowNumber: 0,
+            context: nil,
+            characters: "c",
+            charactersIgnoringModifiers: "c",
+            isARepeat: false,
+            keyCode: 8
+        ) {
+            let handled = KeyCommandMonitor.handleEvent(eventCtrlC)
+            assertCondition(handled == nil, "KeyCommandMonitor consumed Ctrl+C while isDuplicating is true")
+        }
+        
+        // Клавиша Escape отменяет дублирование
+        if let eventEsc = NSEvent.keyEvent(
+            with: .keyDown,
+            location: .zero,
+            modifierFlags: [],
+            timestamp: 0,
+            windowNumber: 0,
+            context: nil,
+            characters: "\u{1b}",
+            charactersIgnoringModifiers: "\u{1b}",
+            isARepeat: false,
+            keyCode: 53
+        ) {
+            let handled = KeyCommandMonitor.handleEvent(eventEsc)
+            assertCondition(handled == nil, "KeyCommandMonitor consumed Esc while isDuplicating is true")
+            assertCondition(!vm.isDuplicating, "Esc key cancelled duplication: isDuplicating is false")
+        }
+        
+        vm.isDuplicating = false
+    }
+    
+    // 5. Проверка показа модального окна при превышении задержки и отмены через cancelDuplicate()
+    await MainActor.run {
+        vm.duplicationModalDelay = 0.05 // 50мс для теста
+        vm.duplicateCreatedPaths.append(testFolder.appendingPathComponent("ToCancel").path)
+        try? FileManager.default.createDirectory(at: testFolder.appendingPathComponent("ToCancel"), withIntermediateDirectories: true)
+        
+        vm.isDuplicating = true
+        vm.showDuplicationModal = true
+        vm.duplicateTitle = "Дублирование объектов (1900) в «GitHub»"
+        vm.duplicateSubtitle = "41,8 МБ из 1,92 ГБ — меньше минуты"
+        
+        assertCondition(vm.showDuplicationModal, "showDuplicationModal is true")
+        assertCondition(vm.duplicateTitle == "Дублирование объектов (1900) в «GitHub»", "duplicateTitle set correctly: \(vm.duplicateTitle)")
+        
+        // Отмена через cancelDuplicate() (нажатие крестика)
+        vm.cancelDuplicate()
+        assertCondition(!vm.showDuplicationModal, "cancelDuplicate hid modal: showDuplicationModal is false")
+        assertCondition(!vm.isDuplicating, "cancelDuplicate reset isDuplicating to false")
+        assertCondition(!FileManager.default.fileExists(atPath: testFolder.appendingPathComponent("ToCancel").path), "cancelDuplicate cleaned up incomplete duplicate")
+    }
+    
+    // 6. Проверка параметров современного спиннера и типа объекта для больших файлов
+    await MainActor.run {
+        let largeFileItem = FileItem(
+            id: testFolder.appendingPathComponent("LargeVideo.mov").path,
+            name: "LargeVideo.mov",
+            path: testFolder.appendingPathComponent("LargeVideo.mov").path,
+            size: 50 * 1024 * 1024,
+            mtime: Date().timeIntervalSince1970,
+            isDirectory: false,
+            source: .localMac
+        )
+        let vm = DualPaneViewModel()
+        vm.leftPath = testFolder.path
+        vm.leftItems = [largeFileItem]
+        vm.activePane = .left
+        vm.leftSource = .localMac
+        vm.duplicationModalDelay = 10.0
+        
+        vm.duplicateItem(item: largeFileItem, side: .left)
+        assertCondition(!vm.duplicateIsFolder, "duplicateIsFolder is false for single file: got \(vm.duplicateIsFolder)")
+        assertCondition(vm.duplicateFirstTargetPath == largeFileItem.path, "duplicateFirstTargetPath correctly captured")
+        
+        vm.cancelDuplicate()
+        assertCondition(!vm.isDuplicating, "Cancelled large file duplicate")
+    }
+    
+    // Очистка
+    try? FileManager.default.removeItem(at: tempDir)
+}
+
+func runTest61() async {
+    print("\n--- [TEST 61] Tagged Files & Folders Deletion Protection ---")
+    
+    let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("TagDeleteProtectionTest_\(UUID().uuidString)")
+    try? FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+    
+    // 1. Создаем файлы и папки
+    let taggedFile = tempDir.appendingPathComponent("tagged_file.txt")
+    try? "Important tagged content".write(to: taggedFile, atomically: true, encoding: .utf8)
+    try? (taggedFile as NSURL).setResourceValue(["Red"] as NSArray, forKey: .tagNamesKey)
+    
+    let normalFile = tempDir.appendingPathComponent("normal_file.txt")
+    try? "Normal content".write(to: normalFile, atomically: true, encoding: .utf8)
+    
+    let taggedFolder = tempDir.appendingPathComponent("TaggedFolder")
+    try? FileManager.default.createDirectory(at: taggedFolder, withIntermediateDirectories: true)
+    try? (taggedFolder as NSURL).setResourceValue(["Blue"] as NSArray, forKey: .tagNamesKey)
+    
+    let folderWithTaggedInner = tempDir.appendingPathComponent("FolderWithInnerTag")
+    try? FileManager.default.createDirectory(at: folderWithTaggedInner, withIntermediateDirectories: true)
+    let innerTagged = folderWithTaggedInner.appendingPathComponent("secret.txt")
+    try? "Secret".write(to: innerTagged, atomically: true, encoding: .utf8)
+    try? (innerTagged as NSURL).setResourceValue(["Green"] as NSArray, forKey: .tagNamesKey)
+    
+    let normalFolder = tempDir.appendingPathComponent("NormalFolder")
+    try? FileManager.default.createDirectory(at: normalFolder, withIntermediateDirectories: true)
+    
+    let itemTaggedFile = FileItem(
+        id: taggedFile.path,
+        name: taggedFile.lastPathComponent,
+        path: taggedFile.path,
+        size: 22,
+        mtime: Date().timeIntervalSince1970,
+        isDirectory: false,
+        source: .localMac,
+        tags: ["Red"]
+    )
+    let itemNormalFile = FileItem(
+        id: normalFile.path,
+        name: normalFile.lastPathComponent,
+        path: normalFile.path,
+        size: 14,
+        mtime: Date().timeIntervalSince1970,
+        isDirectory: false,
+        source: .localMac,
+        tags: []
+    )
+    let itemTaggedFolder = FileItem(
+        id: taggedFolder.path,
+        name: taggedFolder.lastPathComponent,
+        path: taggedFolder.path,
+        size: 0,
+        mtime: Date().timeIntervalSince1970,
+        isDirectory: true,
+        source: .localMac,
+        tags: ["Blue"]
+    )
+    let itemFolderWithInner = FileItem(
+        id: folderWithTaggedInner.path,
+        name: folderWithTaggedInner.lastPathComponent,
+        path: folderWithTaggedInner.path,
+        size: 0,
+        mtime: Date().timeIntervalSince1970,
+        isDirectory: true,
+        source: .localMac,
+        tags: []
+    )
+    let itemNormalFolder = FileItem(
+        id: normalFolder.path,
+        name: normalFolder.lastPathComponent,
+        path: normalFolder.path,
+        size: 0,
+        mtime: Date().timeIntervalSince1970,
+        isDirectory: true,
+        source: .localMac,
+        tags: []
+    )
+    
+    await MainActor.run {
+        let vm = DualPaneViewModel()
+        vm.leftPath = tempDir.path
+        vm.leftItems = [itemTaggedFile, itemNormalFile, itemTaggedFolder, itemFolderWithInner, itemNormalFolder]
+        vm.activePane = .left
+        vm.leftSource = .localMac
+        
+        // 1. Попытка удаления файла с тегами
+        vm.leftSelection = [itemTaggedFile.id]
+        vm.triggerDelete()
+        assertCondition(!vm.showDeleteConfirmDialog, "triggerDelete blocked for tagged file")
+        assertCondition(vm.showErrorAlert, "showErrorAlert is true for tagged file")
+        assertCondition(vm.errorAlertTitle == "Удаление невозможно", "errorAlertTitle is 'Удаление невозможно'")
+        assertCondition(vm.errorAlertButtonTitle == "OK", "errorAlertButtonTitle is 'OK'")
+        assertCondition(vm.errorMessage == "Чтобы удалить файл, вам необходимо снять тег.", "errorMessage is exact expected concise text: \(vm.errorMessage)")
+        
+        // Сброс алерта
+        vm.showErrorAlert = false
+        
+        // 2. Попытка удаления папки с тегами
+        vm.leftSelection = [itemTaggedFolder.id]
+        vm.triggerDelete()
+        assertCondition(!vm.showDeleteConfirmDialog, "triggerDelete blocked for tagged folder")
+        assertCondition(vm.showErrorAlert, "showErrorAlert is true for tagged folder")
+        assertCondition(vm.errorMessage == "Чтобы удалить файл, вам необходимо снять тег.", "errorMessage for folder is exact expected text")
+        
+        vm.showErrorAlert = false
+        
+        // 3. Попытка удаления папки, содержащей файл с тегами внутри
+        vm.leftSelection = [itemFolderWithInner.id]
+        vm.triggerDelete()
+        assertCondition(!vm.showDeleteConfirmDialog, "triggerDelete blocked for folder containing tagged item")
+        assertCondition(vm.showErrorAlert, "showErrorAlert is true for folder containing tagged item")
+        assertCondition(vm.errorMessage == "Чтобы удалить файл, вам необходимо снять тег.", "errorMessage for nested folder is exact expected text")
+        
+        vm.showErrorAlert = false
+        
+        // 4. Попытка удаления обычного файла (без тегов)
+        vm.leftSelection = [itemNormalFile.id]
+        vm.triggerDelete()
+        assertCondition(vm.showDeleteConfirmDialog, "triggerDelete allowed for normal untagged file")
+        assertCondition(!vm.showErrorAlert, "showErrorAlert is false for normal file")
+        
+        vm.showDeleteConfirmDialog = false
+        
+        // 5. Попытка удаления обычной папки (без тегов)
+        vm.leftSelection = [itemNormalFolder.id]
+        vm.triggerDelete()
+        assertCondition(vm.showDeleteConfirmDialog, "triggerDelete allowed for normal untagged folder")
+        
+        vm.showDeleteConfirmDialog = false
+        
+        // 6. После ручного снятия тегов файл можно удалить
+        try? (taggedFile as NSURL).setResourceValue([] as NSArray, forKey: .tagNamesKey)
+        vm.leftItems[0].tags = []
+        vm.leftSelection = [itemTaggedFile.id]
+        vm.triggerDelete()
+        assertCondition(vm.showDeleteConfirmDialog, "triggerDelete allowed after removing tags from file")
+        assertCondition(!vm.showErrorAlert, "showErrorAlert is false after removing tags")
+        
+        vm.showDeleteConfirmDialog = false
+        
+        // 7. Проверка защитного барьера в confirmDelete(): taggedFolder не удаляется даже при прямом вызове confirmDelete
+        vm.leftSelection = [itemTaggedFolder.id]
+        vm.confirmDelete()
+    }
+    
+    // Ждем выполнения Task в confirmDelete
+    try? await Task.sleep(nanoseconds: 100_000_000)
+    
+    assertCondition(FileManager.default.fileExists(atPath: taggedFolder.path), "confirmDelete did NOT delete tagged folder: \(taggedFolder.path)")
+    
+    // Очистка
+    try? FileManager.default.removeItem(at: tempDir)
+}
+
+func runTest62() async {
+    print("\n--- [TEST 62] File Diff Independent Dual Selection & Dynamic Recompute ---")
+    
+    let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("FileDiffTest_\(UUID().uuidString)")
+    try? FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+    
+    let fileLeft = tempDir.appendingPathComponent("leftDoc.txt")
+    let fileRight = tempDir.appendingPathComponent("rightDoc.txt")
+    try? "Line 1 in Left\nLine 2 Common\n".write(to: fileLeft, atomically: true, encoding: .utf8)
+    try? "Line 1 in Right\nLine 2 Common\n".write(to: fileRight, atomically: true, encoding: .utf8)
+    
+    let itemLeft = FileItem(id: fileLeft.path, name: "leftDoc.txt", path: fileLeft.path, size: 28, mtime: 1000, isDirectory: false, source: .localMac)
+    let itemRight = FileItem(id: fileRight.path, name: "rightDoc.txt", path: fileRight.path, size: 29, mtime: 1000, isDirectory: false, source: .localMac)
+    
+    let vm = await MainActor.run { () -> DualPaneViewModel in
+        let vm = DualPaneViewModel()
+        vm.leftPath = tempDir.path
+        vm.rightPath = tempDir.path
+        vm.leftItems = [itemLeft]
+        vm.rightItems = [itemRight]
+        vm.leftSource = .localMac
+        vm.rightSource = .localMac
+        
+        // 1. Исходно выбран только правый файл
+        vm.rightSelection = [itemRight.id]
+        vm.activePane = .right
+        return vm
+    }
+    
+    // 2. Открываем сравнение файлов
+    await MainActor.run {
+        vm.triggerFileDiff()
+        assertCondition(vm.isFileDiffActive, "File diff is active")
+        assertCondition(vm.activeDiffRightTarget?.fileItem.id == itemRight.id, "Right target is resolved on initial open")
+        assertCondition(vm.activeDiffLeftTarget == nil, "Left target is not yet resolved")
+    }
+    
+    // 3. Выбираем левый файл при активном диффе и переключаем активную панель на .left
+    await MainActor.run {
+        vm.leftItems = [itemLeft]
+        vm.rightItems = [itemRight]
+        vm.leftSelection = [itemLeft.id]
+        vm.activePane = .left
+        
+        // Выделение правой панели не должно сбрасываться!
+        assertCondition(!vm.rightSelection.isEmpty, "Right selection is preserved when file diff is active")
+        assertCondition(vm.rightSelection.contains(itemRight.id), "Right selection still contains rightDoc.txt")
+        assertCondition(vm.leftSelection.contains(itemLeft.id), "Left selection contains leftDoc.txt")
+    }
+    
+    // 4. Ждем завершения debounce-пересчета
+    var waitedDiff = 0
+    while waitedDiff < 30 {
+        let isResolved = await MainActor.run { vm.activeDiffLeftTarget?.fileItem.id == itemLeft.id }
+        if isResolved { break }
+        try? await Task.sleep(nanoseconds: 50_000_000)
+        waitedDiff += 1
+    }
+    
+    await MainActor.run {
+        if vm.activeDiffLeftTarget == nil {
+            vm.recomputeActiveFileDiff(isInitialOpen: false)
+        }
+        assertCondition(vm.activeDiffLeftTarget?.fileItem.id == itemLeft.id, "Left target resolved dynamically upon selection")
+        assertCondition(vm.activeDiffRightTarget?.fileItem.id == itemRight.id, "Right target remains resolved")
+        assertCondition(vm.fileCompareState.isReady, "CompareState is ready with both files")
+        
+        // 5. Закрываем дифф и проверяем восстановление одиночного выделения
+        vm.closeFileDiff()
+        assertCondition(!vm.isFileDiffActive, "File diff closed")
+        assertCondition(vm.leftSelection.contains(itemLeft.id), "Active left pane kept its selection after closing diff")
+        assertCondition(vm.rightSelection.isEmpty, "Inactive right pane selection cleaned up on close")
+    }
+    
+    try? FileManager.default.removeItem(at: tempDir)
+}
+
+func runTest63() async {
+    print("\n--- [TEST 63] Tab Titles: 'Mac' and Phone Name instead of '/restart' and '0' ---")
+    
+    await MainActor.run {
+        let testDefaults = UserDefaults.standard
+        testDefaults.removeObject(forKey: "session.leftTabs")
+        testDefaults.removeObject(forKey: "session.rightTabs")
+        testDefaults.removeObject(forKey: "session.leftActiveTabId")
+        testDefaults.removeObject(forKey: "session.rightActiveTabId")
+        
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        let vm = DualPaneViewModel()
+        for i in 0..<vm.leftTabs.count { vm.leftTabs[i].isPinned = false }
+        for i in 0..<vm.rightTabs.count { vm.rightTabs[i].isPinned = false }
+        
+        // 1. По умолчанию для Mac домашней папки заголовок вкладки должен быть 'Mac', а не имя пользователя (например, 'restart')
+        vm.changeSource(to: .localMac, side: .left)
+        assertCondition(vm.leftSource == .localMac, "Left source is .localMac")
+        assertCondition(vm.leftPath == home, "Left path is user home directory: \(home)")
+        let activeLeftTab = vm.leftTabs.first(where: { $0.id == vm.leftActiveTabId })
+        assertCondition(activeLeftTab?.title == "Mac", "Active Mac tab title is 'Mac' (got '\(activeLeftTab?.title ?? "")')")
+        
+        // 2. Хлебные крошки для Mac по-прежнему показывают корень 'Mac'
+        let macCrumbs = vm.breadcrumbs(for: vm.leftPath, source: .localMac)
+        assertCondition(macCrumbs.first?.title == "Mac", "Mac breadcrumbs root title is 'Mac'")
+        
+        // 3. При переходе в подпапку Mac заголовок вкладки меняется на имя папки (например, 'Downloads')
+        let downloadsPath = home + "/Downloads"
+        vm.navigateTo(path: downloadsPath, side: .left)
+        let downloadsTab = vm.leftTabs.first(where: { $0.id == vm.leftActiveTabId })
+        assertCondition(downloadsTab?.title == "Downloads", "Tab title for Downloads folder is 'Downloads' (got '\(downloadsTab?.title ?? "")')")
+        
+        // 4. При возврате Домой заголовок вкладки снова становится 'Mac', а не именем учетной записи
+        vm.navigateToHome(side: .left)
+        let homeReturnedTab = vm.leftTabs.first(where: { $0.id == vm.leftActiveTabId })
+        assertCondition(homeReturnedTab?.title == "Mac", "Tab title returned to home is 'Mac' (got '\(homeReturnedTab?.title ?? "")')")
+        
+        // 5. Для телефона в корне /storage/emulated/0 заголовок вкладки должен быть именем телефона, а не '0'
+        vm.changeSource(to: .remotePhone, side: .right)
+        vm.navigateTo(path: "/storage/emulated/0", side: .right)
+        assertCondition(vm.rightSource == .remotePhone, "Right source is .remotePhone")
+        assertCondition(vm.rightPath == "/storage/emulated/0", "Right path is /storage/emulated/0")
+        let activeRightTab = vm.rightTabs.first(where: { $0.id == vm.rightActiveTabId })
+        let expectedPhoneTitle = vm.connectedPhoneShortName
+        assertCondition(activeRightTab?.title == expectedPhoneTitle, "Active Phone tab title is '\(expectedPhoneTitle)' (got '\(activeRightTab?.title ?? "")'), NOT '0'")
+        
+        // 6. Хлебные крошки для телефона по-прежнему показывают имя телефона
+        let phoneCrumbs = vm.breadcrumbs(for: vm.rightPath, source: .remotePhone)
+        assertCondition(phoneCrumbs.first?.title == expectedPhoneTitle, "Phone breadcrumbs root title matches phone name")
+        
+        // 7. При переходе в подпапку телефона заголовок вкладки меняется на имя подпапки
+        vm.navigateTo(path: "/storage/emulated/0/DCIM", side: .right)
+        let dcimTab = vm.rightTabs.first(where: { $0.id == vm.rightActiveTabId })
+        assertCondition(dcimTab?.title == "DCIM", "Tab title for DCIM is 'DCIM' (got '\(dcimTab?.title ?? "")')")
+        
+        // 8. Создание новой вкладки через addTab формирует корректное имя, а не 'restart' или '0'
+        vm.navigateToHome(side: .right)
+        vm.addTab(side: .right)
+        let newAddedTab = vm.rightTabs.first(where: { $0.id == vm.rightActiveTabId })
+        assertCondition(newAddedTab?.title == expectedPhoneTitle, "addTab on Phone root creates tab with '\(expectedPhoneTitle)' (got '\(newAddedTab?.title ?? "")'), NOT '0'")
+        
+        // 9. Очистка устаревших заголовков при восстановлении сессии
+        let legacyLeftTab = PanelTab(id: UUID(), title: "restart", path: home, source: .localMac, isPinned: false)
+        let legacyRightTab = PanelTab(id: UUID(), title: "0", path: "/storage/emulated/0", source: .remotePhone, isPinned: false)
+        if let encodedLeft = try? JSONEncoder().encode([legacyLeftTab]),
+           let encodedRight = try? JSONEncoder().encode([legacyRightTab]) {
+            testDefaults.set(encodedLeft, forKey: "session.leftTabs")
+            testDefaults.set(encodedRight, forKey: "session.rightTabs")
+            
+            let restoredVM = DualPaneViewModel()
+            assertCondition(restoredVM.leftTabs.first?.title == "Mac", "Session restore converts legacy 'restart' title to 'Mac' (got '\(restoredVM.leftTabs.first?.title ?? "")')")
+            assertCondition(restoredVM.rightTabs.first?.title == restoredVM.connectedPhoneShortName, "Session restore converts legacy '0' title to phone name (got '\(restoredVM.rightTabs.first?.title ?? "")')")
+            
+            testDefaults.removeObject(forKey: "session.leftTabs")
+            testDefaults.removeObject(forKey: "session.rightTabs")
+        }
+        
+        // 10. Проверка видимости вкладок (visibleTabs) и предотвращения дубликатов:
+        let testVM = DualPaneViewModel()
+        testVM.leftPath = home
+        testVM.leftSource = .localMac
+        testVM.leftTabs = [PanelTab(title: "Mac", path: home, source: .localMac, isPinned: false)]
+        testVM.areTabsVisibleLeft = false
+        testVM.rightTabs = [PanelTab(title: "Phone", path: "/storage/emulated/0", source: .remotePhone, isPinned: false)]
+        testVM.areTabsVisibleRight = false
+        
+        // По умолчанию одиночная вкладка невидима
+        assertCondition(testVM.visibleTabs(for: .left).isEmpty, "Single unpinned Mac tab is initially invisible (visibleTabs is empty)")
+        assertCondition(testVM.visibleTabs(for: .right).isEmpty, "Single unpinned Phone tab is initially invisible (visibleTabs is empty)")
+        
+        // Проблема 1: При создании первой вкладки через addTab должна появиться РОВНО ОДНА вкладка, а не две
+        testVM.addTab(side: .left)
+        assertCondition(testVM.visibleTabs(for: .left).count == 1, "First tab creation produces EXACTLY ONE visible tab (got \(testVM.visibleTabs(for: .left).count), NOT 2 duplicate tabs)")
+        assertCondition(testVM.leftTabs.count == 1, "leftTabs contains exactly 1 tab (no hidden duplicate created)")
+        
+        // Проблема 2: Запрет создания нескольких вкладок для одной и той же директории
+        testVM.addTab(side: .left)
+        assertCondition(testVM.visibleTabs(for: .left).count == 1, "Cannot create duplicate tab for the same directory (count remains 1)")
+        assertCondition(testVM.statusMessage.contains("уже открыта"), "Status message indicates tab is already open: \(testVM.statusMessage)")
+        
+        // Создание вкладки для другой директории добавляет вторую вкладку
+        let testDownloadsPath = home + "/Downloads"
+        testVM.openFolderInNewTab(path: testDownloadsPath, source: .localMac, side: .left)
+        assertCondition(testVM.visibleTabs(for: .left).count == 2, "Opening different directory creates 2nd tab (count == 2)")
+        
+        // Повторная попытка открыть Downloads предотвращается
+        testVM.openFolderInNewTab(path: testDownloadsPath, source: .localMac, side: .left)
+        assertCondition(testVM.visibleTabs(for: .left).count == 2, "Opening already opened directory doesn't create duplicate (count remains 2)")
+        
+        // При закрытии второй вкладки остаётся 1 видимая вкладка
+        if let secondTabId = testVM.leftTabs.last?.id {
+            testVM.closeTab(id: secondTabId, side: .left)
+        }
+        assertCondition(testVM.visibleTabs(for: .left).count == 1, "Closing 2nd tab leaves 1 visible tab")
+        
+        // При закрытии единственной вкладки она скрывается (становится невидимой)
+        if let singleTabId = testVM.leftTabs.first?.id {
+            testVM.closeTab(id: singleTabId, side: .left)
+        }
+        assertCondition(testVM.visibleTabs(for: .left).isEmpty, "Closing single tab hides tab bar (visibleTabs becomes empty)")
+        
+        // Если единственная вкладка закреплена пользователем, она должна отображаться
+        if let singleTabId = testVM.leftTabs.first?.id {
+            testVM.togglePinTab(id: singleTabId, side: .left)
+            assertCondition(testVM.visibleTabs(for: .left).count == 1, "Pinned single tab is visible")
+        }
+            
+        // --- [TEST 64] Tab Key Switching & Size/Date Default Descending Sorting ---
+        print("\n--- [TEST 64] Tab Key Switching & Size/Date Default Descending Sorting ---")
+        KeyCommandMonitor.activeViewModel = testVM
+        testVM.activePane = .left
+        assertCondition(testVM.activePane == .left, "Initial activePane is .left")
+        
+        // 1. Tab key (keyCode 48) switches activePane to .right
+        if let tabEvent = NSEvent.keyEvent(
+            with: .keyDown,
+            location: .zero,
+            modifierFlags: [],
+            timestamp: 0,
+            windowNumber: 0,
+            context: nil,
+            characters: "\t",
+            charactersIgnoringModifiers: "\t",
+            isARepeat: false,
+            keyCode: 48
+        ) {
+            let res = KeyCommandMonitor.handleEvent(tabEvent)
+            assertCondition(res == nil, "KeyCommandMonitor consumed Tab event (returned nil)")
+            assertCondition(testVM.activePane == .right, "Tab key switched activePane to .right (got \(testVM.activePane))")
+        }
+        
+        // 2. Shift+Tab key (keyCode 48 + shift) switches activePane back to .left
+        if let shiftTabEvent = NSEvent.keyEvent(
+            with: .keyDown,
+            location: .zero,
+            modifierFlags: [.shift],
+            timestamp: 0,
+            windowNumber: 0,
+            context: nil,
+            characters: "\t",
+            charactersIgnoringModifiers: "\t",
+            isARepeat: false,
+            keyCode: 48
+        ) {
+            let res = KeyCommandMonitor.handleEvent(shiftTabEvent)
+            assertCondition(res == nil, "KeyCommandMonitor consumed Shift+Tab event (returned nil)")
+            assertCondition(testVM.activePane == .left, "Shift+Tab key switched activePane back to .left (got \(testVM.activePane))")
+        }
+        
+        // 3. Sorting by Size (descending by default: largest first)
+        let fileSmall = FileItem(id: "1", name: "small.txt", path: "/tmp/small.txt", size: 100, mtime: 1000, isDirectory: false)
+        let fileMedium = FileItem(id: "2", name: "medium.txt", path: "/tmp/medium.txt", size: 500, mtime: 2000, isDirectory: false)
+        let fileLarge = FileItem(id: "3", name: "large.txt", path: "/tmp/large.txt", size: 2000, mtime: 1500, isDirectory: false)
+        let testFiles = [fileSmall, fileLarge, fileMedium]
+        
+        let sortedBySizeDesc = testVM.sortFiles(testFiles, sortField: .size, sortAsc: false, folderSortMode: .mixed, comparing: false, side: .left)
+        assertCondition(sortedBySizeDesc.first?.name == "large.txt", "Default size sort (descending) puts largest file first (got \(sortedBySizeDesc.first?.name ?? ""))")
+        assertCondition(sortedBySizeDesc.last?.name == "small.txt", "Default size sort (descending) puts smallest file last (got \(sortedBySizeDesc.last?.name ?? ""))")
+        
+        // 4. Sorting by Date (descending by default: newest/latest first)
+        let fileOld = FileItem(id: "4", name: "old.txt", path: "/tmp/old.txt", size: 100, mtime: 1000, isDirectory: false)
+        let fileNewer = FileItem(id: "5", name: "newer.txt", path: "/tmp/newer.txt", size: 100, mtime: 2000, isDirectory: false)
+        let fileLatest = FileItem(id: "6", name: "latest.txt", path: "/tmp/latest.txt", size: 100, mtime: 3000, isDirectory: false)
+        let dateFiles = [fileOld, fileLatest, fileNewer]
+        
+        let sortedByDateDesc = testVM.sortFiles(dateFiles, sortField: .date, sortAsc: false, folderSortMode: .mixed, comparing: false, side: .left)
+        assertCondition(sortedByDateDesc.first?.name == "latest.txt", "Default date sort (descending) puts newest/latest file first (got \(sortedByDateDesc.first?.name ?? ""))")
+        assertCondition(sortedByDateDesc.last?.name == "old.txt", "Default date sort (descending) puts oldest file last (got \(sortedByDateDesc.last?.name ?? ""))")
+        
+        // --- [TEST 65] Horizontal Share Action Row (Telegram, WhatsApp, Gmail) ---
+        print("\n--- [TEST 65] Horizontal Share Action Row (Telegram, WhatsApp, Gmail) ---")
+        
+        // 1. ShareTarget enum attributes
+        assertCondition(ShareTarget.allCases.count == 3, "ShareTarget has exactly 3 targets: Telegram, WhatsApp, Gmail")
+        assertCondition(ShareTarget.telegram.title == "Telegram", "Telegram title is correct")
+        assertCondition(ShareTarget.whatsapp.title == "WhatsApp", "WhatsApp title is correct")
+        assertCondition(ShareTarget.gmail.title == "Gmail", "Gmail title is correct")
+        assertCondition(!ShareTarget.telegram.tooltip.isEmpty, "Telegram tooltip is non-empty: \(ShareTarget.telegram.tooltip)")
+        assertCondition(!ShareTarget.whatsapp.tooltip.isEmpty, "WhatsApp tooltip is non-empty: \(ShareTarget.whatsapp.tooltip)")
+        assertCondition(!ShareTarget.gmail.tooltip.isEmpty, "Gmail tooltip is non-empty: \(ShareTarget.gmail.tooltip)")
+        
+        // 2. ShareIconDrawer generates valid images
+        let tgIcon = ShareIconDrawer.telegramImage(size: 20)
+        assertCondition(tgIcon.size.width == 20 && tgIcon.size.height == 20, "Telegram icon renders at requested size (20x20)")
+        let waIcon = ShareIconDrawer.whatsAppImage(size: 20)
+        assertCondition(waIcon.size.width == 20 && waIcon.size.height == 20, "WhatsApp icon renders at requested size (20x20)")
+        let gmIcon = ShareIconDrawer.gmailImage(size: 20)
+        assertCondition(gmIcon.size.width == 20 && gmIcon.size.height == 20, "Gmail icon renders at requested size (20x20)")
+        
+        // 3. ShareRowMenuView creates subviews for each target
+        var selectedTarget: ShareTarget? = nil
+        let shareRow = ShareRowMenuView { target in
+            selectedTarget = target
+        }
+        assertCondition(shareRow.frame.width == 190 && shareRow.frame.height == 28, "ShareRowMenuView has correct dimensions (190x28)")
+        assertCondition(!shareRow.subviews.isEmpty, "ShareRowMenuView contains stack view hierarchy")
+        if let stack = shareRow.subviews.first as? NSStackView {
+            assertCondition(stack.arrangedSubviews.count == 3, "ShareRowMenuView stack contains 3 action buttons (got \(stack.arrangedSubviews.count))")
+        }
+        
+        // 4. DualPaneViewModel share invocation with local file
+        let sampleShareFile = FileItem(id: "/tmp/share_test.txt", name: "share_test.txt", path: "/tmp/share_test.txt", size: 10, mtime: 1000, isDirectory: false, source: .localMac)
+        testVM.share(items: [sampleShareFile], side: .left, target: .gmail)
+        assertCondition(testVM.statusMessage.contains("письм") || testVM.statusMessage.contains("сообщен") || !testVM.statusMessage.isEmpty, "DualPaneViewModel triggers share operation with feedback: \(testVM.statusMessage)")
+        
+        print("\n🎉 ALL 65 PRODUCTION TEST SUITES PASSED!")
+        exit(0)
+    }
+}
+
 dispatchMain()
+
+

@@ -110,64 +110,73 @@ public struct TransferQueueModalView: View {
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
-                List(queue.tasks) { task in
-                    HStack(spacing: 12) {
-                        Image(systemName: task.isMove ? "arrow.right.circle.fill" : "doc.on.doc.fill")
-                            .foregroundColor(task.isMove ? .orange : .blue)
-                            .font(.system(size: 18))
-                        
-                        VStack(alignment: .leading, spacing: 4) {
-                            Text(task.sourceItem.name)
-                                .font(.system(size: 13, weight: .medium))
+                List {
+                    ForEach(queue.tasks.prefix(200)) { task in
+                        HStack(spacing: 12) {
+                            Image(systemName: task.isMove ? "arrow.right.circle.fill" : "doc.on.doc.fill")
+                                .foregroundColor(task.isMove ? .orange : .blue)
+                                .font(.system(size: 18))
                             
-                            ProgressView(value: task.progress, total: 1.0)
-                                .progressViewStyle(.linear)
-                            
-                            HStack {
-                                Text("\(task.status.rawValue)")
-                                    .font(.caption2)
-                                    .foregroundColor(statusColor(task.status))
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text(task.sourceItem.name)
+                                    .font(.system(size: 13, weight: .medium))
                                 
-                                if task.status == .running && task.speed > 0 {
-                                    Text("• \(TransferSpeedTracker.formatSpeed(task.speed))")
+                                ProgressView(value: task.progress, total: 1.0)
+                                    .progressViewStyle(.linear)
+                                
+                                HStack {
+                                    Text("\(task.status.rawValue)")
                                         .font(.caption2)
-                                        .foregroundColor(.blue)
+                                        .foregroundColor(statusColor(task.status))
                                     
-                                    if let eta = task.eta {
-                                        Text("• \(TransferSpeedTracker.formatETA(eta))")
+                                    if task.status == .running && task.speed > 0 {
+                                        Text("• \(TransferSpeedTracker.formatSpeed(task.speed))")
                                             .font(.caption2)
-                                            .foregroundColor(.secondary)
+                                            .foregroundColor(.blue)
+                                        
+                                        if let eta = task.eta {
+                                            Text("• \(TransferSpeedTracker.formatETA(eta))")
+                                                .font(.caption2)
+                                                .foregroundColor(.secondary)
+                                        }
                                     }
+                                    
+                                    Spacer()
+                                    Text("\(formatBytes(task.bytesTransferred)) / \(formatBytes(task.totalBytes))")
+                                        .font(.caption2)
+                                        .foregroundColor(.secondary)
                                 }
-                                
-                                Spacer()
-                                Text("\(formatBytes(task.bytesTransferred)) / \(formatBytes(task.totalBytes))")
-                                    .font(.caption2)
-                                    .foregroundColor(.secondary)
-                            }
-                        }
-                        
-                        HStack(spacing: 6) {
-                            if task.status == .running {
-                                Button(action: { queue.pauseTask(id: task.id) }) {
-                                    Image(systemName: "pause.circle.fill")
-                                }
-                                .buttonStyle(.plain)
-                            } else if task.status == .paused {
-                                Button(action: { queue.resumeTask(id: task.id) }) {
-                                    Image(systemName: "play.circle.fill")
-                                }
-                                .buttonStyle(.plain)
                             }
                             
-                            Button(action: { queue.cancelTask(id: task.id) }) {
-                                Image(systemName: "xmark.circle.fill")
-                                    .foregroundColor(.red.opacity(0.8))
+                            HStack(spacing: 6) {
+                                if task.status == .running {
+                                    Button(action: { queue.pauseTask(id: task.id) }) {
+                                        Image(systemName: "pause.circle.fill")
+                                    }
+                                    .buttonStyle(.plain)
+                                } else if task.status == .paused {
+                                    Button(action: { queue.resumeTask(id: task.id) }) {
+                                        Image(systemName: "play.circle.fill")
+                                    }
+                                    .buttonStyle(.plain)
+                                }
+                                
+                                Button(action: { queue.cancelTask(id: task.id) }) {
+                                    Image(systemName: "xmark.circle.fill")
+                                        .foregroundColor(.red.opacity(0.8))
+                                }
+                                .buttonStyle(.plain)
                             }
-                            .buttonStyle(.plain)
                         }
+                        .padding(.vertical, 4)
                     }
-                    .padding(.vertical, 4)
+                    
+                    if queue.tasks.count > 200 {
+                        Text("И ещё \(queue.tasks.count - 200) задач(и) в очереди...")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                            .padding(.vertical, 4)
+                    }
                 }
             }
         }

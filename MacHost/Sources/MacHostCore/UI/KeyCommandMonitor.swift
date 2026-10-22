@@ -11,11 +11,23 @@ public enum TextShortcutAction {
 /// and ensures text editing controls receive all key events (including Space, Backspace, Return).
 public final class KeyCommandMonitor {
     private static var monitor: Any?
+    @MainActor public static var activeViewModel: DualPaneViewModel? {
+        get { _activeViewModel ?? DualPaneViewModel.shared }
+        set {
+            _activeViewModel = newValue
+            if let val = newValue {
+                DualPaneViewModel.shared = val
+            }
+        }
+    }
+    private static weak var _activeViewModel: DualPaneViewModel?
 
     public static func installGlobalMonitor() {
         guard monitor == nil else { return }
         monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
-            handleEvent(event)
+            MainActor.assumeIsolated {
+                handleEvent(event)
+            }
         }
     }
 
@@ -69,7 +81,7 @@ public final class KeyCommandMonitor {
             if vm.editingItemId != nil { return true }
             if vm.showRenameDialog || vm.showNewFolderDialog || vm.showCreateArchiveDialog || vm.showSearchDialog { return true }
             if vm.isEditingLeftPath || vm.isEditingRightPath { return true }
-            if vm.showPropertiesDialog || vm.showConflictDialog || vm.showQueueDialog || vm.batchRenameSession != nil { return true }
+            if vm.showPropertiesDialog || vm.showConflictDialog || vm.showQueueDialog || vm.batchRenameSession != nil || vm.isDuplicating || vm.showDuplicationModal { return true }
         }
         let responder = activeResponder()
         return isTextEditingResponder(responder)
@@ -103,7 +115,7 @@ public final class KeyCommandMonitor {
         let hasControl = event.modifierFlags.contains(.control) && !event.modifierFlags.contains(.command)
         let hasCommand = event.modifierFlags.contains(.command) && !event.modifierFlags.contains(.control)
 
-        guard (hasControl || hasCommand), !event.modifierFlags.contains(.option) else {
+        guard (hasControl || hasCommand), !event.modifierFlags.contains(.option), !event.modifierFlags.contains(.shift) else {
             return nil
         }
 
@@ -130,19 +142,129 @@ public final class KeyCommandMonitor {
         }
     }
 
-    /// Returns nil when the event was handled in the focused text editor (consuming the event).
-    /// Returns the event unchanged when not handled or when responder is not a text editor.
+    /// Returns nil when the event was handled (consuming the event).
+    /// Returns the event unchanged when not handled or when responder is editing text.
+    @MainActor
     public static func handleEvent(_ event: NSEvent, targetResponder: NSResponder? = nil) -> NSEvent? {
-        guard let action = textAction(for: event) else {
-            return event
+        let mods = event.modifierFlags.intersection([.command, .option, .control, .shift])
+        let code = Int(event.keyCode)
+        let chars = event.characters?.lowercased()
+        let charsNoMods = event.charactersIgnoringModifiers?.lowercased()
+
+        let hasControl = mods.contains(.control) && !mods.contains(.option)
+        let hasCommand = mods.contains(.command) && !mods.contains(.option)
+        let isCtrlOrCmd = (hasControl || hasCommand)
+
+        // KeyCode 17 = T (English 't', Russian 'е', ASCII 20 \u{14})
+        let isT = (code == 17 || chars == "\u{14}" || chars == "t" || chars == "е" || charsNoMods == "\u{14}" || charsNoMods == "t" || charsNoMods == "е")
+
+        // KeyCode 15 = R (English 'r', Russian 'к', ASCII 18 \u{12})
+        let isR = (code == 15 || chars == "\u{12}" || chars == "r" || chars == "к" || charsNoMods == "\u{12}" || charsNoMods == "r" || charsNoMods == "к")
+
+        // Блокировка всех операций и клавиш при активном дублировании (Esc отменяет дублирование)
+        if let vm = activeViewModel, vm.isDuplicating {
+            if code == 53 && mods.isEmpty {
+                vm.cancelDuplicate()
+            }
+            return nil
+        }
+
+        // 1. Создание новой вкладки: Ctrl+T или Cmd+T
+        if isCtrlOrCmd && isT {
+            if let vm = activeViewModel {
+                if !vm.showRenameDialog && !vm.showNewFolderDialog && !vm.showCreateArchiveDialog && vm.editingItemId == nil {
+                    print("KEY_MONITOR: Intercepted New Tab (Ctrl+T/Cmd+T) on side \(vm.activePane)")
+                    vm.addTab(side: vm.activePane)
+                    return nil
+                }
+            }
+        }
+
+        // 2. Обновление содержимого активной панели: Ctrl+R или Cmd+R
+        if isCtrlOrCmd && isR {
+            if let vm = activeViewModel {
+                if !vm.showRenameDialog && !vm.showNewFolderDialog && !vm.showCreateArchiveDialog && vm.editingItemId == nil {
+                    let targetSide = vm.activePane
+                    print("KEY_MONITOR: Intercepted Refresh Tab (Ctrl+R/Cmd+R) on side \(targetSide)")
+                    vm.refreshPaneToActiveTab(side: targetSide)
+                    return nil
+                }
+            }
+        }
+
+        // 3. Закрытие поиска или сравнения файлов по клавише Esc (keyCode 53)
+        if code == 53 && mods.isEmpty {
+            if let vm = activeViewModel {
+                if vm.isSearchActive(for: vm.activePane) {
+                    vm.closeSearch(side: vm.activePane)
+                    return nil
+                }
+                if vm.isFileDiffActive {
+                    vm.closeFileDiff()
+                    return nil
+                }
+            }
         }
 
         let responder = activeResponder(for: event, targetResponder: targetResponder)
-        guard isTextEditingResponder(responder) else {
+        
+        // 3. Если фокус находится в текстовом редакторе — обрабатываем только действия текста (копировать, вставить, вырезать, выделить всё)
+        if isTextEditingResponder(responder) {
+            if let action = textAction(for: event) {
+                return performTextAction(action, targetResponder: responder) ? nil : event
+            }
             return event
         }
 
-        return performTextAction(action, targetResponder: responder) ? nil : event
+        // Если открыт диалог ввода (переименование, модальные окна, ручной ввод пути), не перехватываем горячие клавиши
+        if let vm = activeViewModel, isTextEditingActive(in: vm) {
+            return event
+        }
+
+        // 4. Переключение между панелями: Tab или Shift+Tab (keyCode 48)
+        if (code == 48 || chars == "\t" || charsNoMods == "\t") && (mods.isEmpty || mods == .shift) {
+            if let vm = activeViewModel {
+                print("KEY_MONITOR: Intercepted Tab switch pane")
+                vm.toggleActivePane()
+                return nil
+            }
+        }
+
+        // 4. Горячие клавиши буфера обмена для файлов и папок (когда фокус в панели/таблице/сетке, а не в поле ввода текста)
+        if let vm = activeViewModel {
+            let hasShift = mods.contains(.shift)
+            let isC = (code == 8 || charsNoMods == "c" || charsNoMods == "с" || chars == "c" || chars == "с" || chars == "\u{3}")
+            let isX = (code == 7 || charsNoMods == "x" || charsNoMods == "ч" || chars == "x" || chars == "ч" || chars == "\u{18}")
+            let isV = (code == 9 || charsNoMods == "v" || charsNoMods == "м" || chars == "v" || chars == "м" || chars == "\u{16}")
+
+            // Ctrl+Shift+C или Cmd+Shift+C: Копирование имени объектов (с расширением)
+            if isCtrlOrCmd && hasShift && isC {
+                print("KEY_MONITOR: Intercepted Copy Names (Ctrl+Shift+C / Cmd+Shift+C) on side \(vm.activePane)")
+                vm.copySelectedNamesToClipboard(side: vm.activePane)
+                return nil
+            }
+
+            // Шорткаты без Shift:
+            if isCtrlOrCmd && !hasShift {
+                if isC {
+                    print("KEY_MONITOR: Intercepted Copy Items (Ctrl+C / Cmd+C) on side \(vm.activePane)")
+                    vm.copyToClipboard(side: vm.activePane)
+                    return nil
+                }
+                if isX {
+                    print("KEY_MONITOR: Intercepted Cut Items (Ctrl+X / Cmd+X) on side \(vm.activePane)")
+                    vm.cutToClipboard(side: vm.activePane)
+                    return nil
+                }
+                if isV {
+                    print("KEY_MONITOR: Intercepted Paste Items (Ctrl+V / Cmd+V) on side \(vm.activePane)")
+                    vm.pasteFromClipboard(targetSide: vm.activePane)
+                    return nil
+                }
+            }
+        }
+
+        return event
     }
 
     /// Performs the specified text shortcut action on the active responder.

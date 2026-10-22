@@ -12,12 +12,41 @@ extension KeyEquivalent {
     static let f8Key = KeyEquivalent(Character(Unicode.Scalar(Int(NSF8FunctionKey))!))
 }
 
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        UserDefaults.standard.set(0, forKey: "NSInitialToolTipDelay")
+        updateAppMenuTitle()
+        configureWindows()
+    }
+    
+    func configureWindows() {
+        DispatchQueue.main.async {
+            for window in NSApp.windows {
+                window.titleVisibility = .hidden
+            }
+        }
+    }
+
+    func updateAppMenuTitle() {
+        if let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String, !version.isEmpty {
+            let title = "MacDroid Commander \(version)"
+            if let firstItem = NSApp.mainMenu?.items.first {
+                firstItem.title = title
+                firstItem.submenu?.title = title
+            }
+        }
+    }
+}
+
 @main
 struct MacFileManagerApp: App {
+    @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     @StateObject private var viewModel = DualPaneViewModel()
 
     init() {
         signal(SIGPIPE, SIG_IGN)
+        UserDefaults.standard.register(defaults: ["NSInitialToolTipDelay": 0])
+        UserDefaults.standard.set(0, forKey: "NSInitialToolTipDelay")
         KeyCommandMonitor.installGlobalMonitor()
     }
 
@@ -26,11 +55,26 @@ struct MacFileManagerApp: App {
             MainContentView()
                 .environmentObject(viewModel)
                 .frame(minWidth: 960, minHeight: 620)
+                .onAppear {
+                    DualPaneViewModel.shared = viewModel
+                    KeyCommandMonitor.activeViewModel = viewModel
+                    KeyCommandMonitor.installGlobalMonitor()
+                    appDelegate.updateAppMenuTitle()
+                    appDelegate.configureWindows()
+                }
         }
         .windowStyle(.titleBar)
-        .windowToolbarStyle(.unified)
+        .windowToolbarStyle(.unified(showsTitle: false))
         .commands {
             CommandGroup(after: .toolbar) {
+                Picker("Режим панелей", selection: Binding(
+                    get: { viewModel.panelLayoutMode },
+                    set: { viewModel.setPanelLayoutMode($0) }
+                )) {
+                    Text("Двухпанельный режим (T)").tag(PanelLayoutMode.dual)
+                    Text("Режим Finder с боковой панелью (F)").tag(PanelLayoutMode.finder)
+                }
+                
                 Divider()
                 
                 Toggle("Показывать скрытые файлы", isOn: Binding(
@@ -67,12 +111,21 @@ struct MacFileManagerApp: App {
                 ))
                 .keyboardShortcut("d", modifiers: [.command])
                 
+                Toggle("Сравнение файлов", isOn: Binding(
+                    get: { viewModel.isFileDiffActive },
+                    set: { _ in viewModel.triggerFileDiff() }
+                ))
+                
                 Divider()
                 
-                Button("Обновить панель (Cmd+R)") {
-                    viewModel.refreshPane(side: viewModel.activePane)
+                Button("Обновить активную вкладку (Cmd+R)") {
+                    viewModel.refreshPaneToActiveTab(side: viewModel.activePane)
                 }
                 .keyboardShortcut("r", modifiers: [.command])
+                
+                Button("Сбросить кэш эскизов") {
+                    ThumbnailCacheManager.shared.clearCache()
+                }
                 
                 Divider()
                 
@@ -118,6 +171,22 @@ struct MacFileManagerApp: App {
                 Button("Сменить панель (Tab)") {
                     viewModel.toggleActivePane()
                 }
+                .keyboardShortcut(.tab, modifiers: [])
+
+                Button("Новая вкладка (Cmd+T)") {
+                    viewModel.addTab(side: viewModel.activePane)
+                }
+                .keyboardShortcut("t", modifiers: [.command])
+
+                Button("Новая вкладка (Ctrl+T)") {
+                    viewModel.addTab(side: viewModel.activePane)
+                }
+                .keyboardShortcut("t", modifiers: [.control])
+
+                Button("Обновить активную вкладку (Ctrl+R)") {
+                    viewModel.refreshPaneToActiveTab(side: viewModel.activePane)
+                }
+                .keyboardShortcut("r", modifiers: [.control])
 
                 Button("Просмотр (F3 / Пробел)") {
                     viewModel.triggerQuickLook(preferNativeQuickLook: true)
@@ -165,6 +234,11 @@ struct MacFileManagerApp: App {
                     viewModel.triggerProperties()
                 }
                 .keyboardShortcut("i", modifiers: [.command])
+                
+                Button("Свойства (Ctrl+I)") {
+                    viewModel.triggerProperties()
+                }
+                .keyboardShortcut("i", modifiers: [.control])
                 
                 Button("Назад (Cmd+[)") {
                     viewModel.navigateBack(side: viewModel.activePane)
@@ -242,6 +316,15 @@ struct MacFileManagerApp: App {
                     viewModel.swapPanes()
                 }
                 .keyboardShortcut("u", modifiers: [.command])
+                
+                Button("Сортировка папок: раздельно / вместе (Finder)") {
+                    viewModel.toggleFolderSortMode(for: viewModel.activePane)
+                }
+                
+                Button("Сравнить каталоги (Cmd+D)") {
+                    viewModel.comparePanes()
+                }
+                .keyboardShortcut("d", modifiers: [.command])
 
                 Button("Групповое переименование (Ctrl+M)") {
                     viewModel.triggerBatchRename()
@@ -249,9 +332,14 @@ struct MacFileManagerApp: App {
                 .keyboardShortcut("m", modifiers: [.control])
                 
                 Button("Поиск файлов (Cmd+F)") {
-                    viewModel.showSearchDialog = true
+                    viewModel.openSearch(side: viewModel.activePane)
                 }
                 .keyboardShortcut("f", modifiers: [.command])
+                
+                Button("Фильтр файлов (Cmd+Shift+F)") {
+                    viewModel.toggleFilter()
+                }
+                .keyboardShortcut("f", modifiers: [.command, .shift])
                 
                 Button("Очередь передач (Cmd+J)") {
                     viewModel.showQueueDialog = true
