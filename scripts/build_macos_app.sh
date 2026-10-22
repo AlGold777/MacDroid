@@ -68,13 +68,19 @@ if [ -d "$PROJECT_ROOT/MacHost/Resources" ]; then
 fi
 
 # Копирование приложения-компаньона Android APK в ресурсы бандла
-APK_SRC="$PROJECT_ROOT/AndroidCompanion/app/build/outputs/apk/debug/app-debug.apk"
-if [ ! -f "$APK_SRC" ] && [ -f "$PROJECT_ROOT/MacHost/Resources/app-debug.apk" ]; then
-    APK_SRC="$PROJECT_ROOT/MacHost/Resources/app-debug.apk"
+# Имя содержит версию (MacDroidCompanion-2.1.14.apk); берётся самая свежая: сначала свежесобранная, затем из MacHost/Resources
+newest_companion_apk() {
+    ls "$1"/MacDroidCompanion-*.apk 2>/dev/null | grep -E 'MacDroidCompanion-[0-9.]+\.apk$' | sort -V | tail -1
+}
+APK_SRC="$(newest_companion_apk "$PROJECT_ROOT/AndroidCompanion/app/build/outputs/apk/debug")"
+RES_APK="$(newest_companion_apk "$PROJECT_ROOT/MacHost/Resources")"
+if [ -n "$RES_APK" ] && { [ -z "$APK_SRC" ] || [ "$(printf '%s\n%s\n' "$(basename "$APK_SRC")" "$(basename "$RES_APK")" | sort -V | tail -1)" = "$(basename "$RES_APK")" ]; }; then
+    APK_SRC="$RES_APK"
 fi
-if [ -f "$APK_SRC" ]; then
-    echo "Копирование Android Companion APK ($APK_SRC) в $RESOURCES/app-debug.apk..."
-    cp "$APK_SRC" "$RESOURCES/app-debug.apk"
+if [ -n "$APK_SRC" ] && [ -f "$APK_SRC" ]; then
+    rm -f "$RESOURCES"/MacDroidCompanion-*.apk "$RESOURCES/app-debug.apk"
+    echo "Копирование Android Companion APK ($APK_SRC) в $RESOURCES/..."
+    cp "$APK_SRC" "$RESOURCES/"
 else
     echo "⚠️  Внимание: Android Companion APK не найден ни в AndroidCompanion, ни в MacHost/Resources!"
 fi

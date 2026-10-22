@@ -2080,7 +2080,7 @@ func runAllAsyncTests() async {
         assertCondition(!orchestrator30.activeLocalPartURLs.contains(activePartURL), "Active part file unregistered cleanly")
         
         // 7. Companion APK presence verification
-        let apkFound = PhoneConnectionManager.shared.findCompanionApk() != nil || FileManager.default.fileExists(atPath: "Resources/app-debug.apk") || FileManager.default.fileExists(atPath: "MacHost/Resources/app-debug.apk")
+        let apkFound = PhoneConnectionManager.shared.findCompanionApk() != nil || PhoneConnectionManager.newestCompanionApk(in: "MacHost/Resources") != nil || PhoneConnectionManager.newestCompanionApk(in: "Resources") != nil
         assertCondition(apkFound, "Android companion app-debug.apk exists in Resources or findCompanionApk() succeeds")
         
         // ============================================================
@@ -4915,7 +4915,20 @@ func runTest63() async {
         assertCondition(subnetHosts.count <= 254 * 4, "Subnet enumeration is capped to /24 per interface (got \(subnetHosts.count))")
         assertCondition(subnetHosts.allSatisfy { ConnectionHostAddress.isIPv4($0) && !$0.hasPrefix("127.") }, "Subnet enumeration yields only non-loopback IPv4 hosts")
 
-        print("\n🎉 ALL 66 PRODUCTION TEST SUITES PASSED!")
+        // 67. Имя APK компаньона содержит версию; выбирается самая свежая
+        print("\n[Test 67] Versioned companion APK naming...")
+        assertCondition(PhoneConnectionManager.companionApkVersion(fileName: "MacDroidCompanion-2.1.14.apk") == [2, 1, 14], "Version parsed from MacDroidCompanion-2.1.14.apk")
+        assertCondition(PhoneConnectionManager.companionApkVersion(fileName: "app-debug.apk") == nil, "Legacy app-debug.apk has no version")
+        assertCondition(PhoneConnectionManager.companionApkVersion(fileName: "MacDroidCompanion-2.1.x.apk") == nil, "Malformed version rejected")
+        let apkDir = NSTemporaryDirectory() + "apk-test-\(UUID().uuidString)"
+        try? FileManager.default.createDirectory(atPath: apkDir, withIntermediateDirectories: true)
+        for name in ["app-debug.apk", "MacDroidCompanion-2.1.9.apk", "MacDroidCompanion-2.1.14.apk"] {
+            FileManager.default.createFile(atPath: apkDir + "/" + name, contents: Data())
+        }
+        assertCondition(PhoneConnectionManager.newestCompanionApk(in: apkDir)?.hasSuffix("MacDroidCompanion-2.1.14.apk") == true, "Newest versioned APK chosen (2.1.14 > 2.1.9 > app-debug)")
+        try? FileManager.default.removeItem(atPath: apkDir)
+
+        print("\n🎉 ALL 67 PRODUCTION TEST SUITES PASSED!")
         exit(0)
     }
 }

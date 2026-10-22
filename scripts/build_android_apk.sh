@@ -43,7 +43,7 @@ if [ -f "$WRAPPER_JAR" ] && [ -n "$ANDROID_HOME" ]; then
     ./gradlew assembleDebug
     echo "=================================================="
     echo "✓ [УСПЕХ] APK успешно собран в:"
-    echo "  $ANDROID_DIR/app/build/outputs/apk/debug/app-debug.apk"
+    echo "  $ANDROID_DIR/app/build/outputs/apk/debug/MacDroidCompanion-<версия>.apk"
     echo "=================================================="
 else
     echo "=================================================="

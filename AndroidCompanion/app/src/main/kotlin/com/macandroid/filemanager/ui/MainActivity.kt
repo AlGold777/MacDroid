@@ -159,6 +159,13 @@ class MainActivity : Activity() {
     /**
      * Построение программной разметки интерфейса на базе ScrollView и LinearLayout.
      */
+    /** Версия приложения из манифеста (versionName), для заголовка. */
+    private fun appVersionName(): String = try {
+        packageManager.getPackageInfo(packageName, 0).versionName ?: ""
+    } catch (e: Exception) {
+        ""
+    }
+
     private fun buildUi() {
         val rootLayout = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -168,7 +175,7 @@ class MainActivity : Activity() {
 
         // Заголовок приложения
         val tvHeader = TextView(this).apply {
-            text = "Mac ↔ Android Commander"
+            text = "Mac ↔ Android Commander ${appVersionName()}"
             textSize = 22f
             setTextColor(Color.WHITE)
             typeface = Typeface.DEFAULT_BOLD

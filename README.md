@@ -66,7 +66,7 @@ swift run MacHost
 ```bash
 cd AndroidCompanion
 ./gradlew assembleDebug
-adb install -r app/build/outputs/apk/debug/app-debug.apk
+adb install -r app/build/outputs/apk/debug/MacDroidCompanion-*.apk
 ```
 4. При первом запуске на смартфоне подтвердите диалог **«Доступ ко всем файлам»** (`MANAGE_EXTERNAL_STORAGE`).
 5. В настройках HyperOS для приложения включите **«Автозапуск»** и установите **«Контроль активности» -> «Нет ограничений»**.

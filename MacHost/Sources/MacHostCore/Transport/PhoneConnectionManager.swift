@@ -132,36 +132,58 @@ public final class PhoneConnectionManager: @unchecked Sendable {
     
     /// Поиск APK-файла компаньона (в бандле приложения или проекте)
     public func findCompanionApk() -> String? {
-        // 1. В ресурсах текущего бандла
-        if let bundleRes = Bundle.main.url(forResource: "app-debug", withExtension: "apk"),
-           FileManager.default.fileExists(atPath: bundleRes.path) {
-            return bundleRes.path
+        // 1. В ресурсах текущего бандла (Contents/Resources)
+        if let resources = Bundle.main.resourceURL, let apk = Self.newestCompanionApk(in: resources.path) {
+            return apk
         }
-        
+
         // 2. В Contents/Resources бандла MacDroid Commander.app
-        let execUrl = Bundle.main.bundleURL
-        let inBundle = execUrl.appendingPathComponent("Contents/Resources/app-debug.apk").path
-        if FileManager.default.fileExists(atPath: inBundle) {
-            return inBundle
+        let inBundle = Bundle.main.bundleURL.appendingPathComponent("Contents/Resources").path
+        if let apk = Self.newestCompanionApk(in: inBundle) {
+            return apk
         }
-        
+
         // 3. В рабочей директории сборки
-        let candidates = [
-            "Resources/app-debug.apk",
-            "MacHost/Resources/app-debug.apk",
-            "build/MacDroid Commander.app/Contents/Resources/app-debug.apk",
-            "AndroidCompanion/app/build/outputs/apk/debug/app-debug.apk",
-            "../AndroidCompanion/app/build/outputs/apk/debug/app-debug.apk"
+        let candidateDirs = [
+            "Resources",
+            "MacHost/Resources",
+            "build/MacDroid Commander.app/Contents/Resources",
+            "AndroidCompanion/app/build/outputs/apk/debug",
+            "../AndroidCompanion/app/build/outputs/apk/debug"
         ]
-        
+
         let pwd = FileManager.default.currentDirectoryPath
-        for c in candidates {
-            let full = (pwd as NSString).appendingPathComponent(c)
-            if FileManager.default.fileExists(atPath: full) {
-                return full
+        for dir in candidateDirs {
+            if let apk = Self.newestCompanionApk(in: (pwd as NSString).appendingPathComponent(dir)) {
+                return apk
             }
         }
-        
+
+        return nil
+    }
+
+    /// Версия компаньона из имени файла `MacDroidCompanion-2.1.14.apk` (nil для старого `app-debug.apk`).
+    public static func companionApkVersion(fileName: String) -> [Int]? {
+        let prefix = "MacDroidCompanion-"
+        guard fileName.hasPrefix(prefix), fileName.hasSuffix(".apk") else { return nil }
+        let version = fileName.dropFirst(prefix.count).dropLast(".apk".count)
+        let parts = version.split(separator: ".").map { Int($0) }
+        guard !parts.isEmpty, !parts.contains(nil) else { return nil }
+        return parts.compactMap { $0 }
+    }
+
+    /// Самый свежий APK компаньона в каталоге: `MacDroidCompanion-<версия>.apk`, затем старое имя `app-debug.apk`.
+    public static func newestCompanionApk(in directory: String) -> String? {
+        let files = (try? FileManager.default.contentsOfDirectory(atPath: directory)) ?? []
+        let versioned = files.compactMap { name -> (String, [Int])? in
+            companionApkVersion(fileName: name).map { (name, $0) }
+        }
+        if let newest = versioned.max(by: { $0.1.lexicographicallyPrecedes($1.1) }) {
+            return (directory as NSString).appendingPathComponent(newest.0)
+        }
+        if files.contains("app-debug.apk") {
+            return (directory as NSString).appendingPathComponent("app-debug.apk")
+        }
         return nil
     }
     
@@ -578,7 +600,7 @@ public final class PhoneConnectionManager: @unchecked Sendable {
                         logs.append("⚠️ Предупреждение установки APK: \(instOut)")
                     }
                 } else {
-                    logs.append("⚠️ Файл app-debug.apk не найден в бандле приложения.")
+                    logs.append("⚠️ APK компаньона (MacDroidCompanion-<версия>.apk) не найден в бандле приложения.")
                 }
             } else {
                 logs.append("✓ [OK] Приложение-компаньон уже установлено на смартфоне")
