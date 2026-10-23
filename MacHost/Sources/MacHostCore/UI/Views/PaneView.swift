@@ -984,6 +984,7 @@ public struct PaneView: View {
             .transition(.opacity.combined(with: .scale(scale: 0.9)))
         }
     }
+    .scrollBounceBehavior(.always, axes: .vertical)
     .background(
         TrackpadSwipeRefreshView(
             side: side,
@@ -3680,14 +3681,17 @@ private struct PaneRefreshButton: View {
     }
 }
 
-// MARK: - Обработчик свайпа двумя пальцами тачпада вниз (Pull-to-refresh)
+// MARK: - Pull-to-refresh: оттяжка списка вниз двумя пальцами тачпада
 
+/// Слушает не сырые события колеса, а саму прокрутку списка: оттяжка («резинка») выше верхней границы
+/// содержимого и есть жест. Обновление срабатывает при отпускании, если оттяжка достигла порога.
+/// Нужный `NSScrollView` определяется по уведомлениям `willStartLiveScroll` — без поиска по иерархии и без перехвата событий.
 public struct TrackpadSwipeRefreshView: NSViewRepresentable {
     public let side: PaneSide
     public let vm: DualPaneViewModel
     public let onPullProgress: (CGFloat) -> Void
     public let onRefreshTriggered: () -> Void
-    
+
     public init(
         side: PaneSide,
         vm: DualPaneViewModel,
@@ -3699,214 +3703,136 @@ public struct TrackpadSwipeRefreshView: NSViewRepresentable {
         self.onPullProgress = onPullProgress
         self.onRefreshTriggered = onRefreshTriggered
     }
-    
-    public func makeNSView(context: Context) -> RefreshContainerView {
-        let view = RefreshContainerView()
+
+    public func makeNSView(context: Context) -> PullObserverView {
+        let view = PullObserverView()
+        update(view)
+        return view
+    }
+
+    public func updateNSView(_ nsView: PullObserverView, context: Context) {
+        update(nsView)
+    }
+
+    private func update(_ view: PullObserverView) {
         view.side = side
         view.vm = vm
         view.onPullProgress = onPullProgress
         view.onRefreshTriggered = onRefreshTriggered
-        return view
     }
-    
-    public func updateNSView(_ nsView: RefreshContainerView, context: Context) {
-        nsView.side = side
-        nsView.vm = vm
-        nsView.onPullProgress = onPullProgress
-        nsView.onRefreshTriggered = onRefreshTriggered
-    }
-    
-    public final class RefreshContainerView: NSView {
+
+    public final class PullObserverView: NSView {
         public var side: PaneSide = .left
         public weak var vm: DualPaneViewModel?
         public var onPullProgress: ((CGFloat) -> Void)?
         public var onRefreshTriggered: (() -> Void)?
-        
-        private var eventMonitor: Any?
-        private var isTrackingSwipe: Bool = false
-        private var accumulatedDownDelta: CGFloat = 0
-        private var hasTriggeredInThisGesture: Bool = false
-        private var lastTriggerTime: Date = .distantPast
-        private weak var cachedScrollView: NSScrollView?
-        
-        public var triggerThreshold: CGFloat = 55.0
-        public var endReleaseThreshold: CGFloat = 30.0
-        
-        public override func hitTest(_ point: NSPoint) -> NSView? {
-            // Background must not block clicks/drags
-            return nil
-        }
-        
+
+        /// Оттяжка (pt), с которой отпускание запускает обновление.
+        private let triggerOverscroll: CGFloat = 18
+        /// Остаток оттяжки (pt), с которого возврат списка считается завершённым.
+        private let settledOverscroll: CGFloat = 3
+
+        private weak var trackedScrollView: NSScrollView?
+        private var peakOverscroll: CGFloat = 0
+        private var didTrigger = false
+        private var observers: [NSObjectProtocol] = []
+        private var boundsObserver: NSObjectProtocol?
+
+        public override func hitTest(_ point: NSPoint) -> NSView? { nil }
+
         public override func viewDidMoveToWindow() {
             super.viewDidMoveToWindow()
-            if window != nil {
-                setupMonitor()
-            } else {
-                removeMonitor()
-            }
+            stopObserving()
+            if window != nil { startObserving() }
         }
-        
-        public override func viewWillMove(toWindow newWindow: NSWindow?) {
-            super.viewWillMove(toWindow: newWindow)
-            if newWindow == nil {
-                removeMonitor()
-            }
-        }
-        
-        deinit {
-            removeMonitor()
-        }
-        
-        private func removeMonitor() {
-            if let monitor = eventMonitor {
-                NSEvent.removeMonitor(monitor)
-                eventMonitor = nil
-            }
-        }
-        
-        private func setupMonitor() {
-            guard eventMonitor == nil else { return }
-            eventMonitor = NSEvent.addLocalMonitorForEvents(matching: .scrollWheel) { [weak self] event in
-                guard let self = self else { return event }
-                return self.handleScrollWheel(event)
-            }
-        }
-        
-        private func findScrollView(in view: NSView) -> NSScrollView? {
-            if let sv = view as? NSScrollView {
-                return sv
-            }
-            for sub in view.subviews {
-                if let found = findScrollView(in: sub) {
-                    return found
+
+        deinit { stopObserving() }
+
+        private func startObserving() {
+            let center = NotificationCenter.default
+            observers = [
+                center.addObserver(forName: NSScrollView.willStartLiveScrollNotification, object: nil, queue: .main) { [weak self] note in
+                    guard let sv = note.object as? NSScrollView else { return }
+                    MainActor.assumeIsolated { self?.beginTracking(sv) }
+                },
+                center.addObserver(forName: NSScrollView.didEndLiveScrollNotification, object: nil, queue: .main) { [weak self] note in
+                    guard let sv = note.object as? NSScrollView else { return }
+                    MainActor.assumeIsolated { self?.endTracking(sv) }
                 }
-            }
-            return nil
+            ]
         }
-        
-        private func resolveScrollView() -> NSScrollView? {
-            if let cached = cachedScrollView, cached.window != nil {
-                return cached
-            }
-            var current: NSView? = self.superview
-            while let v = current {
-                if let sv = findScrollView(in: v) {
-                    cachedScrollView = sv
-                    return sv
-                }
-                current = v.superview
-            }
-            return nil
+
+        private func stopObserving() {
+            observers.forEach(NotificationCenter.default.removeObserver)
+            observers = []
+            detachBoundsObserver()
+            trackedScrollView = nil
+            vm?.setScrollBouncing(false, side: side)
         }
-        
-        public func isContentAtTop() -> Bool {
-            guard let sv = resolveScrollView() else {
-                return true
-            }
+
+        private func detachBoundsObserver() {
+            if let token = boundsObserver { NotificationCenter.default.removeObserver(token) }
+            boundsObserver = nil
+        }
+
+        /// Прокрутка относится к этой панели, если она в нашем окне, вертикальная и её центр лежит внутри панели.
+        private func belongsToPane(_ sv: NSScrollView) -> Bool {
+            guard let window, sv.window === window, sv.hasVerticalScroller, !isHidden else { return false }
+            let center = NSPoint(x: sv.bounds.midX, y: sv.bounds.midY)
+            return bounds.contains(convert(center, from: sv))
+        }
+
+        private func overscroll(of sv: NSScrollView) -> CGFloat {
             let clip = sv.contentView
-            return clip.bounds.origin.y <= 2
+            return max(0, -(clip.bounds.origin.y + clip.contentInsets.top))
         }
-        
-        public func handleScrollWheel(_ event: NSEvent) -> NSEvent? {
-            guard let window = self.window, event.window === window else {
-                return event
+
+        private func beginTracking(_ sv: NSScrollView) {
+            guard belongsToPane(sv) else { return }
+            detachBoundsObserver()
+            trackedScrollView = sv
+            peakOverscroll = 0
+            didTrigger = false
+            sv.contentView.postsBoundsChangedNotifications = true
+            boundsObserver = NotificationCenter.default.addObserver(
+                forName: NSView.boundsDidChangeNotification, object: sv.contentView, queue: .main
+            ) { [weak self, weak sv] _ in
+                guard let sv else { return }
+                MainActor.assumeIsolated { self?.scrolled(sv) }
             }
-            
-            // 1. Verify cursor is within this pane's area
-            let locationInView = self.convert(event.locationInWindow, from: nil)
-            guard self.bounds.contains(locationInView) else {
-                if isTrackingSwipe {
-                    resetTracking()
-                }
-                return event
-            }
-            
-            // 2. Trackpad and touch surfaces have precise scrolling deltas
-            guard event.hasPreciseScrollingDeltas else {
-                return event
-            }
-            
-            // 3. Direction normalization:
-            // Under Natural Scrolling (Apple default): finger moving down -> scrollingDeltaY > 0.
-            // Under Traditional Scrolling: finger moving down -> scrollingDeltaY < 0.
-            let deltaY: CGFloat = event.isDirectionInvertedFromDevice ? event.scrollingDeltaY : -event.scrollingDeltaY
-            
-            let phase = event.phase
-            
-            if phase.contains(.began) {
-                hasTriggeredInThisGesture = false
-                if isContentAtTop() {
-                    isTrackingSwipe = true
-                    accumulatedDownDelta = 0
-                } else {
-                    isTrackingSwipe = false
-                    accumulatedDownDelta = 0
-                }
-            } else if phase.contains(.changed) {
-                if !isTrackingSwipe && isContentAtTop() {
-                    isTrackingSwipe = true
-                    accumulatedDownDelta = 0
-                }
-                
-                if isTrackingSwipe {
-                    if deltaY > 0 {
-                        accumulatedDownDelta += deltaY
-                    } else {
-                        accumulatedDownDelta = max(0, accumulatedDownDelta + deltaY)
-                    }
-                    
-                    let progress = min(1.0, max(0.0, accumulatedDownDelta / triggerThreshold))
-                    DispatchQueue.main.async { [weak self] in
-                        self?.onPullProgress?(progress)
-                    }
-                    
-                    if accumulatedDownDelta >= triggerThreshold && !hasTriggeredInThisGesture {
-                        triggerRefresh()
-                    }
-                }
-            } else if phase.contains(.ended) || phase.contains(.cancelled) {
-                if isTrackingSwipe && !hasTriggeredInThisGesture && accumulatedDownDelta >= endReleaseThreshold {
-                    triggerRefresh()
-                }
-                resetTracking()
-            } else if event.momentumPhase.contains(.began) || event.momentumPhase.contains(.changed) {
-                if isTrackingSwipe {
-                    resetTracking()
-                }
-            }
-            
-            return event
         }
-        
-        public func triggerRefresh() {
-            guard !hasTriggeredInThisGesture else { return }
-            let now = Date()
-            guard now.timeIntervalSince(lastTriggerTime) > 0.6 else { return }
-            
-            hasTriggeredInThisGesture = true
-            lastTriggerTime = now
-            
+
+        /// Отпускание жеста = оттяжка достигла порога и начала возвращаться. Ждать конца всей прокрутки нельзя:
+        /// `didEndLiveScroll` приходит только после полного возврата «резинки».
+        private func scrolled(_ sv: NSScrollView) {
+            let pulled = overscroll(of: sv)
+            if pulled < peakOverscroll, peakOverscroll >= triggerOverscroll, !didTrigger {
+                triggerRefresh()
+            }
+            peakOverscroll = max(peakOverscroll, pulled)
+            onPullProgress?(didTrigger ? 0 : min(1, pulled / triggerOverscroll))
+            // Визуально «резинка» уже на месте задолго до didEndLiveScroll: не ждём её длинный хвост.
+            if didTrigger, pulled <= settledOverscroll { vm?.setScrollBouncing(false, side: side) }
+        }
+
+        private func endTracking(_ sv: NSScrollView) {
+            guard sv === trackedScrollView else { return }
+            if peakOverscroll >= triggerOverscroll, !didTrigger { triggerRefresh() }
+            vm?.setScrollBouncing(false, side: side)
+            detachBoundsObserver()
+            trackedScrollView = nil
+            peakOverscroll = 0
+            onPullProgress?(0)
+        }
+
+        private func triggerRefresh() {
+            didTrigger = true
+            guard let vm else { return }
             NSHapticFeedbackManager.defaultPerformer.perform(.alignment, performanceTime: .default)
-            
-            let performAction = { [weak self] in
-                guard let self = self else { return }
-                if let vm = self.vm {
-                    if vm.activePane != self.side {
-                        vm.activePane = self.side
-                    }
-                    vm.refreshPane(side: self.side)
-                }
-                self.onRefreshTriggered?()
-            }
-            performAction()
-        }
-        
-        public func resetTracking() {
-            isTrackingSwipe = false
-            accumulatedDownDelta = 0
-            DispatchQueue.main.async { [weak self] in
-                self?.onPullProgress?(0)
-            }
+            if vm.activePane != side { vm.activePane = side }
+            vm.setScrollBouncing(true, side: side)
+            vm.refreshPaneToActiveTab(side: side)
+            onRefreshTriggered?()
         }
     }
 }

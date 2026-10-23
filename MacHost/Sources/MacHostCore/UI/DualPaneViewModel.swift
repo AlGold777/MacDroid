@@ -3490,6 +3490,8 @@ public final class DualPaneViewModel: ObservableObject {
                     items = try await driver.listDirectory(at: path)
                 }
                 guard !Task.isCancelled else { return }
+                await self.waitForScrollToSettle(side: side)
+                guard !Task.isCancelled else { return }
                 
                 // Оптимизация P2: Сразу публикуем полученные файлы в интерфейс,
                 // не дожидаясь вторичного сетевого запроса свободного места checkFreeSpace
@@ -3573,6 +3575,27 @@ public final class DualPaneViewModel: ObservableObject {
         }
     }
     
+    // MARK: - Синхронизация публикации файлов с анимацией прокрутки
+
+    private var bouncingSides: Set<PaneSide> = []
+    private var scrollSettleWaiters: [PaneSide: [CheckedContinuation<Void, Never>]] = [:]
+
+    /// Пока список панели возвращается после оттяжки (pull-to-refresh), новые файлы не публикуются:
+    /// подмена данных посреди анимации «резинки» заставляет таблицу дёргаться.
+    public func setScrollBouncing(_ bouncing: Bool, side: PaneSide) {
+        if bouncing {
+            bouncingSides.insert(side)
+        } else {
+            bouncingSides.remove(side)
+            scrollSettleWaiters.removeValue(forKey: side)?.forEach { $0.resume() }
+        }
+    }
+
+    private func waitForScrollToSettle(side: PaneSide) async {
+        guard bouncingSides.contains(side) else { return }
+        await withCheckedContinuation { scrollSettleWaiters[side, default: []].append($0) }
+    }
+
     /// Одновременное обновление содержимого обеих панелей
     public func refreshBothPanes() {
         refreshPane(side: .left)
