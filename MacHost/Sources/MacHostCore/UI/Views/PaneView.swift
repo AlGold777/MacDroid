@@ -389,7 +389,11 @@ public struct PaneView: View {
                                         if vm.activePane != side {
                                             vm.activePane = side
                                         }
-                                        if tab.id != activeTabId {
+                                        // Клик по уже активной закреплённой вкладке возвращает панель в её папку,
+                                        // если пользователь успел уйти из неё внутри панели
+                                        let panePath = (side == .left) ? vm.leftPath : vm.rightPath
+                                        let paneSource = (side == .left) ? vm.leftSource : vm.rightSource
+                                        if tab.id != activeTabId || tab.path != panePath || tab.source != paneSource {
                                             vm.switchTab(id: tab.id, side: side)
                                         }
                                     }

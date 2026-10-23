@@ -1025,7 +1025,12 @@ public final class DualPaneViewModel: ObservableObject {
         if let leftTabsData = defaults.data(forKey: SessionKey.leftTabs),
            let tabs = try? JSONDecoder().decode([PanelTab].self, from: leftTabsData),
            !tabs.isEmpty {
-            leftTabs = tabs.map { tab in
+            leftTabs = tabs.map { original in
+                var tab = original
+                if let fix = repairedPinnedLocation(for: original, homePath: homePath) {
+                    tab.path = fix.path
+                    tab.source = fix.source
+                }
                 var validPath = tab.path
                 if tab.source == .localMac {
                     if validPath.hasPrefix("/storage") || !FileManager.default.fileExists(atPath: validPath) {
@@ -1046,7 +1051,12 @@ public final class DualPaneViewModel: ObservableObject {
         if let rightTabsData = defaults.data(forKey: SessionKey.rightTabs),
            let tabs = try? JSONDecoder().decode([PanelTab].self, from: rightTabsData),
            !tabs.isEmpty {
-            rightTabs = tabs.map { tab in
+            rightTabs = tabs.map { original in
+                var tab = original
+                if let fix = repairedPinnedLocation(for: original, homePath: homePath) {
+                    tab.path = fix.path
+                    tab.source = fix.source
+                }
                 var validPath = tab.path
                 if tab.source == .localMac {
                     if validPath.hasPrefix("/storage") || !FileManager.default.fileExists(atPath: validPath) {
@@ -1618,6 +1628,7 @@ public final class DualPaneViewModel: ObservableObject {
             leftActiveTabId = id
             leftPath = tab.path
             leftSource = tab.source
+            showTabContentImmediately(side: .left, path: tab.path, source: tab.source)
             if tab.source == .remotePhone && !remoteDriver.isConnected {
                 leftIsStale = false
                 if !isRunningTests {
@@ -1631,6 +1642,7 @@ public final class DualPaneViewModel: ObservableObject {
             rightActiveTabId = id
             rightPath = tab.path
             rightSource = tab.source
+            showTabContentImmediately(side: .right, path: tab.path, source: tab.source)
             if tab.source == .remotePhone && !remoteDriver.isConnected {
                 rightIsStale = false
                 if !isRunningTests {
@@ -1641,6 +1653,32 @@ public final class DualPaneViewModel: ObservableObject {
             }
             saveSession()
         }
+    }
+
+    /// Сразу подменяет список файлов панели содержимым новой вкладки, не дожидаясь `refreshPane`.
+    /// Иначе до ответа драйвера (а для неподключённого телефона — бесконечно) на экране остаются файлы предыдущей вкладки.
+    /// Берём свежий кеш телефона, если он есть; иначе список пуст до загрузки.
+    private func showTabContentImmediately(side: PaneSide, path: String, source: FileSource) {
+        let items = (source == .remotePhone) ? (DirectoryCache.shared.get(path: path) ?? []) : []
+        if side == .left {
+            leftItems = items
+        } else {
+            rightItems = items
+        }
+    }
+
+    /// Чинит закреплённую вкладку, чьё название — папка домашнего каталога Mac (например, «Downloads»), а путь «уехал»
+    /// в корень (домашнюю папку Mac или корень телефона). Так портились вкладки, когда путь закреплённой вкладки
+    /// перезаписывался при смене источника панели, а название оставалось прежним.
+    public func repairedPinnedLocation(for tab: PanelTab, homePath: String) -> (path: String, source: FileSource)? {
+        guard tab.isPinned, !tab.title.isEmpty, !tab.title.contains("/") else { return nil }
+        let isRootPath = (tab.source == .localMac && tab.path == homePath) ||
+            (tab.source == .remotePhone && (tab.path == "/storage/emulated/0" || tab.path == "/sdcard"))
+        guard isRootPath else { return nil }
+        let candidate = (homePath as NSString).appendingPathComponent(tab.title)
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: candidate, isDirectory: &isDirectory), isDirectory.boolValue else { return nil }
+        return (candidate, .localMac)
     }
     
     public func renameTab(id: UUID, newTitle: String, side: PaneSide) {
@@ -2587,10 +2625,7 @@ public final class DualPaneViewModel: ObservableObject {
         if side == .left {
             if let idx = leftTabs.firstIndex(where: { $0.id == leftActiveTabId }) {
                 guard !leftTabs[idx].isPinned else {
-                    if leftTabs[idx].source != leftSource {
-                        leftTabs[idx].source = leftSource
-                        leftTabs[idx].path = leftPath
-                    }
+                    // Закреплённая вкладка хранит своё место: путь и источник панели ей не присваиваются
                     saveSession()
                     return
                 }
@@ -2601,10 +2636,7 @@ public final class DualPaneViewModel: ObservableObject {
         } else {
             if let idx = rightTabs.firstIndex(where: { $0.id == rightActiveTabId }) {
                 guard !rightTabs[idx].isPinned else {
-                    if rightTabs[idx].source != rightSource {
-                        rightTabs[idx].source = rightSource
-                        rightTabs[idx].path = rightPath
-                    }
+                    // Закреплённая вкладка хранит своё место: путь и источник панели ей не присваиваются
                     saveSession()
                     return
                 }

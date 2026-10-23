@@ -876,6 +876,28 @@ func runAllAsyncTests() async {
             assertCondition(vm.leftActiveTabId == duplicatedTab.id, "Switched to duplicated tab")
             vm.switchTab(id: firstTabId, side: .left)
             assertCondition(vm.leftPath == pinnedOriginalPath, "Returning to pinned tab restores original pinned path '\(pinnedOriginalPath)'")
+
+            // d) Смена источника панели не перезаписывает путь и источник закреплённой вкладки
+            let pinnedOriginalSource = vm.leftTabs.first(where: { $0.id == firstTabId })!.source
+            vm.leftSource = .remotePhone
+            vm.leftPath = "/storage/emulated/0"
+            vm.updateActiveTab(side: .left)
+            let pinnedAfterSourceChange = vm.leftTabs.first(where: { $0.id == firstTabId })!
+            assertCondition(pinnedAfterSourceChange.path == pinnedOriginalPath && pinnedAfterSourceChange.source == pinnedOriginalSource, "Pinned tab keeps path and source when pane source changes")
+            vm.switchTab(id: firstTabId, side: .left)
+            assertCondition(vm.leftSource == pinnedOriginalSource && vm.leftPath == pinnedOriginalPath, "Clicking pinned tab restores its source and path after pane left it")
+
+            // e) Починка закреплённых вкладок, испорченных прежней перезаписью пути (название «Library», путь — корень)
+            let homeForRepair = FileManager.default.homeDirectoryForCurrentUser.path
+            let brokenMacTab = PanelTab(title: "Library", path: homeForRepair, source: .localMac, isPinned: true)
+            let repairedMac = vm.repairedPinnedLocation(for: brokenMacTab, homePath: homeForRepair)
+            assertCondition(repairedMac?.path == homeForRepair + "/Library" && repairedMac?.source == .localMac, "Pinned tab with home path is repaired to its titled folder")
+            let brokenPhoneTab = PanelTab(title: "Library", path: "/storage/emulated/0", source: .remotePhone, isPinned: true)
+            assertCondition(vm.repairedPinnedLocation(for: brokenPhoneTab, homePath: homeForRepair)?.source == .localMac, "Pinned tab with phone root path is repaired to Mac folder")
+            let unpinnedTab = PanelTab(title: "Library", path: homeForRepair, source: .localMac, isPinned: false)
+            assertCondition(vm.repairedPinnedLocation(for: unpinnedTab, homePath: homeForRepair) == nil, "Unpinned tab is never repaired")
+            let missingFolderTab = PanelTab(title: "NoSuchFolder_xyz", path: homeForRepair, source: .localMac, isPinned: true)
+            assertCondition(vm.repairedPinnedLocation(for: missingFolderTab, homePath: homeForRepair) == nil, "Pinned tab is not repaired when titled folder does not exist")
             
             // Unpin first tab and close it
             vm.togglePinTab(id: firstTabId, side: .left)
