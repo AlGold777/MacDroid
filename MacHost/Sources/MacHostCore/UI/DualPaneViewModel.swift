@@ -110,13 +110,26 @@ public final class DualPaneViewModel: ObservableObject {
     
     // Вкладки левой панели
     @Published public var leftTabs: [PanelTab] = []
-    @Published public var leftActiveTabId: UUID = UUID()
+    /// Любая активация вкладки снимает режим корня: активной становится вкладка, а не кнопка источника
+    @Published public var leftActiveTabId: UUID = UUID() {
+        didSet { leftIsRootMode = false }
+    }
+    /// Панель показывает корень источника, выбранный кнопкой Mac/Phone/USB: активна кнопка, а не вкладка
+    @Published public var leftIsRootMode: Bool = false
     @Published public var areTabsVisibleLeft: Bool = false
     
     // Вкладки правой панели
     @Published public var rightTabs: [PanelTab] = []
-    @Published public var rightActiveTabId: UUID = UUID()
+    @Published public var rightActiveTabId: UUID = UUID() {
+        didSet { rightIsRootMode = false }
+    }
+    @Published public var rightIsRootMode: Bool = false
     @Published public var areTabsVisibleRight: Bool = false
+
+    /// Показывает ли панель корень источника вместо вкладки (учитывается, только когда вкладки видны)
+    public func isRootMode(side: PaneSide) -> Bool {
+        (side == .left ? leftIsRootMode : rightIsRootMode) && !visibleTabs(for: side).isEmpty
+    }
     
     // Состояние левой панели
     private var leftItemsVersion: Int = 0
@@ -667,6 +680,8 @@ public final class DualPaneViewModel: ObservableObject {
         static let rightTabs = "session.rightTabs"
         static let leftActiveTabId = "session.leftActiveTabId"
         static let rightActiveTabId = "session.rightActiveTabId"
+        static let leftIsRootMode = "session.leftIsRootMode"
+        static let rightIsRootMode = "session.rightIsRootMode"
         static let areTabsVisibleLeft = "session.areTabsVisibleLeft"
         static let areTabsVisibleRight = "session.areTabsVisibleRight"
         static let activePane = "session.activePane"
@@ -837,6 +852,8 @@ public final class DualPaneViewModel: ObservableObject {
         defaults.set(rightShowHidden, forKey: SessionKey.rightShowHidden)
         defaults.set(leftActiveTabId.uuidString, forKey: SessionKey.leftActiveTabId)
         defaults.set(rightActiveTabId.uuidString, forKey: SessionKey.rightActiveTabId)
+        defaults.set(leftIsRootMode, forKey: SessionKey.leftIsRootMode)
+        defaults.set(rightIsRootMode, forKey: SessionKey.rightIsRootMode)
         defaults.set(activePane.rawValue, forKey: SessionKey.activePane)
         defaults.set(isQuickViewActive, forKey: SessionKey.isQuickViewActive)
         defaults.set(panelLayoutMode.rawValue, forKey: SessionKey.panelLayoutMode)
@@ -880,6 +897,8 @@ public final class DualPaneViewModel: ObservableObject {
         defaults.removeObject(forKey: SessionKey.rightTabs)
         defaults.removeObject(forKey: SessionKey.leftActiveTabId)
         defaults.removeObject(forKey: SessionKey.rightActiveTabId)
+        defaults.removeObject(forKey: SessionKey.leftIsRootMode)
+        defaults.removeObject(forKey: SessionKey.rightIsRootMode)
         defaults.removeObject(forKey: SessionKey.areTabsVisibleLeft)
         defaults.removeObject(forKey: SessionKey.areTabsVisibleRight)
         defaults.removeObject(forKey: SessionKey.activePane)
@@ -1092,12 +1111,17 @@ public final class DualPaneViewModel: ObservableObject {
             rightActiveTabId = first.id
         }
         
-        // Синхронизация текущего пути и источника с активными вкладками
-        if let active = leftTabs.first(where: { $0.id == leftActiveTabId }) {
+        // Режим корня (панель показывала корень источника, а не вкладку) — после установки активных вкладок,
+        // иначе didSet активной вкладки его сбросит
+        leftIsRootMode = defaults.bool(forKey: SessionKey.leftIsRootMode)
+        rightIsRootMode = defaults.bool(forKey: SessionKey.rightIsRootMode)
+
+        // Синхронизация текущего пути и источника с активными вкладками (в режиме корня остаются сохранённые путь и источник)
+        if !leftIsRootMode, let active = leftTabs.first(where: { $0.id == leftActiveTabId }) {
             leftPath = active.path
             leftSource = active.source
         }
-        if let active = rightTabs.first(where: { $0.id == rightActiveTabId }) {
+        if !rightIsRootMode, let active = rightTabs.first(where: { $0.id == rightActiveTabId }) {
             rightPath = active.path
             rightSource = active.source
         }
@@ -2551,6 +2575,8 @@ public final class DualPaneViewModel: ObservableObject {
         let tempIsStale = leftIsStale
         let tempTabs = leftTabs
         let tempActiveTabId = leftActiveTabId
+        let tempIsRootMode = leftIsRootMode
+        let rightIsRootModeBeforeSwap = rightIsRootMode
         let tempViewMode = leftViewMode
         let tempThumbnailSize = leftGridThumbnailSize
         let tempSpacing = leftGridSpacing
@@ -2583,6 +2609,9 @@ public final class DualPaneViewModel: ObservableObject {
         rightIsStale = tempIsStale
         rightTabs = tempTabs
         rightActiveTabId = tempActiveTabId
+        // didSet активной вкладки сбросил режимы корня: возвращаем их вместе с панелями
+        leftIsRootMode = rightIsRootModeBeforeSwap
+        rightIsRootMode = tempIsRootMode
         rightViewMode = tempViewMode
         rightGridThumbnailSize = tempThumbnailSize
         rightGridSpacing = tempSpacing
@@ -2622,6 +2651,11 @@ public final class DualPaneViewModel: ObservableObject {
     
     /// Обновление заголовка, пути и источника активной вкладки
     public func updateActiveTab(side: PaneSide) {
+        // Пока панель показывает корень источника, ни одна вкладка не активна и не перезаписывается
+        if isRootMode(side: side) {
+            saveSession()
+            return
+        }
         if side == .left {
             if let idx = leftTabs.firstIndex(where: { $0.id == leftActiveTabId }) {
                 guard !leftTabs[idx].isPinned else {
@@ -2653,27 +2687,26 @@ public final class DualPaneViewModel: ObservableObject {
         if activePane != side { activePane = side }
         if side == .left {
             leftSource = newSource
-            if newSource == .localMac {
-                if leftPath.hasPrefix("/storage") || !FileManager.default.fileExists(atPath: leftPath) {
-                    leftPath = FileManager.default.homeDirectoryForCurrentUser.path
-                }
-                leftIsStale = false
-            } else {
-                if !leftPath.hasPrefix("/storage") {
-                    leftPath = "/storage/emulated/0"
-                }
-                leftIsStale = false
-            }
+            // Кнопки Mac/Phone ведут себя как вкладки без пути: всегда показывают корень источника
+            leftPath = (newSource == .localMac) ? FileManager.default.homeDirectoryForCurrentUser.path : "/storage/emulated/0"
+            leftIsStale = false
             leftSelection.removeAll()
-            if let idx = leftTabs.firstIndex(where: { $0.id == leftActiveTabId }) {
-                leftTabs[idx].source = newSource
-                leftTabs[idx].path = leftPath
-                if !leftTabs[idx].isPinned {
-                    leftTabs[idx].title = defaultTabTitle(for: leftPath, source: newSource)
-                }
-            }
             if leftTabs.count <= 1 && !(leftTabs.first?.isPinned ?? false) {
                 areTabsVisibleLeft = false
+            }
+            if visibleTabs(for: .left).isEmpty {
+                // Вкладок на экране нет: единственная скрытая вкладка следует за панелью
+                leftIsRootMode = false
+                if let idx = leftTabs.firstIndex(where: { $0.id == leftActiveTabId }) {
+                    leftTabs[idx].source = newSource
+                    leftTabs[idx].path = leftPath
+                    if !leftTabs[idx].isPinned {
+                        leftTabs[idx].title = defaultTabTitle(for: leftPath, source: newSource)
+                    }
+                }
+            } else {
+                // Вкладки видны: панель показывает корень, ни одна вкладка не активна и не перезаписывается
+                leftIsRootMode = true
             }
             updateActiveTab(side: .left)
             if newSource == .remotePhone {
@@ -2690,27 +2723,26 @@ public final class DualPaneViewModel: ObservableObject {
             }
         } else {
             rightSource = newSource
-            if newSource == .localMac {
-                if rightPath.hasPrefix("/storage") || !FileManager.default.fileExists(atPath: rightPath) {
-                    rightPath = FileManager.default.homeDirectoryForCurrentUser.path
-                }
-                rightIsStale = false
-            } else {
-                if !rightPath.hasPrefix("/storage") {
-                    rightPath = "/storage/emulated/0"
-                }
-                rightIsStale = false
-            }
+            // Кнопки Mac/Phone ведут себя как вкладки без пути: всегда показывают корень источника
+            rightPath = (newSource == .localMac) ? FileManager.default.homeDirectoryForCurrentUser.path : "/storage/emulated/0"
+            rightIsStale = false
             rightSelection.removeAll()
-            if let idx = rightTabs.firstIndex(where: { $0.id == rightActiveTabId }) {
-                rightTabs[idx].source = newSource
-                rightTabs[idx].path = rightPath
-                if !rightTabs[idx].isPinned {
-                    rightTabs[idx].title = defaultTabTitle(for: rightPath, source: newSource)
-                }
-            }
             if rightTabs.count <= 1 && !(rightTabs.first?.isPinned ?? false) {
                 areTabsVisibleRight = false
+            }
+            if visibleTabs(for: .right).isEmpty {
+                // Вкладок на экране нет: единственная скрытая вкладка следует за панелью
+                rightIsRootMode = false
+                if let idx = rightTabs.firstIndex(where: { $0.id == rightActiveTabId }) {
+                    rightTabs[idx].source = newSource
+                    rightTabs[idx].path = rightPath
+                    if !rightTabs[idx].isPinned {
+                        rightTabs[idx].title = defaultTabTitle(for: rightPath, source: newSource)
+                    }
+                }
+            } else {
+                // Вкладки видны: панель показывает корень, ни одна вкладка не активна и не перезаписывается
+                rightIsRootMode = true
             }
             updateActiveTab(side: .right)
             if newSource == .remotePhone {
@@ -3119,6 +3151,8 @@ public final class DualPaneViewModel: ObservableObject {
     /// Переключение на внешний USB накопитель
     public func switchToUsbDrive(_ drive: UsbDriveInfo, side: PaneSide) {
         if activePane != side { activePane = side }
+        // Кнопка USB, как Mac/Phone, показывает корень накопителя и не трогает вкладки
+        if side == .left { leftIsRootMode = true } else { rightIsRootMode = true }
         if drive.isMac {
             if (side == .left ? leftSource : rightSource) != .localMac {
                 changeSource(to: .localMac, side: side)

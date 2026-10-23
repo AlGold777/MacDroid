@@ -156,9 +156,12 @@ public struct PaneView: View {
                     let currentSrc = (side == .left ? vm.leftSource : vm.rightSource)
                     let currentP = (side == .left ? vm.leftPath : vm.rightPath)
                     let activeUsb = vm.detectedUsbDrives.first(where: { currentP.hasPrefix($0.path) })
-                    let isMacActive = (currentSrc == .localMac && activeUsb == nil)
-                    let isPhoneActive = (sourceBinding.wrappedValue == .remotePhone && activeUsb == nil)
-                    let isUsbActive = (activeUsb != nil)
+                    // Кнопки источников — такие же «вкладки»: подсвечены, только когда панель показывает корень источника
+                    // (или вкладок на экране нет); при активной вкладке подсвечена она, а не кнопка
+                    let buttonsOwnHighlight = vm.isRootMode(side: side) || vm.visibleTabs(for: side).isEmpty
+                    let isMacActive = (currentSrc == .localMac && activeUsb == nil && buttonsOwnHighlight)
+                    let isPhoneActive = (sourceBinding.wrappedValue == .remotePhone && activeUsb == nil && buttonsOwnHighlight)
+                    let isUsbActive = (activeUsb != nil && buttonsOwnHighlight)
                     
                     // Кнопка Mac
                     DriveTabToolbarButton(
@@ -367,7 +370,7 @@ public struct PaneView: View {
                                 }
                                 .padding(.horizontal, 8)
                                 .padding(.vertical, 4)
-                                .background(tab.id == activeTabId ? Color(nsColor: .controlBackgroundColor) : Color(nsColor: .windowBackgroundColor).opacity(0.5))
+                                .background((tab.id == activeTabId && !vm.isRootMode(side: side)) ? Color(nsColor: .controlBackgroundColor) : Color(nsColor: .windowBackgroundColor).opacity(0.5))
                                 .cornerRadius(4)
                                 .contentShape(Rectangle())
                                 .onHover { hovering in
@@ -393,7 +396,7 @@ public struct PaneView: View {
                                         // если пользователь успел уйти из неё внутри панели
                                         let panePath = (side == .left) ? vm.leftPath : vm.rightPath
                                         let paneSource = (side == .left) ? vm.leftSource : vm.rightSource
-                                        if tab.id != activeTabId || tab.path != panePath || tab.source != paneSource {
+                                        if tab.id != activeTabId || vm.isRootMode(side: side) || tab.path != panePath || tab.source != paneSource {
                                             vm.switchTab(id: tab.id, side: side)
                                         }
                                     }

@@ -898,6 +898,26 @@ func runAllAsyncTests() async {
             assertCondition(vm.repairedPinnedLocation(for: unpinnedTab, homePath: homeForRepair) == nil, "Unpinned tab is never repaired")
             let missingFolderTab = PanelTab(title: "NoSuchFolder_xyz", path: homeForRepair, source: .localMac, isPinned: true)
             assertCondition(vm.repairedPinnedLocation(for: missingFolderTab, homePath: homeForRepair) == nil, "Pinned tab is not repaired when titled folder does not exist")
+
+            // f) Кнопки Mac/Phone — как вкладки без пути: показывают корень, вкладка не активна и не перезаписывается
+            vm.switchTab(id: firstTabId, side: .left)
+            assertCondition(!vm.isRootMode(side: .left), "Tab click leaves root mode")
+            let tabLocationsBeforeRoot = vm.leftTabs.map { $0.path + "|" + "\($0.source)" + "|" + $0.title }
+            vm.changeSource(to: .localMac, side: .left)
+            assertCondition(vm.isRootMode(side: .left), "Mac button enters root mode when tabs are visible")
+            assertCondition(vm.leftPath == homeForRepair, "Mac button shows Mac root even when pane was already on Mac")
+            vm.leftPath = homeForRepair + "/Library"
+            vm.updateActiveTab(side: .left)
+            assertCondition(vm.leftTabs.map { $0.path + "|" + "\($0.source)" + "|" + $0.title } == tabLocationsBeforeRoot, "Navigation in root mode does not rewrite tabs")
+            vm.changeSource(to: .remotePhone, side: .left)
+            assertCondition(vm.isRootMode(side: .left) && vm.leftPath == "/storage/emulated/0" && vm.leftSource == .remotePhone, "Phone button shows phone root in root mode")
+            assertCondition(vm.leftTabs.map { $0.path + "|" + "\($0.source)" + "|" + $0.title } == tabLocationsBeforeRoot, "Pinned tab untouched after Mac/Phone buttons")
+            vm.switchTab(id: firstTabId, side: .left)
+            assertCondition(!vm.isRootMode(side: .left) && vm.leftSource == pinnedOriginalSource && vm.leftPath == pinnedOriginalPath, "Clicking tab after root mode restores the tab and clears root mode")
+            vm.changeSource(to: .localMac, side: .left)
+            vm.switchTab(id: duplicatedTab.id, side: .left)
+            assertCondition(vm.leftActiveTabId == duplicatedTab.id && !vm.isRootMode(side: .left), "Switching to another tab after root mode makes that tab active")
+            vm.switchTab(id: firstTabId, side: .left)
             
             // Unpin first tab and close it
             vm.togglePinTab(id: firstTabId, side: .left)
@@ -4320,11 +4340,16 @@ func runTest59() async {
         vm.refreshPane(side: .right)
         assertCondition(vm.rightPath == "/storage/emulated/0/Photos", "refreshPane preserved normalized phone path")
         
-        // 4. Проверяем смену источника через changeSource: вкладка должна обновить source на .remotePhone
+        // 4. Проверяем смену источника через changeSource: при видимых вкладках панель переходит в режим корня
+        // и вкладки не перезаписываются, при скрытых — единственная вкладка следует за источником панели
         vm.changeSource(to: .remotePhone, side: .left)
         assertCondition(vm.leftSource == .remotePhone, "changeSource sets leftSource to .remotePhone")
         if let activeLeftTab = vm.leftTabs.first(where: { $0.id == vm.leftActiveTabId }) {
-            assertCondition(activeLeftTab.source == .remotePhone, "Active left tab source is synchronized to .remotePhone")
+            if vm.visibleTabs(for: .left).isEmpty {
+                assertCondition(activeLeftTab.source == .remotePhone, "Hidden single left tab follows pane source .remotePhone")
+            } else {
+                assertCondition(vm.isRootMode(side: .left), "Visible tabs: changeSource enters root mode instead of rewriting the active tab")
+            }
         }
         
         // 5. Проверяем, что refreshPane очищает DirectoryCache для обновляемого пути
