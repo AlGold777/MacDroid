@@ -1,7 +1,11 @@
 import Darwin
 import Foundation
 import CryptoKit
+#if DEBUG
+@testable import MacHostCore
+#else
 import MacHostCore
+#endif
 import UniformTypeIdentifiers
 import SwiftUI
 import AppKit
@@ -4779,6 +4783,164 @@ func runTest62() async {
     try? FileManager.default.removeItem(at: tempDir)
 }
 
+private func runColumnBoundaryResizeTests() {
+    print("\n[Test 69] Right-anchored column boundary resizing...")
+    typealias Layout = TableDoubleClickHandler.TableColumnLayoutEngine
+    let baseline: [CGFloat] = [500, 90, 25, 130, 58]
+    let total = baseline.reduce(0, +)
+    let close: ([CGFloat], [CGFloat]) -> Bool = { lhs, rhs in
+        lhs.count == rhs.count && zip(lhs, rhs).allSatisfy { abs($0.0 - $0.1) < 0.001 }
+    }
+    let boundaryPosition: ([CGFloat], Int) -> CGFloat = { widths, boundary in
+        widths[...boundary].reduce(0, +)
+    }
+    let widthThroughColumn: ([CGFloat], Int) -> CGFloat = { widths, column in
+        widths[...column].reduce(0, +)
+    }
+
+    // Each visible separator controls the left edge of the metadata column on its right.
+    for boundary in 0...2 {
+        let target = boundary + 1
+        for translation: CGFloat in [-5, 5] {
+            let result = Layout.widthsByMovingBoundary(
+                initialWidths: baseline,
+                boundaryIndex: boundary,
+                translation: translation
+            )
+            assertCondition(abs(result[target] - (baseline[target] - translation)) < 0.001,
+                            "Boundary \(boundary) applies signed translation to metadata width")
+            assertCondition(abs(result[0] - (baseline[0] + translation)) < 0.001,
+                            "Boundary \(boundary) compensates through flexible Name width")
+            assertCondition(abs(boundaryPosition(result, boundary) - boundaryPosition(baseline, boundary) - translation) < 0.001,
+                            "Boundary \(boundary) tracks the pointer translation")
+            assertCondition(abs(result.reduce(0, +) - total) < 0.001,
+                            "Boundary \(boundary) preserves total table width")
+            assertCondition(abs(widthThroughColumn(result, target) - widthThroughColumn(baseline, target)) < 0.001,
+                            "Boundary \(boundary) keeps the selected column's right edge fixed")
+            assertCondition(close(Array(result[(target + 1)...]), Array(baseline[(target + 1)...])),
+                            "Boundary \(boundary) leaves trailing columns and separators fixed")
+        }
+        let moved = Layout.widthsByMovingBoundary(
+            initialWidths: baseline, boundaryIndex: boundary, translation: 12
+        )
+        let returnedToMouseDown = Layout.widthsByMovingBoundary(
+            initialWidths: baseline, boundaryIndex: boundary, translation: 0
+        )
+        assertCondition(!close(moved, baseline), "Boundary \(boundary) changes width during a drag")
+        assertCondition(close(returnedToMouseDown, baseline),
+                        "Boundary \(boundary) returns exactly to its mouse-down snapshot when pointer returns")
+    }
+
+    // Metadata limits clamp both directions, with Name absorbing only available space.
+    let minWidths: [CGFloat] = [200, 90, 25, 130, 58]
+    let metadataLimits: [(boundary: Int, minimum: CGFloat, maximum: CGFloat)] = [
+        (0, 55, 130), (1, 17, 35), (2, 90, 180)
+    ]
+    for (boundary, minimum, maximum) in metadataLimits {
+        let lower = Layout.widthsByMovingBoundary(
+            initialWidths: minWidths, boundaryIndex: boundary, translation: 1_000
+        )
+        let upper = Layout.widthsByMovingBoundary(
+            initialWidths: minWidths, boundaryIndex: boundary, translation: -1_000
+        )
+        assertCondition(abs(lower[boundary + 1] - minimum) < 0.001,
+                        "Boundary \(boundary) reaches metadata minimum \(minimum)")
+        assertCondition(abs(upper[boundary + 1] - maximum) < 0.001,
+                        "Boundary \(boundary) reaches metadata maximum \(maximum)")
+        assertCondition(abs(lower[0] - (minWidths[0] + minWidths[boundary + 1] - minimum)) < 0.001,
+                        "Boundary \(boundary) clamps without changing unrelated columns")
+        assertCondition(abs(upper[0] - (minWidths[0] + minWidths[boundary + 1] - maximum)) < 0.001,
+                        "Boundary \(boundary) stops at its max without accumulating drag distance")
+        assertCondition(close(Layout.widthsByMovingBoundary(
+            initialWidths: minWidths, boundaryIndex: boundary, translation: 0
+        ), minWidths), "Boundary \(boundary) returns to baseline after either limit is reached")
+    }
+
+    let nameAtMinimum = Layout.widthsByMovingBoundary(
+        initialWidths: [125, 80, 25, 130, 58], boundaryIndex: 0, translation: -100
+    )
+    assertCondition(abs(nameAtMinimum[0] - Layout.constraints[0].min) < 0.001,
+                    "Metadata expansion stops when Name reaches its 120 pt minimum")
+    assertCondition(abs(nameAtMinimum[1] - 85) < 0.001,
+                    "Name minimum limits expansion to the available 5 pt")
+
+    let locked = Layout.widthsByMovingBoundary(
+        initialWidths: baseline, boundaryIndex: 3, translation: 40
+    )
+    assertCondition(close(locked, baseline), "Locked Date | Type boundary cannot be moved")
+    assertCondition(close(Layout.widthsByMovingBoundary(
+        initialWidths: baseline, boundaryIndex: -1, translation: 40
+    ), baseline), "Invalid boundary index leaves widths unchanged")
+
+#if DEBUG
+    let table = NSTableView(frame: NSRect(x: 0, y: 0, width: total, height: 300))
+    for (index, width) in baseline.enumerated() {
+        let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("hit-test-\(index)"))
+        column.width = width
+        table.addTableColumn(column)
+    }
+    let nativeHeader = NSTableHeaderView(frame: NSRect(x: 0, y: 0, width: total, height: 24))
+    table.headerView = nativeHeader
+    let overlay = TableDoubleClickHandler.ColumnResizeView(frame: nativeHeader.bounds)
+    overlay.tableView = table
+    nativeHeader.addSubview(overlay)
+    for boundary in 0...2 {
+        let x = nativeHeader.headerRect(ofColumn: boundary).maxX
+        for offset: CGFloat in [-6, 6] {
+            let point = NSPoint(x: x + offset, y: 12)
+            assertCondition(overlay.hitTest(point) === overlay,
+                            "Header overlay captures active boundary \(boundary) within 6 pt")
+            assertCondition(nativeHeader.hitTest(point) === overlay,
+                            "Native header routes active boundary \(boundary) to overlay")
+        }
+        for offset: CGFloat in [-8, 8] {
+            assertCondition(overlay.hitTest(NSPoint(x: x + offset, y: 12)) == nil,
+                            "Header overlay releases active boundary \(boundary) beyond 7 pt")
+        }
+    }
+    for columnIndex in [0, 1, 2, 3, 4] {
+        let center = nativeHeader.headerRect(ofColumn: columnIndex).midX
+        let point = NSPoint(x: center, y: 12)
+        assertCondition(overlay.hitTest(point) == nil,
+                        "Native header receives center clicks in column \(columnIndex)")
+        assertCondition(nativeHeader.hitTest(point) !== overlay,
+                        "Native header does not route center click in column \(columnIndex) to overlay")
+    }
+#endif
+
+    func columns(_ widths: [CGFloat]) -> [NSTableColumn] {
+        widths.enumerated().map { index, width in
+            let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("column-\(index)"))
+            column.width = width
+            return column
+        }
+    }
+    func currentWidths(_ columns: [NSTableColumn]) -> [CGFloat] { columns.map(\.width) }
+
+    let tooNarrow = columns([200, 100, 25, 130, 58])
+    let unchanged = currentWidths(tooNarrow)
+    Layout.adjust(columns: tooNarrow, targetWidth: 339)
+    assertCondition(close(currentWidths(tooNarrow), unchanged),
+                    "Pane resize below the 340 pt table minimum leaves widths unchanged")
+
+    let exactMinimum = columns([200, 100, 25, 130, 58])
+    Layout.adjust(columns: exactMinimum, targetWidth: 340)
+    assertCondition(close(currentWidths(exactMinimum), [120, 55, 17, 90, 58]),
+                    "340 pt table uses each column's minimum width")
+    assertCondition(abs(Layout.minimumPaneWidth - 360) < 0.001,
+                    "Pane minimum includes 20 pt scrollbar allowance (360 pt)")
+
+    let paneMinimum = columns([200, 100, 25, 130, 58])
+    Layout.adjust(columns: paneMinimum, targetWidth: 360)
+    assertCondition(close(currentWidths(paneMinimum), [120, 67, 25, 90, 58]),
+                    "360 pt pane resize reaches Name minimum and compresses metadata only as needed")
+
+    let widerPane = columns([200, 100, 25, 130, 58])
+    Layout.adjust(columns: widerPane, targetWidth: 900)
+    assertCondition(close(currentWidths(widerPane), [587, 100, 25, 130, 58]),
+                    "Large pane resize expands Name while metadata widths stay fixed")
+}
+
 func runTest63() async {
     print("\n--- [TEST 63] Tab Titles: 'Mac' and Phone Name instead of '/restart' and '0' ---")
     
@@ -5200,7 +5362,9 @@ func runTest63() async {
         assertCondition(PhoneConnectionManager.newestCompanionApk(in: apkDir)?.hasSuffix("MacDroidCompanion-2.1.14.apk") == true, "Newest versioned APK chosen (2.1.14 > 2.1.9 > app-debug)")
         try? FileManager.default.removeItem(atPath: apkDir)
 
-        print("\n🎉 ALL 68 PRODUCTION TEST SUITES PASSED!")
+        runColumnBoundaryResizeTests()
+
+        print("\n🎉 ALL 69 PRODUCTION TEST SUITES PASSED!")
         exit(0)
 }
 

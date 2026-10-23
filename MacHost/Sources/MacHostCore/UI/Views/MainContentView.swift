@@ -78,9 +78,9 @@ public struct MainContentView: View {
                         .frame(minWidth: 145, idealWidth: sidebarWidth, maxWidth: 220)
                 }
                 PaneView(side: .left)
-                    .frame(minWidth: 320, idealWidth: paneIdealWidth)
+                    .frame(minWidth: TableDoubleClickHandler.TableColumnLayoutEngine.minimumPaneWidth, idealWidth: paneIdealWidth)
                 PaneView(side: .right)
-                    .frame(minWidth: 320, idealWidth: paneIdealWidth)
+                    .frame(minWidth: TableDoubleClickHandler.TableColumnLayoutEngine.minimumPaneWidth, idealWidth: paneIdealWidth)
             }
             .id(vm.splitViewResetId)
             .background(

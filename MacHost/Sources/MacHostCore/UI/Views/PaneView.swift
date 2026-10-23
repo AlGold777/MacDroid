@@ -1907,6 +1907,7 @@ public struct TableDoubleClickHandler: NSViewRepresentable {
             nsView.hookTableView()
         }
         if let tv = nsView.hookedTableView {
+            nsView.installColumnHeader(on: tv)
             for col in tv.tableColumns {
                 if col.headerCell.font?.pointSize != 12 {
                     col.headerCell.font = NSFont.systemFont(ofSize: 12, weight: .regular)
@@ -1925,149 +1926,171 @@ public struct TableDoubleClickHandler: NSViewRepresentable {
         }
     }
     
-    // MARK: - Table Column Layout Engine (Consensus Architecture G01-G05 + S03 + S01/N02)
+    // MARK: - Right-anchored metadata columns
 
     public struct TableColumnLayoutEngine {
         public struct Constraint {
             public let min: CGFloat
             public let max: CGFloat
         }
-        
-        /// Фиксированная ширина колонки «Тип» (58 pt, заголовок строго по центру, расширения выровнены по левому краю)
+
         public static let fixedTypeWidth: CGFloat = 58
-        
-        // Индексы колонок: 0 - Имя, 1 - Размер, 2 - Теги, 3 - Дата изменения, 4 - Тип
+        // Name fills the remaining space; metadata widths are independent preferences.
         public static let constraints: [Constraint] = [
-            Constraint(min: 120, max: 4000),                      // 0: Имя
-            Constraint(min: 55,  max: 130),                       // 1: Размер
-            Constraint(min: 17,  max: 35),                        // 2: Теги
-            Constraint(min: 90,  max: 180),                       // 3: Дата изменения
-            Constraint(min: fixedTypeWidth, max: fixedTypeWidth)  // 4: Тип (закреплена к правому краю, неизменяемая)
+            Constraint(min: 120, max: .greatestFiniteMagnitude),
+            Constraint(min: 55, max: 130),
+            Constraint(min: 17, max: 35),
+            Constraint(min: 90, max: 180),
+            Constraint(min: fixedTypeWidth, max: fixedTypeWidth)
         ]
-        
-        public static func adjust(
-            columns: [NSTableColumn],
-            targetWidth: CGFloat,
-            draggedColumn: NSTableColumn? = nil
-        ) {
-            guard columns.count >= 5 else { return }
-            guard targetWidth >= 200 else { return }
-            
-            if let dragged = draggedColumn, let draggedIdx = columns.firstIndex(of: dragged) {
-                handleColumnDrag(columns: columns, targetWidth: targetWidth, draggedIdx: draggedIdx)
-            } else {
-                handlePaneResize(columns: columns, targetWidth: targetWidth)
-            }
+        public static let minimumTableWidth = constraints.reduce(CGFloat.zero) { $0 + $1.min }
+        // Allow room for a non-overlay vertical scrollbar as well as the table.
+        public static let minimumPaneWidth = minimumTableWidth + 20
+
+        /// A separator controls the LEFT edge of the metadata column on its right.
+        /// Always use the mouse-down snapshot, so clamping never accumulates drift.
+        public static func widthsByMovingBoundary(
+            initialWidths: [CGFloat], boundaryIndex: Int, translation: CGFloat
+        ) -> [CGFloat] {
+            guard initialWidths.count == constraints.count,
+                  (0...2).contains(boundaryIndex), translation.isFinite else { return initialWidths }
+            let index = boundaryIndex + 1
+            let limit = constraints[index]
+            let available = max(0, initialWidths[0] - constraints[0].min)
+            let upper = min(limit.max, initialWidths[index] + available)
+            let width = max(limit.min, min(upper, initialWidths[index] - translation))
+            var result = initialWidths
+            result[index] = width
+            result[0] += initialWidths[index] - width
+            return result
         }
-        
-        public static func handlePaneResize(columns: [NSTableColumn], targetWidth: CGFloat) {
-            // Колонка 4 («Тип») строго фиксирована
-            columns[4].width = fixedTypeWidth
-            
-            // Колонки 1..3 сохраняют свои пропорции (зажаты в лимиты)
-            for i in 1...3 {
-                let c = constraints[i]
-                columns[i].width = max(c.min, min(c.max, columns[i].width))
+
+        public static func adjust(columns: [NSTableColumn], targetWidth: CGFloat) {
+            guard columns.count == constraints.count, targetWidth >= minimumTableWidth else { return }
+            var widths = columns.map(\.width)
+            widths[4] = fixedTypeWidth
+            for index in 1...3 {
+                widths[index] = max(constraints[index].min, min(constraints[index].max, widths[index]))
             }
-            
-            var otherSum: CGFloat = fixedTypeWidth
-            for i in 1...3 {
-                otherSum += columns[i].width
-            }
-            
-            let targetName = targetWidth - otherSum
-            if targetName >= constraints[0].min {
-                columns[0].width = targetName
-            } else {
-                columns[0].width = constraints[0].min
-                var deficit = constraints[0].min - targetName
-                // Каскадное сжатие колонок справа налево (Дата 3, Размер 1, Теги 2)
-                let shrinkOrder = [3, 1, 2]
-                for idx in shrinkOrder {
-                    guard deficit > 0 else { break }
-                    let canReduce = max(0, columns[idx].width - constraints[idx].min)
-                    let take = min(deficit, canReduce)
-                    columns[idx].width -= take
+            widths[0] = targetWidth - widths[1...4].reduce(0, +)
+            if widths[0] < constraints[0].min {
+                var deficit = constraints[0].min - widths[0]
+                // Only a panel resize may compress other metadata columns.
+                for index in [3, 1, 2] {
+                    let take = min(deficit, widths[index] - constraints[index].min)
+                    widths[index] -= take
                     deficit -= take
                 }
+                widths[0] = targetWidth - widths[1...4].reduce(0, +)
             }
-            
-            // Колонка 4 («Тип») ВСЕГДА строго fixedTypeWidth
-            columns[4].width = fixedTypeWidth
-            
-            let total = columns.map { $0.width }.reduce(0, +)
-            let residual = targetWidth - total
-            if abs(residual) > 0.001 {
-                columns[0].width += residual
-            }
+            apply(widths: widths, to: columns)
         }
-        
-        public static func handleColumnDrag(columns: [NSTableColumn], targetWidth: CGFloat, draggedIdx: Int) {
-            guard draggedIdx < columns.count else { return }
-            
-            // Если перетаскивается колонка 3 или 4 — колонка 4 неизменна и закреплена
-            if draggedIdx >= 3 {
-                columns[4].width = fixedTypeWidth
-                handlePaneResize(columns: columns, targetWidth: targetWidth)
-                return
-            }
-            
-            // draggedIdx < 3: перетаскивание разделителя 0 (Имя|Размер), 1 (Размер|Теги) или 2 (Теги|Дата)
-            columns[draggedIdx].width = max(constraints[draggedIdx].min, min(constraints[draggedIdx].max, columns[draggedIdx].width))
-            columns[4].width = fixedTypeWidth
-            
-            let currentSum = columns.map { $0.width }.reduce(0, +)
-            var delta = currentSum - targetWidth
-            
-            if delta > 0 {
-                // Пользователь расширил колонку: сжимаем соседей справа (до колонки 3 включительно)
-                for k in (draggedIdx + 1)...3 {
-                    guard delta > 0 else { break }
-                    let canShrink = max(0, columns[k].width - constraints[k].min)
-                    let take = min(delta, canShrink)
-                    columns[k].width -= take
-                    delta -= take
-                }
-                // Если соседи справа уперлись в минимум, пробуем сжать колонку 0 ("Имя")
-                if delta > 0 && draggedIdx != 0 {
-                    let canShrink0 = max(0, columns[0].width - constraints[0].min)
-                    let take0 = min(delta, canShrink0)
-                    columns[0].width -= take0
-                    delta -= take0
-                }
-                // Если все еще осталась дельта — откатываем draggedIdx обратно
-                if delta > 0 {
-                    columns[draggedIdx].width -= delta
-                    delta = 0
-                }
-            } else if delta < 0 {
-                // Пользователь сузил колонку: расширяем соседей справа (до колонки 3 включительно)
-                var needed = -delta
-                for k in (draggedIdx + 1)...3 {
-                    guard needed > 0 else { break }
-                    let canExpand = max(0, constraints[k].max - columns[k].width)
-                    let add = min(needed, canExpand)
-                    columns[k].width += add
-                    needed -= add
-                }
-                // Если соседи уперлись в максимум — отдаем остаток колонке 0 ("Имя")
-                if needed > 0 {
-                    columns[0].width += needed
-                    needed = 0
-                }
-            }
-            
-            // Колонка 4 («Тип») ВСЕГДА строго fixedTypeWidth
-            columns[4].width = fixedTypeWidth
-            
-            let finalSum = columns.map { $0.width }.reduce(0, +)
-            let residual = targetWidth - finalSum
-            if abs(residual) > 0.001 {
-                columns[0].width += residual
+
+        public static func apply(widths: [CGFloat], to columns: [NSTableColumn]) {
+            guard widths.count == columns.count else { return }
+            for (column, width) in zip(columns, widths) where abs(column.width - width) > 0.001 {
+                column.width = width
             }
         }
     }
-    
+
+    /// Intercept only separator hit areas. Keep SwiftUI's original header and
+    /// its sorting/accessibility behavior underneath the transparent overlay.
+    final class ColumnResizeView: NSView {
+        weak var tableView: NSTableView?
+        private(set) var isResizingBoundary = false
+        private var hoveredBoundary: Int? {
+            didSet { if oldValue != hoveredBoundary { needsDisplay = true } }
+        }
+        private var hoverTrackingArea: NSTrackingArea?
+        private let handleRadius: CGFloat = 7
+        var onBoundaryDrag: (([CGFloat], Int, CGFloat) -> Void)?
+        var onBoundaryDragEnded: (() -> Void)?
+
+        private func boundaryX(_ index: Int) -> CGFloat? {
+            guard let header = tableView?.headerView else { return nil }
+            return convert(header.headerRect(ofColumn: index), from: header).maxX
+        }
+
+        private func boundary(at point: NSPoint) -> Int? {
+            guard tableView?.tableColumns.count == 5, bounds.contains(point) else { return nil }
+            return (0...3).first { index in
+                guard let x = boundaryX(index) else { return false }
+                return abs(x - point.x) <= handleRadius
+            }
+        }
+
+        override func hitTest(_ point: NSPoint) -> NSView? {
+            guard !isHidden, boundary(at: convert(point, from: superview)) != nil else { return nil }
+            return self
+        }
+
+        override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+        override func updateTrackingAreas() {
+            super.updateTrackingAreas()
+            if let hoverTrackingArea { removeTrackingArea(hoverTrackingArea) }
+            let area = NSTrackingArea(
+                rect: .zero, options: [.mouseMoved, .mouseEnteredAndExited, .activeInKeyWindow, .inVisibleRect],
+                owner: self, userInfo: nil
+            )
+            addTrackingArea(area)
+            hoverTrackingArea = area
+        }
+
+        override func mouseMoved(with event: NSEvent) {
+            let index = boundary(at: convert(event.locationInWindow, from: nil))
+            hoveredBoundary = index.flatMap { $0 < 3 ? $0 : nil }
+            if hoveredBoundary != nil { NSCursor.resizeLeftRight.set() }
+        }
+
+        override func mouseEntered(with event: NSEvent) { mouseMoved(with: event) }
+
+        override func mouseExited(with event: NSEvent) {
+            if !isResizingBoundary { hoveredBoundary = nil }
+        }
+
+        override func draw(_ dirtyRect: NSRect) {
+            guard let index = hoveredBoundary, let x = boundaryX(index) else { return }
+            NSColor.controlAccentColor.withAlphaComponent(0.8).setFill()
+            NSRect(x: x - 1, y: bounds.minY + 3, width: 2, height: max(0, bounds.height - 6)).fill()
+        }
+
+        override func resetCursorRects() {
+            guard tableView?.tableColumns.count == 5 else { return }
+            for index in 0...2 {
+                guard let x = boundaryX(index) else { continue }
+                addCursorRect(NSRect(x: x - handleRadius, y: bounds.minY, width: handleRadius * 2, height: bounds.height), cursor: .resizeLeftRight)
+            }
+        }
+
+        override func mouseDown(with event: NSEvent) {
+            let point = convert(event.locationInWindow, from: nil)
+            guard let boundaryIndex = boundary(at: point), boundaryIndex < 3,
+                  let tableView, let window else { return }
+            let initialWidths = tableView.tableColumns.map(\.width)
+            let startX = event.locationInWindow.x
+            hoveredBoundary = boundaryIndex
+            isResizingBoundary = true
+            NSCursor.resizeLeftRight.push()
+            defer {
+                isResizingBoundary = false
+                hoveredBoundary = nil
+                NSCursor.pop()
+                onBoundaryDragEnded?()
+                window.invalidateCursorRects(for: self)
+            }
+            while let next = window.nextEvent(
+                matching: [.leftMouseDragged, .leftMouseUp],
+                until: .distantFuture, inMode: .eventTracking, dequeue: true
+            ) {
+                onBoundaryDrag?(initialWidths, boundaryIndex, next.locationInWindow.x - startX)
+                window.displayIfNeeded()
+                if next.type == .leftMouseUp { break }
+            }
+        }
+    }
+
     public final class HandlerView: NSView {
         public static weak var leftTableView: NSTableView?
         public static weak var rightTableView: NSTableView?
@@ -2164,6 +2187,7 @@ public struct TableDoubleClickHandler: NSViewRepresentable {
         private var mouseDownLocation: NSPoint = .zero
         private var pendingSingleClickSelection: (id: String, side: PaneSide)? = nil
         private var isAdjustingColumns = false
+        private weak var columnResizeView: ColumnResizeView?
         
         deinit {
             longPressWorkItem?.cancel()
@@ -2191,7 +2215,7 @@ public struct TableDoubleClickHandler: NSViewRepresentable {
                 if let tv = hookedTableView, tv.columnAutoresizingStyle != .noColumnAutoresizing {
                     tv.columnAutoresizingStyle = .noColumnAutoresizing
                 }
-                adjustTableColumns(draggedColumn: nil)
+                adjustTableColumns()
             }
         }
         
@@ -2274,6 +2298,8 @@ public struct TableDoubleClickHandler: NSViewRepresentable {
             tv.allowsMultipleSelection = true
             tv.allowsEmptySelection = true
             tv.allowsColumnReordering = false
+            tv.allowsColumnResizing = false
+            installColumnHeader(on: tv)
             if #available(macOS 11.0, *) {
                 tv.style = .plain
             }
@@ -2347,18 +2373,38 @@ public struct TableDoubleClickHandler: NSViewRepresentable {
             setupEventMonitor()
         }
         
-        @objc public func adjustTableColumns() {
-            adjustTableColumns(draggedColumn: nil)
+        fileprivate func installColumnHeader(on table: NSTableView) {
+            guard let nativeHeader = table.headerView else { return }
+            let overlay = nativeHeader.subviews.compactMap { $0 as? ColumnResizeView }.first
+                ?? ColumnResizeView(frame: nativeHeader.bounds)
+            overlay.autoresizingMask = [.width, .height]
+            overlay.tableView = table
+            overlay.setAccessibilityElement(false)
+            overlay.onBoundaryDrag = { [weak self, weak table] initialWidths, boundary, translation in
+                guard let self, let table, !self.isAdjustingColumns else { return }
+                self.isAdjustingColumns = true
+                defer { self.isAdjustingColumns = false }
+                let widths = TableColumnLayoutEngine.widthsByMovingBoundary(
+                    initialWidths: initialWidths, boundaryIndex: boundary, translation: translation
+                )
+                TableColumnLayoutEngine.apply(widths: widths, to: table.tableColumns)
+                table.headerView?.needsDisplay = true
+            }
+            overlay.onBoundaryDragEnded = { [weak self] in self?.adjustTableColumns() }
+            if overlay.superview !== nativeHeader { nativeHeader.addSubview(overlay) }
+            columnResizeView = overlay
+            table.allowsColumnResizing = false
         }
-        
-        public func adjustTableColumns(draggedColumn: NSTableColumn?) {
+
+        @objc public func adjustTableColumns() {
             guard !isAdjustingColumns else { return }
             guard let tv = hookedTableView else { return }
+            guard columnResizeView?.isResizingBoundary != true else { return }
             let columns = tv.tableColumns
-            guard columns.count >= 5 else { return }
-            
+            guard columns.count == 5 else { return }
+
             let clipWidth = tv.enclosingScrollView?.contentView.bounds.width ?? tv.bounds.width
-            guard clipWidth >= 200 else { return }
+            guard clipWidth >= TableColumnLayoutEngine.minimumTableWidth else { return }
             
             isAdjustingColumns = true
             defer { isAdjustingColumns = false }
@@ -2371,7 +2417,7 @@ public struct TableDoubleClickHandler: NSViewRepresentable {
                 columns[4].resizingMask = []
                 tv.headerView?.needsDisplay = true
             }
-            TableColumnLayoutEngine.adjust(columns: columns, targetWidth: targetWidth, draggedColumn: draggedColumn)
+            TableColumnLayoutEngine.adjust(columns: columns, targetWidth: targetWidth)
             
             if abs(tv.frame.size.width - targetWidth) > 0.5 {
                 tv.setFrameSize(NSSize(width: targetWidth, height: tv.frame.height))
@@ -2379,12 +2425,12 @@ public struct TableDoubleClickHandler: NSViewRepresentable {
         }
         
         @objc private func onTableFrameDidChange(_ notification: Notification) {
-            adjustTableColumns(draggedColumn: nil)
+            adjustTableColumns()
         }
         
         @objc private func onTableColumnDidResize(_ notification: Notification) {
-            let draggedCol = notification.userInfo?["NSTableColumn"] as? NSTableColumn
-            adjustTableColumns(draggedColumn: draggedCol)
+            // Programmatic/SwiftUI changes are not user boundary drags.
+            adjustTableColumns()
         }
         
         @objc private func onTableSelectionDidChange(_ notification: Notification) {
