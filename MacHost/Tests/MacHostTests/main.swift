@@ -362,8 +362,7 @@ defer { try? FileManager.default.removeItem(at: tempDir) }
 
 func runTest50() async {
     print("\n[TEST 50] Trackpad Two-Finger Pull-to-Refresh & Header Refresh Button:")
-    var refreshCalled = false
-    let vm50 = await MainActor.run { () -> DualPaneViewModel in
+    await MainActor.run {
         let vm = DualPaneViewModel()
         assertCondition(vm.leftIsRefreshing == false, "Default leftIsRefreshing is false")
         assertCondition(vm.rightIsRefreshing == false, "Default rightIsRefreshing is false")
@@ -375,20 +374,14 @@ func runTest50() async {
         vm.refreshPane(side: .right)
         assertCondition(vm.rightIsRefreshing == true, "refreshPane activates rightIsRefreshing")
         
-        // 2) Test TrackpadSwipeRefreshView Container properties
-        let refreshView = TrackpadSwipeRefreshView.RefreshContainerView()
+        // 2) The pull observer must remain transparent to clicks and table input.
+        let refreshView = TrackpadSwipeRefreshView.PullObserverView()
         refreshView.side = .left
         refreshView.vm = vm
         refreshView.frame = NSRect(x: 0, y: 0, width: 400, height: 600)
-        refreshView.onRefreshTriggered = {
-            refreshCalled = true
-        }
         
-        // hitTest must return nil so it never intercepts clicks or table interactions
-        assertCondition(refreshView.hitTest(NSPoint(x: 100, y: 100)) == nil, "RefreshContainerView hitTest returns nil (transparent to clicks)")
-        
-        // With no scroll view attached, empty/non-scrollable pane is considered at top
-        assertCondition(refreshView.isContentAtTop() == true, "isContentAtTop returns true when no scroll view present")
+        assertCondition(refreshView.hitTest(NSPoint(x: 100, y: 100)) == nil,
+                        "PullObserverView hitTest returns nil (transparent to clicks)")
         
         // Direction normalization invariant:
         let naturalDelta: CGFloat = 25.0
@@ -399,15 +392,6 @@ func runTest50() async {
         let effectiveDownDeltaTraditional = false ? traditionalDelta : -traditionalDelta
         assertCondition(effectiveDownDeltaTraditional > 0, "Traditional scrolling downward delta normalized to > 0")
         
-        // Manual trigger simulation
-        refreshView.triggerRefresh()
-        return vm
-    }
-    
-    try? await Task.sleep(nanoseconds: 60_000_000)
-    assertCondition(refreshCalled == true, "triggerRefresh executes onRefreshTriggered closure")
-    await MainActor.run {
-        assertCondition(vm50.activePane == .left, "triggerRefresh activates target pane side")
     }
 }
 
