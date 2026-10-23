@@ -3188,14 +3188,6 @@ public struct PaneTableDropDelegate: DropDelegate {
         let isMove = NSEvent.modifierFlags.contains(.command)
         SSHTransportLog.write("DND_PERFORM_DROP side=\(side) hasPayload=\(vm.currentDragPayload != nil) targetDir=\(targetDirPath ?? "nil")")
         
-        // 1. Приоритетный путь для внутреннего Drag & Drop между панелями
-        // Если payload активен, обрабатываем напрямую без запроса провайдеров из AppKit/NSPasteboard,
-        // предотвращая синхронную блокировку главного потока и дедлок.
-        // Внешний drop (Finder) сбрасывает устаревший payload и идёт обычным путём (D11).
-        if vm.consumeInternalDragPayload(isInternalDrop: info.hasItemsConforming(to: [DualPaneViewModel.dragUTType])) {
-            return vm.handleDroppedProviders([], toSide: side, targetDirPath: targetDirPath, isMove: isMove)
-        }
-        
         let customUTType = UTType(exportedAs: DualPaneViewModel.dragUTType, conformingTo: .data)
         let utTypes: [UTType] = [
             customUTType,
@@ -3206,6 +3198,19 @@ public struct PaneTableDropDelegate: DropDelegate {
             .item
         ]
         let providers = info.itemProviders(for: utTypes)
+
+        // 1. Приоритетный путь для внутреннего Drag & Drop между панелями
+        // Если payload активен, обрабатываем напрямую без запроса провайдеров из AppKit/NSPasteboard,
+        // предотвращая синхронную блокировку главного потока и дедлок.
+        // Внутренний drag опознаём по провайдерам: hasItemsConforming(to:) для нашего нестандартного UTI
+        // возвращает false, и payload сбрасывался до того, как перенос успевал выполниться.
+        // Внешний drop (Finder) сбрасывает устаревший payload и идёт обычным путём (D11).
+        let isInternalDrop = DualPaneViewModel.providersCarryInternalPayload(providers)
+            || info.hasItemsConforming(to: [DualPaneViewModel.dragUTType])
+        if vm.consumeInternalDragPayload(isInternalDrop: isInternalDrop) {
+            return vm.handleDroppedProviders([], toSide: side, targetDirPath: targetDirPath, isMove: isMove)
+        }
+
         return vm.handleDroppedProviders(providers, toSide: side, targetDirPath: targetDirPath, isMove: isMove)
     }
     
