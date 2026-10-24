@@ -33,7 +33,6 @@ struct HeaderLaunchApp: Identifiable {
 }
 
 struct HeaderAppLauncher: View {
-    @ObservedObject var vm: DualPaneViewModel
     let windowWidth: CGFloat
     @AppStorage("headerAppLauncherOrder") private var savedOrder = ""
     @State private var apps = HeaderLaunchApp.installed()
@@ -50,13 +49,12 @@ struct HeaderAppLauncher: View {
     }
 
     var body: some View {
-        // Reserve the right-hand toolbar's width; overflow goes immediately before refresh.
+        // Preserve the existing app positions as the window width changes.
         let rightCount = min(apps.count, max(0, Int((windowWidth / 2 - 430) / 26)))
         let right = Array(orderedApps.prefix(rightCount))
         let left = Array(orderedApps.dropFirst(rightCount))
         HStack(spacing: 2) {
             icons(left)
-            TopToolbarCenterSplitResetButton(vm: vm)
             icons(right)
         }
         .fixedSize()

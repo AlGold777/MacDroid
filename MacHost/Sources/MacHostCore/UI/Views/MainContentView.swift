@@ -173,7 +173,7 @@ public struct MainContentView: View {
         }
         
         ToolbarItem(placement: .principal) {
-            HeaderAppLauncher(vm: vm, windowWidth: headerWindowWidth)
+            HeaderAppLauncher(windowWidth: headerWindowWidth)
         }
         
         ToolbarItem(placement: .primaryAction) {
@@ -320,6 +320,7 @@ private struct TopToolbarTrailingActionsView: View {
                 vm.navigateForward(side: vm.activePane)
             }
             
+            TopToolbarCenterSplitResetButton(vm: vm)
             ToolButton(icon: .rename, tooltip: "Групповое переименование (Ctrl+M)") { vm.triggerBatchRename() }
             ToolButton(icon: .comparePanes, tooltip: "Сравнить папки", isActive: vm.isComparing) { vm.comparePanes() }
             ToolButton(
