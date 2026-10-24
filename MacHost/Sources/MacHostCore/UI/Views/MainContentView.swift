@@ -4,7 +4,7 @@ public struct MainContentView: View {
     @EnvironmentObject var vm: DualPaneViewModel
     @Environment(\.colorScheme) var colorScheme
     
-    @State private var headerWindowWidth: CGFloat = 1400
+    @State private var headerWindowWidth: CGFloat = 0
 
     public init() {}
     

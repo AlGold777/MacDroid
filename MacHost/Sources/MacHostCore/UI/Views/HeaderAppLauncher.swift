@@ -17,10 +17,14 @@ struct HeaderLaunchApp: Identifiable {
             ("net.whatsapp.WhatsApp", "WhatsApp", ["WhatsApp.app"]),
             ("com.linguee.DeepLCopyTranslator", "DeepL", ["DeepL.app"]),
             ("notion.id", "Notion", ["Notion.app"]),
-            ("com.google.GeminiMacOS", "Gemini", ["Gemini.app"])
+            ("com.google.GeminiMacOS", "Gemini", ["Gemini.app"]),
+            ("com.microsoft.VSCode", "Visual Studio Code", ["Visual Studio Code.app"]),
+            ("com.apple.Notes", "Заметки", ["Notes.app"]),
+            ("com.apple.systempreferences", "Системные настройки", ["System Settings.app"])
         ]
         return definitions.compactMap { id, name, filenames in
             let roots = [URL(fileURLWithPath: "/Applications"),
+                         URL(fileURLWithPath: "/System/Applications"),
                          FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Applications")]
             let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: id)
                 ?? roots.flatMap { root in filenames.map { root.appendingPathComponent($0) } }
@@ -57,13 +61,30 @@ struct HeaderAppLauncher: View {
         return Array(ordered.dropFirst(rightCount)) + Array(ordered.prefix(rightCount))
     }
 
+    /// Append newly available apps to the visible right edge without disturbing saved positions.
+    private func appendNewApps() {
+        guard windowWidth > 0 else { return }
+        let known = Set(savedOrder.split(separator: "|").map(String.init))
+        let added = orderedApps.filter { !known.contains($0.id) }
+        guard !added.isEmpty else { return }
+        let existing = orderedApps.filter { known.contains($0.id) }
+        let previousRightCount = min(rightCount, existing.count)
+        let visible = Array(existing.dropFirst(previousRightCount)) + Array(existing.prefix(previousRightCount)) + added
+        let ids = visible.map(\.id)
+        let stored = Array(ids.suffix(rightCount)) + Array(ids.dropLast(rightCount))
+        savedOrder = stored.joined(separator: "|")
+    }
+
     var body: some View {
         HStack(spacing: 2) {
             icons(displayedApps)
         }
         .fixedSize()
+        .onAppear { appendNewApps() }
+        .onChange(of: windowWidth) { _, _ in appendNewApps() }
         .onReceive(NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.didLaunchApplicationNotification)) { _ in
             apps = HeaderLaunchApp.installed()
+            appendNewApps()
         }
         .alert("Не удалось открыть приложение", isPresented: Binding(
             get: { launchError != nil }, set: { if !$0 { launchError = nil } }
