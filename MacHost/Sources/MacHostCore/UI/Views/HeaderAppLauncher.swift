@@ -48,14 +48,18 @@ struct HeaderAppLauncher: View {
         }
     }
 
+    private var rightCount: Int {
+        min(apps.count, max(0, Int((windowWidth / 2 - 430) / 26)))
+    }
+
+    private var displayedApps: [HeaderLaunchApp] {
+        let ordered = orderedApps
+        return Array(ordered.dropFirst(rightCount)) + Array(ordered.prefix(rightCount))
+    }
+
     var body: some View {
-        // Preserve the existing app positions as the window width changes.
-        let rightCount = min(apps.count, max(0, Int((windowWidth / 2 - 430) / 26)))
-        let right = Array(orderedApps.prefix(rightCount))
-        let left = Array(orderedApps.dropFirst(rightCount))
         HStack(spacing: 2) {
-            icons(left)
-            icons(right)
+            icons(displayedApps)
         }
         .fixedSize()
         .onReceive(NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.didLaunchApplicationNotification)) { _ in
@@ -74,12 +78,15 @@ struct HeaderAppLauncher: View {
                         DispatchQueue.main.async { launchError = "\(app.name): \(error.localizedDescription)" }
                     }
                 }
-            }, move: { id in
-                var ids = orderedApps.map(\.id)
-                guard let from = ids.firstIndex(of: id), let to = ids.firstIndex(of: app.id), from != to else { return }
+            }, move: { id, before in
+                var ids = displayedApps.map(\.id)
+                guard id != app.id, let from = ids.firstIndex(of: id) else { return }
                 ids.remove(at: from)
-                ids.insert(id, at: to)
-                savedOrder = ids.joined(separator: "|")
+                guard let target = ids.firstIndex(of: app.id) else { return }
+                ids.insert(id, at: target + (before ? 0 : 1))
+                // Undo the display rotation so the exact indicated slot survives a redraw.
+                let stored = Array(ids.suffix(rightCount)) + Array(ids.dropLast(rightCount))
+                savedOrder = stored.joined(separator: "|")
             })
             .frame(width: 24, height: 28)
         }
@@ -90,7 +97,7 @@ struct HeaderAppLauncher: View {
 private struct HeaderAppIcon: NSViewRepresentable {
     let app: HeaderLaunchApp
     let launch: () -> Void
-    let move: (String) -> Void
+    let move: (String, Bool) -> Void
 
     func makeNSView(context: Context) -> HeaderAppIconButton {
         let button = HeaderAppIconButton(frame: NSRect(x: 0, y: 0, width: 24, height: 28))
@@ -117,10 +124,23 @@ private struct HeaderAppIcon: NSViewRepresentable {
 private final class HeaderAppIconButton: NSButton {
     var appID = ""
     var launch: (() -> Void)?
-    var move: ((String) -> Void)?
+    var move: ((String, Bool) -> Void)?
     private var mouseDownPoint: NSPoint?
     private var isDraggingIcon = false
     private weak var dropTarget: HeaderAppIconButton?
+    private var insertionBefore: Bool? {
+        didSet { needsDisplay = true }
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        super.draw(dirtyRect)
+        if let before = insertionBefore {
+            NSColor.systemBlue.setFill()
+            let marker = NSRect(x: before ? bounds.minX : bounds.maxX - 2,
+                                y: bounds.minY + 2, width: 2, height: max(0, bounds.height - 4))
+            NSBezierPath(roundedRect: marker, xRadius: 1, yRadius: 1).fill()
+        }
+    }
 
     @objc func openApp() { launch?() }
 
@@ -138,9 +158,11 @@ private final class HeaderAppIconButton: NSButton {
         highlight(false)
         alphaValue = 0.5
         NSCursor.closedHand.set()
-        dropTarget?.highlight(false)
+        dropTarget?.insertionBefore = nil
         dropTarget = target(at: event.locationInWindow)
-        dropTarget?.highlight(true)
+        if let destination = dropTarget {
+            destination.insertionBefore = destination.convert(event.locationInWindow, from: nil).x < destination.bounds.midX
+        }
     }
 
     override func mouseUp(with event: NSEvent) {
@@ -148,14 +170,17 @@ private final class HeaderAppIconButton: NSButton {
         let wasDragging = isDraggingIcon
         let hadMouseDown = mouseDownPoint != nil
         highlight(false)
-        dropTarget?.highlight(false)
+        dropTarget?.insertionBefore = nil
         dropTarget = nil
         alphaValue = 1
         mouseDownPoint = nil
         isDraggingIcon = false
         NSCursor.arrow.set()
         if wasDragging {
-            destination?.move?(appID)
+            if let destination {
+                let before = destination.convert(event.locationInWindow, from: nil).x < destination.bounds.midX
+                destination.move?(appID, before)
+            }
         } else if hadMouseDown, bounds.contains(convert(event.locationInWindow, from: nil)) {
             performClick(nil)
         }
@@ -167,7 +192,7 @@ private final class HeaderAppIconButton: NSButton {
         while let parent = root.superview { root = parent }
         func find(in view: NSView) -> HeaderAppIconButton? {
             if let button = view as? HeaderAppIconButton,
-               button !== self, button.bounds.contains(button.convert(point, from: nil)) {
+               button !== self, button.bounds.insetBy(dx: -1, dy: 0).contains(button.convert(point, from: nil)) {
                 return button
             }
             for child in view.subviews {
