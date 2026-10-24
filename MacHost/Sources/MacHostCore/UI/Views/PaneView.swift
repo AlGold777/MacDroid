@@ -746,15 +746,15 @@ public struct PaneView: View {
                                         .controlSize(.mini)
                                         .scaleEffect(0.7)
                                 } else if let size = vm.calculatedFolderSizes[item.path] {
-                                    Text(formatBytes(size))
-                                        .font(.system(size: 13, design: .monospaced))
+                                    Text(formatColumnBytes(size))
+                                        .font(.system(size: 12, design: .monospaced))
                                         .foregroundColor(.primary)
                                 } else {
                                     Text("")
                                 }
                             } else {
-                                Text(formatBytes(item.size))
-                                    .font(.system(size: 13, design: .monospaced))
+                                Text(formatColumnBytes(item.size))
+                                    .font(.system(size: 12, design: .monospaced))
                                     .foregroundColor(.secondary)
                             }
                             Spacer(minLength: 0)
@@ -1136,6 +1136,33 @@ public struct PaneView: View {
         ByteCountFormatter.string(fromByteCount: Int64(b), countStyle: .file)
     }
     
+    // Keep localized numbers, but use stable lowercase Latin units in the Size column.
+    private static let columnSizeFormats: [(formatter: ByteCountFormatter, suffix: String)] = {
+        let units: [(ByteCountFormatter.Units, String)] = [
+            (.useBytes, "b"), (.useKB, "kb"), (.useMB, "mb"), (.useGB, "gb"),
+            (.useTB, "tb"), (.usePB, "pb"), (.useEB, "eb")
+        ]
+        return units.map { unit, suffix in
+            let formatter = ByteCountFormatter()
+            formatter.countStyle = .file
+            formatter.allowedUnits = unit
+            formatter.includesUnit = false
+            formatter.allowsNonnumericFormatting = false
+            return (formatter, suffix)
+        }
+    }()
+
+    private func formatColumnBytes(_ bytes: UInt64) -> String {
+        var index = 0
+        var scaled = bytes
+        while scaled >= 1_000 && index < Self.columnSizeFormats.count - 1 {
+            scaled /= 1_000
+            index += 1
+        }
+        let format = Self.columnSizeFormats[index]
+        return "\(format.formatter.string(fromByteCount: Int64(clamping: bytes))) \(format.suffix)"
+    }
+
     private static let dateFormatter: DateFormatter = {
         let df = DateFormatter()
         df.dateFormat = "dd.MM.yy HH:mm"
@@ -2053,7 +2080,7 @@ public struct TableDoubleClickHandler: NSViewRepresentable {
         override func draw(_ dirtyRect: NSRect) {
             guard let index = hoveredBoundary, let x = boundaryX(index) else { return }
             NSColor.controlAccentColor.withAlphaComponent(0.8).setFill()
-            NSRect(x: x - 1, y: bounds.minY + 3, width: 2, height: max(0, bounds.height - 6)).fill()
+            NSRect(x: x - 1.5, y: bounds.minY + 3, width: 3, height: max(0, bounds.height - 6)).fill()
         }
 
         override func resetCursorRects() {
