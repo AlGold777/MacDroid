@@ -4,11 +4,15 @@ public struct MainContentView: View {
     @EnvironmentObject var vm: DualPaneViewModel
     @Environment(\.colorScheme) var colorScheme
     
+    @State private var headerWindowWidth: CGFloat = 1400
+
     public init() {}
     
     public var body: some View {
         GeometryReader { fullGeo in
             mainLayout(fullGeo: fullGeo)
+                .onAppear { headerWindowWidth = fullGeo.size.width }
+                .onChange(of: fullGeo.size.width) { _, width in headerWindowWidth = width }
         }
         .coordinateSpace(name: "MainContentSpace")
         .overlay(alignment: .topLeading) {
@@ -142,7 +146,7 @@ public struct MainContentView: View {
     private var windowToolbar: some ToolbarContent {
         ToolbarItem(placement: .navigation) {
             HStack(spacing: 6) {
-                Text("MacDroid Commander")
+                Text(headerWindowWidth < 1200 ? "MacDroid" : "MacDroid Commander")
                     .font(.system(size: 13, weight: .semibold))
                 if let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String, !version.isEmpty {
                     Text(version)
@@ -169,7 +173,7 @@ public struct MainContentView: View {
         }
         
         ToolbarItem(placement: .principal) {
-            TopToolbarCenterSplitResetButton(vm: vm)
+            HeaderAppLauncher(vm: vm, windowWidth: headerWindowWidth)
         }
         
         ToolbarItem(placement: .primaryAction) {
