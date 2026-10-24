@@ -1,6 +1,5 @@
 import AppKit
 import SwiftUI
-import UniformTypeIdentifiers
 
 /// Only installed desktop apps participate; stable IDs preserve order across moves and installs.
 struct HeaderLaunchApp: Identifiable {
@@ -71,47 +70,114 @@ struct HeaderAppLauncher: View {
 
     private func icons(_ items: [HeaderLaunchApp]) -> some View {
         ForEach(items) { app in
-            Button {
+            HeaderAppIcon(app: app, launch: {
                 NSWorkspace.shared.openApplication(at: app.url, configuration: .init()) { _, error in
                     if let error {
                         DispatchQueue.main.async { launchError = "\(app.name): \(error.localizedDescription)" }
                     }
                 }
-            } label: {
-                Image(nsImage: app.icon)
-                    .resizable()
-                    .interpolation(.high)
-                    .frame(width: 22, height: 22)
-                    .frame(width: 24, height: 28)
-                    .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-            .accessibilityLabel("Открыть \(app.name)")
-            .help("\(app.name) — открыть. Перетащите на другую иконку, чтобы изменить порядок.")
-            .onDrag {
-                let provider = NSItemProvider()
-                provider.registerDataRepresentation(forTypeIdentifier: Self.dragType.identifier, visibility: .ownProcess) { completion in
-                    completion(Data(app.id.utf8), nil)
-                    return nil
-                }
-                return provider
-            }
-            .onDrop(of: [Self.dragType], isTargeted: nil) { providers in
-                guard let provider = providers.first else { return false }
-                provider.loadDataRepresentation(forTypeIdentifier: Self.dragType.identifier) { data, _ in
-                    guard let data, let id = String(data: data, encoding: .utf8) else { return }
-                    DispatchQueue.main.async {
-                        var ids = orderedApps.map(\.id)
-                        guard let from = ids.firstIndex(of: id), let to = ids.firstIndex(of: app.id), from != to else { return }
-                        ids.remove(at: from)
-                        ids.insert(id, at: to)
-                        savedOrder = ids.joined(separator: "|")
-                    }
-                }
-                return true
-            }
+            }, move: { id in
+                var ids = orderedApps.map(\.id)
+                guard let from = ids.firstIndex(of: id), let to = ids.firstIndex(of: app.id), from != to else { return }
+                ids.remove(at: from)
+                ids.insert(id, at: to)
+                savedOrder = ids.joined(separator: "|")
+            })
+            .frame(width: 24, height: 28)
         }
     }
+}
 
-    private static let dragType = UTType(exportedAs: "com.macandroid.MacDroidCommander.header-app")
+/// Native event handling distinguishes a click from a drag before NSButton starts tracking.
+private struct HeaderAppIcon: NSViewRepresentable {
+    let app: HeaderLaunchApp
+    let launch: () -> Void
+    let move: (String) -> Void
+
+    func makeNSView(context: Context) -> HeaderAppIconButton {
+        let button = HeaderAppIconButton(frame: NSRect(x: 0, y: 0, width: 24, height: 28))
+        button.isBordered = false
+        button.imagePosition = .imageOnly
+        button.imageScaling = .scaleProportionallyUpOrDown
+        button.registerForDraggedTypes([HeaderAppIconButton.pasteboardType])
+        return button
+    }
+
+    func updateNSView(_ button: HeaderAppIconButton, context: Context) {
+        button.appID = app.id
+        let icon = app.icon.copy() as! NSImage
+        icon.size = NSSize(width: 22, height: 22)
+        button.image = icon
+        button.toolTip = "\(app.name) — открыть. Перетащите на другую иконку, чтобы изменить порядок."
+        button.setAccessibilityLabel("Открыть \(app.name)")
+        button.launch = launch
+        button.move = move
+        button.target = button
+        button.action = #selector(HeaderAppIconButton.openApp)
+    }
+}
+
+private final class HeaderAppIconButton: NSButton, NSDraggingSource {
+    static let pasteboardType = NSPasteboard.PasteboardType("com.macandroid.MacDroidCommander.header-app")
+    var appID = ""
+    var launch: (() -> Void)?
+    var move: ((String) -> Void)?
+    private var mouseDownPoint: NSPoint?
+    private var isDraggingIcon = false
+
+    @objc func openApp() { launch?() }
+
+    override func mouseDown(with event: NSEvent) {
+        mouseDownPoint = convert(event.locationInWindow, from: nil)
+        isDraggingIcon = false
+        highlight(true)
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        guard let start = mouseDownPoint, !isDraggingIcon else { return }
+        let point = convert(event.locationInWindow, from: nil)
+        guard hypot(point.x - start.x, point.y - start.y) >= 4 else { return }
+        isDraggingIcon = true
+        highlight(false)
+        let payload = NSPasteboardItem()
+        payload.setString(appID, forType: Self.pasteboardType)
+        let item = NSDraggingItem(pasteboardWriter: payload)
+        item.setDraggingFrame(NSRect(x: 1, y: 3, width: 22, height: 22), contents: image)
+        beginDraggingSession(with: [item], event: event, source: self)
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        highlight(false)
+        if mouseDownPoint != nil, !isDraggingIcon, bounds.contains(convert(event.locationInWindow, from: nil)) {
+            performClick(nil)
+        }
+        mouseDownPoint = nil
+    }
+
+    func draggingSession(_ session: NSDraggingSession, sourceOperationMaskFor context: NSDraggingContext) -> NSDragOperation {
+        context == .withinApplication ? .move : []
+    }
+
+    func draggingSession(_ session: NSDraggingSession, endedAt screenPoint: NSPoint, operation: NSDragOperation) {
+        mouseDownPoint = nil
+        isDraggingIcon = false
+        highlight(false)
+    }
+
+    override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
+        guard sender.draggingSource is HeaderAppIconButton,
+              let id = sender.draggingPasteboard.string(forType: Self.pasteboardType), id != appID else { return [] }
+        highlight(true)
+        return .move
+    }
+
+    override func draggingExited(_ sender: NSDraggingInfo?) { highlight(false) }
+
+    override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
+        highlight(false)
+        guard sender.draggingSource is HeaderAppIconButton,
+              let id = sender.draggingPasteboard.string(forType: Self.pasteboardType), id != appID else { return false }
+        move?(id)
+        return true
+    }
 }
