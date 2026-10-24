@@ -89,15 +89,17 @@ struct HeaderAppLauncher: View {
             .accessibilityLabel("Открыть \(app.name)")
             .help("\(app.name) — открыть. Перетащите на другую иконку, чтобы изменить порядок.")
             .onDrag {
-                NSItemProvider(item: app.id as NSString, typeIdentifier: Self.dragType.identifier)
+                let provider = NSItemProvider()
+                provider.registerDataRepresentation(forTypeIdentifier: Self.dragType.identifier, visibility: .ownProcess) { completion in
+                    completion(Data(app.id.utf8), nil)
+                    return nil
+                }
+                return provider
             }
             .onDrop(of: [Self.dragType], isTargeted: nil) { providers in
                 guard let provider = providers.first else { return false }
-                provider.loadItem(forTypeIdentifier: Self.dragType.identifier, options: nil) { item, _ in
-                    let id: String?
-                    if let data = item as? Data { id = String(data: data, encoding: .utf8) }
-                    else { id = item as? String }
-                    guard let id else { return }
+                provider.loadDataRepresentation(forTypeIdentifier: Self.dragType.identifier) { data, _ in
+                    guard let data, let id = String(data: data, encoding: .utf8) else { return }
                     DispatchQueue.main.async {
                         var ids = orderedApps.map(\.id)
                         guard let from = ids.firstIndex(of: id), let to = ids.firstIndex(of: app.id), from != to else { return }
