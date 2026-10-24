@@ -2085,6 +2085,10 @@ public struct TableDoubleClickHandler: NSViewRepresentable {
                 until: .distantFuture, inMode: .eventTracking, dequeue: true
             ) {
                 onBoundaryDrag?(initialWidths, boundaryIndex, next.locationInWindow.x - startX)
+                // The active boundary index stays the same while its position changes.
+                // Invalidate the overlay itself so the old highlight is erased and
+                // redrawn at the actual boundary, including when a width limit is hit.
+                needsDisplay = true
                 window.displayIfNeeded()
                 if next.type == .leftMouseUp { break }
             }
