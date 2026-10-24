@@ -99,7 +99,6 @@ private struct HeaderAppIcon: NSViewRepresentable {
         button.isBordered = false
         button.imagePosition = .imageOnly
         button.imageScaling = .scaleProportionallyUpOrDown
-        button.registerForDraggedTypes([HeaderAppIconButton.pasteboardType])
         return button
     }
 
@@ -117,13 +116,13 @@ private struct HeaderAppIcon: NSViewRepresentable {
     }
 }
 
-private final class HeaderAppIconButton: NSButton, NSDraggingSource {
-    static let pasteboardType = NSPasteboard.PasteboardType("com.macandroid.MacDroidCommander.header-app")
+private final class HeaderAppIconButton: NSButton {
     var appID = ""
     var launch: (() -> Void)?
     var move: ((String) -> Void)?
     private var mouseDownPoint: NSPoint?
     private var isDraggingIcon = false
+    private weak var dropTarget: HeaderAppIconButton?
 
     @objc func openApp() { launch?() }
 
@@ -134,50 +133,50 @@ private final class HeaderAppIconButton: NSButton, NSDraggingSource {
     }
 
     override func mouseDragged(with event: NSEvent) {
-        guard let start = mouseDownPoint, !isDraggingIcon else { return }
+        guard let start = mouseDownPoint else { return }
         let point = convert(event.locationInWindow, from: nil)
-        guard hypot(point.x - start.x, point.y - start.y) >= 4 else { return }
+        guard isDraggingIcon || hypot(point.x - start.x, point.y - start.y) >= 4 else { return }
         isDraggingIcon = true
         highlight(false)
-        let payload = NSPasteboardItem()
-        payload.setString(appID, forType: Self.pasteboardType)
-        let item = NSDraggingItem(pasteboardWriter: payload)
-        item.setDraggingFrame(NSRect(x: 1, y: 3, width: 22, height: 22), contents: image)
-        beginDraggingSession(with: [item], event: event, source: self)
+        alphaValue = 0.5
+        NSCursor.closedHand.set()
+        dropTarget?.highlight(false)
+        dropTarget = target(at: event.locationInWindow)
+        dropTarget?.highlight(true)
     }
 
     override func mouseUp(with event: NSEvent) {
+        let destination = target(at: event.locationInWindow)
+        let wasDragging = isDraggingIcon
+        let hadMouseDown = mouseDownPoint != nil
         highlight(false)
-        if mouseDownPoint != nil, !isDraggingIcon, bounds.contains(convert(event.locationInWindow, from: nil)) {
-            performClick(nil)
-        }
-        mouseDownPoint = nil
-    }
-
-    func draggingSession(_ session: NSDraggingSession, sourceOperationMaskFor context: NSDraggingContext) -> NSDragOperation {
-        context == .withinApplication ? .move : []
-    }
-
-    func draggingSession(_ session: NSDraggingSession, endedAt screenPoint: NSPoint, operation: NSDragOperation) {
+        dropTarget?.highlight(false)
+        dropTarget = nil
+        alphaValue = 1
         mouseDownPoint = nil
         isDraggingIcon = false
-        highlight(false)
+        NSCursor.arrow.set()
+        if wasDragging {
+            destination?.move?(appID)
+        } else if hadMouseDown, bounds.contains(convert(event.locationInWindow, from: nil)) {
+            performClick(nil)
+        }
     }
 
-    override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
-        guard sender.draggingSource is HeaderAppIconButton,
-              let id = sender.draggingPasteboard.string(forType: Self.pasteboardType), id != appID else { return [] }
-        highlight(true)
-        return .move
-    }
-
-    override func draggingExited(_ sender: NSDraggingInfo?) { highlight(false) }
-
-    override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
-        highlight(false)
-        guard sender.draggingSource is HeaderAppIconButton,
-              let id = sender.draggingPasteboard.string(forType: Self.pasteboardType), id != appID else { return false }
-        move?(id)
-        return true
+    /// Keep this drag local to the header; dropping outside an app icon cancels it.
+    private func target(at point: NSPoint) -> HeaderAppIconButton? {
+        var root: NSView = self
+        while let parent = root.superview { root = parent }
+        func find(in view: NSView) -> HeaderAppIconButton? {
+            if let button = view as? HeaderAppIconButton,
+               button !== self, button.bounds.contains(button.convert(point, from: nil)) {
+                return button
+            }
+            for child in view.subviews {
+                if let found = find(in: child) { return found }
+            }
+            return nil
+        }
+        return find(in: root)
     }
 }
