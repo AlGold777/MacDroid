@@ -66,6 +66,12 @@ struct MacFileManagerApp: App {
         .windowStyle(.titleBar)
         .windowToolbarStyle(.unified(showsTitle: false))
         .commands {
+            CommandGroup(after: .newItem) {
+                Button("Найти точные дубликаты…") {
+                    viewModel.showDuplicateFinder = true
+                }
+            }
+
             CommandGroup(after: .toolbar) {
                 Picker("Режим панелей", selection: Binding(
                     get: { viewModel.panelLayoutMode },
