@@ -194,7 +194,7 @@ public struct ArchiveBrowserView: View {
                 }
                 return .handled
             }
-            .background(ArchiveReturnKeyHandler(isEnabled: isListFocused && !model.isBusy) {
+            .background(ArchiveReturnKeyHandler(isEnabled: !model.isBusy && model.selectedItem != nil) {
                 guard let entry = model.selectedItem else { return false }
                 model.open(entry)
                 return true
@@ -585,7 +585,11 @@ private struct ArchiveReturnKeyHandler: NSViewRepresentable {
                 if let text = self.window?.firstResponder as? NSTextView, text.isEditable {
                     return event
                 }
-                if self.window?.firstResponder is NSTextField { return event }
+                // File labels can be read-only NSTextFields; only an editor owns Return.
+                if let field = self.window?.firstResponder as? NSTextField, field.isEditable {
+                    return event
+                }
+                if self.window?.firstResponder is NSButton { return event }
                 return self.openSelection?() == true ? nil : event
             }
         }
