@@ -149,7 +149,8 @@ public final class RemoteSFTPDriver: FileSystemDriver, @unchecked Sendable {
                                     size: entry.size,
                                     mtime: Double(entry.mtime),
                                     isDirectory: entry.isDirectory,
-                                    source: .remotePhone
+                                    source: .remotePhone,
+                                    isSymbolicLink: entry.isSymbolicLink
                                 ))
                             }
                         }

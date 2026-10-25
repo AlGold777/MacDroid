@@ -37,6 +37,7 @@ public struct FileItem: Identifiable, Hashable, Sendable, Codable {
     public let size: UInt64
     public let mtime: Double
     public let isDirectory: Bool
+    public let isSymbolicLink: Bool
     public let source: FileSource
     public let creationDate: Double?
     public var tags: [String]
@@ -50,7 +51,8 @@ public struct FileItem: Identifiable, Hashable, Sendable, Codable {
         isDirectory: Bool,
         source: FileSource = .localMac,
         creationDate: Double? = nil,
-        tags: [String] = []
+        tags: [String] = [],
+        isSymbolicLink: Bool = false
     ) {
         self.id = id
         // Гарантируем каноническую нормализацию Unicode (NFC)
@@ -60,6 +62,7 @@ public struct FileItem: Identifiable, Hashable, Sendable, Codable {
         self.size = size
         self.mtime = mtime
         self.isDirectory = isDirectory
+        self.isSymbolicLink = isSymbolicLink
         self.source = source
         self.creationDate = creationDate
         self.tags = tags
@@ -75,6 +78,7 @@ public struct FileItem: Identifiable, Hashable, Sendable, Codable {
         self.size = try container.decode(UInt64.self, forKey: .size)
         self.mtime = try container.decode(Double.self, forKey: .mtime)
         self.isDirectory = try container.decode(Bool.self, forKey: .isDirectory)
+        self.isSymbolicLink = try container.decodeIfPresent(Bool.self, forKey: .isSymbolicLink) ?? false
         self.source = try container.decodeIfPresent(FileSource.self, forKey: .source) ?? .localMac
         self.creationDate = try container.decodeIfPresent(Double.self, forKey: .creationDate)
         self.tags = try container.decodeIfPresent([String].self, forKey: .tags) ?? []

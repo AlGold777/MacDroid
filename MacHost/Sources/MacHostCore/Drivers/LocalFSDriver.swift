@@ -26,7 +26,7 @@ public final class LocalFSDriver: FileSystemDriver, @unchecked Sendable {
     
     public func listDirectory(at path: String) async throws -> [FileItem] {
         let url = URL(fileURLWithPath: path)
-        let keys: Set<URLResourceKey> = [.fileSizeKey, .contentModificationDateKey, .creationDateKey, .isDirectoryKey, .isHiddenKey, .tagNamesKey]
+        let keys: Set<URLResourceKey> = [.fileSizeKey, .contentModificationDateKey, .creationDateKey, .isDirectoryKey, .isSymbolicLinkKey, .isHiddenKey, .tagNamesKey]
         
         let contents = try FileManager.default.contentsOfDirectory(
             at: url,
@@ -53,7 +53,8 @@ public final class LocalFSDriver: FileSystemDriver, @unchecked Sendable {
                 isDirectory: isDir,
                 source: .localMac,
                 creationDate: creationDate,
-                tags: tags
+                tags: tags,
+                isSymbolicLink: vals.isSymbolicLink ?? false
             )
         }
     }

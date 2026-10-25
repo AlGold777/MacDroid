@@ -25,6 +25,8 @@ public struct DuplicateFinderView: View {
             }
             Text("Поиск в двух текущих папках и подпапках. Имена и даты могут отличаться; содержимое проверяется SHA-256.")
                 .font(.caption).foregroundColor(.secondary)
+            Text("Символические ссылки пропускаются; содержимое обычных папок и пакетов приложений проверяется.")
+                .font(.caption).foregroundColor(.secondary)
             Text("Mac/Phone: \(vm.leftPath) ↔ \(vm.rightPath)")
                 .font(.caption).lineLimit(2).textSelection(.enabled)
             if busy { ProgressView("Проверка содержимого…").controlSize(.small) }

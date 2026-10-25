@@ -40,10 +40,11 @@ private func item(
     directory: Bool = false,
     size: UInt64 = 0,
     mtime: Double = 100,
-    source: FileSource = .localMac
+    source: FileSource = .localMac,
+    isSymbolicLink: Bool = false
 ) -> FileItem {
     FileItem(id: path, name: name, path: path, size: size, mtime: mtime,
-             isDirectory: directory, source: source)
+             isDirectory: directory, source: source, isSymbolicLink: isSymbolicLink)
 }
 
 private actor TestTree {
@@ -122,6 +123,11 @@ private func makeTempDirectory(_ label: String) throws -> URL {
 private func appendLE<T: FixedWidthInteger>(_ value: T, to data: inout Data) {
     var littleEndian = value.littleEndian
     withUnsafeBytes(of: &littleEndian) { data.append(contentsOf: $0) }
+}
+
+private func appendBE<T: FixedWidthInteger>(_ value: T, to data: inout Data) {
+    var bigEndian = value.bigEndian
+    withUnsafeBytes(of: &bigEndian) { data.append(contentsOf: $0) }
 }
 
 private func crc32(_ data: Data) -> UInt32 {
@@ -397,6 +403,8 @@ private func runDuplicateFinderTests() async throws {
     try check(remoteGroups.count == 1 && Set(remoteGroups[0].items.map(\.source)) == [.remotePhone],
               "Duplicate search works with injected remote listings and digests without a connected phone")
 
+    try await runDuplicateSymlinkTests()
+
     let cancellationFinder = DuplicateFinder(
         listDirectory: { _ in
             withUnsafeCurrentTask { $0?.cancel() }
@@ -411,6 +419,134 @@ private func runDuplicateFinderTests() async throws {
     } catch is CancellationError {
         try check(true, "Duplicate search responds to task cancellation")
     }
+}
+
+private func runDuplicateSymlinkTests() async throws {
+    let rootURL = try makeTempDirectory("duplicate_symlinks")
+    defer { try? FileManager.default.removeItem(at: rootURL) }
+
+    let targetURL = try makeTempDirectory("duplicate_symlink_target")
+    defer { try? FileManager.default.removeItem(at: targetURL) }
+
+    let firstURL = rootURL.appendingPathComponent("first.bin")
+    let secondURL = rootURL.appendingPathComponent("second.bin")
+    let targetFileURL = targetURL.appendingPathComponent("through-directory-link.bin")
+    let brokenTargetURL = rootURL.appendingPathComponent("missing-target.bin")
+    let directoryLinkURL = rootURL.appendingPathComponent("directory-link")
+    let fileLinkURL = rootURL.appendingPathComponent("file-link.bin")
+    let brokenLinkURL = rootURL.appendingPathComponent("broken-link.bin")
+    let loopLinkURL = rootURL.appendingPathComponent("directory-loop")
+    try Data("same bytes".utf8).write(to: firstURL)
+    try Data("same bytes".utf8).write(to: secondURL)
+    try Data("same bytes".utf8).write(to: targetFileURL)
+    try FileManager.default.createSymbolicLink(at: directoryLinkURL, withDestinationURL: targetURL)
+    try FileManager.default.createSymbolicLink(at: fileLinkURL, withDestinationURL: firstURL)
+    try FileManager.default.createSymbolicLink(at: brokenLinkURL, withDestinationURL: brokenTargetURL)
+    try FileManager.default.createSymbolicLink(at: loopLinkURL, withDestinationURL: rootURL)
+
+    let localDriver = LocalFSDriver()
+    let driverEntries = try await localDriver.listDirectory(at: rootURL.path)
+    let driverLinks = Dictionary(uniqueKeysWithValues:
+        driverEntries.filter(\.isSymbolicLink).map { ($0.name, $0) }
+    )
+    try check(Set(driverLinks.keys) == Set([directoryLinkURL.lastPathComponent, fileLinkURL.lastPathComponent,
+                                           brokenLinkURL.lastPathComponent, loopLinkURL.lastPathComponent]),
+              "Local directory listing marks file, directory, broken, and loop symlinks")
+    let contentService = FileContentService(transport: TransportMultiplexer())
+    let localFinder = DuplicateFinder(
+        listDirectory: { try await localDriver.listDirectory(at: $0.path) },
+        contentDigest: { try await contentService.digest($0) }
+    )
+    let localGroups = try await localFinder.findDuplicates(roots: [item("root", rootURL.path, directory: true)])
+    try check(localGroups.count == 1 && localGroups[0].items.map(\.name).sorted() == ["first.bin", "second.bin"],
+              "Local driver and real file reader find regular duplicates without reading symlink targets")
+
+    let root = item("root", rootURL.path, directory: true)
+    let first = try localItem(at: firstURL)
+    let second = try localItem(at: secondURL)
+    let linkedDirectory = item(directoryLinkURL.lastPathComponent, directoryLinkURL.path,
+                               directory: true, isSymbolicLink: true)
+    let linkedFile = item(fileLinkURL.lastPathComponent, fileLinkURL.path,
+                          size: first.size, isSymbolicLink: true)
+    let brokenLink = item(brokenLinkURL.lastPathComponent, brokenLinkURL.path,
+                          size: first.size, isSymbolicLink: true)
+    let directoryLoop = item(loopLinkURL.lastPathComponent, loopLinkURL.path,
+                             directory: true, isSymbolicLink: true)
+    let linkedPayload = item(targetFileURL.lastPathComponent,
+                             directoryLinkURL.appendingPathComponent(targetFileURL.lastPathComponent).path,
+                             size: first.size)
+    let links = [linkedDirectory, linkedFile, brokenLink, directoryLoop]
+    let tree = TestTree(
+        listings: [root.path: [first, second] + links,
+                   linkedDirectory.path: [linkedPayload],
+                   directoryLoop.path: [linkedDirectory]],
+        digests: [first.path: "real-file-digest", second.path: "real-file-digest",
+                  linkedPayload.path: "real-file-digest"]
+    )
+    let listedPaths = LockedPaths()
+    let finder = DuplicateFinder(
+        listDirectory: { directory in
+            listedPaths.append(directory.path)
+            return try await tree.list(directory)
+        },
+        contentDigest: { try await tree.digest($0) }
+    )
+    let groups = try await finder.findDuplicates(roots: [root])
+    let digestPaths = await tree.digestCallPaths()
+    let traversedPaths = listedPaths.snapshot()
+
+    try check(groups.count == 1 && groups[0].items.map(\.path).sorted() == [first.path, second.path].sorted(),
+              "Local duplicate search returns only regular files beside file, directory, broken, and loop symlinks")
+    try check(digestPaths.sorted() == [first.path, second.path].sorted(),
+              "Local symlinks are never passed to the content digest reader")
+    try check(traversedPaths == [root.path],
+              "Local symlink directories and directory loops are not traversed")
+
+    let remoteRoot = item("remote", "/remote/scan", directory: true, source: .remotePhone)
+    let remoteFileA = item("one.bin", "/remote/scan/one.bin", size: 3, source: .remotePhone)
+    let remoteFileB = item("two.bin", "/remote/scan/two.bin", size: 3, source: .remotePhone)
+    let remoteLink = item("link.bin", "/remote/scan/link.bin", size: 3,
+                          source: .remotePhone, isSymbolicLink: true)
+    let remoteDirectoryLink = item("linked-dir", "/remote/scan/linked-dir", directory: true,
+                                   source: .remotePhone, isSymbolicLink: true)
+    let remoteTree = TestTree(
+        listings: [remoteRoot.path: [remoteFileA, remoteFileB, remoteLink, remoteDirectoryLink],
+                   remoteDirectoryLink.path: [item("payload.bin", remoteDirectoryLink.path + "/payload.bin",
+                                                   size: 3, source: .remotePhone)]],
+        digests: [remoteFileA.path: "remote-digest", remoteFileB.path: "remote-digest",
+                  remoteDirectoryLink.path + "/payload.bin": "remote-digest"]
+    )
+    let remoteFinder = DuplicateFinder(
+        listDirectory: { try await remoteTree.list($0) },
+        contentDigest: { try await remoteTree.digest($0) }
+    )
+    let remoteGroups = try await remoteFinder.findDuplicates(roots: [remoteRoot])
+    let remoteDigestPaths = await remoteTree.digestCallPaths()
+    try check(remoteGroups.count == 1
+              && remoteGroups[0].items.map(\.path).sorted() == [remoteFileA.path, remoteFileB.path].sorted(),
+              "Remote duplicate search excludes entries marked as symbolic links")
+    try check(remoteDigestPaths.sorted() == [remoteFileA.path, remoteFileB.path].sorted(),
+              "Remote symbolic links are never passed to the content digest reader")
+
+    var sftpNames = Data()
+    appendBE(UInt32(7), to: &sftpNames) // request ID
+    appendBE(UInt32(2), to: &sftpNames) // entry count
+    appendSFTPString("mode-link", to: &sftpNames)
+    appendSFTPString("lrwxr-xr-x 1 user group 4 Jan 1 00:00 mode-link -> file", to: &sftpNames)
+    appendBE(UInt32(0x0000_0004), to: &sftpNames) // permissions present
+    appendBE(UInt32(0o120777), to: &sftpNames)
+    appendSFTPString("longname-link", to: &sftpNames)
+    appendSFTPString("lrwxr-xr-x 1 user group 4 Jan 1 00:00 longname-link -> file", to: &sftpNames)
+    appendBE(UInt32(0), to: &sftpNames) // no permissions; rely on longname prefix
+    let parsedEntries = try SFTPPacketEngine().parseNameResponse(data: sftpNames)
+    try check(parsedEntries.count == 2 && parsedEntries.allSatisfy(\.isSymbolicLink),
+              "SFTP listings identify symbolic links from permissions or longname fallback")
+}
+
+private func appendSFTPString(_ value: String, to data: inout Data) {
+    let bytes = Data(value.utf8)
+    appendBE(UInt32(bytes.count), to: &data)
+    data.append(bytes)
 }
 
 private func runDuplicateCleanupTests() async throws {

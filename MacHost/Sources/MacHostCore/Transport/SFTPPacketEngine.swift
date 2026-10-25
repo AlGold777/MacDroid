@@ -50,8 +50,9 @@ public struct SFTPNameEntry: Sendable {
     public let size: UInt64
     public let mtime: UInt32
     public let isDirectory: Bool
+    public let isSymbolicLink: Bool
     
-    public init(filename: String, longname: String, size: UInt64, mtime: UInt32, isDirectory: Bool) {
+    public init(filename: String, longname: String, size: UInt64, mtime: UInt32, isDirectory: Bool, isSymbolicLink: Bool = false) {
         // Оптимизация: пропускаем NFC-нормализацию для чистых ASCII-имён
         self.filename = filename.utf8.allSatisfy({ $0 < 128 }) ? filename : filename.precomposedStringWithCanonicalMapping
         // longname не требует нормализации, так как используется лишь как служебная строка
@@ -59,6 +60,7 @@ public struct SFTPNameEntry: Sendable {
         self.size = size
         self.mtime = mtime
         self.isDirectory = isDirectory
+        self.isSymbolicLink = isSymbolicLink
     }
 }
 
@@ -406,7 +408,8 @@ public final class SFTPPacketEngine: @unchecked Sendable {
                 longname: longname,
                 size: size,
                 mtime: mtime,
-                isDirectory: isDir
+                isDirectory: isDir,
+                isSymbolicLink: (permissions & 0o170000) == 0o120000 || (permissions == 0 && longname.hasPrefix("l"))
             ))
         }
         return entries

@@ -58,7 +58,7 @@ public struct DuplicateFinder: Sendable {
 
         for root in roots {
             try Task.checkCancellation()
-            guard !isInsideTrash(root) else { continue }
+            guard !root.isSymbolicLink, !isInsideTrash(root) else { continue }
             if root.isDirectory {
                 pending.append((root, [], 0))
             } else {
@@ -79,7 +79,7 @@ public struct DuplicateFinder: Sendable {
             try Task.checkCancellation()
             for child in children {
                 try Task.checkCancellation()
-                guard !isInsideTrash(child), child.name != PhoneTrashService.directoryName else { continue }
+                guard !child.isSymbolicLink, !isInsideTrash(child), child.name != PhoneTrashService.directoryName else { continue }
                 if child.isDirectory {
                     pending.append((child, ancestors.union([key]), depth + 1))
                 } else {
