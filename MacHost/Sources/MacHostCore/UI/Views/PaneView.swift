@@ -1058,6 +1058,20 @@ public struct PaneView: View {
                         vm.mirrorPane(from: .right, to: .left)
                     }
                     .padding(.leading, 8)
+                } else {
+                    ToolButton(
+                        systemImage: "trash",
+                        tooltip: "Корзина телефона",
+                        isActive: vm.showPhoneTrash,
+                        isEnabled: !vm.isPhoneTrashBusy,
+                        width: 24,
+                        height: 20,
+                        iconSize: 14
+                    ) {
+                        vm.openPhoneTrash()
+                    }
+                    .accessibilityLabel("Корзина телефона")
+                    .padding(.leading, 8)
                 }
             }
             .padding(.horizontal, 8)
