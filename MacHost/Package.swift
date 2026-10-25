@@ -7,6 +7,7 @@ let package = Package(
     products: [
         .executable(name: "MacHost", targets: ["MacHost"]),
         .executable(name: "MacHostTests", targets: ["MacHostTests"]),
+        .executable(name: "PhoneTrashTests", targets: ["PhoneTrashTests"]),
         .library(name: "MacHostCore", targets: ["MacHostCore"])
     ],
     targets: [
@@ -24,6 +25,11 @@ let package = Package(
             name: "MacHostTests",
             dependencies: ["MacHostCore"],
             path: "Tests/MacHostTests"
+        ),
+        .executableTarget(
+            name: "PhoneTrashTests",
+            dependencies: ["MacHostCore"],
+            path: "Tests/PhoneTrashTests"
         )
     ]
 )

@@ -282,6 +282,11 @@ public final class DualPaneViewModel: ObservableObject {
     
     // Диалоги и задачи
     @Published public var showNewFolderDialog: Bool = false
+    @Published public var showPhoneTrash = false
+    @Published public private(set) var phoneTrashEntries: [PhoneTrashEntry] = []
+    @Published public private(set) var isPhoneTrashBusy = false
+    @Published public private(set) var phoneTrashError: String?
+    @Published public private(set) var phoneTrashVolumePath = ""
     @Published public var showRenameDialog: Bool = false
     @Published public var itemToRename: FileItem? = nil
     @Published public var renameNewName: String = ""
@@ -4549,6 +4554,7 @@ public final class DualPaneViewModel: ObservableObject {
         
         Task {
             var failedCount = 0
+            var firstFailure: String?
             var skippedTaggedCount = 0
             var successfullyDeletedIds: Set<String> = []
             
@@ -4578,10 +4584,11 @@ public final class DualPaneViewModel: ObservableObject {
                 }
                 
                 do {
-                    try await driver.deleteItem(at: id, moveToTrash: source == .localMac)
+                    try await driver.deleteItem(at: itemToCheck.path, moveToTrash: true)
                     successfullyDeletedIds.insert(id)
                 } catch {
                     failedCount += 1
+                    if firstFailure == nil { firstFailure = error.localizedDescription }
                 }
             }
             
@@ -4592,17 +4599,103 @@ public final class DualPaneViewModel: ObservableObject {
             }
             self.refreshPane(side: side)
             
-            if skippedTaggedCount > 0 {
-                self.errorAlertTitle = "Удаление невозможно"
+            if skippedTaggedCount > 0 || failedCount > 0 {
+                self.statusMessage = "В корзине: \(successfullyDeletedIds.count), пропущено из-за тегов: \(skippedTaggedCount), с ошибкой: \(failedCount)"
+                self.errorAlertTitle = "Не все объекты перемещены в корзину"
                 self.errorAlertButtonTitle = "OK"
-                self.errorMessage = "Чтобы удалить файл, вам необходимо снять тег."
+                var messages: [String] = []
+                if skippedTaggedCount > 0 {
+                    messages.append("Чтобы удалить объекты с тегами, необходимо снять тег.")
+                }
+                if let firstFailure { messages.append(firstFailure) }
+                self.errorMessage = messages.joined(separator: "\n")
                 self.showErrorAlert = true
-                self.statusMessage = "Удаление отменено: необходимо снять тег"
-            } else if failedCount > 0 {
-                let successCount = selectedIds.count - failedCount
-                self.statusMessage = "Удалено: \(successCount), с ошибкой: \(failedCount)"
             } else {
-                self.statusMessage = "Удалено объектов: \(selectedIds.count)"
+                self.statusMessage = "Перемещено в корзину объектов: \(selectedIds.count)"
+            }
+        }
+    }
+
+    public func openPhoneTrash() {
+        guard !isPhoneTrashBusy else {
+            showPhoneTrash = true
+            return
+        }
+        let path: String
+        if activePane == .left && leftSource == .remotePhone {
+            path = leftPath
+        } else if rightSource == .remotePhone {
+            path = rightPath
+        } else if leftSource == .remotePhone {
+            path = leftPath
+        } else {
+            path = "/storage/emulated/0"
+        }
+        phoneTrashEntries = []
+        phoneTrashError = nil
+        showPhoneTrash = true
+        do {
+            phoneTrashVolumePath = try PhoneTrashService.volumeRoot(for: path)
+            reloadPhoneTrash()
+        } catch {
+            phoneTrashVolumePath = ""
+            phoneTrashError = error.localizedDescription
+        }
+    }
+
+    public func reloadPhoneTrash() {
+        performPhoneTrashOperation { _ in }
+    }
+
+    public func restorePhoneTrashEntry(_ entry: PhoneTrashEntry) {
+        performPhoneTrashOperation(success: "Восстановлено: \(entry.name)") { service in
+            try await service.restore(entry)
+        }
+    }
+
+    /// Вызывается только после отдельного подтверждения в окне корзины.
+    public func emptyPhoneTrash() {
+        let entries = phoneTrashEntries
+        guard !entries.isEmpty else { return }
+        performPhoneTrashOperation(success: "Корзина телефона очищена") { service in
+            for entry in entries {
+                try await service.permanentlyDelete(entry)
+            }
+        }
+    }
+
+    private func performPhoneTrashOperation(
+        success: String? = nil,
+        operation: @escaping @Sendable (PhoneTrashService) async throws -> Void
+    ) {
+        guard !isPhoneTrashBusy else { return }
+        guard !phoneTrashVolumePath.isEmpty else { return }
+        guard remoteDriver.isConnected else {
+            phoneTrashError = "Подключите телефон, затем нажмите «Обновить»."
+            return
+        }
+        isPhoneTrashBusy = true
+        phoneTrashError = nil
+        let volume = phoneTrashVolumePath
+        let service = remoteDriver.phoneTrash
+        Task { [weak self] in
+            do {
+                try await operation(service)
+                let entries = try await service.entries(volumePath: volume)
+                guard let self else { return }
+                self.phoneTrashEntries = entries
+                if let success {
+                    self.statusMessage = success
+                    if self.leftSource == .remotePhone { self.refreshPane(side: .left) }
+                    if self.rightSource == .remotePhone { self.refreshPane(side: .right) }
+                }
+                self.isPhoneTrashBusy = false
+            } catch {
+                let updated = try? await service.entries(volumePath: volume)
+                guard let self else { return }
+                if let updated { self.phoneTrashEntries = updated }
+                self.phoneTrashError = error.localizedDescription
+                self.isPhoneTrashBusy = false
             }
         }
     }

@@ -202,7 +202,7 @@ AndroidCompanion/
 
 1. Заменить хардкод в `listDirectory()` → отправить `SSH_FXP_OPENDIR` → loop `SSH_FXP_READDIR` (до `SSH_FXP_STATUS` с `EOF`) → `SSH_FXP_CLOSE`. Распарсить через `SFTPPacketEngine.parseNameResponse()`
 2. `createDirectory()` → отправить `SSH_FXP_MKDIR`, дождаться `SSH_FXP_STATUS`
-3. `deleteItem()` → `SSH_FXP_REMOVE` (файл) или `SSH_FXP_RMDIR` (папка)
+3. `deleteItem(moveToTrash: true)` → запись метаданных в `.MacDroidTrash/<UUID>/info.json`, затем `SSH_FXP_RENAME` исходника в `payload`. Безвозвратные `SSH_FXP_REMOVE`/`SSH_FXP_RMDIR` применяются только при явном `moveToTrash: false`, в том числе для подтверждённой очистки корзины.
 4. `renameItem()` → `SSH_FXP_RENAME`
 5. `checkFreeSpace()` → SFTP v3 не поддерживает `statvfs`. Два варианта:
    - Использовать SSH exec `df -B1 /storage/emulated/0` и распарсить вывод
@@ -443,7 +443,7 @@ content.body = "Скопировано \(count) файлов (\(size))"
 
 > Эти правила не подлежат обсуждению. Нарушение любого из них — брак.
 
-1. **Никогда не удалять файл пользователя молча.** На Mac — только через `trashItem()`. Если `trashItem` не удалось — бросить `LocalFSDriverError.trashUnavailable`, НЕ fallback на `removeItem`. На Android — предупреждение о безвозвратности.
+1. **Никогда не удалять файл пользователя молча.** На Mac — только через `trashItem()`. Если `trashItem` не удалось — бросить `LocalFSDriverError.trashUnavailable`, НЕ fallback на `removeItem`. На Android обычное удаление перемещает объект в собственную `.MacDroidTrash` на том же накопителе с сохранением исходного пути. Ошибка корзины не допускает fallback на безвозвратное удаление. Безвозвратная очистка требует отдельного подтверждения.
 
 2. **Частичный файл НИКОГДА не выглядит как готовый.** Запись идёт в `.{name}.part.{actionId}`, финальное имя — только после `renameItem` и верификации.
 

@@ -229,6 +229,11 @@ struct MacFileManagerApp: App {
                     }
                 }
                 .keyboardShortcut(.delete, modifiers: [.command])
+
+                Button("Корзина телефона…") {
+                    viewModel.openPhoneTrash()
+                }
+                .disabled(viewModel.isPhoneTrashBusy)
                 
                 Button("Свойства (Cmd+I)") {
                     viewModel.triggerProperties()

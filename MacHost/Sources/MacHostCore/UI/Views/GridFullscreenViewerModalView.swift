@@ -515,9 +515,9 @@ public struct GridFullscreenHostView: View {
             
             VStack(spacing: 16) {
                 HStack(alignment: .top, spacing: 14) {
-                    Image(systemName: activeSource == .localMac ? "trash.fill" : "exclamationmark.triangle.fill")
+                    Image(systemName: "trash.fill")
                         .font(.system(size: 32))
-                        .foregroundColor(activeSource == .localMac ? .accentColor : .red)
+                        .foregroundColor(.accentColor)
                     
                     VStack(alignment: .leading, spacing: 6) {
                         Text("Подтверждение удаления")
@@ -530,9 +530,9 @@ public struct GridFullscreenHostView: View {
                                 .foregroundColor(.secondary)
                                 .fixedSize(horizontal: false, vertical: true)
                         } else {
-                            Text("ВНИМАНИЕ: На телефоне нет общей Корзины. \(selectedCount) объектов будут УДАЛЕНЫ БЕЗВОЗВРАТНО!")
+                            Text("Переместить \(selectedCount) выбранных объектов в Корзину телефона? Их можно восстановить через меню «Корзина телефона…».")
                                 .font(.system(size: 12, weight: .medium))
-                                .foregroundColor(.red)
+                                .foregroundColor(.secondary)
                                 .fixedSize(horizontal: false, vertical: true)
                         }
                     }

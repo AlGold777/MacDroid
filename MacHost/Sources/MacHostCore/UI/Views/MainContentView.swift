@@ -268,6 +268,10 @@ private struct MainContentSheetsModifier: ViewModifier {
                 PathDisplaySettingsModalView()
                     .environmentObject(vm)
             }
+            .sheet(isPresented: $vm.showPhoneTrash) {
+                PhoneTrashView()
+                    .environmentObject(vm)
+            }
             .alert(vm.errorAlertTitle, isPresented: Binding(
                 get: { vm.showErrorAlert && vm.fullscreenGridPaneSide == nil },
                 set: { vm.showErrorAlert = $0 }
@@ -290,7 +294,7 @@ private struct MainContentSheetsModifier: ViewModifier {
                 if activeSource == .localMac {
                     Text("Вы действительно хотите переместить в Корзину \(count) выбранных объектов?")
                 } else {
-                    Text("ВНИМАНИЕ: На телефоне нет общей Корзины. \(count) объектов будут УДАЛЕНЫ БЕЗВОЗВРАТНО!")
+                    Text("Переместить \(count) выбранных объектов в Корзину телефона? Их можно восстановить через меню «Корзина телефона…».")
                 }
             }
     }
