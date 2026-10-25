@@ -28,10 +28,6 @@ public struct TopToolbarSearchView: View {
         vm.isSearchActive(for: vm.activePane)
     }
     
-    private var isExpandedView: Bool {
-        isExpanded || !currentQuery.isEmpty
-    }
-    
     private var queryBinding: Binding<String> {
         Binding(
             get: { vm.activePane == .left ? vm.leftSearchQuery : vm.rightSearchQuery },
@@ -53,31 +49,26 @@ public struct TopToolbarSearchView: View {
     }
     
     public var body: some View {
-        Group {
-            if isExpandedView {
-                expandedSearchField
-            } else {
-                collapsedSearchButton
+        collapsedSearchButton
+            // Keep the native toolbar item's width constant while editing.
+            .popover(isPresented: $isExpanded, arrowEdge: .bottom) {
+                VStack(alignment: .leading, spacing: 8) {
+                    expandedSearchField
+                    searchDropdownMenu
+                }
+                .padding(10)
+                .onAppear { isFocused = true }
+                .onExitCommand { clearAndCloseSearch() }
             }
-        }
-        .animation(.easeInOut(duration: 0.18), value: isExpandedView)
-        .onChange(of: vm.searchFocusTrigger) { _ in
-            withAnimation(.easeInOut(duration: 0.18)) {
-                isExpanded = true
-            }
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
-                isFocused = true
-            }
-        }
-        .onChange(of: isFocused) { focused in
-            if !focused {
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
-                    if !isFocused && currentQuery.trimmingCharacters(in: .whitespaces).isEmpty {
-                        clearAndCloseSearch()
-                    }
+            .onChange(of: isExpanded) { presented in
+                if !presented && currentQuery.trimmingCharacters(in: .whitespaces).isEmpty {
+                    clearAndCloseSearch()
                 }
             }
-        }
+            .onChange(of: vm.searchFocusTrigger) { _ in
+                isExpanded = true
+                isFocused = true
+            }
     }
     
     private var expandedSearchField: some View {
@@ -126,7 +117,7 @@ public struct TopToolbarSearchView: View {
             }
         }
         .padding(.horizontal, 7)
-        .frame(width: isFocused || !currentQuery.isEmpty ? 200 : 160, height: 23)
+        .frame(width: 250, height: 23)
         .background(
             RoundedRectangle(cornerRadius: 6, style: .continuous)
                 .fill(Color(nsColor: .controlBackgroundColor))
@@ -135,29 +126,11 @@ public struct TopToolbarSearchView: View {
             RoundedRectangle(cornerRadius: 6, style: .continuous)
                 .stroke(isFocused ? Color.accentColor : Color.secondary.opacity(0.3), lineWidth: isFocused ? 1.5 : 1)
         )
-        .overlay(alignment: .topTrailing) {
-            // Выпадающее меню в стиле Finder (точно как на скриншоте)
-            if isExpandedView {
-                searchDropdownMenu
-                    .offset(y: 28)
-                    .zIndex(999)
-            }
-        }
-        .transition(.asymmetric(
-            insertion: .scale(scale: 0.85, anchor: .trailing).combined(with: .opacity),
-            removal: .scale(scale: 0.85, anchor: .trailing).combined(with: .opacity)
-        ))
     }
     
     private var collapsedSearchButton: some View {
         Button(action: {
-            withAnimation(.easeInOut(duration: 0.18)) {
-                isExpanded = true
-                vm.openSearch(side: vm.activePane)
-            }
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
-                isFocused = true
-            }
+            vm.openSearch(side: vm.activePane)
         }) {
             ToolbarIconView(icon: .search, size: 15, lineWidth: 1.3)
                 .foregroundColor(isSearchActive ? .accentColor : (isHovered ? .primary : Color(nsColor: .darkGray)))
@@ -186,7 +159,6 @@ public struct TopToolbarSearchView: View {
         .onHover { hovering in
             isHovered = hovering
         }
-        .transition(.opacity)
     }
     
     /// Меню подсказок / фильтров (Имена файлов / Содержание)

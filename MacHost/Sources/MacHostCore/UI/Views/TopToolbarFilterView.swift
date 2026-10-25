@@ -15,10 +15,6 @@ public struct TopToolbarFilterView: View {
         vm.activeFilterText
     }
     
-    private var isExpandedView: Bool {
-        isExpanded || !currentFilter.isEmpty
-    }
-    
     private var filterBinding: Binding<String> {
         Binding(
             get: { vm.activeFilterText },
@@ -27,33 +23,20 @@ public struct TopToolbarFilterView: View {
     }
     
     public var body: some View {
-        Group {
-            if isExpandedView {
-                expandedFilterField
-            } else {
-                collapsedFilterButton
+        collapsedFilterButton
+            // Keep the native toolbar item's width constant while editing.
+            .popover(isPresented: $isExpanded, arrowEdge: .bottom) {
+                VStack(alignment: .leading, spacing: 8) {
+                    expandedFilterField
+                }
+                .padding(10)
+                .onAppear { isFocused = true }
+                .onExitCommand { clearAndCloseFilter() }
             }
-        }
-        .animation(.easeInOut(duration: 0.18), value: isExpandedView)
-        .onChange(of: vm.filterFocusTrigger) { _ in
-            withAnimation(.easeInOut(duration: 0.18)) {
+            .onChange(of: vm.filterFocusTrigger) { _ in
                 isExpanded = true
-            }
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
                 isFocused = true
             }
-        }
-        .onChange(of: isFocused) { focused in
-            if !focused {
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
-                    if !isFocused && currentFilter.trimmingCharacters(in: .whitespaces).isEmpty {
-                        withAnimation(.easeInOut(duration: 0.18)) {
-                            isExpanded = false
-                        }
-                    }
-                }
-            }
-        }
     }
     
     private var expandedFilterField: some View {
@@ -95,7 +78,7 @@ public struct TopToolbarFilterView: View {
             }
         }
         .padding(.horizontal, 7)
-        .frame(width: isFocused || !currentFilter.isEmpty ? 180 : 140, height: 23)
+        .frame(width: 220, height: 23)
         .background(
             RoundedRectangle(cornerRadius: 6, style: .continuous)
                 .fill(Color(nsColor: .controlBackgroundColor))
@@ -104,20 +87,11 @@ public struct TopToolbarFilterView: View {
             RoundedRectangle(cornerRadius: 6, style: .continuous)
                 .stroke(isFocused ? Color.accentColor : Color.secondary.opacity(0.3), lineWidth: isFocused ? 1.5 : 1)
         )
-        .transition(.asymmetric(
-            insertion: .scale(scale: 0.85, anchor: .trailing).combined(with: .opacity),
-            removal: .scale(scale: 0.85, anchor: .trailing).combined(with: .opacity)
-        ))
     }
     
     private var collapsedFilterButton: some View {
         Button(action: {
-            withAnimation(.easeInOut(duration: 0.18)) {
-                isExpanded = true
-            }
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
-                isFocused = true
-            }
+            isExpanded = true
         }) {
             ToolbarIconView(icon: .filter, size: 15, lineWidth: 1.3)
                 .foregroundColor(!currentFilter.isEmpty ? .accentColor : (isHovered ? .primary : Color(nsColor: .darkGray)))
@@ -146,7 +120,6 @@ public struct TopToolbarFilterView: View {
         .onHover { hovering in
             isHovered = hovering
         }
-        .transition(.opacity)
     }
     
     private func clearAndCloseFilter() {
