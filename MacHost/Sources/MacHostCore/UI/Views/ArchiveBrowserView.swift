@@ -194,11 +194,11 @@ public struct ArchiveBrowserView: View {
                 }
                 return .handled
             }
-            .onKeyPress(.return, phases: .down) { press in
-                guard press.modifiers.isEmpty, let entry = model.selectedItem else { return .ignored }
+            .background(ArchiveReturnKeyHandler(isEnabled: isListFocused && !model.isBusy) {
+                guard let entry = model.selectedItem else { return false }
                 model.open(entry)
-                return .handled
-            }
+                return true
+            })
             .onChange(of: model.selectedID) { _ in
                 if QuickLookBridge.shared.isVisible, let entry = model.selectedEntry {
                     Task { await model.openPreview(entry) }
@@ -544,5 +544,55 @@ private final class ArchiveOpenedFiles: NSObject {
     @objc private func cleanup() {
         for copy in copies { try? copy.cleanup() }
         copies.removeAll()
+    }
+}
+
+/// SwiftUI List can consume Return before onKeyPress; route it at the native window boundary.
+private struct ArchiveReturnKeyHandler: NSViewRepresentable {
+    let isEnabled: Bool
+    let openSelection: () -> Bool
+
+    func makeNSView(context: Context) -> KeyView {
+        let view = KeyView()
+        view.isEnabled = isEnabled
+        view.openSelection = openSelection
+        view.installMonitor()
+        return view
+    }
+
+    func updateNSView(_ view: KeyView, context: Context) {
+        view.isEnabled = isEnabled
+        view.openSelection = openSelection
+    }
+
+    static func dismantleNSView(_ view: KeyView, coordinator: ()) {
+        view.removeMonitor()
+    }
+
+    final class KeyView: NSView {
+        var isEnabled = false
+        var openSelection: (() -> Bool)?
+        private var monitor: Any?
+
+        func installMonitor() {
+            monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+                guard let self, self.isEnabled, event.window === self.window,
+                      self.window?.isKeyWindow == true,
+                      event.keyCode == 36 || event.keyCode == 76,
+                      event.modifierFlags.intersection([.command, .option, .control, .shift]).isEmpty else {
+                    return event
+                }
+                if let text = self.window?.firstResponder as? NSTextView, text.isEditable {
+                    return event
+                }
+                if self.window?.firstResponder is NSTextField { return event }
+                return self.openSelection?() == true ? nil : event
+            }
+        }
+
+        func removeMonitor() {
+            if let monitor { NSEvent.removeMonitor(monitor) }
+            monitor = nil
+        }
     }
 }
