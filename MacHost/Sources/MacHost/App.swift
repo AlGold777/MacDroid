@@ -203,6 +203,17 @@ struct MacFileManagerApp: App {
                 }
                 .keyboardShortcut(.f5Key, modifiers: [.option])
 
+                Button("Распаковать выбранный архив полностью") {
+                    let items = viewModel.activePane == .left ? viewModel.leftItems : viewModel.rightItems
+                    let selection = viewModel.activePane == .left ? viewModel.leftSelection : viewModel.rightSelection
+                    if selection.count == 1, let item = items.first(where: { selection.contains($0.id) || selection.contains($0.path) }),
+                       !item.isDirectory, ArchiveService.isArchive(fileName: item.name) {
+                        viewModel.unarchive(item: item, side: viewModel.activePane)
+                    } else {
+                        viewModel.statusMessage = "Выберите один архив для полной распаковки"
+                    }
+                }
+
                 Button("Переместить (F6)") {
                     viewModel.triggerMove()
                 }

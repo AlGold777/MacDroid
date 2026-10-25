@@ -275,6 +275,22 @@ private struct MainContentSheetsModifier: ViewModifier {
             .sheet(isPresented: $vm.showDuplicateFinder) {
                 DuplicateFinderView().environmentObject(vm)
             }
+            .sheet(isPresented: $vm.showArchiveBrowser, onDismiss: { vm.closeArchiveBrowser() }) {
+                if let url = vm.archiveBrowserURL {
+                    ArchiveBrowserView(archiveURL: url, title: vm.archiveBrowserTitle)
+                        .id(url)
+                } else {
+                    VStack(spacing: 16) {
+                        Text(vm.archiveBrowserTitle).font(.headline)
+                        if let error = vm.archiveBrowserError {
+                            Text(error).textSelection(.enabled)
+                        } else {
+                            ProgressView("Загрузка архива с телефона…")
+                        }
+                        Button("Закрыть") { vm.showArchiveBrowser = false }
+                    }.padding(24).frame(minWidth: 480, minHeight: 200)
+                }
+            }
             .alert(vm.errorAlertTitle, isPresented: Binding(
                 get: { vm.showErrorAlert && vm.fullscreenGridPaneSide == nil },
                 set: { vm.showErrorAlert = $0 }

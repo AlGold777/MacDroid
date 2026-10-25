@@ -284,6 +284,13 @@ public final class DualPaneViewModel: ObservableObject {
     @Published public var showNewFolderDialog: Bool = false
     @Published public var showPhoneTrash = false
     @Published public var showDuplicateFinder = false
+    @Published public var showArchiveBrowser = false
+    @Published public private(set) var archiveBrowserURL: URL?
+    @Published public private(set) var archiveBrowserTitle = ""
+    @Published public private(set) var archiveBrowserError: String?
+    private var archiveBrowserTask: Task<Void, Never>?
+    private var archiveBrowserTemporaryDirectory: URL?
+    private var archiveBrowserGeneration = UUID()
     @Published public private(set) var phoneTrashEntries: [PhoneTrashEntry] = []
     @Published public private(set) var isPhoneTrashBusy = false
     @Published public private(set) var phoneTrashError: String?
@@ -3716,12 +3723,62 @@ public final class DualPaneViewModel: ObservableObject {
         if item.isDirectory {
             navigateInto(item: item, side: side)
         } else if isArchive(item: item) {
-            unarchive(item: item, side: side)
+            if ["zip", "apk"].contains(URL(fileURLWithPath: item.name).pathExtension.lowercased()) {
+                openArchiveBrowser(item: item)
+            } else {
+                unarchive(item: item, side: side)
+            }
         } else {
             openFile(item: item)
         }
     }
     
+    public func openArchiveBrowser(item: FileItem) {
+        closeArchiveBrowser()
+        archiveBrowserTitle = item.name
+        archiveBrowserError = nil
+        showArchiveBrowser = true
+        if item.source == .localMac {
+            archiveBrowserURL = URL(fileURLWithPath: item.path)
+            return
+        }
+        let generation = archiveBrowserGeneration
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("MacDroidArchive-\(UUID().uuidString)")
+        archiveBrowserTemporaryDirectory = directory
+        let stagingName = URL(fileURLWithPath: item.name).pathExtension.lowercased() == "apk" ? "archive.apk" : "archive.zip"
+        let destination = directory.appendingPathComponent(stagingName)
+        archiveBrowserTask = Task { [weak self] in
+            var published = false
+            defer {
+                if !published { try? FileManager.default.removeItem(at: directory) }
+            }
+            do {
+                try Task.checkCancellation()
+                guard let self, self.archiveBrowserGeneration == generation else { return }
+                try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+                try await self.downloadRemoteFile(remotePath: item.path, targetURL: destination, totalSize: item.size)
+                try Task.checkCancellation()
+                guard self.archiveBrowserGeneration == generation else { return }
+                self.archiveBrowserURL = destination
+                published = true
+            } catch {
+                guard let self, self.archiveBrowserGeneration == generation else { return }
+                self.archiveBrowserError = error.localizedDescription
+            }
+        }
+    }
+
+    public func closeArchiveBrowser() {
+        archiveBrowserGeneration = UUID()
+        archiveBrowserTask?.cancel()
+        archiveBrowserTask = nil
+        archiveBrowserURL = nil
+        if let directory = archiveBrowserTemporaryDirectory {
+            try? FileManager.default.removeItem(at: directory)
+        }
+        archiveBrowserTemporaryDirectory = nil
+    }
+
     public func openFile(item: FileItem) {
         print("DUAL_PANE: openFile '\(item.name)', source: \(item.source)")
         if item.source == .localMac {

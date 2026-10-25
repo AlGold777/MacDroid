@@ -3866,10 +3866,13 @@ func runAllAsyncTests() async {
             let uniqueNameNew = vm49.generateUniqueArchiveName(baseName: "brand_new", extension: "zip", destinationPath: archiveTestDir.path)
             assertCondition(uniqueNameNew == "brand_new.zip", "Non-existing base name gets plain .zip without counter: got \(uniqueNameNew)")
             
-            // 5) Test openItem on archive triggers unarchive directly in app
-            vm49.isArchiving = false
-            vm49.openItem(item: zipItem, side: .left)
-            assertCondition(vm49.isArchiving == true, "openItem on archive triggers in-app unarchive (isArchiving == true)")
+            // 5) ZIP/APK double-click opens the selective archive browser; extraction stays explicit.
+            let browserVM49 = DualPaneViewModel()
+            browserVM49.openItem(item: zipItem, side: .left)
+            assertCondition(browserVM49.showArchiveBrowser && browserVM49.archiveBrowserURL == URL(fileURLWithPath: targetZipPath),
+                            "openItem on a local ZIP opens the archive browser without extracting it")
+            assertCondition(browserVM49.isArchiving == false, "Opening an archive does not start a full extraction")
+            browserVM49.closeArchiveBrowser()
         }
         
         try? FileManager.default.removeItem(at: archiveTestDir)

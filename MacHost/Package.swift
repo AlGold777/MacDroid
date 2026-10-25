@@ -8,13 +8,19 @@ let package = Package(
         .executable(name: "MacHost", targets: ["MacHost"]),
         .executable(name: "MacHostTests", targets: ["MacHostTests"]),
         .executable(name: "PhoneTrashTests", targets: ["PhoneTrashTests"]),
+        .executable(name: "ContentToolsTests", targets: ["ContentToolsTests"]),
         .library(name: "MacHostCore", targets: ["MacHostCore"])
     ],
     targets: [
         .executableTarget(name: "TransportRegressionTests", dependencies: ["MacHostCore"], path: "Tests/TransportRegressionTests"),
         .target(
             name: "MacHostCore",
+            dependencies: ["CLibArchive"],
             path: "Sources/MacHostCore"
+        ),
+        .systemLibrary(
+            name: "CLibArchive",
+            path: "Sources/CLibArchive"
         ),
         .executableTarget(
             name: "MacHost",
@@ -30,6 +36,11 @@ let package = Package(
             name: "PhoneTrashTests",
             dependencies: ["MacHostCore"],
             path: "Tests/PhoneTrashTests"
+        ),
+        .executableTarget(
+            name: "ContentToolsTests",
+            dependencies: ["MacHostCore"],
+            path: "Tests/ContentToolsTests"
         )
     ]
 )
