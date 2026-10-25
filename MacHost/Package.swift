@@ -46,14 +46,14 @@ let package = Package(
             path: "Tests/ContentToolsTests"
         ),
         .executableTarget(
-            name: "CopyDoneTests",
-            dependencies: ["MacHostCore"],
-            path: "Tests/CopyDoneTests"
-        ),
-        .executableTarget(
             name: "ExternalEditTests",
             dependencies: ["MacHostCore"],
             path: "Tests/ExternalEditTests"
+        ),
+        .executableTarget(
+            name: "CopyDoneTests",
+            dependencies: ["MacHostCore"],
+            path: "Tests/CopyDoneTests"
         ),
         .executableTarget(
             name: "ArchiveInteractionTests",
