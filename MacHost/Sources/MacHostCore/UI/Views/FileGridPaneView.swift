@@ -1571,6 +1571,8 @@ public struct FileGridCell: View {
             .disabled(!vm.canPaste)
         Button("Дублировать (Cmd+Shift+D)") { vm.duplicateItem(item: item, side: side) }
 
+        Button("Разархивировать") { vm.unarchive(item: item, side: side) }
+            .disabled(item.isDirectory || !vm.isArchive(item: item) || vm.isArchiving)
         Button("Сжать в архив... (Alt+F5)") { vm.triggerCreateArchive(item: item, side: side) }
         Button("Переименовать (F2)") { vm.triggerRename(item: item, side: side) }
         Button("Свойства (Cmd+I)") { vm.triggerProperties(item: item, side: side) }

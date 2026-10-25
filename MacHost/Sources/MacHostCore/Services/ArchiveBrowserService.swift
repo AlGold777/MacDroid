@@ -22,6 +22,25 @@ public struct ArchiveEntry: Identifiable, Hashable, Sendable {
     }
 }
 
+/// A single member decoded into an isolated temporary directory for viewing.
+/// The owner retains it until the viewer closes, then calls cleanup().
+public struct ArchiveFilePreview: Identifiable, Sendable {
+    public let url: URL
+    private let directory: URL
+    public var id: URL { directory }
+
+    fileprivate init(url: URL, directory: URL) {
+        self.url = url
+        self.directory = directory
+    }
+
+    public func cleanup() throws {
+        if FileManager.default.fileExists(atPath: directory.path) {
+            try FileManager.default.removeItem(at: directory)
+        }
+    }
+}
+
 public enum ArchiveBrowserError: LocalizedError {
     case invalidArchive(String)
     case unsupportedArchive
@@ -88,6 +107,24 @@ public enum ArchiveBrowserService {
             try await task.value
         } onCancel: {
             task.cancel()
+        }
+    }
+
+    /// Only the chosen member is decoded. No output is written alongside the archive.
+    public static func preparePreview(entry: ArchiveEntry, from archiveURL: URL) async throws -> ArchiveFilePreview {
+        guard !entry.isDirectory else { throw ArchiveBrowserError.unsupportedEntry(entry.path) }
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("MacDroidArchivePreview_" + UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false,
+                                               attributes: [.posixPermissions: 0o700])
+        do {
+            let url = try await extract(entry: entry, from: archiveURL, toDirectory: directory)
+            try Task.checkCancellation()
+            try FileManager.default.setAttributes([.posixPermissions: 0o400], ofItemAtPath: url.path)
+            return ArchiveFilePreview(url: url, directory: directory)
+        } catch {
+            try? FileManager.default.removeItem(at: directory)
+            throw error
         }
     }
 

@@ -1,5 +1,6 @@
 import AppKit
 import SwiftUI
+import Quartz
 
 public struct ArchiveBrowserView: View {
     public let archiveURL: URL
@@ -27,7 +28,10 @@ public struct ArchiveBrowserView: View {
         }
         .frame(minWidth: 620, minHeight: 440)
         .task { await model.loadIfNeeded() }
-        .alert("Не удалось открыть архив", isPresented: $model.showError) {
+        .sheet(item: $model.preview, onDismiss: { model.closePreview() }) { preview in
+            ArchiveFilePreviewView(url: preview.url)
+        }
+        .alert("Ошибка работы с архивом", isPresented: $model.showError) {
             Button("ОК", role: .cancel) { model.errorMessage = nil }
         } message: {
             Text(model.errorMessage ?? "Неизвестная ошибка")
@@ -163,12 +167,20 @@ public struct ArchiveBrowserView: View {
                         } else {
                             model.selectedID = entry.id
                         }
+                    } open: {
+                        if entry.isDirectory {
+                            model.navigate(to: entry.path)
+                        } else {
+                            Task { await model.openPreview(entry) }
+                        }
                     }
                     .tag(entry.id)
                     .contextMenu {
                         if entry.isDirectory {
                             Button("Открыть папку") { model.navigate(to: entry.path) }
                         } else {
+                            Button("Просмотреть") { Task { await model.openPreview(entry) } }
+                                .disabled(model.isBusy)
                             Button("Извлечь…") { Task { await extract(entry) } }
                                 .disabled(model.isBusy)
                         }
@@ -182,7 +194,12 @@ public struct ArchiveBrowserView: View {
 
     private var footer: some View {
         HStack {
-            if model.isExtracting {
+            if model.isPreparingPreview {
+                ProgressView().controlSize(.small)
+                Text("Подготовка просмотра…")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            } else if model.isExtracting {
                 ProgressView()
                     .controlSize(.small)
                 Text("Извлечение выбранного файла…")
@@ -194,15 +211,19 @@ public struct ArchiveBrowserView: View {
                     .foregroundStyle(.green)
                     .lineLimit(1)
             } else {
-                Text("Извлечение не распаковывает остальные файлы архива.")
+                Text("Двойной клик по файлу открывает просмотр.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
             Spacer()
+            Button("Просмотреть") {
+                if let entry = model.selectedEntry { Task { await model.openPreview(entry) } }
+            }
+            .keyboardShortcut(.defaultAction)
+            .disabled(model.isBusy || !model.didLoad || model.selectedEntry == nil)
             Button("Извлечь выбранный файл…") {
                 if let entry = model.selectedEntry { Task { await extract(entry) } }
             }
-            .keyboardShortcut(.defaultAction)
             .disabled(model.isBusy || !model.didLoad || model.selectedEntry == nil)
             Button("Закрыть") { dismiss() }
                 .keyboardShortcut(.cancelAction)
@@ -235,6 +256,9 @@ private final class ArchiveBrowserModel: ObservableObject {
     @Published var selectedID: String?
     @Published var isLoading = false
     @Published var isExtracting = false
+    @Published var isPreparingPreview = false
+    @Published var preview: ArchiveFilePreview?
+    private var previewCopy: ArchiveFilePreview?
     @Published var didLoad = false
     @Published var errorMessage: String?
     @Published var showError = false
@@ -242,7 +266,7 @@ private final class ArchiveBrowserModel: ObservableObject {
 
     init(archiveURL: URL) { self.archiveURL = archiveURL }
 
-    var isBusy: Bool { isLoading || isExtracting }
+    var isBusy: Bool { isLoading || isExtracting || isPreparingPreview }
     var indexedEntries: Int { entries.count }
     var selectedEntry: ArchiveEntry? { entries.first { $0.id == selectedID && !$0.isDirectory } }
 
@@ -322,6 +346,34 @@ private final class ArchiveBrowserModel: ObservableObject {
         }
     }
 
+    func openPreview(_ entry: ArchiveEntry) async {
+        guard !isBusy, !entry.isDirectory else { return }
+        isPreparingPreview = true
+        errorMessage = nil
+        defer { isPreparingPreview = false }
+        do {
+            closePreview()
+            let copy = try await ArchiveBrowserService.preparePreview(entry: entry, from: archiveURL)
+            previewCopy = copy
+            preview = copy
+        } catch is CancellationError {
+            // A dismissed/cancelled preview never leaves a partial file behind.
+        } catch {
+            errorMessage = error.localizedDescription
+            showError = true
+        }
+    }
+
+    func closePreview() {
+        preview = nil
+        try? previewCopy?.cleanup()
+        previewCopy = nil
+    }
+
+    deinit {
+        try? previewCopy?.cleanup()
+    }
+
     private func directChildren() -> [ArchiveEntry] {
         let prefix = currentDirectory.isEmpty ? "" : currentDirectory + "/"
         var rows: [String: ArchiveEntry] = [:]
@@ -368,9 +420,9 @@ private struct ArchiveBrowserRow: View {
     let entry: ArchiveEntry
     let isSelected: Bool
     let action: () -> Void
+    let open: () -> Void
 
     var body: some View {
-        Button(action: action) {
             HStack(spacing: 9) {
                 Image(systemName: entry.isDirectory ? "folder.fill" : "doc")
                     .foregroundStyle(entry.isDirectory ? Color.accentColor : Color.secondary)
@@ -403,9 +455,55 @@ private struct ArchiveBrowserRow: View {
             .contentShape(Rectangle())
             .padding(.vertical, 3)
             .background(isSelected ? Color.accentColor.opacity(0.12) : Color.clear, in: RoundedRectangle(cornerRadius: 4))
-        }
-        .buttonStyle(.plain)
+        .onTapGesture(count: 2, perform: open)
+        .onTapGesture(perform: action)
+        .accessibilityAddTraits(.isButton)
+        .accessibilityAction { open() }
         .accessibilityLabel(entry.isDirectory ? "Папка \(entry.name)" : "Файл \(entry.name), \(ByteCountFormatter.string(fromByteCount: entry.size, countStyle: .file))")
-        .accessibilityHint(entry.isDirectory ? "Открыть папку в архиве" : "Выбрать файл для извлечения")
+        .accessibilityHint(entry.isDirectory ? "Открыть папку в архиве" : "Двойной клик открывает просмотр файла")
+    }
+}
+
+/// Embedded Quick Look keeps viewing inside the archive browser without launching a file.
+private struct ArchiveFilePreviewView: View {
+    let url: URL
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack {
+                Text(url.lastPathComponent).font(.headline).lineLimit(1)
+                Spacer()
+                Button("Закрыть просмотр") { dismiss() }
+                    .keyboardShortcut(.cancelAction)
+            }
+            .padding(14)
+            Divider()
+            ArchiveQuickLookView(url: url)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
+        .frame(minWidth: 640, minHeight: 480)
+    }
+}
+
+private struct ArchiveQuickLookView: NSViewRepresentable {
+    let url: URL
+
+    func makeNSView(context: Context) -> QLPreviewView {
+        let view = QLPreviewView(frame: .zero, style: .normal)!
+        view.autostarts = false
+        view.previewItem = url as NSURL
+        return view
+    }
+
+    func updateNSView(_ view: QLPreviewView, context: Context) {
+        if (view.previewItem?.previewItemURL ?? nil) != url {
+            view.previewItem = url as NSURL
+        }
+    }
+
+    static func dismantleNSView(_ view: QLPreviewView, coordinator: ()) {
+        view.previewItem = nil
+        view.close()
     }
 }

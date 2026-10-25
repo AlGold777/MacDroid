@@ -490,10 +490,14 @@ private func runArchiveBrowserTests() async throws {
     let archiveURL = root.appendingPathComponent("fixture.zip")
     let nestedPath = "nested/旅行/literal[1]*.txt"
     let selectedBytes = Data("selected payload".utf8)
+    let firstSameNameBytes = Data("first preview payload".utf8)
+    let secondSameNameBytes = Data("second preview payload".utf8)
     try writeZIP([
         ZIPFixtureEntry(path: nestedPath, data: selectedBytes),
         ZIPFixtureEntry(path: "target.txt", data: Data("target".utf8)),
-        ZIPFixtureEntry(path: ".hidden", data: Data("hidden".utf8))
+        ZIPFixtureEntry(path: ".hidden", data: Data("hidden".utf8)),
+        ZIPFixtureEntry(path: "one/report.bin", data: firstSameNameBytes),
+        ZIPFixtureEntry(path: "two/report.bin", data: secondSameNameBytes)
     ], to: archiveURL)
 
     let entries = try await ArchiveBrowserService.index(archiveURL: archiveURL)
@@ -504,7 +508,7 @@ private func runArchiveBrowserTests() async throws {
               "Hidden members are indexed and missing directory entries remain implicit")
     let apkURL = root.appendingPathComponent("fixture.apk")
     try FileManager.default.copyItem(at: archiveURL, to: apkURL)
-    try check(try await ArchiveBrowserService.index(archiveURL: apkURL).count == 3,
+    try check(try await ArchiveBrowserService.index(archiveURL: apkURL).count == 5,
               "APK archives use the ZIP member index")
 
     let output = root.appendingPathComponent("selected-output", isDirectory: true)
@@ -518,6 +522,68 @@ private func runArchiveBrowserTests() async throws {
               "Extraction writes only the selected member with its literal filename")
     try check(!FileManager.default.fileExists(atPath: output.appendingPathComponent("target.txt").path),
               "Selected-file extraction does not unpack sibling archive members")
+
+    let preview = try await ArchiveBrowserService.preparePreview(entry: selected, from: archiveURL)
+    defer { try? preview.cleanup() }
+    let previewDirectory = preview.url.deletingLastPathComponent()
+    let previewAttributes = try FileManager.default.attributesOfItem(atPath: preview.url.path)
+    let previewPermissions = (previewAttributes[.posixPermissions] as? NSNumber)?.intValue
+    let previewContents = try FileManager.default.contentsOfDirectory(atPath: previewDirectory.path)
+    let previewBytes = try Data(contentsOf: preview.url)
+    try check(preview.url.lastPathComponent == selected.name && previewBytes == selectedBytes,
+              "Preview preserves the selected member's extension and exact payload")
+    try check(preview.id == previewDirectory && previewDirectory.lastPathComponent.hasPrefix("MacDroidArchivePreview_"),
+              "Preview owns an isolated UUID temporary directory")
+    try check(previewPermissions == 0o400,
+              "Preview payload is read-only (mode 0400)")
+    try check(previewContents == [selected.name]
+              && !FileManager.default.fileExists(atPath: previewDirectory.appendingPathComponent("target.txt").path),
+              "Preview materializes only the selected member, without archive siblings")
+
+    guard let firstReport = entries.first(where: { $0.path == "one/report.bin" }),
+          let secondReport = entries.first(where: { $0.path == "two/report.bin" }) else {
+        throw TestFailure(description: "Same-basename preview fixtures were not indexed")
+    }
+    let firstReportPreview = try await ArchiveBrowserService.preparePreview(entry: firstReport, from: archiveURL)
+    defer { try? firstReportPreview.cleanup() }
+    let secondReportPreview = try await ArchiveBrowserService.preparePreview(entry: secondReport, from: archiveURL)
+    defer { try? secondReportPreview.cleanup() }
+    let repeatedOpenPreview = try await ArchiveBrowserService.preparePreview(entry: firstReport, from: archiveURL)
+    defer { try? repeatedOpenPreview.cleanup() }
+    let firstReportPreviewBytes = try Data(contentsOf: firstReportPreview.url)
+    let secondReportPreviewBytes = try Data(contentsOf: secondReportPreview.url)
+    let repeatedOpenPreviewBytes = try Data(contentsOf: repeatedOpenPreview.url)
+    try check(firstReportPreview.url.lastPathComponent == secondReportPreview.url.lastPathComponent
+              && firstReportPreview.id != secondReportPreview.id
+              && firstReportPreview.id != repeatedOpenPreview.id,
+              "Same-basename members and repeated opens receive distinct preview directories")
+    try check(firstReportPreviewBytes == firstSameNameBytes
+              && secondReportPreviewBytes == secondSameNameBytes
+              && repeatedOpenPreviewBytes == firstSameNameBytes,
+              "Same-basename preview sessions retain their own selected payload")
+
+    try preview.cleanup()
+    try check(!FileManager.default.fileExists(atPath: preview.url.path)
+              && !FileManager.default.fileExists(atPath: previewDirectory.path),
+              "Preview cleanup removes its payload and isolated session directory")
+    let survivingReportPreviewBytes = try Data(contentsOf: firstReportPreview.url)
+    try check(FileManager.default.fileExists(atPath: archiveURL.path)
+              && FileManager.default.fileExists(atPath: firstReportPreview.url.path)
+              && survivingReportPreviewBytes == firstSameNameBytes,
+              "Cleaning one preview preserves the source archive and other open preview sessions")
+
+    let previewTempRoot = FileManager.default.temporaryDirectory
+    let existingPreviewDirectories = Set(try FileManager.default.contentsOfDirectory(atPath: previewTempRoot.path)
+        .filter { $0.hasPrefix("MacDroidArchivePreview_") })
+    let forgedEntry = ArchiveEntry(id: "forged", ordinal: 999, path: "orphan.bin", name: "orphan.bin",
+                                   size: 0, isDirectory: false)
+    try await expectThrows("Preview extraction failure is propagated") {
+        _ = try await ArchiveBrowserService.preparePreview(entry: forgedEntry, from: archiveURL)
+    }
+    let previewDirectoriesAfterFailure = Set(try FileManager.default.contentsOfDirectory(atPath: previewTempRoot.path)
+        .filter { $0.hasPrefix("MacDroidArchivePreview_") })
+    try check(previewDirectoriesAfterFailure == existingPreviewDirectories,
+              "Failed preview preparation leaves no isolated temporary artifact")
 
     let existing = output.appendingPathComponent("target.txt")
     try Data("preserve".utf8).write(to: existing)

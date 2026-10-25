@@ -1280,6 +1280,8 @@ public struct PaneView: View {
             .disabled(!vm.canPaste)
         Button("Дублировать (Cmd+Shift+D)") { vm.duplicateItem(item: item, side: side) }
 
+        Button("Разархивировать") { vm.unarchive(item: item, side: side) }
+            .disabled(item.isDirectory || !vm.isArchive(item: item) || vm.isArchiving)
         Button("Сжать в архив... (Alt+F5)") { vm.triggerCreateArchive(item: item, side: side) }
         Button("Переименовать (F2)") { vm.triggerRename(item: item, side: side) }
         Button("Свойства (Cmd+I)") { vm.triggerProperties(item: item, side: side) }
@@ -2998,6 +3000,12 @@ public struct TableDoubleClickHandler: NSViewRepresentable {
             menu.addItem(duplicateItem)
             
             menu.addItem(NSMenuItem.separator())
+
+            let unarchiveItem = NSMenuItem(title: "Разархивировать", action: #selector(menuActionUnarchive(_:)), keyEquivalent: "")
+            unarchiveItem.target = self
+            unarchiveItem.representedObject = item
+            unarchiveItem.isEnabled = !item.isDirectory && vm.isArchive(item: item) && !vm.isArchiving
+            menu.addItem(unarchiveItem)
             
             let archiveItem = NSMenuItem(title: "Сжать в архив... (Alt+F5)", action: #selector(menuActionArchive(_:)), keyEquivalent: "")
             archiveItem.target = self
@@ -3106,6 +3114,15 @@ public struct TableDoubleClickHandler: NSViewRepresentable {
         @objc private func menuActionArchive(_ sender: NSMenuItem) {
             guard let item = sender.representedObject as? FileItem else { return }
             self.vm?.triggerCreateArchive(item: item, side: self.side)
+        }
+
+        @objc private func menuActionUnarchive(_ sender: NSMenuItem) {
+            guard let item = sender.representedObject as? FileItem,
+                  let vm = self.vm,
+                  !item.isDirectory,
+                  vm.isArchive(item: item),
+                  !vm.isArchiving else { return }
+            vm.unarchive(item: item, side: self.side)
         }
         
         @objc private func menuActionRename(_ sender: NSMenuItem) {
