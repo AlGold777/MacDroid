@@ -7057,12 +7057,6 @@ public final class DualPaneViewModel: ObservableObject {
             let ext = (fileName as NSString).pathExtension
             let base = (fileName as NSString).deletingPathExtension
             var counter = 1
-        guard !showCopyDone else {
-            statusMessage = "Закройте проверку copy done перед новой передачей."
-            return
-        }
-        showCopyDoneOffer = false
-        let copyDoneImportEpoch = remoteDriver.coordinator.sessionEpoch
             var candidate = fileName
             while existing.contains(candidate) {
                 candidate = ext.isEmpty ? "\(base)-\(counter)" : "\(base)-\(counter).\(ext)"
@@ -7080,6 +7074,12 @@ public final class DualPaneViewModel: ObservableObject {
         isMove: Bool
     ) {
         guard !requestedPaths.isEmpty else { return }
+        guard !showCopyDone else {
+            statusMessage = "Закройте проверку copy done перед новой передачей."
+            return
+        }
+        showCopyDoneOffer = false
+        let copyDoneImportEpoch = remoteDriver.coordinator.sessionEpoch
 
         let targetSource = (toSide == .left) ? leftSource : rightSource
         let targetDirPath = targetDirPath ?? ((toSide == .left) ? leftPath : rightPath)
@@ -7616,13 +7616,6 @@ public final class DualPaneViewModel: ObservableObject {
                 
                 if self.showTransferProgress {
                     // Отображаем успешное завершение в окне прогресса 0.9 секунды (сокращено в 2 раза) и автоматически закрываем
-            if !isMove, !transferAborted, failed.isEmpty, !succeeded.isEmpty,
-               fromSource == .remotePhone, targetSource == .localMac,
-               self.remoteDriver.coordinator.sessionEpoch == copyDoneImportEpoch {
-                self.copyDoneOfferScopes = succeeded.map { CopyDoneScope(path: $0, isDirectory: false) }
-                self.copyDoneOfferEpoch = copyDoneImportEpoch
-                self.showCopyDoneOffer = true
-            }
                     try? await Task.sleep(nanoseconds: 900_000_000)
                     self.showTransferProgress = false
                 }
@@ -7640,6 +7633,13 @@ public final class DualPaneViewModel: ObservableObject {
             
             self.refreshPane(side: .left)
             self.refreshPane(side: .right)
+            if !isMove, !transferAborted, failed.isEmpty, !succeeded.isEmpty,
+               fromSource == .remotePhone, targetSource == .localMac,
+               self.remoteDriver.coordinator.sessionEpoch == copyDoneImportEpoch {
+                self.copyDoneOfferScopes = succeeded.map { CopyDoneScope(path: $0, isDirectory: false) }
+                self.copyDoneOfferEpoch = copyDoneImportEpoch
+                self.showCopyDoneOffer = true
+            }
         }
     }
     

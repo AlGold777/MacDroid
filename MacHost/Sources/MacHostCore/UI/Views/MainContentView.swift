@@ -79,13 +79,6 @@ public struct MainContentView: View {
                 Divider()
             }
             
-            let sidebarWidth: CGFloat = 166
-            let availableWidth = max(400, fullGeo.size.width - (vm.panelLayoutMode == .finder ? sidebarWidth : 0))
-            let paneIdealWidth = availableWidth / 2
-            
-            HSplitView {
-                if vm.panelLayoutMode == .finder {
-                    FinderSidebarView()
             if vm.showCopyDoneOffer {
                 HStack {
                     Label("Импорт завершён. Проверить копии и освободить место на телефоне?", systemImage: "checkmark.shield")
@@ -98,6 +91,13 @@ public struct MainContentView: View {
                 .padding(10)
                 .background(Color.accentColor.opacity(0.08))
             }
+            let sidebarWidth: CGFloat = 166
+            let availableWidth = max(400, fullGeo.size.width - (vm.panelLayoutMode == .finder ? sidebarWidth : 0))
+            let paneIdealWidth = availableWidth / 2
+            
+            HSplitView {
+                if vm.panelLayoutMode == .finder {
+                    FinderSidebarView()
                         .frame(minWidth: 145, idealWidth: sidebarWidth, maxWidth: 220)
                 }
                 PaneView(side: .left)
@@ -303,6 +303,9 @@ private struct MainContentSheetsModifier: ViewModifier {
             .sheet(isPresented: $vm.showDuplicateFinder) {
                 DuplicateFinderView().environmentObject(vm)
             }
+            .sheet(isPresented: $vm.showCopyDone) {
+                CopyDoneView().environmentObject(vm)
+            }
             .sheet(isPresented: $vm.showArchiveBrowser, onDismiss: { vm.closeArchiveBrowser() }) {
                 if let url = vm.archiveBrowserURL {
                     ArchiveBrowserView(archiveURL: url, title: vm.archiveBrowserTitle)
@@ -318,9 +321,6 @@ private struct MainContentSheetsModifier: ViewModifier {
                         Button("Закрыть") { vm.showArchiveBrowser = false }
                     }.padding(24).frame(minWidth: 480, minHeight: 200)
                 }
-            }
-            .sheet(isPresented: $vm.showCopyDone) {
-                CopyDoneView().environmentObject(vm)
             }
             .alert(vm.errorAlertTitle, isPresented: Binding(
                 get: { vm.showErrorAlert && vm.fullscreenGridPaneSide == nil },
