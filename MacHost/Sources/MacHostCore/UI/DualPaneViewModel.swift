@@ -269,9 +269,16 @@ public final class DualPaneViewModel: ObservableObject {
     
     // Сравнение каталогов
     @Published public var isComparing: Bool = false
-    @Published public var comparisonResult: DirectoryComparisonResult = DirectoryComparisonResult()
+    @Published public var comparisonResult: DirectoryComparisonResult = DirectoryComparisonResult() {
+        didSet { leftDisplayCache = nil; rightDisplayCache = nil }
+    }
+    @Published public private(set) var isComparisonRunning = false
     @Published public var hideIdenticalInComparison: Bool = false
     private let comparator = DirectoryComparator()
+    private var comparisonTask: Task<Void, Never>?
+    private var comparisonGeneration = 0
+    private var leftComparisonReady = true
+    private var rightComparisonReady = true
     
     // Диалоги и задачи
     @Published public var showNewFolderDialog: Bool = false
@@ -2448,19 +2455,70 @@ public final class DualPaneViewModel: ObservableObject {
     // MARK: - Directory Comparison
     public func comparePanes() {
         if isComparing {
+            cancelDirectoryComparison()
             isComparing = false
             hideIdenticalInComparison = false
             comparisonResult = DirectoryComparisonResult()
             statusMessage = "Сравнение каталогов отключено"
         } else {
             isComparing = true
-            comparisonResult = comparator.compare(left: leftItems, right: rightItems)
-            statusMessage = "Сравнение: одинаковых: \(comparisonResult.identical.count), измененных: \(comparisonResult.different.count), слева: \(comparisonResult.onlyLeft.count), справа: \(comparisonResult.onlyRight.count)"
+            startDirectoryComparison()
         }
+    }
+
+    private func cancelDirectoryComparison() {
+        comparisonGeneration &+= 1
+        comparisonTask?.cancel()
+        comparisonTask = nil
+        isComparisonRunning = false
+        comparisonResult = DirectoryComparisonResult()
+    }
+
+    private func startDirectoryComparison() {
+        cancelDirectoryComparison()
+        guard isComparing else { return }
+        // Не сравниваем прежний список одной панели с новым списком другой.
+        guard leftComparisonReady, rightComparisonReady, !leftIsStale, !rightIsStale,
+              !(isConnectingPhone && (leftSource == .remotePhone || rightSource == .remotePhone)) else {
+            statusMessage = "Сравнение не завершено: содержимое панели недоступно. Обновите панели."
+            return
+        }
+        let left = leftItems, right = rightItems
+        if !left.contains(where: \.isDirectory) || !right.contains(where: \.isDirectory) {
+            comparisonResult = comparator.compare(left: left, right: right)
+            showDirectoryComparisonSummary()
+            return
+        }
+        let generation = comparisonGeneration
+        let local = localDriver, remote = remoteDriver, comparator = comparator
+        isComparisonRunning = true
+        statusMessage = "Сравнение: проверка содержимого вложенных папок…"
+        comparisonTask = Task { [weak self] in
+            do {
+                let result = try await comparator.compare(left: left, right: right) { item in
+                    if item.source == .localMac {
+                        return try await local.listDirectory(at: item.path)
+                    }
+                    return try await remote.listDirectory(at: item.path, forceRefresh: true)
+                }
+                guard let self, self.isComparing, self.comparisonGeneration == generation else { return }
+                self.isComparisonRunning = false
+                self.comparisonResult = result
+                self.showDirectoryComparisonSummary()
+            } catch {
+                guard let self, self.isComparing, self.comparisonGeneration == generation else { return }
+                self.isComparisonRunning = false
+                self.statusMessage = "Сравнение не завершено: \(error.localizedDescription)"
+            }
+        }
+    }
+
+    private func showDirectoryComparisonSummary() {
+        statusMessage = "Сравнение: одинаковых: \(comparisonResult.identical.count), измененных: \(comparisonResult.different.count), слева: \(comparisonResult.onlyLeft.count), справа: \(comparisonResult.onlyRight.count)"
     }
     
     public func selectDifferences() {
-        guard isComparing else { return }
+        guard isComparing, !isComparisonRunning else { return }
         let diffLeft = comparisonResult.onlyLeft.union(comparisonResult.different)
         let diffRight = comparisonResult.onlyRight.union(comparisonResult.different)
         
@@ -2475,7 +2533,7 @@ public final class DualPaneViewModel: ObservableObject {
     }
     
     public func syncDifferences(direction: SyncDirection) {
-        guard isComparing else { return }
+        guard isComparing, !isComparisonRunning else { return }
         
         switch direction {
         case .leftToRight:
@@ -2781,6 +2839,11 @@ public final class DualPaneViewModel: ObservableObject {
             return
         }
         isConnectingPhone = true
+        if leftSource == .remotePhone || rightSource == .remotePhone {
+            if isComparing { cancelDirectoryComparison() }
+            if leftSource == .remotePhone { leftComparisonReady = false }
+            if rightSource == .remotePhone { rightComparisonReady = false }
+        }
         if leftSource == .remotePhone { leftIsStale = false }
         if rightSource == .remotePhone { rightIsStale = false }
         if isExplicit {
@@ -3427,6 +3490,8 @@ public final class DualPaneViewModel: ObservableObject {
     }
     
     public func refreshPane(side: PaneSide, selectPath: String? = nil) {
+        if isComparing { cancelDirectoryComparison() }
+        if side == .left { leftComparisonReady = false } else { rightComparisonReady = false }
         var path = (side == .left) ? leftPath : rightPath
         let source = (side == .left) ? leftSource : rightSource
         
@@ -3535,9 +3600,12 @@ public final class DualPaneViewModel: ObservableObject {
                 } else if source == .localMac {
                     self.statusMessage = "Mac: \(path)"
                 }
-                if self.isComparing {
-                    self.comparisonResult = self.comparator.compare(left: self.leftItems, right: self.rightItems)
+                if side == .left {
+                    self.leftComparisonReady = !isRemoteOffline
+                } else {
+                    self.rightComparisonReady = !isRemoteOffline
                 }
+                if self.isComparing { self.startDirectoryComparison() }
                 
                 // Проверка свободного места выполняется вторым шагом без задержки показа файлов
                 if let space = try? await driver.checkFreeSpace(at: path), !Task.isCancelled {

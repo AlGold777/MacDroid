@@ -34,10 +34,9 @@ public final class LocalFSDriver: FileSystemDriver, @unchecked Sendable {
             options: []
         )
         
-        return contents.compactMap { itemURL in
-            guard let vals = try? itemURL.resourceValues(forKeys: keys) else {
-                return nil
-            }
+        return try contents.map { itemURL in
+            // Неполный список нельзя выдавать за полный, особенно при сравнении.
+            let vals = try itemURL.resourceValues(forKeys: keys)
             let isDir = vals.isDirectory ?? false
             let size = UInt64(vals.fileSize ?? 0)
             let mtime = vals.contentModificationDate?.timeIntervalSince1970 ?? 0

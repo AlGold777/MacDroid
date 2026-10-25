@@ -627,6 +627,9 @@ func runAllAsyncTests() async {
         
         let space = try await localFS.checkFreeSpace(at: tempDir.path)
         assertCondition(space.total > 0, "Free space check reports valid disk capacity")
+
+        // Recursive comparator coverage runs before the larger integration suites.
+        try await runDirectoryComparatorTests()
         
         // Transfer Queue tests
         let q = TransferQueueManager.shared
@@ -1924,21 +1927,24 @@ func runAllAsyncTests() async {
             qm.clearCompleted()
             
             // 4. Directory Comparison Difference Sync
+            // Use a fresh fixture so the earlier navigation/refresh scenarios cannot leave
+            // one pane's comparison readiness false while these direct arrays are installed.
+            let comparisonVM = DualPaneViewModel()
             let leftItem1 = FileItem(id: "sync1.txt", name: "sync1.txt", path: "/tmp/sync1.txt", size: 100, mtime: 1000, isDirectory: false, source: .localMac)
             let leftItem2 = FileItem(id: "shared.txt", name: "shared.txt", path: "/tmp/shared.txt", size: 200, mtime: 2000, isDirectory: false, source: .localMac)
             let rightItem1 = FileItem(id: "sync2.txt", name: "sync2.txt", path: "/sdcard/sync2.txt", size: 300, mtime: 1000, isDirectory: false, source: .remotePhone)
             let rightItem2 = FileItem(id: "shared.txt", name: "shared.txt", path: "/sdcard/shared.txt", size: 200, mtime: 2000, isDirectory: false, source: .remotePhone)
             
-            vm.leftItems = [leftItem1, leftItem2]
-            vm.rightItems = [rightItem1, rightItem2]
-            vm.comparePanes()
-            assertCondition(vm.isComparing == true, "comparePanes activated comparison")
-            assertCondition(vm.comparisonResult.onlyLeft.contains("sync1.txt"), "Comparison found sync1.txt onlyLeft")
-            assertCondition(vm.comparisonResult.onlyRight.contains("sync2.txt"), "Comparison found sync2.txt onlyRight")
+            comparisonVM.leftItems = [leftItem1, leftItem2]
+            comparisonVM.rightItems = [rightItem1, rightItem2]
+            comparisonVM.comparePanes()
+            assertCondition(comparisonVM.isComparing == true, "comparePanes activated comparison")
+            assertCondition(comparisonVM.comparisonResult.onlyLeft.contains("sync1.txt"), "Comparison found sync1.txt onlyLeft")
+            assertCondition(comparisonVM.comparisonResult.onlyRight.contains("sync2.txt"), "Comparison found sync2.txt onlyRight")
             
             // Sync direction execution
-            vm.syncDifferences(direction: .leftToRight)
-            assertCondition(vm.statusMessage.contains("Запущена синхронизация"), "syncDifferences leftToRight launched transfer: \(vm.statusMessage)")
+            comparisonVM.syncDifferences(direction: .leftToRight)
+            assertCondition(comparisonVM.statusMessage.contains("Запущена синхронизация"), "syncDifferences leftToRight launched transfer: \(comparisonVM.statusMessage)")
             
             // 5. Folder Size Calculation on Space
             vm.leftItems = [folderItem28]
@@ -3875,7 +3881,7 @@ func runAllAsyncTests() async {
         await runTest63()
         
         print("\n🎉 ==================================================")
-        print("🎉   ALL 63 PRODUCTION TEST SUITES PASSED!          ")
+        print("🎉   ALL PRODUCTION TEST SUITES PASSED!             ")
         print("🎉 ==================================================")
         exit(0)
     } catch {
@@ -5366,6 +5372,247 @@ func runTest63() async {
 
         print("\n🎉 ALL 69 PRODUCTION TEST SUITES PASSED!")
         exit(0)
+}
+
+private struct DirectoryReadTestError: Error, Equatable {}
+
+private actor DirectoryListingMock {
+    private let listings: [String: [FileItem]]
+
+    init(_ listings: [String: [FileItem]]) {
+        self.listings = listings
+    }
+
+    func list(_ item: FileItem) throws -> [FileItem] {
+        guard let listing = listings[item.path] else {
+            throw DirectoryReadTestError()
+        }
+        return listing
+    }
+}
+
+private func runDirectoryComparatorTests() async throws {
+    print("\n--- [TEST 70] Recursive Directory Comparison ---")
+    let comparator = DirectoryComparator()
+
+    func item(_ name: String, _ path: String, directory: Bool, size: UInt64 = 0, mtime: Double = 100) -> FileItem {
+        FileItem(id: path, name: name, path: path, size: size, mtime: mtime, isDirectory: directory)
+    }
+
+    let leftRoot = item("tree", "/left/tree", directory: true)
+    let rightRoot = item("tree", "/right/tree", directory: true)
+    let leftHidden = item(".hidden", "/left/tree/.hidden", directory: false, size: 5, mtime: 100)
+    let rightHidden = item(".hidden", "/right/tree/.hidden", directory: false, size: 5, mtime: 100.5)
+    let leftSubdir = item("nested", "/left/tree/nested", directory: true)
+    let rightSubdir = item("nested", "/right/tree/nested", directory: true)
+    let leftDeep = item("deeper", "/left/tree/nested/deeper", directory: true)
+    let rightDeep = item("deeper", "/right/tree/nested/deeper", directory: true)
+    let emptyLeft = item("empty", "/left/tree/empty", directory: true)
+    let emptyRight = item("empty", "/right/tree/empty", directory: true)
+    let equalLoader = DirectoryListingMock([
+        leftRoot.path: [leftHidden, leftSubdir, emptyLeft],
+        rightRoot.path: [rightHidden, rightSubdir, emptyRight],
+        leftSubdir.path: [leftDeep], rightSubdir.path: [rightDeep],
+        leftDeep.path: [item("deep.txt", "/left/tree/nested/deeper/deep.txt", directory: false, size: 7)],
+        rightDeep.path: [item("deep.txt", "/right/tree/nested/deeper/deep.txt", directory: false, size: 7)],
+        emptyLeft.path: [], emptyRight.path: []
+    ])
+    let equalResult = try await comparator.compare(left: [leftRoot], right: [rightRoot]) { item in
+        try await equalLoader.list(item)
+    }
+    assertCondition(equalResult.identical.contains("tree") && equalResult.different.isEmpty,
+                    "Equal nested trees, empty folders, and hidden files compare identical")
+
+    let leftSizeDir = item("size", "/left/size", directory: true)
+    let rightSizeDir = item("size", "/right/size", directory: true)
+    let leftMtimeDir = item("mtime", "/left/mtime", directory: true)
+    let rightMtimeDir = item("mtime", "/right/mtime", directory: true)
+    let leftSizeNested = item("nested", "/left/size/nested", directory: true)
+    let rightSizeNested = item("nested", "/right/size/nested", directory: true)
+    let leftMtimeNested = item("nested", "/left/mtime/nested", directory: true)
+    let rightMtimeNested = item("nested", "/right/mtime/nested", directory: true)
+    let sizeLoader = DirectoryListingMock([
+        leftSizeDir.path: [leftSizeNested], rightSizeDir.path: [rightSizeNested],
+        leftSizeNested.path: [item("data", "/left/size/nested/data", directory: false, size: 10)],
+        rightSizeNested.path: [item("data", "/right/size/nested/data", directory: false, size: 11)],
+        leftMtimeDir.path: [leftMtimeNested], rightMtimeDir.path: [rightMtimeNested],
+        leftMtimeNested.path: [item("data", "/left/mtime/nested/data", directory: false, size: 10, mtime: 100)],
+        rightMtimeNested.path: [item("data", "/right/mtime/nested/data", directory: false, size: 10, mtime: 103)]
+    ])
+    let changedFiles = try await comparator.compare(
+        left: [leftSizeDir, leftMtimeDir], right: [rightSizeDir, rightMtimeDir]
+    ) { item in
+        try await sizeLoader.list(item)
+    }
+    assertCondition(changedFiles.different == ["size", "mtime"] && changedFiles.identical.isEmpty,
+                    "Nested file size and modification-time differences mark their parent folders different")
+
+    let leftMissingDir = item("missing", "/left/missing", directory: true)
+    let rightMissingDir = item("missing", "/right/missing", directory: true)
+    let leftKindDir = item("kind", "/left/kind", directory: true)
+    let rightKindDir = item("kind", "/right/kind", directory: true)
+    let leftEntry = item("entry", "/left/kind/entry", directory: false, size: 0)
+    let rightEntryDir = item("entry", "/right/kind/entry", directory: true)
+    let nestedShapeLoader = DirectoryListingMock([
+        leftMissingDir.path: [item("left-only", "/left/missing/left-only", directory: false)],
+        rightMissingDir.path: [],
+        leftKindDir.path: [leftEntry], rightKindDir.path: [rightEntryDir]
+    ])
+    let nestedShape = try await comparator.compare(
+        left: [leftMissingDir, leftKindDir], right: [rightMissingDir, rightKindDir]
+    ) { item in
+        try await nestedShapeLoader.list(item)
+    }
+    assertCondition(nestedShape.different == ["missing", "kind"],
+                    "Nested missing entries and file/directory type mismatches mark folders different")
+
+    let rootOnlyLeft = item("only-left", "/left/only-left", directory: true)
+    let rootOnlyRight = item("only-right", "/right/only-right", directory: true)
+    let rootFile = item("shape", "/left/shape", directory: false, size: 1)
+    let rootDirectory = item("shape", "/right/shape", directory: true)
+    let topLevel = comparator.compare(
+        left: [rootOnlyLeft, rootFile], right: [rootOnlyRight, rootDirectory]
+    )
+    assertCondition(topLevel.onlyLeft == ["only-left"] && topLevel.onlyRight == ["only-right"]
+                    && topLevel.different == ["shape"],
+                    "Top-level missing entries and file/directory mismatches remain classified")
+
+    do {
+        _ = try await comparator.compare(left: [leftRoot], right: [rightRoot]) { _ in
+            throw DirectoryReadTestError()
+        }
+        assertCondition(false, "Directory listing failures propagate to the caller")
+    } catch is DirectoryReadTestError {
+        assertCondition(true, "Directory listing failures propagate to the caller")
+    }
+
+    let cancellationTask = Task {
+        try await comparator.compare(left: [leftRoot], right: [rightRoot]) { _ in
+            withUnsafeCurrentTask { $0?.cancel() }
+            return []
+        }
+    }
+    do {
+        _ = try await cancellationTask.value
+        assertCondition(false, "Cancellation during directory loading throws CancellationError")
+    } catch is CancellationError {
+        assertCondition(true, "Cancellation during directory loading throws CancellationError")
+    }
+
+    let cycleBase = FileManager.default.temporaryDirectory
+        .appendingPathComponent("directory-comparison-cycle-\(UUID().uuidString)")
+    let cycleLeftURL = cycleBase.appendingPathComponent("left", isDirectory: true)
+    let cycleRightURL = cycleBase.appendingPathComponent("right", isDirectory: true)
+    try FileManager.default.createDirectory(at: cycleLeftURL, withIntermediateDirectories: true)
+    try FileManager.default.createDirectory(at: cycleRightURL, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: cycleBase) }
+    try FileManager.default.createSymbolicLink(
+        at: cycleLeftURL.appendingPathComponent("loop"), withDestinationURL: cycleLeftURL
+    )
+    try FileManager.default.createSymbolicLink(
+        at: cycleRightURL.appendingPathComponent("loop"), withDestinationURL: cycleRightURL
+    )
+    let cycleLeft = item("cycle", cycleLeftURL.path, directory: true)
+    let cycleRight = item("cycle", cycleRightURL.path, directory: true)
+    let leftLoop = item("loop", cycleLeftURL.appendingPathComponent("loop").path, directory: true)
+    let rightLoop = item("loop", cycleRightURL.appendingPathComponent("loop").path, directory: true)
+    let cycleLoader = DirectoryListingMock([
+        cycleLeft.path: [leftLoop], cycleRight.path: [rightLoop]
+    ])
+    do {
+        _ = try await comparator.compare(left: [cycleLeft], right: [cycleRight]) { item in
+            try await cycleLoader.list(item)
+        }
+        assertCondition(false, "Local symbolic-link cycles are rejected")
+    } catch is DirectoryReadTestError {
+        assertCondition(false, "Local symbolic-link cycle is detected before asking the loader for the repeated path")
+    } catch {
+        assertCondition(error.localizedDescription.contains("Циклическая ссылка"),
+                        "Local symbolic-link cycles report the unsafe traversal error")
+    }
+
+    let remoteLeft = FileItem(id: "remote-left", name: "remote", path: "/phone/remote", size: 0,
+                              mtime: 0, isDirectory: true, source: .remotePhone)
+    let remoteRight = FileItem(id: "remote-right", name: "remote", path: "/backup/remote", size: 0,
+                               mtime: 0, isDirectory: true, source: .remotePhone)
+    let remoteChildLeft = FileItem(id: "remote-a", name: "note.txt", path: "/phone/remote/note.txt",
+                                   size: 3, mtime: 100, isDirectory: false, source: .remotePhone)
+    let remoteChildRight = FileItem(id: "remote-b", name: "note.txt", path: "/backup/remote/note.txt",
+                                    size: 3, mtime: 101, isDirectory: false, source: .remotePhone)
+    let remoteLoader = DirectoryListingMock([
+        remoteLeft.path: [remoteChildLeft], remoteRight.path: [remoteChildRight]
+    ])
+    let remoteResult = try await comparator.compare(left: [remoteLeft], right: [remoteRight]) { item in
+        try await remoteLoader.list(item)
+    }
+    assertCondition(remoteResult.identical.contains("remote"),
+                    "Remote directory comparison uses an injected loader without a phone connection")
+
+    let navigationBase = FileManager.default.temporaryDirectory
+        .appendingPathComponent("directory-comparison-navigation-\(UUID().uuidString)")
+    let navigationLeftURL = navigationBase.appendingPathComponent("left", isDirectory: true)
+    let navigationRightURL = navigationBase.appendingPathComponent("right", isDirectory: true)
+    try FileManager.default.createDirectory(at: navigationLeftURL, withIntermediateDirectories: true)
+    try FileManager.default.createDirectory(at: navigationRightURL, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: navigationBase) }
+    for index in 0..<32 {
+        let leftChild = navigationLeftURL.appendingPathComponent("folder-\(index)", isDirectory: true)
+        let rightChild = navigationRightURL.appendingPathComponent("folder-\(index)", isDirectory: true)
+        try FileManager.default.createDirectory(at: leftChild, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: rightChild, withIntermediateDirectories: true)
+        try Data("left".utf8).write(to: leftChild.appendingPathComponent("payload.txt"))
+        try Data("right".utf8).write(to: rightChild.appendingPathComponent("payload.txt"))
+    }
+    let navigationLeftItem = item("tree", navigationLeftURL.path, directory: true)
+    let navigationRightItem = item("tree", navigationRightURL.path, directory: true)
+    let navigationTargetPath = navigationLeftURL.appendingPathComponent("folder-0", isDirectory: true).path
+    let refreshVM = await MainActor.run { () -> DualPaneViewModel in
+        let vm = DualPaneViewModel()
+        vm.leftSource = .localMac
+        vm.rightSource = .localMac
+        vm.leftPath = navigationLeftURL.path
+        vm.rightPath = navigationRightURL.path
+        vm.leftItems = [navigationLeftItem]
+        vm.rightItems = [navigationRightItem]
+        vm.comparePanes()
+        assertCondition(vm.isComparisonRunning, "View-model comparison starts before refresh cancellation")
+        vm.refreshPane(side: .left)
+        assertCondition(!vm.isComparisonRunning && vm.comparisonResult.identical.isEmpty,
+                        "Refreshing a pane cancels its in-flight comparison and clears results")
+        vm.comparePanes()
+        assertCondition(!vm.isComparing && vm.comparisonResult.identical.isEmpty,
+                        "Disabling comparison after refresh leaves no pending result")
+        return vm
+    }
+    try? await Task.sleep(nanoseconds: 50_000_000)
+    await MainActor.run {
+        assertCondition(refreshVM.comparisonResult.identical.isEmpty,
+                        "A cancelled and disabled comparison cannot publish results after refresh")
+    }
+
+    let navigationVM = await MainActor.run { () -> DualPaneViewModel in
+        let vm = DualPaneViewModel()
+        vm.leftSource = .localMac
+        vm.rightSource = .localMac
+        vm.leftPath = navigationLeftURL.path
+        vm.rightPath = navigationRightURL.path
+        vm.leftItems = [navigationLeftItem]
+        vm.rightItems = [navigationRightItem]
+        vm.comparePanes()
+        assertCondition(vm.isComparisonRunning, "Second view-model comparison starts before navigation")
+        vm.navigateTo(path: navigationTargetPath, side: .left)
+        assertCondition(!vm.isComparisonRunning && vm.comparisonResult.identical.isEmpty,
+                        "Navigating to another directory cancels the in-flight comparison and clears results")
+        vm.comparePanes()
+        assertCondition(!vm.isComparing && vm.comparisonResult.identical.isEmpty,
+                        "Disabling comparison after navigation leaves no pending result")
+        return vm
+    }
+    try? await Task.sleep(nanoseconds: 50_000_000)
+    await MainActor.run {
+        assertCondition(navigationVM.comparisonResult.identical.isEmpty,
+                        "A cancelled and disabled comparison cannot publish results after navigation")
+    }
 }
 
 dispatchMain()
