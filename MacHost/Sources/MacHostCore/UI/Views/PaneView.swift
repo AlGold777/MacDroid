@@ -1271,6 +1271,10 @@ public struct PaneView: View {
             }
         }
 
+        if item.source == .remotePhone {
+            Button("Освободить место — copy done") { vm.openCopyDone(side: side, item: item) }
+                .disabled(!vm.canStartCopyDone)
+        }
         Button("Удалить (F8 / Delete)", role: .destructive) {
             vm.selectContextMenuItems(for: item, side: side)
             vm.triggerDelete()
@@ -1296,6 +1300,11 @@ public struct PaneView: View {
 
     @ViewBuilder
     private var pathContextMenu: some View {
+        if (side == .left ? vm.leftSource : vm.rightSource) == .remotePhone {
+            Button("Освободить место — copy done") { vm.openCopyDone(side: side) }
+                .disabled(!vm.canStartCopyDone)
+            Divider()
+        }
         Button("Скопировать путь") {
             NSPasteboard.general.clearContents()
             NSPasteboard.general.setString(currentPath, forType: .string)
@@ -2979,6 +2988,13 @@ public struct TableDoubleClickHandler: NSViewRepresentable {
             
             menu.addItem(NSMenuItem.separator())
             
+            if item.source == .remotePhone {
+                let cleanup = NSMenuItem(title: "Освободить место — copy done", action: #selector(menuActionCopyDone(_:)), keyEquivalent: "")
+                cleanup.target = self
+                cleanup.representedObject = item
+                cleanup.isEnabled = vm.canStartCopyDone
+                menu.addItem(cleanup)
+            }
             let deleteItem = NSMenuItem(title: "Удалить (F8 / Delete)", action: #selector(menuActionDelete(_:)), keyEquivalent: "")
             deleteItem.target = self
             deleteItem.representedObject = item
@@ -3036,6 +3052,13 @@ public struct TableDoubleClickHandler: NSViewRepresentable {
         private func showEmptyAreaContextMenu(with event: NSEvent, in tv: NSTableView) {
             guard let vm = self.vm else { return }
             let menu = NSMenu(title: "Empty Area Context Menu")
+            if (side == .left ? vm.leftSource : vm.rightSource) == .remotePhone {
+                let cleanup = NSMenuItem(title: "Освободить место — copy done", action: #selector(menuActionCopyDone(_:)), keyEquivalent: "")
+                cleanup.target = self
+                cleanup.isEnabled = vm.canStartCopyDone
+                menu.addItem(cleanup)
+                menu.addItem(.separator())
+            }
             
             let newFolderItem = NSMenuItem(title: "Новая папка", action: #selector(menuActionNewFolder(_:)), keyEquivalent: "")
             newFolderItem.target = self
@@ -3091,6 +3114,11 @@ public struct TableDoubleClickHandler: NSViewRepresentable {
             self.vm?.chooseCustomApplicationAndOpen(item: item)
         }
         
+        @objc private func menuActionCopyDone(_ sender: NSMenuItem) {
+            guard let vm, vm.canStartCopyDone else { return }
+            vm.openCopyDone(side: side, item: sender.representedObject as? FileItem)
+        }
+
         @objc private func menuActionDelete(_ sender: NSMenuItem) {
             guard let item = sender.representedObject as? FileItem, let vm = self.vm else { return }
             vm.selectContextMenuItems(for: item, side: self.side)

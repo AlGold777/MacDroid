@@ -9,6 +9,7 @@ let package = Package(
         .executable(name: "MacHostTests", targets: ["MacHostTests"]),
         .executable(name: "PhoneTrashTests", targets: ["PhoneTrashTests"]),
         .executable(name: "ContentToolsTests", targets: ["ContentToolsTests"]),
+        .executable(name: "CopyDoneTests", targets: ["CopyDoneTests"]),
         .executable(name: "ArchiveInteractionTests", targets: ["ArchiveInteractionTests"]),
         .library(name: "MacHostCore", targets: ["MacHostCore"])
     ],
@@ -42,6 +43,11 @@ let package = Package(
             name: "ContentToolsTests",
             dependencies: ["MacHostCore"],
             path: "Tests/ContentToolsTests"
+        ),
+        .executableTarget(
+            name: "CopyDoneTests",
+            dependencies: ["MacHostCore"],
+            path: "Tests/CopyDoneTests"
         ),
         .executableTarget(
             name: "ArchiveInteractionTests",

@@ -315,6 +315,35 @@ public final class TransferJournal: @unchecked Sendable {
         return parseRecord(stmt: stmt!)
     }
     
+    /// Candidate locations only. Callers must freshly verify both files before offering cleanup.
+    /// A stable device ID permits discovery after an IP/port change; legacy sessions use exact endpoint identity.
+    public func copyDoneLocations(deviceID: String?, sessionIdentity: String) -> [CopyDoneLocation] {
+        lock.lock()
+        defer { lock.unlock() }
+        guard db != nil else { return [] }
+        let prefix = deviceID.map { $0 + ":" }
+        let sql = """
+        SELECT DISTINCT source_path, target_final_path FROM transfers
+        WHERE direction = 'download' AND state = 'completed'
+          AND (session_identity = ? OR (? IS NOT NULL AND substr(session_identity, 1, length(?)) = ?))
+        ORDER BY source_path, target_final_path;
+        """
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return [] }
+        defer { sqlite3_finalize(stmt) }
+        sqlite3_bind_text(stmt, 1, sessionIdentity, -1, SQLITE_TRANSIENT)
+        for index: Int32 in 2...4 {
+            if let prefix { sqlite3_bind_text(stmt, index, prefix, -1, SQLITE_TRANSIENT) }
+            else { sqlite3_bind_null(stmt, index) }
+        }
+        var result: [CopyDoneLocation] = []
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            guard let phone = sqlite3_column_text(stmt, 0), let mac = sqlite3_column_text(stmt, 1) else { continue }
+            result.append(CopyDoneLocation(phonePath: String(cString: phone), macPath: String(cString: mac)))
+        }
+        return result
+    }
+
     public func deleteTransfer(transferId: String) {
         lock.lock()
         defer { lock.unlock() }

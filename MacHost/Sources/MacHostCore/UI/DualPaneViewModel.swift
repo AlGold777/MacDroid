@@ -284,6 +284,11 @@ public final class DualPaneViewModel: ObservableObject {
     @Published public var showNewFolderDialog: Bool = false
     @Published public var showPhoneTrash = false
     @Published public var showDuplicateFinder = false
+    @Published public var showCopyDone = false
+    @Published public var copyDoneScopes: [CopyDoneScope] = []
+    @Published public var showCopyDoneOffer = false
+    public var copyDoneOfferScopes: [CopyDoneScope] = []
+    public var copyDoneOfferEpoch: UInt64 = 0
     @Published public var showArchiveBrowser = false
     @Published public private(set) var archiveBrowserURL: URL?
     @Published public private(set) var archiveBrowserTitle = ""
@@ -7069,6 +7074,12 @@ public final class DualPaneViewModel: ObservableObject {
             let ext = (fileName as NSString).pathExtension
             let base = (fileName as NSString).deletingPathExtension
             var counter = 1
+        guard !showCopyDone else {
+            statusMessage = "Закройте проверку copy done перед новой передачей."
+            return
+        }
+        showCopyDoneOffer = false
+        let copyDoneImportEpoch = remoteDriver.coordinator.sessionEpoch
             var candidate = fileName
             while existing.contains(candidate) {
                 candidate = ext.isEmpty ? "\(base)-\(counter)" : "\(base)-\(counter).\(ext)"
@@ -7622,6 +7633,13 @@ public final class DualPaneViewModel: ObservableObject {
                 
                 if self.showTransferProgress {
                     // Отображаем успешное завершение в окне прогресса 0.9 секунды (сокращено в 2 раза) и автоматически закрываем
+            if !isMove, !transferAborted, failed.isEmpty, !succeeded.isEmpty,
+               fromSource == .remotePhone, targetSource == .localMac,
+               self.remoteDriver.coordinator.sessionEpoch == copyDoneImportEpoch {
+                self.copyDoneOfferScopes = succeeded.map { CopyDoneScope(path: $0, isDirectory: false) }
+                self.copyDoneOfferEpoch = copyDoneImportEpoch
+                self.showCopyDoneOffer = true
+            }
                     try? await Task.sleep(nanoseconds: 900_000_000)
                     self.showTransferProgress = false
                 }

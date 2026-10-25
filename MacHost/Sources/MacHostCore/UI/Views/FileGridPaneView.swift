@@ -703,6 +703,11 @@ public struct FileGridPaneView: View {
 
     @ViewBuilder
     private var emptyGridContextMenu: some View {
+        if (side == .left ? vm.leftSource : vm.rightSource) == .remotePhone {
+            Button("Освободить место — copy done") { vm.openCopyDone(side: side) }
+                .disabled(!vm.canStartCopyDone)
+            Divider()
+        }
         Button("Новая папка") { vm.prepareNewFolder(side: side) }
         Button("Вставить (Cmd+V)") { vm.pasteFromClipboard(targetSide: side) }
             .disabled(!vm.canPaste)
@@ -1562,6 +1567,10 @@ public struct FileGridCell: View {
             }
         }
 
+        if item.source == .remotePhone {
+            Button("Освободить место — copy done") { vm.openCopyDone(side: side, item: item) }
+                .disabled(!vm.canStartCopyDone)
+        }
         Button("Удалить (F8 / Delete)", role: .destructive) {
             vm.selectContextMenuItems(for: item, side: side)
             vm.triggerDelete()

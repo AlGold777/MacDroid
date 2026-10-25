@@ -109,7 +109,7 @@ public struct PhoneTrashService: Sendable {
         return "/storage/\(components[1])"
     }
 
-    public func moveToTrash(at path: String) async throws -> PhoneTrashEntry {
+    public func moveToTrash(at path: String, beforeMove: @Sendable () async throws -> Void = {}) async throws -> PhoneTrashEntry {
         let originalPath = try Self.validatedSourcePath(path)
         let volumeRoot = try Self.volumeRoot(for: originalPath)
         let parentPath = (originalPath as NSString).deletingLastPathComponent
@@ -155,6 +155,7 @@ public struct PhoneTrashService: Sendable {
                   let currentEntry = try await findChild(id, in: trashRoot), currentEntry.isDirectory else {
                 throw PhoneTrashError.damagedEntry(entryPath)
             }
+            try await beforeMove()
             try await storage.rename(originalPath, payloadPath)
         } catch {
             // A lost SFTP response can make the rename outcome ambiguous. Keep the

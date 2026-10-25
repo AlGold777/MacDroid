@@ -79,6 +79,18 @@ public struct MainContentView: View {
             HSplitView {
                 if vm.panelLayoutMode == .finder {
                     FinderSidebarView()
+            if vm.showCopyDoneOffer {
+                HStack {
+                    Label("Импорт завершён. Проверить копии и освободить место на телефоне?", systemImage: "checkmark.shield")
+                        .font(.callout)
+                    Spacer()
+                    Button("Проверить — copy done") { vm.acceptCopyDoneOffer() }
+                        .disabled(!vm.canStartCopyDone)
+                    Button("Позже") { vm.showCopyDoneOffer = false }
+                }
+                .padding(10)
+                .background(Color.accentColor.opacity(0.08))
+            }
                         .frame(minWidth: 145, idealWidth: sidebarWidth, maxWidth: 220)
                 }
                 PaneView(side: .left)
@@ -290,6 +302,9 @@ private struct MainContentSheetsModifier: ViewModifier {
                         Button("Закрыть") { vm.showArchiveBrowser = false }
                     }.padding(24).frame(minWidth: 480, minHeight: 200)
                 }
+            }
+            .sheet(isPresented: $vm.showCopyDone) {
+                CopyDoneView().environmentObject(vm)
             }
             .alert(vm.errorAlertTitle, isPresented: Binding(
                 get: { vm.showErrorAlert && vm.fullscreenGridPaneSide == nil },

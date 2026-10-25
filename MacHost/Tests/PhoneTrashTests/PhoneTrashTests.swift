@@ -285,6 +285,19 @@ private func runPhoneTrashTests() async throws {
     ]),
               "A metadata-write orphan without a payload does not block valid trash entries")
 
+    try await fixture.storage.seedFile("/storage/emulated/0/before-move-failure.bin", data: Data("keep".utf8))
+    let operationsBeforeCallbackFailure = await fixture.storage.operationLog().count
+    try await expectThrows("A before-move validation failure prevents trash rename") {
+        _ = try await fixture.service.moveToTrash(at: "/storage/emulated/0/before-move-failure.bin") {
+            throw NSError(domain: "PhoneTrashTests", code: 1)
+        }
+    }
+    try check(try await fixture.storage.exists("/storage/emulated/0/before-move-failure.bin"),
+              "A before-move failure leaves the source file intact")
+    let eventsAfterCallbackFailure = await fixture.storage.operationLog().dropFirst(operationsBeforeCallbackFailure)
+    try check(!eventsAfterCallbackFailure.contains(where: { $0.hasPrefix("rename:") }),
+              "PhoneTrashService does not rename when beforeMove validation fails")
+
     try await fixture.storage.seedFile("/storage/emulated/0/rename-failure.bin", data: Data("keep".utf8))
     await fixture.storage.failNextMove()
     try await expectThrows("Rename failure is surfaced without permanent-delete fallback") {
