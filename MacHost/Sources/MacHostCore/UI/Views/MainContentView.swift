@@ -272,6 +272,9 @@ private struct MainContentSheetsModifier: ViewModifier {
                 PhoneTrashView()
                     .environmentObject(vm)
             }
+            .sheet(isPresented: $vm.showDuplicateFinder) {
+                DuplicateFinderView().environmentObject(vm)
+            }
             .alert(vm.errorAlertTitle, isPresented: Binding(
                 get: { vm.showErrorAlert && vm.fullscreenGridPaneSide == nil },
                 set: { vm.showErrorAlert = $0 }

@@ -283,6 +283,7 @@ public final class DualPaneViewModel: ObservableObject {
     // Диалоги и задачи
     @Published public var showNewFolderDialog: Bool = false
     @Published public var showPhoneTrash = false
+    @Published public var showDuplicateFinder = false
     @Published public private(set) var phoneTrashEntries: [PhoneTrashEntry] = []
     @Published public private(set) var isPhoneTrashBusy = false
     @Published public private(set) var phoneTrashError: String?

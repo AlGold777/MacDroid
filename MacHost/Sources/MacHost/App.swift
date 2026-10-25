@@ -234,6 +234,10 @@ struct MacFileManagerApp: App {
                     viewModel.openPhoneTrash()
                 }
                 .disabled(viewModel.isPhoneTrashBusy)
+
+                Button("Найти точные дубликаты…") {
+                    viewModel.showDuplicateFinder = true
+                }
                 
                 Button("Свойства (Cmd+I)") {
                     viewModel.triggerProperties()
