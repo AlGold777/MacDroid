@@ -7,6 +7,7 @@ public final class QuickLookBridge: NSObject, @preconcurrency QLPreviewPanelData
     public static let shared = QuickLookBridge()
     private var previewURL: URL?
     private var currentItem: (any QLPreviewItem)?
+    private var onCloseCleanup: (() -> Void)?
     
     public var onNavigateNext: (() -> Void)?
     public var onNavigatePrevious: (() -> Void)?
@@ -23,10 +24,20 @@ public final class QuickLookBridge: NSObject, @preconcurrency QLPreviewPanelData
     public var currentPreviewItem: (any QLPreviewItem)? {
         return currentItem
     }
+
+    private override init() {
+        super.init()
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(previewWindowWillClose(_:)),
+            name: NSWindow.willCloseNotification,
+            object: nil
+        )
+    }
     
-    public func preview(url: URL, title: String? = nil) {
-        self.previewURL = url
-        self.currentItem = preparePreviewItem(for: url, title: title)
+    public func preview(url: URL, title: String? = nil, onClose: (() -> Void)? = nil) {
+        let previousCleanup = replacePreviewState(url: url, title: title, onClose: onClose)
+        defer { previousCleanup?() }
         guard NSApp != nil, !NSApp.windows.isEmpty else { return }
         guard let panel = QLPreviewPanel.shared() else { return }
         panel.dataSource = self
@@ -38,8 +49,8 @@ public final class QuickLookBridge: NSObject, @preconcurrency QLPreviewPanelData
     
     /// Динамическое обновление отображаемого файла в уже открытом окне без перехвата фокуса клавиатуры
     public func updatePreview(url: URL, title: String? = nil) {
-        self.previewURL = url
-        self.currentItem = preparePreviewItem(for: url, title: title)
+        let previousCleanup = replacePreviewState(url: url, title: title, onClose: nil)
+        defer { previousCleanup?() }
         guard QLPreviewPanel.sharedPreviewPanelExists() else { return }
         guard let panel = QLPreviewPanel.shared(), panel.isVisible else { return }
         panel.dataSource = self
@@ -49,11 +60,42 @@ public final class QuickLookBridge: NSObject, @preconcurrency QLPreviewPanelData
     }
     
     public func close() {
-        self.previewURL = nil
-        self.currentItem = nil
-        guard QLPreviewPanel.sharedPreviewPanelExists() else { return }
-        guard let panel = QLPreviewPanel.shared(), panel.isVisible else { return }
-        panel.orderOut(nil)
+        let cleanup = clearPreviewState()
+        if QLPreviewPanel.sharedPreviewPanelExists(),
+           let panel = QLPreviewPanel.shared(), panel.isVisible {
+            panel.orderOut(nil)
+        }
+        cleanup?()
+    }
+
+    private func replacePreviewState(url: URL, title: String?, onClose: (() -> Void)?) -> (() -> Void)? {
+        let isNewURL = previewURL != url
+        let previousCleanup: (() -> Void)?
+        if isNewURL {
+            previousCleanup = onCloseCleanup
+            onCloseCleanup = onClose
+        } else {
+            previousCleanup = nil
+            if onCloseCleanup == nil { onCloseCleanup = onClose }
+        }
+        previewURL = url
+        currentItem = preparePreviewItem(for: url, title: title)
+        return previousCleanup
+    }
+
+    /// Clears state before returning the callback so reentrant close notifications cannot run cleanup twice.
+    private func clearPreviewState() -> (() -> Void)? {
+        previewURL = nil
+        currentItem = nil
+        let cleanup = onCloseCleanup
+        onCloseCleanup = nil
+        return cleanup
+    }
+
+    @objc private func previewWindowWillClose(_ notification: Notification) {
+        guard notification.object is QLPreviewPanel else { return }
+        let cleanup = clearPreviewState()
+        cleanup?()
     }
     
     public func numberOfPreviewItems(in panel: QLPreviewPanel!) -> Int {
