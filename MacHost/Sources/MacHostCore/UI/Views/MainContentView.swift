@@ -43,6 +43,13 @@ public struct MainContentView: View {
             windowToolbar
         }
         .modifier(MainContentSheetsModifier(vm: vm))
+        .sheet(isPresented: $vm.showExternalEdits) {
+            ExternalEditsView(manager: vm.externalEdits)
+        }
+        .task { await vm.externalEdits.refresh() }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+            Task { await vm.externalEdits.refresh() }
+        }
         .onAppear {
             DualPaneViewModel.shared = vm
             KeyCommandMonitor.activeViewModel = vm
@@ -188,6 +195,15 @@ public struct MainContentView: View {
             HeaderAppLauncher(windowWidth: headerWindowWidth)
         }
         
+        ToolbarItem(placement: .primaryAction) {
+            Button {
+                vm.showExternalEdits = true
+            } label: {
+                Label("Рабочие копии", systemImage: "doc.badge.arrow.up")
+            }
+            .help("Рабочие копии файлов телефона: изменения и сохранение обратно")
+            .accessibilityLabel("Рабочие копии файлов телефона")
+        }
         ToolbarItem(placement: .primaryAction) {
             TopToolbarTrailingActionsView(vm: vm)
         }

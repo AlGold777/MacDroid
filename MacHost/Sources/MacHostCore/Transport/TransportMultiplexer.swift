@@ -112,8 +112,15 @@ public final class TransportMultiplexer: @unchecked Sendable {
                           userInfo: [NSLocalizedDescriptionKey: "No active SFTP channel"])
         }
 
-        let initialPath = toSftpPath(path)
-        let (sftpPath, before) = try await resolveRemoteFile(initialPath, channel: channel)
+        return try await digestCapturedRemoteFile(at: toSftpPath(path), expectedSize: expectedSize,
+                                                  expectedMtime: expectedMtime, channel: channel)
+    }
+
+    private func digestCapturedRemoteFile(at path: String, expectedSize: UInt64, expectedMtime: Double,
+                                          channel: SFTPChannel, resolveAlternate: Bool = true) async throws -> String {
+        let (sftpPath, before) = resolveAlternate
+            ? try await resolveRemoteFile(path, channel: channel)
+            : (path, try await statRemoteFile(path, channel: channel))
         guard !before.isDirectory,
               before.size == expectedSize,
               Double(before.mtime) == expectedMtime else {
@@ -506,6 +513,101 @@ public final class TransportMultiplexer: @unchecked Sendable {
         return result
     }
     
+    /// Publishes an edited snapshot as a NEW sibling. The original is never opened for writing.
+    /// Every request uses one captured channel; a reconnect cannot redirect an in-flight save.
+    public func publishEditedCopy(snapshot: ExternalEditSnapshot, deviceFingerprint: String) async throws {
+        try await ensureConnected()
+        guard coordinator.hostKeyFingerprint == deviceFingerprint,
+              HostKeyStore.shared.pinnedDeviceId(matchingFingerprint: deviceFingerprint) != nil else {
+            throw ExternalEditError.wrongDevice
+        }
+        let captured = try coordinator.captureExternalEditSession(fingerprint: deviceFingerprint, path: snapshot.remotePath)
+        let channel = captured.channel
+        let epoch = captured.epoch
+        let target = captured.path
+        let parent = (target as NSString).deletingLastPathComponent
+        let part = (parent as NSString).appendingPathComponent(".mcdedit-\(UUID().uuidString).part")
+        let budget = coordinator.budget
+        guard budget.acquireHandle() else { throw ExternalEditError.unavailable }
+        defer { budget.releaseHandle() }
+
+        func checkSession() throws {
+            try Task.checkCancellation()
+            guard coordinator.sessionEpoch == epoch, coordinator.hostKeyFingerprint == deviceFingerprint else {
+                throw ExternalEditError.wrongDevice
+            }
+        }
+        func status(_ packet: Data, id: UInt32) async throws {
+            try checkSession()
+            let (type, payload) = try await channel.sendRequest(packet: packet, requestId: id)
+            guard type == .status else { throw contentProtocolError("Unexpected response during edited copy upload") }
+            let reply = try packetEngine.parseStatusResponse(data: payload)
+            guard reply.requestId == id else { throw contentProtocolError("Mismatched request id during edited copy upload") }
+            guard reply.code == .ok else { throw contentStatusError("Edited copy upload", reply.code, reply.message) }
+        }
+
+        try checkSession()
+        let local = try FileHandle(forReadingFrom: snapshot.url)
+        defer { try? local.close() }
+        let openId = channel.allocateRequestId()
+        // WRITE | CREAT | EXCL; never truncate an existing path, even a staging path.
+        let packet = packetEngine.createOpenPacket(requestId: openId, path: part, pflags: 0x2A)
+        let (type, payload) = try await channel.sendRequest(packet: packet, requestId: openId)
+        guard type == .handle else {
+            if type == .status {
+                let reply = try packetEngine.parseStatusResponse(data: payload)
+                throw contentStatusError("OPEN(EXCL)", reply.code, reply.message)
+            }
+            throw contentProtocolError("OPEN(EXCL): unexpected reply")
+        }
+        let opened = try packetEngine.parseHandleResponse(data: payload)
+        guard opened.requestId == openId else { throw contentProtocolError("OPEN(EXCL): mismatched id") }
+        var closed = false
+        do {
+            let limit = min(UInt64(64 * 1024), coordinator.currentServerLimits?.maxWriteLen ?? 65536)
+            guard limit > 0 else { throw contentProtocolError("Zero write limit") }
+            var offset: UInt64 = 0
+            while let data = try local.read(upToCount: Int(limit)), !data.isEmpty {
+                guard await budget.acquirePayload(bytes: data.count, isInteractive: false) else { throw CancellationError() }
+                do {
+                    let id = channel.allocateRequestId()
+                    try await status(packetEngine.createWritePacket(requestId: id, handle: opened.handle,
+                                                                   offset: offset, data: data), id: id)
+                } catch {
+                    budget.releasePayload(bytes: data.count)
+                    throw error
+                }
+                budget.releasePayload(bytes: data.count)
+                offset += UInt64(data.count)
+            }
+            let closeId = channel.allocateRequestId()
+            try await status(packetEngine.createClosePacket(requestId: closeId, handle: opened.handle), id: closeId)
+            closed = true
+            try checkSession()
+            let info = try await statRemoteFile(part, channel: channel)
+            guard info.size == offset,
+                  try await digestCapturedRemoteFile(at: part, expectedSize: info.size,
+                                                     expectedMtime: Double(info.mtime), channel: channel, resolveAlternate: false) == snapshot.digest else {
+                throw contentProtocolError("Uploaded edited copy failed SHA-256 verification")
+            }
+            // SFTP v3 RENAME refuses an existing destination. Do NOT use posix-rename here.
+            let renameId = channel.allocateRequestId()
+            try await status(packetEngine.createRenamePacket(requestId: renameId, oldPath: part, newPath: target), id: renameId)
+            try checkSession()
+            let result = try await statRemoteFile(target, channel: channel)
+            guard result.size == offset,
+                  try await digestCapturedRemoteFile(at: target, expectedSize: result.size,
+                                                     expectedMtime: Double(result.mtime), channel: channel, resolveAlternate: false) == snapshot.digest else {
+                throw ExternalEditError.uncertain(snapshot.remotePath)
+            }
+            try checkSession()
+        } catch {
+            if !closed { await sendCloseUncancellable(handle: opened.handle, channel: channel) }
+            // No destructive cleanup on an unknown outcome; retain the snapshot and journal.
+            throw error
+        }
+    }
+
     /// Потоковая выгрузка (Upload) с учетом SessionBudget и подтверждением диапазонов
     public func uploadFileStreaming(
         actionId: String,

@@ -100,6 +100,7 @@ public final class SessionCoordinator: @unchecked Sendable {
         self.port = port
         self.deviceId = deviceId
         self.expectedHostKeyAlgorithm = nil
+        self.hostKeyFingerprint = nil
         self.hostKeyAlias = nil
         self.preferredLegacyFallbackPolicy = nil
         self._interactiveChannel?.close()
@@ -630,6 +631,19 @@ public final class SessionCoordinator: @unchecked Sendable {
         lock.unlock()
     }
     
+    /// Capture identity, channel, epoch and path mapping under one lock.
+    public func captureExternalEditSession(fingerprint: String, path: String)
+        throws -> (channel: SFTPChannel, epoch: UInt64, path: String) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard hostKeyFingerprint == fingerprint,
+              let pinKey = HostKeyStore.shared.pinnedDeviceId(matchingFingerprint: fingerprint),
+              hostKeyAlias == HostKeyStore.safeHostKeyAlias(pinKey) else { throw ExternalEditError.wrongDevice }
+        guard let channel = _bulkChannel?.isRunning == true ? _bulkChannel : _interactiveChannel,
+              channel.isRunning else { throw ExternalEditError.unavailable }
+        return (channel, sessionEpoch, toSftpPath(path))
+    }
+
     public func toSftpPath(_ path: String) -> String {
         var p = path.precomposedStringWithCanonicalMapping
         lock.lock()

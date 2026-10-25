@@ -362,6 +362,7 @@ public final class ConnectionController: ObservableObject {
         try HostKeyStore.shared.installOpenSSHHostKey(hostKey, host: host, port: port, deviceId: pinKey, hostKeyAlias: hostKeyAlias)
         viewModel.remoteDriver.coordinator.setExpectedHostKeyAlgorithm(hostKey.keyAlgorithm)
         viewModel.remoteDriver.coordinator.setHostKeyAlias(hostKeyAlias)
+        viewModel.remoteDriver.coordinator.setSessionIdentity(fingerprint: fp, isMigrated: false)
 
         // Личный ключ (legacy fallback) допускается только для устройства с подтверждённым закреплённым отпечатком.
         let existingDev = DeviceRegistry.shared.device(withId: pinKey)

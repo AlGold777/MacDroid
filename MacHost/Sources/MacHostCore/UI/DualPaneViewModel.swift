@@ -643,6 +643,8 @@ public final class DualPaneViewModel: ObservableObject {
     public let queueManager = TransferQueueManager.shared
     
     public private(set) var transport = TransportMultiplexer()
+    public let externalEdits = ExternalEditManager()
+    @Published public var showExternalEdits = false
     
     // Индикаторы процесса обновления панелей
     @Published public var leftIsRefreshing: Bool = false
@@ -3800,35 +3802,18 @@ public final class DualPaneViewModel: ObservableObject {
                 }
             }
         } else {
-            // Файл на телефоне: скачивание во временный каталог и открытие
-            let fileName = item.name
-            let tempDir = FileManager.default.temporaryDirectory
-                .appendingPathComponent("MacDroidOpenedFiles")
-            let tempURL = tempDir.appendingPathComponent(fileName)
-            
-            statusMessage = "Скачивание для открытия: \(fileName)..."
-            
+            statusMessage = "Подготовка рабочей копии: \(item.name)…"
             Task {
                 do {
-                    try FileManager.default.createDirectory(
-                        at: tempDir,
-                        withIntermediateDirectories: true
-                    )
-                    
-                    let stat = try await transport.prepareRead(actionId: UUID().uuidString, path: item.path)
-                    try await transport.downloadFileStreaming(
-                        actionId: UUID().uuidString,
-                        remotePath: item.path,
-                        targetURL: tempURL,
-                        totalSize: stat.size
-                    ) { _ in }
-                    
-                    self.statusMessage = "Открыт файл: \(fileName)"
-                    NSWorkspace.shared.open(tempURL)
+                    let url = try await externalEdits.prepare(item)
+                    guard NSWorkspace.shared.open(url) else {
+                        throw NSError(domain: "ExternalEdit", code: 2,
+                                      userInfo: [NSLocalizedDescriptionKey: "Не удалось открыть рабочую копию во внешнем приложении"])
+                    }
+                    statusMessage = "Открыта рабочая копия: \(item.name). Изменения доступны в «Рабочие копии»."
                 } catch {
-                    self.statusMessage = "Ошибка скачивания для открытия: \(error.localizedDescription)"
-                    self.errorMessage = "Не удалось открыть файл с телефона: \(error.localizedDescription)"
-                    self.showErrorAlert = true
+                    errorMessage = "Не удалось открыть файл телефона: \(error.localizedDescription)"
+                    showErrorAlert = true
                 }
             }
         }
@@ -5498,26 +5483,24 @@ public final class DualPaneViewModel: ObservableObject {
             NSWorkspace.shared.open([fileURL], withApplicationAt: appURL, configuration: NSWorkspace.OpenConfiguration(), completionHandler: nil)
             statusMessage = "Открыто в \(appURL.deletingPathExtension().lastPathComponent): \(item.name)"
         } else {
-            let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("MacDroidOpenWith")
-            let tempURL = tempDir.appendingPathComponent(item.name)
-            statusMessage = "Скачивание для открытия: \(item.name)..."
-            
+            statusMessage = "Подготовка рабочей копии: \(item.name)…"
             Task {
                 do {
-                    try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
-                    let stat = try await self.transport.prepareRead(actionId: UUID().uuidString, path: item.path)
-                    try await self.transport.downloadFileStreaming(
-                        actionId: UUID().uuidString,
-                        remotePath: item.path,
-                        targetURL: tempURL,
-                        totalSize: stat.size
-                    ) { _ in }
-                    
-                    self.statusMessage = "Открыто в \(appURL.deletingPathExtension().lastPathComponent): \(item.name)"
-                    NSWorkspace.shared.open([tempURL], withApplicationAt: appURL, configuration: NSWorkspace.OpenConfiguration(), completionHandler: nil)
+                    let url = try await externalEdits.prepare(item)
+                    NSWorkspace.shared.open([url], withApplicationAt: appURL,
+                                            configuration: NSWorkspace.OpenConfiguration()) { _, error in
+                        Task { @MainActor in
+                            if let error {
+                                self.errorMessage = "Не удалось открыть рабочую копию: \(error.localizedDescription)"
+                                self.showErrorAlert = true
+                            } else {
+                                self.statusMessage = "Открыта рабочая копия: \(item.name). Изменения доступны в «Рабочие копии»."
+                            }
+                        }
+                    }
                 } catch {
-                    self.errorMessage = "Ошибка скачивания для открытия: \(error.localizedDescription)"
-                    self.showErrorAlert = true
+                    errorMessage = "Не удалось открыть файл телефона: \(error.localizedDescription)"
+                    showErrorAlert = true
                 }
             }
         }
