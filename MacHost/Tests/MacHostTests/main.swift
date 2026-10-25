@@ -352,7 +352,8 @@ let rightFiles = [
 ]
 
 let comp = comparator.compare(left: leftFiles, right: rightFiles)
-assertCondition(comp.identical.contains("same.txt"), "same.txt identified as IDENTICAL")
+assertCondition(comp.different.contains("same.txt") && comp.identical.isEmpty,
+                "Metadata-only comparison keeps same.txt unverified (conservative DIFFERENT)")
 assertCondition(comp.different.contains("diff.txt"), "diff.txt identified as DIFFERENT")
 assertCondition(comp.onlyLeft.contains("only_left.txt"), "only_left.txt identified as ONLY_LEFT")
 assertCondition(comp.onlyRight.contains("only_right.txt"), "only_right.txt identified as ONLY_RIGHT")
@@ -932,7 +933,12 @@ func runAllAsyncTests() async {
             ]
             
             vm.isComparing = true
-            vm.comparisonResult = DirectoryComparator().compare(left: vm.leftItems, right: vm.rightItems)
+            // This test exercises selection behavior using an already verified comparison result.
+            // Metadata-only compare is intentionally conservative and cannot prove identical bytes.
+            vm.comparisonResult = DirectoryComparisonResult(
+                onlyLeft: ["only_l.txt"], onlyRight: ["only_r.txt"],
+                different: ["diff.txt"], identical: ["same.txt"]
+            )
             assertCondition(vm.comparisonResult.identical.contains("same.txt"), "Comparison found identical file")
             assertCondition(vm.comparisonResult.different.contains("diff.txt"), "Comparison found differing file")
             assertCondition(vm.comparisonResult.onlyLeft.contains("only_l.txt"), "Comparison found onlyLeft file")
@@ -1854,6 +1860,54 @@ func runAllAsyncTests() async {
         try? data2_28.write(to: file2_28)
         let folderItem28 = FileItem(id: testDir28.path, name: testDir28.lastPathComponent, path: testDir28.path, size: 0, mtime: Date().timeIntervalSince1970, isDirectory: true, source: .localMac)
 
+        // Exact async comparison uses real local files so the digest path is exercised
+        // without requiring a connected phone or relying on size/mtime metadata.
+        let comparisonRoot28 = FileManager.default.temporaryDirectory
+            .appendingPathComponent("compare_panes_test_\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: comparisonRoot28) }
+        let leftCompareURL28 = comparisonRoot28.appendingPathComponent("left", isDirectory: true)
+        let rightCompareURL28 = comparisonRoot28.appendingPathComponent("right", isDirectory: true)
+        let leftTreeURL28 = leftCompareURL28.appendingPathComponent("tree", isDirectory: true)
+        let rightTreeURL28 = rightCompareURL28.appendingPathComponent("tree", isDirectory: true)
+        try FileManager.default.createDirectory(at: leftTreeURL28, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: rightTreeURL28, withIntermediateDirectories: true)
+        try Data("same bytes".utf8).write(to: leftCompareURL28.appendingPathComponent("shared.txt"))
+        try Data("same bytes".utf8).write(to: rightCompareURL28.appendingPathComponent("shared.txt"))
+        try Data("left only".utf8).write(to: leftCompareURL28.appendingPathComponent("sync1.txt"))
+        try Data("right only".utf8).write(to: rightCompareURL28.appendingPathComponent("sync2.txt"))
+        try Data("nested same bytes".utf8).write(to: leftTreeURL28.appendingPathComponent("nested.txt"))
+        try Data("nested same bytes".utf8).write(to: rightTreeURL28.appendingPathComponent("nested.txt"))
+        let comparisonLeftItems28 = try await LocalFSDriver().listDirectory(at: leftCompareURL28.path)
+        let comparisonRightItems28 = try await LocalFSDriver().listDirectory(at: rightCompareURL28.path)
+        let comparisonVM28 = await MainActor.run { () -> DualPaneViewModel in
+            let vm = DualPaneViewModel()
+            vm.leftSource = .localMac
+            vm.rightSource = .localMac
+            vm.leftPath = leftCompareURL28.path
+            vm.rightPath = rightCompareURL28.path
+            vm.leftItems = comparisonLeftItems28
+            vm.rightItems = comparisonRightItems28
+            vm.comparePanes()
+            assertCondition(vm.isComparing, "comparePanes activated exact content comparison")
+            return vm
+        }
+        var comparisonWait28 = 0
+        while comparisonWait28 < 100 {
+            let isRunning = await MainActor.run { comparisonVM28.isComparisonRunning }
+            if !isRunning { break }
+            try? await Task.sleep(nanoseconds: 20_000_000)
+            comparisonWait28 += 1
+        }
+        await MainActor.run {
+            assertCondition(comparisonVM28.isComparisonRunning == false, "Exact comparison completed asynchronously")
+            assertCondition(comparisonVM28.comparisonResult.onlyLeft.contains("sync1.txt"), "Comparison found sync1.txt onlyLeft")
+            assertCondition(comparisonVM28.comparisonResult.onlyRight.contains("sync2.txt"), "Comparison found sync2.txt onlyRight")
+            assertCondition(comparisonVM28.comparisonResult.identical.contains("shared.txt"), "Matching metadata is confirmed by exact shared-file content")
+            assertCondition(comparisonVM28.comparisonResult.identical.contains("tree"), "Nested matching files are confirmed by exact directory comparison")
+            comparisonVM28.syncDifferences(direction: .leftToRight)
+            assertCondition(comparisonVM28.statusMessage.contains("Запущена синхронизация"), "syncDifferences leftToRight launched transfer: \(comparisonVM28.statusMessage)")
+        }
+
         let vm28 = await MainActor.run { () -> DualPaneViewModel in
             let vm = DualPaneViewModel()
             vm.changeSource(to: .localMac, side: .left)
@@ -1926,25 +1980,7 @@ func runAllAsyncTests() async {
             assertCondition(pendingCount >= 2, "Failed and cancelled tasks successfully reset to queued")
             qm.clearCompleted()
             
-            // 4. Directory Comparison Difference Sync
-            // Use a fresh fixture so the earlier navigation/refresh scenarios cannot leave
-            // one pane's comparison readiness false while these direct arrays are installed.
-            let comparisonVM = DualPaneViewModel()
-            let leftItem1 = FileItem(id: "sync1.txt", name: "sync1.txt", path: "/tmp/sync1.txt", size: 100, mtime: 1000, isDirectory: false, source: .localMac)
-            let leftItem2 = FileItem(id: "shared.txt", name: "shared.txt", path: "/tmp/shared.txt", size: 200, mtime: 2000, isDirectory: false, source: .localMac)
-            let rightItem1 = FileItem(id: "sync2.txt", name: "sync2.txt", path: "/sdcard/sync2.txt", size: 300, mtime: 1000, isDirectory: false, source: .remotePhone)
-            let rightItem2 = FileItem(id: "shared.txt", name: "shared.txt", path: "/sdcard/shared.txt", size: 200, mtime: 2000, isDirectory: false, source: .remotePhone)
-            
-            comparisonVM.leftItems = [leftItem1, leftItem2]
-            comparisonVM.rightItems = [rightItem1, rightItem2]
-            comparisonVM.comparePanes()
-            assertCondition(comparisonVM.isComparing == true, "comparePanes activated comparison")
-            assertCondition(comparisonVM.comparisonResult.onlyLeft.contains("sync1.txt"), "Comparison found sync1.txt onlyLeft")
-            assertCondition(comparisonVM.comparisonResult.onlyRight.contains("sync2.txt"), "Comparison found sync2.txt onlyRight")
-            
-            // Sync direction execution
-            comparisonVM.syncDifferences(direction: .leftToRight)
-            assertCondition(comparisonVM.statusMessage.contains("Запущена синхронизация"), "syncDifferences leftToRight launched transfer: \(comparisonVM.statusMessage)")
+            // 4. Exact async directory comparison and diff sync are exercised above with real files.
             
             // 5. Folder Size Calculation on Space
             vm.leftItems = [folderItem28]
@@ -5417,9 +5453,11 @@ private func runDirectoryComparatorTests() async throws {
         rightDeep.path: [item("deep.txt", "/right/tree/nested/deeper/deep.txt", directory: false, size: 7)],
         emptyLeft.path: [], emptyRight.path: []
     ])
-    let equalResult = try await comparator.compare(left: [leftRoot], right: [rightRoot]) { item in
-        try await equalLoader.list(item)
-    }
+    let equalResult = try await comparator.compare(
+        left: [leftRoot], right: [rightRoot],
+        listDirectory: { item in try await equalLoader.list(item) },
+        contentDigest: { item in item.name == ".hidden" ? "hidden-bytes" : "deep-bytes" }
+    )
     assertCondition(equalResult.identical.contains("tree") && equalResult.different.isEmpty,
                     "Equal nested trees, empty folders, and hidden files compare identical")
 
@@ -5440,12 +5478,12 @@ private func runDirectoryComparatorTests() async throws {
         rightMtimeNested.path: [item("data", "/right/mtime/nested/data", directory: false, size: 10, mtime: 103)]
     ])
     let changedFiles = try await comparator.compare(
-        left: [leftSizeDir, leftMtimeDir], right: [rightSizeDir, rightMtimeDir]
-    ) { item in
-        try await sizeLoader.list(item)
-    }
-    assertCondition(changedFiles.different == ["size", "mtime"] && changedFiles.identical.isEmpty,
-                    "Nested file size and modification-time differences mark their parent folders different")
+        left: [leftSizeDir, leftMtimeDir], right: [rightSizeDir, rightMtimeDir],
+        listDirectory: { item in try await sizeLoader.list(item) },
+        contentDigest: { _ in "same-content" }
+    )
+    assertCondition(changedFiles.different == ["size"] && changedFiles.identical == ["mtime"],
+                    "Nested size changes are different while equal bytes ignore modification-time changes")
 
     let leftMissingDir = item("missing", "/left/missing", directory: true)
     let rightMissingDir = item("missing", "/right/missing", directory: true)
@@ -5459,10 +5497,10 @@ private func runDirectoryComparatorTests() async throws {
         leftKindDir.path: [leftEntry], rightKindDir.path: [rightEntryDir]
     ])
     let nestedShape = try await comparator.compare(
-        left: [leftMissingDir, leftKindDir], right: [rightMissingDir, rightKindDir]
-    ) { item in
-        try await nestedShapeLoader.list(item)
-    }
+        left: [leftMissingDir, leftKindDir], right: [rightMissingDir, rightKindDir],
+        listDirectory: { item in try await nestedShapeLoader.list(item) },
+        contentDigest: { _ in "unused" }
+    )
     assertCondition(nestedShape.different == ["missing", "kind"],
                     "Nested missing entries and file/directory type mismatches mark folders different")
 
@@ -5474,23 +5512,25 @@ private func runDirectoryComparatorTests() async throws {
         left: [rootOnlyLeft, rootFile], right: [rootOnlyRight, rootDirectory]
     )
     assertCondition(topLevel.onlyLeft == ["only-left"] && topLevel.onlyRight == ["only-right"]
-                    && topLevel.different == ["shape"],
-                    "Top-level missing entries and file/directory mismatches remain classified")
+                    && topLevel.different == ["shape"] && topLevel.identical.isEmpty,
+                    "Top-level missing entries and type mismatches remain classified conservatively")
 
     do {
-        _ = try await comparator.compare(left: [leftRoot], right: [rightRoot]) { _ in
-            throw DirectoryReadTestError()
-        }
+        _ = try await comparator.compare(left: [leftRoot], right: [rightRoot],
+                                         listDirectory: { _ in throw DirectoryReadTestError() },
+                                         contentDigest: { _ in "unused" })
         assertCondition(false, "Directory listing failures propagate to the caller")
     } catch is DirectoryReadTestError {
         assertCondition(true, "Directory listing failures propagate to the caller")
     }
 
     let cancellationTask = Task {
-        try await comparator.compare(left: [leftRoot], right: [rightRoot]) { _ in
-            withUnsafeCurrentTask { $0?.cancel() }
-            return []
-        }
+        try await comparator.compare(left: [leftRoot], right: [rightRoot],
+                                     listDirectory: { _ in
+                                         withUnsafeCurrentTask { $0?.cancel() }
+                                         return []
+                                     },
+                                     contentDigest: { _ in "unused" })
     }
     do {
         _ = try await cancellationTask.value
@@ -5520,9 +5560,9 @@ private func runDirectoryComparatorTests() async throws {
         cycleLeft.path: [leftLoop], cycleRight.path: [rightLoop]
     ])
     do {
-        _ = try await comparator.compare(left: [cycleLeft], right: [cycleRight]) { item in
-            try await cycleLoader.list(item)
-        }
+        _ = try await comparator.compare(left: [cycleLeft], right: [cycleRight],
+                                         listDirectory: { item in try await cycleLoader.list(item) },
+                                         contentDigest: { _ in "unused" })
         assertCondition(false, "Local symbolic-link cycles are rejected")
     } catch is DirectoryReadTestError {
         assertCondition(false, "Local symbolic-link cycle is detected before asking the loader for the repeated path")
@@ -5542,9 +5582,11 @@ private func runDirectoryComparatorTests() async throws {
     let remoteLoader = DirectoryListingMock([
         remoteLeft.path: [remoteChildLeft], remoteRight.path: [remoteChildRight]
     ])
-    let remoteResult = try await comparator.compare(left: [remoteLeft], right: [remoteRight]) { item in
-        try await remoteLoader.list(item)
-    }
+    let remoteResult = try await comparator.compare(
+        left: [remoteLeft], right: [remoteRight],
+        listDirectory: { item in try await remoteLoader.list(item) },
+        contentDigest: { _ in "remote-same-bytes" }
+    )
     assertCondition(remoteResult.identical.contains("remote"),
                     "Remote directory comparison uses an injected loader without a phone connection")
 

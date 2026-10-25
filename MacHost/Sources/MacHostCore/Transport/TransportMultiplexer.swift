@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 
 public struct RemoteStat: Sendable {
@@ -99,6 +100,140 @@ public final class TransportMultiplexer: @unchecked Sendable {
                 userInfo: [NSLocalizedDescriptionKey: "SFTP Stat unexpected response type: \(respType)"]
             )
         }
+    }
+
+    /// Streams a remote file through one captured SFTP channel and hashes its bytes.
+    /// The listing metadata is checked before and after the read to reject stale or
+    /// concurrently changed entries instead of returning an unverified digest.
+    public func digestRemoteFile(at path: String, expectedSize: UInt64, expectedMtime: Double) async throws -> String {
+        try await ensureConnected()
+        guard let channel = coordinator.interactiveChannel else {
+            throw NSError(domain: "TransportMultiplexer", code: 1,
+                          userInfo: [NSLocalizedDescriptionKey: "No active SFTP channel"])
+        }
+
+        let initialPath = toSftpPath(path)
+        let (sftpPath, before) = try await resolveRemoteFile(initialPath, channel: channel)
+        guard !before.isDirectory,
+              before.size == expectedSize,
+              Double(before.mtime) == expectedMtime else {
+            throw FileContentError.changed(path)
+        }
+
+        let openId = channel.allocateRequestId()
+        let openPacket = packetEngine.createOpenPacket(requestId: openId, path: sftpPath, pflags: 0x00000001)
+        let (openResponse, openPayload) = try await channel.sendRequest(packet: openPacket, requestId: openId)
+        guard openResponse == .handle else {
+            if openResponse == .status {
+                let status = try packetEngine.parseStatusResponse(data: openPayload)
+                guard status.requestId == openId else { throw contentProtocolError("OPEN вернул другой request id") }
+                throw contentStatusError("OPEN", status.code, status.message)
+            }
+            throw contentProtocolError("OPEN: неожиданный ответ сервера (\(openResponse))")
+        }
+        let parsedHandle = try packetEngine.parseHandleResponse(data: openPayload)
+        guard parsedHandle.requestId == openId else { throw contentProtocolError("OPEN вернул другой request id") }
+        let handle = parsedHandle.handle
+        var didClose = false
+        do {
+            var hasher = SHA256()
+            var offset: UInt64 = 0
+            let advertisedReadLimit = coordinator.currentServerLimits?.maxReadLen ?? UInt64(64 * 1024)
+            guard advertisedReadLimit > 0 else {
+                throw contentProtocolError("SFTP server advertised a zero read limit")
+            }
+            let effectiveChunkSize = min(UInt64(256 * 1024), advertisedReadLimit)
+            while offset < before.size {
+                try Task.checkCancellation()
+                let length = UInt32(min(effectiveChunkSize, before.size - offset))
+                let readId = channel.allocateRequestId()
+                let packet = packetEngine.createReadPacket(requestId: readId, handle: handle,
+                                                           offset: offset, length: length)
+                let (response, payload) = try await channel.sendRequest(packet: packet, requestId: readId,
+                                                                        timeoutSeconds: 30)
+                if response == .data {
+                    let result = try packetEngine.parseDataResponse(data: payload)
+                    guard result.requestId == readId else { throw contentProtocolError("READ вернул другой request id") }
+                    guard !result.data.isEmpty, result.data.count <= Int(length) else {
+                        throw FileContentError.incompleteRead(path)
+                    }
+                    hasher.update(data: result.data)
+                    offset += UInt64(result.data.count)
+                } else if response == .status {
+                    let status = try packetEngine.parseStatusResponse(data: payload)
+                    guard status.requestId == readId else { throw contentProtocolError("READ вернул другой request id") }
+                    if status.code == .eof { throw FileContentError.incompleteRead(path) }
+                    throw contentStatusError("READ", status.code, status.message)
+                } else {
+                    throw contentProtocolError("READ: неожиданный ответ сервера (\(response))")
+                }
+            }
+
+            try await closeContentHandle(handle, channel: channel)
+            didClose = true
+            try Task.checkCancellation()
+            let after = try await statRemoteFile(sftpPath, channel: channel)
+            guard !after.isDirectory, after.size == before.size, after.mtime == before.mtime else {
+                throw FileContentError.changed(path)
+            }
+            return hasher.finalize().map { String(format: "%02x", $0) }.joined()
+        } catch {
+            if !didClose { await sendCloseUncancellable(handle: handle, channel: channel) }
+            throw error
+        }
+    }
+
+    private func resolveRemoteFile(_ initialPath: String, channel: SFTPChannel) async throws -> (String, RemoteStat) {
+        do {
+            return (initialPath, try await statRemoteFile(initialPath, channel: channel))
+        } catch let error as NSError
+            where error.domain == "TransportMultiplexer" && error.code == Int(SFTPStatusCode.noSuchFile.rawValue) {
+            let alternatePath: String
+            if RemoteSFTPDriver.isEmulatedZeroPath(initialPath) {
+                let suffix = String(initialPath.dropFirst("/emulated/0".count))
+                alternatePath = suffix.isEmpty ? "/" : suffix
+            } else {
+                alternatePath = "/emulated/0" + (initialPath == "/" ? "" : initialPath)
+            }
+            return (alternatePath, try await statRemoteFile(alternatePath, channel: channel))
+        }
+    }
+
+    private func statRemoteFile(_ path: String, channel: SFTPChannel) async throws -> RemoteStat {
+        let requestId = channel.allocateRequestId()
+        let packet = packetEngine.createStatPacket(requestId: requestId, path: path)
+        let (response, payload) = try await channel.sendRequest(packet: packet, requestId: requestId)
+        if response == .attrs {
+            let parsed = try packetEngine.parseAttrsResponse(data: payload)
+            guard parsed.requestId == requestId else { throw contentProtocolError("STAT вернул другой request id") }
+            return RemoteStat(size: parsed.size, mtime: Int64(parsed.mtime), isDirectory: parsed.isDirectory)
+        }
+        if response == .status {
+            let status = try packetEngine.parseStatusResponse(data: payload)
+            guard status.requestId == requestId else { throw contentProtocolError("STAT вернул другой request id") }
+            throw contentStatusError("STAT", status.code, status.message)
+        }
+        throw contentProtocolError("STAT: неожиданный ответ сервера (\(response))")
+    }
+
+    private func closeContentHandle(_ handle: Data, channel: SFTPChannel) async throws {
+        let requestId = channel.allocateRequestId()
+        let packet = packetEngine.createClosePacket(requestId: requestId, handle: handle)
+        let (response, payload) = try await channel.sendRequest(packet: packet, requestId: requestId)
+        guard response == .status else { throw contentProtocolError("CLOSE: неожиданный ответ сервера (\(response))") }
+        let status = try packetEngine.parseStatusResponse(data: payload)
+        guard status.requestId == requestId else { throw contentProtocolError("CLOSE вернул другой request id") }
+        guard status.code == .ok else { throw contentStatusError("CLOSE", status.code, status.message) }
+    }
+
+    private func contentStatusError(_ operation: String, _ code: SFTPStatusCode, _ message: String) -> NSError {
+        NSError(domain: "TransportMultiplexer", code: Int(code.rawValue),
+                userInfo: [NSLocalizedDescriptionKey: "\(operation): \(message) (SFTP \(code.rawValue))"])
+    }
+
+    private func contentProtocolError(_ message: String) -> NSError {
+        NSError(domain: "TransportMultiplexer", code: 100,
+                userInfo: [NSLocalizedDescriptionKey: message])
     }
     
     /// Чтение начального чанка файла для безопасной верификации префикса при возобновлении (Resume)

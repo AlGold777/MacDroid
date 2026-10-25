@@ -2489,23 +2489,19 @@ public final class DualPaneViewModel: ObservableObject {
             return
         }
         let left = leftItems, right = rightItems
-        if !left.contains(where: \.isDirectory) || !right.contains(where: \.isDirectory) {
-            comparisonResult = comparator.compare(left: left, right: right)
-            showDirectoryComparisonSummary()
-            return
-        }
         let generation = comparisonGeneration
         let local = localDriver, remote = remoteDriver, comparator = comparator
+        let content = FileContentService(transport: transport)
         isComparisonRunning = true
-        statusMessage = "Сравнение: проверка содержимого вложенных папок…"
+        statusMessage = "Сравнение содержимого файлов и вложенных папок (SHA-256)…"
         comparisonTask = Task { [weak self] in
             do {
-                let result = try await comparator.compare(left: left, right: right) { item in
+                let result = try await comparator.compare(left: left, right: right, listDirectory: { item in
                     if item.source == .localMac {
                         return try await local.listDirectory(at: item.path)
                     }
                     return try await remote.listDirectory(at: item.path, forceRefresh: true)
-                }
+                }, contentDigest: { item in try await content.digest(item) })
                 guard let self, self.isComparing, self.comparisonGeneration == generation else { return }
                 self.isComparisonRunning = false
                 self.comparisonResult = result

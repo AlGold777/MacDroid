@@ -78,6 +78,8 @@ public struct DirectoryComparisonResult: Sendable {
 public final class DirectoryComparator: Sendable {
     public init() {}
     
+    /// Metadata-only classification. Matching files remain unverified and are
+    /// deliberately marked different; use the digest overload to prove equality.
     public func compare(left: [FileItem], right: [FileItem]) -> DirectoryComparisonResult {
         let leftMap = Dictionary(left.map { ($0.name, $0) }, uniquingKeysWith: { a, _ in a })
         let rightMap = Dictionary(right.map { ($0.name, $0) }, uniquingKeysWith: { a, _ in a })
@@ -90,15 +92,9 @@ public final class DirectoryComparator: Sendable {
         for (name, leftItem) in leftMap {
             if let rightItem = rightMap[name] {
                 if leftItem.isDirectory && rightItem.isDirectory {
-                    // Без чтения содержимого равенство каталогов не установлено.
                     different.insert(name)
-                } else if !leftItem.isDirectory && !rightItem.isDirectory {
-                    if leftItem.size == rightItem.size && abs(leftItem.mtime - rightItem.mtime) < 2 {
-                        identical.insert(name)
-                    } else {
-                        different.insert(name)
-                    }
                 } else {
+                    // Size and mtime cannot establish content equality.
                     different.insert(name)
                 }
             } else {
@@ -120,7 +116,8 @@ public final class DirectoryComparator: Sendable {
         )
     }
 
-    /// Сохраняет результаты на уровне панелей, проверяя каждую общую папку до листьев.
+    /// Legacy metadata-only traversal. It cannot mark matching files identical.
+    @available(*, deprecated, message: "Use the contentDigest overload for verified comparison")
     public func compare(
         left: [FileItem], right: [FileItem],
         listDirectory: @Sendable (FileItem) async throws -> [FileItem]
@@ -140,6 +137,100 @@ public final class DirectoryComparator: Sendable {
         try Task.checkCancellation()
         return DirectoryComparisonResult(onlyLeft: base.onlyLeft, onlyRight: base.onlyRight,
                                          different: different, identical: identical)
+    }
+
+    /// Recursively compares common directories and hashes same-sized files.
+    /// Modification dates never establish equality.
+    public func compare(
+        left: [FileItem], right: [FileItem],
+        listDirectory: @Sendable (FileItem) async throws -> [FileItem],
+        contentDigest: @Sendable (FileItem) async throws -> String
+    ) async throws -> DirectoryComparisonResult {
+        try Task.checkCancellation()
+        var onlyLeft = Set<String>()
+        var onlyRight = Set<String>()
+        var different = Set<String>()
+        var identical = Set<String>()
+        let leftMap = Dictionary(left.map { ($0.name, $0) }, uniquingKeysWith: { first, _ in first })
+        let rightMap = Dictionary(right.map { ($0.name, $0) }, uniquingKeysWith: { first, _ in first })
+
+        for (name, leftItem) in leftMap {
+            try Task.checkCancellation()
+            guard let rightItem = rightMap[name] else {
+                onlyLeft.insert(name)
+                continue
+            }
+            guard leftItem.isDirectory == rightItem.isDirectory else {
+                different.insert(name)
+                continue
+            }
+            if leftItem.isDirectory {
+                if try await directoriesMatchExact(leftItem, rightItem,
+                                                   listDirectory: listDirectory,
+                                                   contentDigest: contentDigest) {
+                    identical.insert(name)
+                } else {
+                    different.insert(name)
+                }
+            } else if leftItem.size != rightItem.size {
+                different.insert(name)
+            } else {
+                let leftDigest = try await contentDigest(leftItem)
+                try Task.checkCancellation()
+                let rightDigest = try await contentDigest(rightItem)
+                if leftDigest == rightDigest {
+                    identical.insert(name)
+                } else {
+                    different.insert(name)
+                }
+            }
+        }
+        for name in rightMap.keys where leftMap[name] == nil {
+            onlyRight.insert(name)
+        }
+        try Task.checkCancellation()
+        return DirectoryComparisonResult(onlyLeft: onlyLeft, onlyRight: onlyRight,
+                                         different: different, identical: identical)
+    }
+
+    private func directoriesMatchExact(
+        _ left: FileItem, _ right: FileItem,
+        listDirectory: @Sendable (FileItem) async throws -> [FileItem],
+        contentDigest: @Sendable (FileItem) async throws -> String
+    ) async throws -> Bool {
+        var pending: [(FileItem, FileItem, Set<String>, Set<String>, Int)] = [(left, right, [], [], 0)]
+        while let (lhs, rhs, leftAncestors, rightAncestors, depth) = pending.popLast() {
+            try Task.checkCancellation()
+            let leftKey = directoryKey(lhs)
+            let rightKey = directoryKey(rhs)
+            guard depth < 256, !leftAncestors.contains(leftKey), !rightAncestors.contains(rightKey) else {
+                throw DirectoryComparisonError.unsafeTraversal(lhs.path)
+            }
+            let leftChildren = try await listDirectory(lhs)
+            try Task.checkCancellation()
+            let rightChildren = try await listDirectory(rhs)
+            try Task.checkCancellation()
+            let leftMap = Dictionary(leftChildren.map { ($0.name, $0) }, uniquingKeysWith: { first, _ in first })
+            let rightMap = Dictionary(rightChildren.map { ($0.name, $0) }, uniquingKeysWith: { first, _ in first })
+            guard leftMap.count == rightMap.count,
+                  leftMap.keys.allSatisfy({ rightMap[$0] != nil }) else { return false }
+
+            for (name, child) in leftMap {
+                try Task.checkCancellation()
+                guard let other = rightMap[name], child.isDirectory == other.isDirectory else { return false }
+                if child.isDirectory {
+                    pending.append((child, other, leftAncestors.union([leftKey]),
+                                    rightAncestors.union([rightKey]), depth + 1))
+                } else {
+                    guard child.size == other.size else { return false }
+                    let leftDigest = try await contentDigest(child)
+                    try Task.checkCancellation()
+                    let rightDigest = try await contentDigest(other)
+                    guard leftDigest == rightDigest else { return false }
+                }
+            }
+        }
+        return true
     }
 
     private func directoriesMatch(
