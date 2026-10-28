@@ -48,15 +48,17 @@ public enum UsbRoutePolicy {
     }
 
     /// Фоновое автоподключение для одного авторизованного серийника.
-    /// knownAutoConnect: nil — серийник не известен реестру, тогда нужна проба; иначе флаг записи.
+    /// Подключение только после пробы: ключ узла должен совпасть с закреплённым, и запись должна иметь autoConnect.
+    /// Известный реестру серийник проверяется так же, как неизвестный: серийник — лишь маршрут, а ключ может смениться.
+    /// knownAutoConnect == false — запись с выключенным автоподключением не подключается, проба не нужна (.skip).
     public static func backgroundDecision(
         serial: String,
         knownAutoConnect: Bool?,
         probe: () -> ProbeOutcome,
         autoConnectFor: (_ pinKey: String, _ fingerprint: String) -> Bool?
     ) -> BackgroundDecision {
-        if let known = knownAutoConnect {
-            return known ? .connect(serial: serial) : .skip
+        if knownAutoConnect == false {
+            return .skip
         }
         switch probe() {
         case .notPinned:

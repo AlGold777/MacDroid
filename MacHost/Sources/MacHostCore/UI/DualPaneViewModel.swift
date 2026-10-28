@@ -3030,8 +3030,8 @@ public final class DualPaneViewModel: ObservableObject {
                 let key = AutoConnectBackoffTable.usbKey(serial: id)
                 let allowed = newSerials.contains(id) ? !backoffState.isSuppressed(key) : backoffState.allowed(key)
                 guard allowed else { continue }
-                // Серийник — маршрут: известный реестру находится по нему (даже если сопряжён по Wi-Fi);
-                // неизвестный опознаётся пробой ключа узла.
+                // Серийник — маршрут. Подключение только после пробы ключа узла, и для известного серийника тоже:
+                // иначе смена ключа телефона дошла бы до установки компаньона до проверки.
                 let decision = UsbRoutePolicy.backgroundDecision(
                     serial: id,
                     knownAutoConnect: DeviceRegistry.shared.device(matchingUsbSerial: id)?.autoConnect,
@@ -3582,7 +3582,10 @@ public final class DualPaneViewModel: ObservableObject {
                 if side == .left { leftIsStale = true } else { rightIsStale = true }
                 // Подсказка для пользователя, которое действие (навигация, своп панелей) не подключает телефон явно.
                 // Успешное автоподключение перезапишет её собственным статусом «✓ Подключено…».
-                statusMessage = "Телефон не подключен — нажмите PHONE"
+                // Подсказка не перебивает «Телефон отключен» после ручного отключения и текущее автоподключение
+                if !ConnectionController.shared.isManualDisconnectSuppressed && !isAutoConnecting {
+                    statusMessage = "Телефон не подключен — нажмите PHONE"
+                }
                 autoConnectPhoneIfAvailable()
                 return
             }

@@ -3457,9 +3457,15 @@ func runAllAsyncTests() async {
             // USB-опознание по ключу (без adb и сети: ввод-вывод подставлен)
             var probeCalls = 0
             let countingProbe: () -> UsbRoutePolicy.ProbeOutcome = { probeCalls += 1; return .notPinned }
+            var knownOnProbes = 0
             let knownOn = UsbRoutePolicy.backgroundDecision(serial: "SERIAL1", knownAutoConnect: true,
-                                                            probe: countingProbe, autoConnectFor: { _, _ in nil })
-            assertCondition(knownOn == .connect(serial: "SERIAL1") && probeCalls == 0, "Known serial with autoConnect connects without a probe")
+                                                            probe: { knownOnProbes += 1; return .notPinned }, autoConnectFor: { _, _ in nil })
+            assertCondition(knownOn == .pause && knownOnProbes == 1, "Known serial is probed too; a mismatched key pauses and does not connect")
+            var knownProbes = 0
+            let knownPinned = UsbRoutePolicy.backgroundDecision(serial: "SERIAL1", knownAutoConnect: true,
+                                                                probe: { knownProbes += 1; return .pinned(pinKey: "bonjour-pixel", fingerprint: "SHA256:pixel") },
+                                                                autoConnectFor: { _, _ in true })
+            assertCondition(knownPinned == .connect(serial: "SERIAL1") && knownProbes == 1, "Known serial connects only after its key is verified by a probe")
             let knownOff = UsbRoutePolicy.backgroundDecision(serial: "SERIAL1", knownAutoConnect: false,
                                                              probe: countingProbe, autoConnectFor: { _, _ in nil })
             assertCondition(knownOff == .skip && probeCalls == 0, "Known serial with autoConnect off is skipped without a probe")
@@ -3481,8 +3487,9 @@ func runAllAsyncTests() async {
             assertCondition(reg.device(withId: "bonjour-pixel")?.lastKnownHost == "192.168.1.60", "The cable connection keeps the Wi-Fi route")
             var secondProbes = 0
             let second = UsbRoutePolicy.backgroundDecision(serial: "SERIAL9", knownAutoConnect: reg.device(matchingUsbSerial: "SERIAL9")?.autoConnect,
-                                                           probe: { secondProbes += 1; return .notPinned }, autoConnectFor: { _, _ in nil })
-            assertCondition(second == .connect(serial: "SERIAL9") && secondProbes == 0, "Next cable connection is recognized by the stored serial, without a probe")
+                                                           probe: { secondProbes += 1; return .pinned(pinKey: "bonjour-pixel", fingerprint: "SHA256:pixel") },
+                                                           autoConnectFor: { pinKey, fp in reg.device(withId: pinKey, orFingerprint: fp)?.autoConnect })
+            assertCondition(second == .connect(serial: "SERIAL9") && secondProbes == 1, "Next cable connection by a stored serial is still verified by a probe before connecting")
 
             // Выключенное автоподключение у совпавшего ключа не подключается
             reg.setAutoConnect(id: "no-host", enabled: false)
