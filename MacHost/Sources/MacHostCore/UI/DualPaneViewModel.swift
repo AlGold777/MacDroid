@@ -7257,15 +7257,20 @@ public final class DualPaneViewModel: ObservableObject {
                 self.statusMessage = "Внимание: пропущено защищенных папок (\(plan.skippedFolders.count))"
             }
             
-            // 1. Предварительное создание всех подпапок (включая пустые)
-            for dir in plan.directoriesToCreate {
-                if targetSource == .localMac {
+            // 1. Предварительное создание всех подпапок (включая пустые).
+            // Папка, созданная сейчас, заведомо пуста: листинг для проверки конфликтов в ней не нужен.
+            var targetListingCache: [String: [String: FileItem]] = [:]
+            if targetSource == .localMac {
+                for dir in plan.directoriesToCreate {
                     try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true, attributes: nil)
-                } else {
-                    try? await self.remoteDriver.createDirectory(at: dir)
+                }
+            } else {
+                let created = await Self.createRemoteDirectories(plan.directoriesToCreate, driver: self.remoteDriver)
+                for dir in created {
+                    targetListingCache[dir] = [:]
                 }
             }
-            
+
             // 2. Расчёт общего объёма и регистрация файлов в очереди
             var totalQueueBytes: UInt64 = 0
             var taskIds: [String: UUID] = [:]
@@ -7283,380 +7288,283 @@ public final class DualPaneViewModel: ObservableObject {
                 let tid = TransferQueueManager.shared.enqueue(source: fileItem, targetDir: file.targetDirPath, isMove: isMove)
                 taskIds[file.sourcePath] = tid
             }
-            
+
             var succeeded: [String] = []
             var failed: [(path: String, error: String)] = []
             var skipped: [String] = []
-            var completedBytesSoFar: UInt64 = 0
             let totalCount = plan.filesToTransfer.count
-            var completedCount = 0
             let startTime = Date()
-            // Стратегия конфликта выбирается для каждого файла: по диалогу либо по «применить ко всем»
-            var targetListingCache: [String: [String: FileItem]] = [:]
             var stoppedByUser = false
             var transferredMediaPaths: [String] = []
             let mediaExtensions = Set(["jpg", "jpeg", "png", "heic", "dng", "webp", "mp4", "mov", "mkv", "avi", "3gp", "mp3", "flac", "wav", "aac", "m4a"])
-            
-            for file in plan.filesToTransfer {
-                if Task.isCancelled { break }
-                
-                let taskId = taskIds[file.sourcePath]
-                if let tid = taskId, TransferQueueManager.shared.isTaskCancelled(id: tid) {
-                    skipped.append(file.sourcePath)
-                    continue
-                }
-                
-                // Проверка паузы
-                while self.isTransferPaused && !Task.isCancelled {
-                    try? await Task.sleep(nanoseconds: 100_000_000)
-                }
-                if Task.isCancelled { break }
+            let progressState = TransferProgressState(totalBytes: totalQueueBytes, totalCount: totalCount)
+            let orchestrator = self.orchestrator
+            // Mac ↔ телефон: несколько файлов одновременно (запросы по одному каналу различаются по requestId),
+            // иначе на мелких файлах канал простаивает в ожидании ответов. Mac→Mac и телефон→телефон — по одному.
+            let concurrency = (fromSource != targetSource) ? Self.parallelTransferLimit : 1
 
-                // D6: детект конфликта имён в цели и диалог выбора. D4/D13: «нет файла» отличается от ошибки сети —
-                // при ошибке проверки файл НЕ передаётся (раньше любая ошибка считалась «файла нет» и вела к перезаписи).
-                let conflict: ConflictContext?
-                do {
-                    conflict = try await self.detectTransferConflict(
-                        file: file,
-                        fromSource: fromSource,
-                        targetSource: targetSource,
-                        totalFilesCount: totalCount,
-                        listingCache: &targetListingCache
-                    )
-                } catch {
-                    failed.append((path: file.sourcePath, error: "Не удалось проверить папку назначения: \(error.localizedDescription)"))
-                    completedCount += 1
-                    if let tid = taskId {
-                        TransferQueueManager.shared.markFailed(id: tid, error: error.localizedDescription)
-                    }
-                    continue
-                }
-
-                let jobId = UUID().uuidString
-                let itemId = UUID().uuidString
-                let path = file.sourcePath
-                let fileName = file.fileName
-                let fileSize = file.size
-                let targetSubDir = file.targetDirPath
-                let targetSubDirURL = URL(fileURLWithPath: targetSubDir)
-
-                var fileStrategy: ConflictResolutionStrategy? = nil
-                var destinationFileName: String? = nil
-
-                if let conflict = conflict {
-                    if let remembered = self.rememberedStrategy {
-                        fileStrategy = remembered
-                    } else {
-                        self.statusMessage = "Конфликт имени: \(fileName)"
-                        guard let resolution = await self.promptConflictResolution(conflict: conflict) else {
-                            // Диалог закрыт без выбора: прекращаем всю передачу
-                            SSHTransportLog.write("UI_TRANSFER cancelled by user at conflict dialog")
-                            TransferQueueManager.shared.cancelAll()
-                            stoppedByUser = true
-                            break
+            // Учёт результата одного файла (выполняется на MainActor по мере завершения передач)
+            @MainActor func record(_ job: TransferJob, _ outcome: Result<TransferExecutionResult, Error>) {
+                let completedBytes = progressState.finish(path: job.path, transferredBytes: {
+                    if case .success(let result) = outcome, case .skipped = result { return 0 }
+                    if case .success = outcome { return job.fileSize }
+                    return 0
+                }())
+                self.transferProgress = (totalQueueBytes > 0)
+                    ? min(1.0, Double(completedBytes) / Double(totalQueueBytes))
+                    : (Double(progressState.completedCount) / Double(max(1, totalCount)))
+                switch outcome {
+                case .success(let result):
+                    switch result {
+                    case .skipped:
+                        skipped.append(job.path)
+                        if let tid = job.taskId {
+                            TransferQueueManager.shared.updateProgress(id: tid, progress: 1.0, bytesTransferred: job.fileSize, speed: 0, eta: nil)
                         }
-                        fileStrategy = resolution.action
-                        if let custom = resolution.customName, !custom.isEmpty {
-                            destinationFileName = custom
+                    case .transferred:
+                        succeeded.append(job.path)
+                        if let tid = job.taskId {
+                            TransferQueueManager.shared.updateProgress(id: tid, progress: 1.0, bytesTransferred: job.fileSize, speed: 0, eta: nil)
+                        }
+                    case .transferredWithoutSourceDeletion(let reason):
+                        succeeded.append(job.path)
+                        failed.append((path: job.path, error: reason))
+                        if let tid = job.taskId {
+                            TransferQueueManager.shared.markFailed(id: tid, error: reason)
                         }
                     }
-                }
-                if Task.isCancelled { break }
-
-                // Без конфликта стратегия — «пропустить»: если цель успеет появиться, оркестратор её не затрёт
-                let effectiveStrategy = fileStrategy ?? .skip
-
-                // Обработка стратегии
-                switch effectiveStrategy {
-                case .skip:
-                    if conflict != nil {
-                        skipped.append(file.sourcePath)
-                        if let tid = taskId {
+                    if fromSource == .localMac, targetSource == .remotePhone {
+                        let wasTransferred: Bool
+                        if case .skipped = result { wasTransferred = false } else { wasTransferred = true }
+                        let ext = URL(fileURLWithPath: job.displayName).pathExtension.lowercased()
+                        if wasTransferred && mediaExtensions.contains(ext) {
+                            transferredMediaPaths.append((job.targetDir as NSString).appendingPathComponent(job.displayName))
+                        }
+                    }
+                    if fromSource == .remotePhone, targetSource == .localMac {
+                        SSHTransportLog.verbose("UI_COPY_PHONE_TO_MAC_RESULT path=\(job.path) result=\(result)")
+                    }
+                case .failure(let error):
+                    if error is CancellationError {
+                        if let tid = job.taskId {
                             TransferQueueManager.shared.cancelTask(id: tid)
                         }
+                    } else {
+                        failed.append((path: job.path, error: error.localizedDescription))
+                        if let tid = job.taskId {
+                            TransferQueueManager.shared.markFailed(id: tid, error: error.localizedDescription)
+                        }
+                    }
+                }
+            }
+
+            await withTaskGroup(of: (TransferJob, Result<TransferExecutionResult, Error>).self) { group in
+                var inFlight = 0
+                for file in plan.filesToTransfer {
+                    if Task.isCancelled { break }
+
+                    let taskId = taskIds[file.sourcePath]
+                    if let tid = taskId, TransferQueueManager.shared.isTaskCancelled(id: tid) {
+                        skipped.append(file.sourcePath)
                         continue
                     }
 
-                case .customRename:
-                    // Новое имя тоже не должно затирать существующий объект
-                    let customName = destinationFileName ?? fileName
-                    let customExists: Bool
-                    if targetSource == .localMac {
-                        customExists = FileManager.default.fileExists(atPath: (targetSubDir as NSString).appendingPathComponent(customName))
-                    } else {
-                        customExists = targetListingCache[targetSubDir]?[customName] != nil
+                    // Проверка паузы (уже идущие передачи завершаются)
+                    while self.isTransferPaused && !Task.isCancelled {
+                        try? await Task.sleep(nanoseconds: 100_000_000)
                     }
-                    if customExists {
-                        skipped.append(file.sourcePath)
-                        failed.append((path: file.sourcePath, error: "Объект с именем «\(customName)» уже существует"))
-                        completedCount += 1
+                    if Task.isCancelled { break }
+
+                    // D6: детект конфликта имён в цели и диалог выбора. D4/D13: «нет файла» отличается от ошибки сети —
+                    // при ошибке проверки файл НЕ передаётся (раньше любая ошибка считалась «файла нет» и вела к перезаписи).
+                    let conflict: ConflictContext?
+                    do {
+                        conflict = try await self.detectTransferConflict(
+                            file: file,
+                            fromSource: fromSource,
+                            targetSource: targetSource,
+                            totalFilesCount: totalCount,
+                            listingCache: &targetListingCache
+                        )
+                    } catch {
+                        failed.append((path: file.sourcePath, error: "Не удалось проверить папку назначения: \(error.localizedDescription)"))
+                        _ = progressState.finish(path: file.sourcePath, transferredBytes: 0)
                         if let tid = taskId {
-                            TransferQueueManager.shared.markFailed(id: tid, error: "Объект с именем «\(customName)» уже существует")
+                            TransferQueueManager.shared.markFailed(id: tid, error: error.localizedDescription)
                         }
                         continue
                     }
 
-                case .skipIfIdentical, .overwriteIfNewer, .autoRename, .overwrite:
-                    // Решение принимает оркестратор (Mac/телефон) либо resolvePhonePlacement (телефон → телефон)
-                    break
-                }
+                    let fileName = file.fileName
+                    let targetSubDir = file.targetDirPath
 
-                let effectiveDisplayName = destinationFileName ?? fileName
-                let actionVerb = isMove ? "Перемещение: " : "Копирование: "
-                self.currentTransferFileName = effectiveDisplayName
-                self.statusMessage = "\(actionVerb)\(effectiveDisplayName)"
-                if self.showConflictDialog {
-                    self.showConflictDialog = false
-                    self.activeConflict = nil
-                }
-                if !self.isTransferMinimized && !self.showTransferProgress {
-                    self.showTransferProgress = true
-                }
-                
-                var lastUIProgressUpdate: CFAbsoluteTime = 0
-                let onProgress: @Sendable (Double) -> Void = { @Sendable pct in
-                    Task { @MainActor [weak self] in
-                        guard let self = self else { return }
-                        let currentFileBytes = UInt64(Double(fileSize) * pct)
-                        let totalTransferredNow = completedBytesSoFar + currentFileBytes
-                        speedTracker.update(bytesTransferred: totalTransferredNow)
-                        
-                        let currentSpeed = speedTracker.currentSpeedBytesPerSec
-                        let remainingBytes = (totalQueueBytes > totalTransferredNow) ? (totalQueueBytes - totalTransferredNow) : 0
-                        let eta = speedTracker.calculateETA(remainingBytes: remainingBytes)
-                        
-                        // Троттлинг: обновляем @Published свойства UI не чаще 15 раз/сек (~67мс),
-                        // предотвращая лаги SwiftUI при передаче со скоростью 100+ МБ/с
-                        let now = CFAbsoluteTimeGetCurrent()
-                        let isComplete = pct >= 1.0
-                        if isComplete || (now - lastUIProgressUpdate >= 0.067) {
-                            lastUIProgressUpdate = now
-                            self.transferSpeed = TransferSpeedTracker.formatSpeed(currentSpeed)
-                            self.transferETA = TransferSpeedTracker.formatETA(eta)
-                            
-                            if totalQueueBytes > 0 {
-                                self.transferProgress = min(1.0, Double(totalTransferredNow) / Double(totalQueueBytes))
-                            } else {
-                                self.transferProgress = Double(completedCount) / Double(max(1, totalCount))
+                    var fileStrategy: ConflictResolutionStrategy? = nil
+                    var destinationFileName: String? = nil
+
+                    if let conflict = conflict {
+                        if let remembered = self.rememberedStrategy {
+                            fileStrategy = remembered
+                        } else {
+                            self.statusMessage = "Конфликт имени: \(fileName)"
+                            guard let resolution = await self.promptConflictResolution(conflict: conflict) else {
+                                // Диалог закрыт без выбора: прекращаем всю передачу
+                                SSHTransportLog.write("UI_TRANSFER cancelled by user at conflict dialog")
+                                TransferQueueManager.shared.cancelAll()
+                                stoppedByUser = true
+                                group.cancelAll()
+                                break
+                            }
+                            fileStrategy = resolution.action
+                            if let custom = resolution.customName, !custom.isEmpty {
+                                destinationFileName = custom
                             }
                         }
-                        
-                        if let tid = taskId {
-                            TransferQueueManager.shared.updateProgress(
-                                id: tid,
-                                progress: pct,
-                                bytesTransferred: currentFileBytes,
-                                speed: currentSpeed,
-                                eta: eta
-                            )
-                        }
                     }
-                }
-                
-                do {
-                    let result: TransferExecutionResult
-                    switch (fromSource, targetSource) {
-                    case (.localMac, .remotePhone):
-                        let localURL = URL(fileURLWithPath: path)
-                        if isMove {
-                            result = try await orchestrator.executeMoveMacToPhone(
-                                jobId: jobId,
-                                itemId: itemId,
-                                localSourceURL: localURL,
-                                remoteTargetDir: targetSubDir,
-                                destinationFileName: destinationFileName,
-                                strategy: effectiveStrategy,
-                                progress: onProgress
-                            )
+                    if Task.isCancelled { break }
+
+                    // Без конфликта стратегия — «пропустить»: если цель успеет появиться, оркестратор её не затрёт
+                    let effectiveStrategy = fileStrategy ?? .skip
+
+                    // Обработка стратегии
+                    switch effectiveStrategy {
+                    case .skip:
+                        if conflict != nil {
+                            skipped.append(file.sourcePath)
+                            _ = progressState.finish(path: file.sourcePath, transferredBytes: 0)
+                            if let tid = taskId {
+                                TransferQueueManager.shared.cancelTask(id: tid)
+                            }
+                            continue
+                        }
+
+                    case .customRename:
+                        // Новое имя тоже не должно затирать существующий объект
+                        let customName = destinationFileName ?? fileName
+                        let customExists: Bool
+                        if targetSource == .localMac {
+                            customExists = FileManager.default.fileExists(atPath: (targetSubDir as NSString).appendingPathComponent(customName))
                         } else {
-                            result = try await orchestrator.executeCopyMacToPhone(
-                                jobId: jobId,
-                                itemId: itemId,
-                                localSourceURL: localURL,
-                                remoteTargetDir: targetSubDir,
-                                destinationFileName: destinationFileName,
-                                strategy: effectiveStrategy,
-                                progress: onProgress
-                            )
+                            customExists = targetListingCache[targetSubDir]?[customName] != nil
                         }
-                        let ext = URL(fileURLWithPath: effectiveDisplayName).pathExtension.lowercased()
-                        let wasTransferred: Bool
-                        switch result {
-                        case .transferred, .transferredWithoutSourceDeletion:
-                            wasTransferred = true
-                        case .skipped:
-                            wasTransferred = false
+                        if customExists {
+                            skipped.append(file.sourcePath)
+                            failed.append((path: file.sourcePath, error: "Объект с именем «\(customName)» уже существует"))
+                            _ = progressState.finish(path: file.sourcePath, transferredBytes: 0)
+                            if let tid = taskId {
+                                TransferQueueManager.shared.markFailed(id: tid, error: "Объект с именем «\(customName)» уже существует")
+                            }
+                            continue
                         }
-                        if mediaExtensions.contains(ext) && wasTransferred {
-                            let remoteTargetFilePath = (targetSubDir as NSString).appendingPathComponent(effectiveDisplayName)
-                            transferredMediaPaths.append(remoteTargetFilePath)
-                        }
-                        
-                    case (.remotePhone, .localMac):
-                        SSHTransportLog.write("UI_CALL_ORCH_COPY_PHONE_TO_MAC path=\(path) target=\(targetSubDirURL.path) isMove=\(isMove)")
-                        if isMove {
-                            result = try await orchestrator.executeMovePhoneToMac(
-                                jobId: jobId,
-                                itemId: itemId,
-                                remotePath: path,
-                                localTargetDir: targetSubDirURL,
-                                destinationFileName: destinationFileName,
-                                strategy: effectiveStrategy,
-                                progress: onProgress
-                            )
-                        } else {
-                            result = try await orchestrator.executeCopyPhoneToMac(
-                                jobId: jobId,
-                                itemId: itemId,
-                                remotePath: path,
-                                localTargetDir: targetSubDirURL,
-                                destinationFileName: destinationFileName,
-                                strategy: effectiveStrategy,
-                                progress: onProgress
-                            )
-                        }
-                        SSHTransportLog.write("UI_COPY_PHONE_TO_MAC_RESULT path=\(path) result=\(result)")
-                        
-                    case (.localMac, .localMac):
-                        let localURL = URL(fileURLWithPath: path)
-                        if isMove {
-                            result = try await orchestrator.executeMoveMacToMac(
-                                jobId: jobId,
-                                itemId: itemId,
-                                localSourceURL: localURL,
-                                localTargetDir: targetSubDirURL,
-                                destinationFileName: destinationFileName,
-                                strategy: effectiveStrategy,
-                                progress: onProgress
-                            )
-                        } else {
-                            result = try await orchestrator.executeCopyMacToMac(
-                                jobId: jobId,
-                                itemId: itemId,
-                                localSourceURL: localURL,
-                                localTargetDir: targetSubDirURL,
-                                destinationFileName: destinationFileName,
-                                strategy: effectiveStrategy,
-                                progress: onProgress
-                            )
-                        }
-                        
-                    case (.remotePhone, .remotePhone):
-                        // D9: стратегия конфликта применяется здесь, т.к. cp/rename на телефоне перезаписывают цель
-                        let placement = self.resolvePhonePlacement(
+
+                    case .skipIfIdentical, .overwriteIfNewer, .autoRename, .overwrite:
+                        // Решение принимает оркестратор (Mac/телефон) либо resolvePhonePlacement (телефон → телефон)
+                        break
+                    }
+
+                    let effectiveDisplayName = destinationFileName ?? fileName
+                    // D9: для телефон → телефон стратегия применяется здесь, т.к. cp/rename на телефоне перезаписывают цель
+                    let phonePlacement: PhonePlacement? = (fromSource == .remotePhone && targetSource == .remotePhone)
+                        ? self.resolvePhonePlacement(
                             fileName: effectiveDisplayName,
                             targetDir: targetSubDir,
                             conflict: conflict,
                             strategy: effectiveStrategy,
                             listingCache: targetListingCache
                         )
-                        switch placement {
-                        case .skip(let reason):
-                            result = .skipped(reason: reason)
-                        case .place(let targetPath):
-                            if isMove {
-                                let ok = try await orchestrator.transport.executeRename(oldPath: path, newPath: targetPath)
-                                if ok {
-                                    result = .transferred
-                                } else if PhoneConnectionManager.shared.copyFileOnDevice(sourcePath: path, targetPath: targetPath) {
-                                    // Обработка EXDEV (Cross-device link): если перенос между разделами (SD-карта / память), копируем и удаляем оригинал.
-                                    // Результат удаления проверяем: иначе копия есть, а исходник тихо остался.
-                                    let deleted = (try? await orchestrator.transport.executeDelete(actionId: itemId, path: path)) ?? false
-                                    onProgress(1.0)
-                                    result = deleted
-                                        ? .transferred
-                                        : .transferredWithoutSourceDeletion(reason: "Копия создана, но исходный файл на телефоне не удалён")
+                        : nil
+                    let job = TransferJob(
+                        path: file.sourcePath,
+                        fileName: fileName,
+                        displayName: effectiveDisplayName,
+                        fileSize: file.size,
+                        targetDir: targetSubDir,
+                        destinationFileName: destinationFileName,
+                        strategy: effectiveStrategy,
+                        phonePlacement: phonePlacement,
+                        taskId: taskId
+                    )
+
+                    // Имя текущего файла в окне прогресса: не чаще 10 раз в секунду
+                    if progressState.shouldUpdateLabel() {
+                        let actionVerb = isMove ? "Перемещение: " : "Копирование: "
+                        self.currentTransferFileName = effectiveDisplayName
+                        self.statusMessage = "\(actionVerb)\(effectiveDisplayName)"
+                    }
+                    if self.showConflictDialog {
+                        self.showConflictDialog = false
+                        self.activeConflict = nil
+                    }
+                    if !self.isTransferMinimized && !self.showTransferProgress {
+                        self.showTransferProgress = true
+                    }
+
+                    let fileSize = file.size
+                    let onProgress: @Sendable (Double) -> Void = { @Sendable pct in
+                        Task { @MainActor [weak self] in
+                            guard let self = self else { return }
+                            let currentFileBytes = UInt64(Double(fileSize) * pct)
+                            guard let totalTransferredNow = progressState.update(path: job.path, bytes: currentFileBytes) else { return }
+                            speedTracker.update(bytesTransferred: totalTransferredNow)
+
+                            let currentSpeed = speedTracker.currentSpeedBytesPerSec
+                            let remainingBytes = (totalQueueBytes > totalTransferredNow) ? (totalQueueBytes - totalTransferredNow) : 0
+                            let eta = speedTracker.calculateETA(remainingBytes: remainingBytes)
+
+                            // Троттлинг: @Published свойства UI обновляются не чаще 15 раз/сек на всю передачу
+                            if progressState.shouldUpdateProgress() {
+                                self.transferSpeed = TransferSpeedTracker.formatSpeed(currentSpeed)
+                                self.transferETA = TransferSpeedTracker.formatETA(eta)
+                                if totalQueueBytes > 0 {
+                                    self.transferProgress = min(1.0, Double(totalTransferredNow) / Double(totalQueueBytes))
                                 } else {
-                                    result = .skipped(reason: "Не удалось переименовать или переместить на телефоне (защита Scoped Storage или разные разделы)")
+                                    self.transferProgress = Double(progressState.completedCount) / Double(max(1, totalCount))
                                 }
-                            } else {
-                                // Оптимизация P1: Прямое серверное копирование файла внутри телефона без прокачки 20 ГБ трафика через Mac
-                                if PhoneConnectionManager.shared.copyFileOnDevice(sourcePath: path, targetPath: targetPath) {
-                                    onProgress(1.0)
-                                    result = .transferred
-                                } else {
-                                    // Фоллбэк: если прямое копирование на телефоне недоступно (нет ADB / беспроводной SFTP без shell).
-                                    // Решение по конфликту уже принято выше, поэтому второй шаг не перепроверяет его заново.
-                                    let tempDir = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("MacDroidCommander/PhoneCopy", isDirectory: true)
-                                    try? FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
-                                    try await orchestrator.executeCopyPhoneToMac(
-                                        jobId: jobId,
-                                        itemId: itemId,
-                                        remotePath: path,
-                                        localTargetDir: tempDir,
-                                        strategy: .overwrite,
-                                        progress: onProgress
-                                    )
-                                    let tempLocalURL = tempDir.appendingPathComponent(fileName)
-                                    defer { try? FileManager.default.removeItem(at: tempLocalURL) }
-                                    let fallbackStrategy: ConflictResolutionStrategy = (effectiveStrategy == .autoRename) ? .autoRename : .overwrite
-                                    result = try await orchestrator.executeCopyMacToPhone(
-                                        jobId: jobId,
-                                        itemId: itemId,
-                                        localSourceURL: tempLocalURL,
-                                        remoteTargetDir: targetSubDir,
-                                        destinationFileName: destinationFileName,
-                                        strategy: fallbackStrategy,
-                                        progress: onProgress
-                                    )
-                                }
+                            }
+
+                            if let tid = job.taskId {
+                                TransferQueueManager.shared.updateProgress(
+                                    id: tid,
+                                    progress: pct,
+                                    bytesTransferred: currentFileBytes,
+                                    speed: currentSpeed,
+                                    eta: eta
+                                )
                             }
                         }
                     }
-                    
-                    switch result {
-                    case .skipped:
-                        skipped.append(path)
-                        completedCount += 1
-                        self.transferProgress = (totalQueueBytes > 0) ? min(1.0, Double(completedBytesSoFar) / Double(totalQueueBytes)) : (Double(completedCount) / Double(max(1, totalCount)))
-                        if let tid = taskId {
-                            TransferQueueManager.shared.updateProgress(
-                                id: tid,
-                                progress: 1.0,
-                                bytesTransferred: fileSize,
-                                speed: 0,
-                                eta: nil
-                            )
-                        }
-                    case .transferred:
-                        succeeded.append(path)
-                        completedBytesSoFar += fileSize
-                        completedCount += 1
-                        self.transferProgress = (totalQueueBytes > 0) ? min(1.0, Double(completedBytesSoFar) / Double(totalQueueBytes)) : (Double(completedCount) / Double(max(1, totalCount)))
-                        
-                        if let tid = taskId {
-                            TransferQueueManager.shared.updateProgress(
-                                id: tid,
-                                progress: 1.0,
-                                bytesTransferred: fileSize,
-                                speed: 0,
-                                eta: nil
-                            )
-                        }
-                    case .transferredWithoutSourceDeletion(let reason):
-                        succeeded.append(path)
-                        failed.append((path: path, error: reason))
-                        completedBytesSoFar += fileSize
-                        completedCount += 1
-                        self.transferProgress = (totalQueueBytes > 0) ? min(1.0, Double(completedBytesSoFar) / Double(totalQueueBytes)) : (Double(completedCount) / Double(max(1, totalCount)))
-                        if let tid = taskId {
-                            TransferQueueManager.shared.markFailed(id: tid, error: reason)
-                        }
+
+                    // Свободный слот: дожидаемся завершения одной из идущих передач
+                    if inFlight >= concurrency, let (doneJob, outcome) = await group.next() {
+                        inFlight -= 1
+                        record(doneJob, outcome)
                     }
-                } catch {
-                    if Task.isCancelled || error is CancellationError {
-                        if let tid = taskId {
-                            TransferQueueManager.shared.cancelTask(id: tid)
+                    if Task.isCancelled { break }
+
+                    inFlight += 1
+                    group.addTask {
+                        do {
+                            let result = try await Self.performTransferJob(
+                                job,
+                                fromSource: fromSource,
+                                targetSource: targetSource,
+                                isMove: isMove,
+                                orchestrator: orchestrator,
+                                progress: onProgress
+                            )
+                            return (job, .success(result))
+                        } catch {
+                            if Task.isCancelled { return (job, .failure(CancellationError())) }
+                            return (job, .failure(error))
                         }
-                        break
-                    }
-                    failed.append((path: path, error: error.localizedDescription))
-                    if let tid = taskId {
-                        TransferQueueManager.shared.markFailed(id: tid, error: error.localizedDescription)
                     }
                 }
+
+                for await (doneJob, outcome) in group {
+                    record(doneJob, outcome)
+                }
             }
-            
+            let completedBytesSoFar = progressState.completedBytes
+
             let transferAborted = Task.isCancelled || stoppedByUser
             // Если перемещение (Move): удаляем исходные папки ТОЛЬКО если они стали ПУСТЫМИ!
             // Если внутри папки остался хотя бы один пропущенный или непереданный файл,
@@ -7760,6 +7668,196 @@ public final class DualPaneViewModel: ObservableObject {
         }
     }
     
+    /// Сколько файлов Mac ↔ телефон передаётся одновременно. Ниже лимита открытых дескрипторов
+    /// SessionBudget (32) и сервера (32), с запасом под миниатюры и предпросмотр.
+    nonisolated static let parallelTransferLimit = 6
+
+    /// Один файл передачи с уже принятым решением по конфликту
+    private struct TransferJob: Sendable {
+        let path: String
+        let fileName: String
+        let displayName: String
+        let fileSize: UInt64
+        let targetDir: String
+        let destinationFileName: String?
+        let strategy: ConflictResolutionStrategy
+        let phonePlacement: PhonePlacement?
+        let taskId: UUID?
+    }
+
+    /// Общий прогресс передачи при нескольких одновременных файлах, с троттлингом обновлений UI
+    @MainActor
+    private final class TransferProgressState {
+        let totalBytes: UInt64
+        let totalCount: Int
+        private(set) var completedBytes: UInt64 = 0
+        private(set) var completedCount = 0
+        private var inFlightBytes: [String: UInt64] = [:]
+        private var finished: Set<String> = []
+        private var lastProgressUpdate: CFAbsoluteTime = 0
+        private var lastLabelUpdate: CFAbsoluteTime = 0
+
+        init(totalBytes: UInt64, totalCount: Int) {
+            self.totalBytes = totalBytes
+            self.totalCount = totalCount
+        }
+
+        /// Байты идущего файла; nil, если файл уже учтён как завершённый (запоздавший колбэк прогресса)
+        func update(path: String, bytes: UInt64) -> UInt64? {
+            guard !finished.contains(path) else { return nil }
+            inFlightBytes[path] = bytes
+            return completedBytes + inFlightBytes.values.reduce(0, +)
+        }
+
+        /// Завершение файла; возвращает объём завершённых файлов
+        func finish(path: String, transferredBytes: UInt64) -> UInt64 {
+            finished.insert(path)
+            inFlightBytes[path] = nil
+            completedBytes += transferredBytes
+            completedCount += 1
+            return completedBytes
+        }
+
+        /// Не чаще ~15 раз в секунду на всю передачу (а не на каждый файл)
+        func shouldUpdateProgress() -> Bool {
+            let now = CFAbsoluteTimeGetCurrent()
+            guard now - lastProgressUpdate >= 0.067 else { return false }
+            lastProgressUpdate = now
+            return true
+        }
+
+        func shouldUpdateLabel() -> Bool {
+            let now = CFAbsoluteTimeGetCurrent()
+            guard now - lastLabelUpdate >= 0.1 else { return false }
+            lastLabelUpdate = now
+            return true
+        }
+    }
+
+    /// Передача одного файла вне MainActor (вызывается из пула одновременных передач)
+    private nonisolated static func performTransferJob(
+        _ job: TransferJob,
+        fromSource: FileSource,
+        targetSource: FileSource,
+        isMove: Bool,
+        orchestrator: JobOrchestrator,
+        progress onProgress: @escaping @Sendable (Double) -> Void
+    ) async throws -> TransferExecutionResult {
+        let jobId = UUID().uuidString
+        let itemId = UUID().uuidString
+        let targetDirURL = URL(fileURLWithPath: job.targetDir)
+        switch (fromSource, targetSource) {
+        case (.localMac, .remotePhone):
+            let localURL = URL(fileURLWithPath: job.path)
+            if isMove {
+                return try await orchestrator.executeMoveMacToPhone(
+                    jobId: jobId, itemId: itemId, localSourceURL: localURL, remoteTargetDir: job.targetDir,
+                    destinationFileName: job.destinationFileName, strategy: job.strategy, progress: onProgress
+                )
+            }
+            return try await orchestrator.executeCopyMacToPhone(
+                jobId: jobId, itemId: itemId, localSourceURL: localURL, remoteTargetDir: job.targetDir,
+                destinationFileName: job.destinationFileName, strategy: job.strategy, progress: onProgress
+            )
+
+        case (.remotePhone, .localMac):
+            SSHTransportLog.verbose("UI_CALL_ORCH_COPY_PHONE_TO_MAC path=\(job.path) target=\(job.targetDir) isMove=\(isMove)")
+            if isMove {
+                return try await orchestrator.executeMovePhoneToMac(
+                    jobId: jobId, itemId: itemId, remotePath: job.path, localTargetDir: targetDirURL,
+                    destinationFileName: job.destinationFileName, strategy: job.strategy, progress: onProgress
+                )
+            }
+            return try await orchestrator.executeCopyPhoneToMac(
+                jobId: jobId, itemId: itemId, remotePath: job.path, localTargetDir: targetDirURL,
+                destinationFileName: job.destinationFileName, strategy: job.strategy, progress: onProgress
+            )
+
+        case (.localMac, .localMac):
+            let localURL = URL(fileURLWithPath: job.path)
+            if isMove {
+                return try await orchestrator.executeMoveMacToMac(
+                    jobId: jobId, itemId: itemId, localSourceURL: localURL, localTargetDir: targetDirURL,
+                    destinationFileName: job.destinationFileName, strategy: job.strategy, progress: onProgress
+                )
+            }
+            return try await orchestrator.executeCopyMacToMac(
+                jobId: jobId, itemId: itemId, localSourceURL: localURL, localTargetDir: targetDirURL,
+                destinationFileName: job.destinationFileName, strategy: job.strategy, progress: onProgress
+            )
+
+        case (.remotePhone, .remotePhone):
+            switch job.phonePlacement ?? .place(targetPath: (job.targetDir as NSString).appendingPathComponent(job.displayName)) {
+            case .skip(let reason):
+                return .skipped(reason: reason)
+            case .place(let targetPath):
+                if isMove {
+                    let ok = try await orchestrator.transport.executeRename(oldPath: job.path, newPath: targetPath)
+                    if ok {
+                        return .transferred
+                    } else if PhoneConnectionManager.shared.copyFileOnDevice(sourcePath: job.path, targetPath: targetPath) {
+                        // Обработка EXDEV (Cross-device link): если перенос между разделами (SD-карта / память), копируем и удаляем оригинал.
+                        // Результат удаления проверяем: иначе копия есть, а исходник тихо остался.
+                        let deleted = (try? await orchestrator.transport.executeDelete(actionId: itemId, path: job.path)) ?? false
+                        onProgress(1.0)
+                        return deleted
+                            ? .transferred
+                            : .transferredWithoutSourceDeletion(reason: "Копия создана, но исходный файл на телефоне не удалён")
+                    }
+                    return .skipped(reason: "Не удалось переименовать или переместить на телефоне (защита Scoped Storage или разные разделы)")
+                }
+                // Оптимизация P1: Прямое серверное копирование файла внутри телефона без прокачки 20 ГБ трафика через Mac
+                if PhoneConnectionManager.shared.copyFileOnDevice(sourcePath: job.path, targetPath: targetPath) {
+                    onProgress(1.0)
+                    return .transferred
+                }
+                // Фоллбэк: если прямое копирование на телефоне недоступно (нет ADB / беспроводной SFTP без shell).
+                // Решение по конфликту уже принято выше, поэтому второй шаг не перепроверяет его заново.
+                let tempDir = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("MacDroidCommander/PhoneCopy", isDirectory: true)
+                try? FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+                try await orchestrator.executeCopyPhoneToMac(
+                    jobId: jobId, itemId: itemId, remotePath: job.path, localTargetDir: tempDir,
+                    strategy: .overwrite, progress: onProgress
+                )
+                let tempLocalURL = tempDir.appendingPathComponent(job.fileName)
+                defer { try? FileManager.default.removeItem(at: tempLocalURL) }
+                let fallbackStrategy: ConflictResolutionStrategy = (job.strategy == .autoRename) ? .autoRename : .overwrite
+                return try await orchestrator.executeCopyMacToPhone(
+                    jobId: jobId, itemId: itemId, localSourceURL: tempLocalURL, remoteTargetDir: job.targetDir,
+                    destinationFileName: job.destinationFileName, strategy: fallbackStrategy, progress: onProgress
+                )
+            }
+        }
+    }
+
+    /// Создание папок на телефоне: родитель раньше детей, папки одного уровня вложенности — параллельно.
+    /// Возвращает папки, созданные этим вызовом (то есть заведомо пустые).
+    private nonisolated static func createRemoteDirectories(_ directories: [String], driver: RemoteSFTPDriver) async -> Set<String> {
+        let levels = Dictionary(grouping: directories) { $0.split(separator: "/").count }
+        var created = Set<String>()
+        for depth in levels.keys.sorted() {
+            let dirs = levels[depth] ?? []
+            await withTaskGroup(of: String?.self) { group in
+                var inFlight = 0
+                for dir in dirs {
+                    if inFlight >= parallelTransferLimit, let done = await group.next() {
+                        inFlight -= 1
+                        if let done { created.insert(done) }
+                    }
+                    inFlight += 1
+                    group.addTask {
+                        // Ошибка MKDIR — обычно «уже существует»: такую папку проверим листингом
+                        (try? await driver.createDirectory(at: dir)) != nil ? dir : nil
+                    }
+                }
+                for await done in group {
+                    if let done { created.insert(done) }
+                }
+            }
+        }
+        return created
+    }
+
     public struct TransferPlanItem: Sendable {
         public let sourcePath: String
         public let targetDirPath: String

@@ -55,6 +55,17 @@ public final class SessionBudget: @unchecked Sendable {
         return false
     }
     
+    /// Резервирование дескриптора с ожиданием освобождения: при пике одновременных передач
+    /// операция ждёт свой слот, а не падает сразу с «Exceeded max handles»
+    public func acquireHandle(waitingUpTo timeout: TimeInterval) async -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while true {
+            if acquireHandle() { return true }
+            if Task.isCancelled || Date() >= deadline { return false }
+            try? await Task.sleep(nanoseconds: 20_000_000)
+        }
+    }
+
     /// Освобождение дескриптора файла
     public func releaseHandle() {
         lock.lock()

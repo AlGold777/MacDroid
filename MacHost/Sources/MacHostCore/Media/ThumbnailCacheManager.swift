@@ -269,7 +269,7 @@ public final class ThumbnailCacheManager: @unchecked Sendable {
         
         // 1. Проверяем кэш миниатюр (память и диск) — вне главного потока
         if let cached = getThumbnail(for: item) {
-            SSHTransportLog.write("THUMB_CACHE_HIT path=\(item.name)")
+            SSHTransportLog.verbose("THUMB_CACHE_HIT path=\(item.name)")
             return cached
         }
         
@@ -277,7 +277,7 @@ public final class ThumbnailCacheManager: @unchecked Sendable {
         if item.source == .localMac {
             let url = URL(fileURLWithPath: item.path)
             guard FileManager.default.fileExists(atPath: item.path) else {
-                SSHTransportLog.write("THUMB_SKIP reason=noLocalFile path=\(item.name)")
+                SSHTransportLog.verbose("THUMB_SKIP reason=noLocalFile path=\(item.name)")
                 return nil
             }
             
@@ -315,7 +315,7 @@ public final class ThumbnailCacheManager: @unchecked Sendable {
             return nil
         }
         
-        SSHTransportLog.write("THUMB_START path=\(item.name) size=\(item.size)")
+        SSHTransportLog.verbose("THUMB_START path=\(item.name) size=\(item.size)")
         
         // Если уже есть в локальном QuickLook кэше
         if let cachedLocalURL = QuickLookCacheManager.shared.isCached(for: item) {
@@ -323,37 +323,37 @@ public final class ThumbnailCacheManager: @unchecked Sendable {
                !Self.isCorruptedGrayFrame(img) {
                 storeThumbnail(image: img, for: item)
                 let elapsedMs = Int((ProcessInfo.processInfo.systemUptime - startUptime) * 1000)
-                SSHTransportLog.write("THUMB_DECODE ok w×h=\(Int(img.size.width))x\(Int(img.size.height)) path=\(item.name)")
-                SSHTransportLog.write("THUMB_DONE path=\(item.name) ms=\(elapsedMs)")
+                SSHTransportLog.verbose("THUMB_DECODE ok w×h=\(Int(img.size.width))x\(Int(img.size.height)) path=\(item.name)")
+                SSHTransportLog.verbose("THUMB_DONE path=\(item.name) ms=\(elapsedMs)")
                 return img
             }
         }
         
         // Для файлов размером больше 60 МБ фоновую подгрузку эскиза пропускаем
         guard item.size <= 60 * 1024 * 1024 else {
-            SSHTransportLog.write("THUMB_SKIP reason=size path=\(item.name)")
+            SSHTransportLog.verbose("THUMB_SKIP reason=size path=\(item.name)")
             return nil
         }
         guard let transport = transport else {
-            SSHTransportLog.write("THUMB_SKIP reason=noTransport path=\(item.name)")
+            SSHTransportLog.verbose("THUMB_SKIP reason=noTransport path=\(item.name)")
             return nil
         }
         
         // QoS Transfer Arbiter: если активен трансфер файлов, приостанавливаем удалённые превью
         guard !isThrottledDueToTransfer else {
-            SSHTransportLog.write("THUMB_SKIP reason=throttle path=\(item.name)")
+            SSHTransportLog.verbose("THUMB_SKIP reason=throttle path=\(item.name)")
             return nil
         }
         
         // Ограничиваем параллельные запросы к телефону. Очередь LIFO: первыми обслуживаются
         // только что показанные ячейки; ячейки, ушедшие с экрана (отменённые задачи), не ждут.
         guard await remoteQueue.acquire() else {
-            SSHTransportLog.write("THUMB_SKIP reason=cancelled path=\(item.name)")
+            SSHTransportLog.verbose("THUMB_SKIP reason=cancelled path=\(item.name)")
             return nil
         }
         defer { Task { await remoteQueue.release() } }
         guard !Task.isCancelled else {
-            SSHTransportLog.write("THUMB_SKIP reason=cancelled path=\(item.name)")
+            SSHTransportLog.verbose("THUMB_SKIP reason=cancelled path=\(item.name)")
             return nil
         }
         
@@ -365,7 +365,7 @@ public final class ThumbnailCacheManager: @unchecked Sendable {
                 let prefixData = try await transport.readChunk(remotePath: item.path, offset: 0, length: prefixLen)
                 let isWholeFile = UInt64(prefixData.count) >= item.size
                 let hasExif = Self.exifThumbnailJPEG(from: prefixData) != nil
-                SSHTransportLog.write("THUMB_PREFIX path=\(item.name) bytes=\(prefixData.count) exif=\(hasExif ? "yes" : "no") isWhole=\(isWholeFile)")
+                SSHTransportLog.verbose("THUMB_PREFIX path=\(item.name) bytes=\(prefixData.count) exif=\(hasExif ? "yes" : "no") isWhole=\(isWholeFile)")
                 
                 let fastImg: NSImage?
                 if isWholeFile {
@@ -377,8 +377,8 @@ public final class ThumbnailCacheManager: @unchecked Sendable {
                 if let fastImg = fastImg, !Self.isCorruptedGrayFrame(fastImg) {
                     storeThumbnail(image: fastImg, for: item)
                     let elapsedMs = Int((ProcessInfo.processInfo.systemUptime - startUptime) * 1000)
-                    SSHTransportLog.write("THUMB_DECODE ok w×h=\(Int(fastImg.size.width))x\(Int(fastImg.size.height)) path=\(item.name)")
-                    SSHTransportLog.write("THUMB_DONE path=\(item.name) ms=\(elapsedMs)")
+                    SSHTransportLog.verbose("THUMB_DECODE ok w×h=\(Int(fastImg.size.width))x\(Int(fastImg.size.height)) path=\(item.name)")
+                    SSHTransportLog.verbose("THUMB_DONE path=\(item.name) ms=\(elapsedMs)")
                     return fastImg
                 }
             } catch {
@@ -387,27 +387,27 @@ public final class ThumbnailCacheManager: @unchecked Sendable {
         }
         
         guard !Task.isCancelled else {
-            SSHTransportLog.write("THUMB_SKIP reason=cancelled path=\(item.name)")
+            SSHTransportLog.verbose("THUMB_SKIP reason=cancelled path=\(item.name)")
             return nil
         }
         
         // Если префикса недостаточно (HEIC, WebP, DNG, фото без встроенного EXIF),
         // загружаем файл в фоне до 25 МБ
         guard item.size <= 25 * 1024 * 1024 else {
-            SSHTransportLog.write("THUMB_SKIP reason=sizeAbove25MB path=\(item.name)")
+            SSHTransportLog.verbose("THUMB_SKIP reason=sizeAbove25MB path=\(item.name)")
             return nil
         }
         
-        SSHTransportLog.write("THUMB_FULL_DL_START path=\(item.name) size=\(item.size)")
+        SSHTransportLog.verbose("THUMB_FULL_DL_START path=\(item.name) size=\(item.size)")
         do {
             let localURL = try await QuickLookCacheManager.shared.fetchFile(item: item, transport: transport)
-            SSHTransportLog.write("THUMB_FULL_DL ok path=\(item.name)")
+            SSHTransportLog.verbose("THUMB_FULL_DL ok path=\(item.name)")
             if let img = Self.createThumbnail(from: localURL, maxPixelSize: maxPixel),
                !Self.isCorruptedGrayFrame(img) {
                 storeThumbnail(image: img, for: item)
                 let elapsedMs = Int((ProcessInfo.processInfo.systemUptime - startUptime) * 1000)
-                SSHTransportLog.write("THUMB_DECODE ok w×h=\(Int(img.size.width))x\(Int(img.size.height)) path=\(item.name)")
-                SSHTransportLog.write("THUMB_DONE path=\(item.name) ms=\(elapsedMs)")
+                SSHTransportLog.verbose("THUMB_DECODE ok w×h=\(Int(img.size.width))x\(Int(img.size.height)) path=\(item.name)")
+                SSHTransportLog.verbose("THUMB_DONE path=\(item.name) ms=\(elapsedMs)")
                 return img
             } else {
                 SSHTransportLog.write("THUMB_DECODE nil path=\(item.name)")

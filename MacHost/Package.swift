@@ -59,6 +59,11 @@ let package = Package(
             name: "ArchiveInteractionTests",
             dependencies: ["MacHostCore"],
             path: "Tests/ArchiveInteractionTests"
+        ),
+        .executableTarget(
+            name: "TransferBench",
+            dependencies: ["MacHostCore"],
+            path: "Tests/TransferBench"
         )
     ]
 )

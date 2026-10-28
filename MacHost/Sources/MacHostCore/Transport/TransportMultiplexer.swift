@@ -62,9 +62,9 @@ public final class TransportMultiplexer: @unchecked Sendable {
         var sftpPath = toSftpPath(path)
         let reqId = channel.allocateRequestId()
         let statPacket = packetEngine.createStatPacket(requestId: reqId, path: sftpPath)
-        SSHTransportLog.write("PREPARE_READ_SEND path=\(path) sftpPath=\(sftpPath) reqId=\(reqId)")
+        SSHTransportLog.verbose("PREPARE_READ_SEND path=\(path) sftpPath=\(sftpPath) reqId=\(reqId)")
         var (respType, payload) = try await channel.sendRequest(packet: statPacket, requestId: reqId)
-        SSHTransportLog.write("PREPARE_READ_RESP path=\(path) respType=\(respType)")
+        SSHTransportLog.verbose("PREPARE_READ_RESP path=\(path) respType=\(respType)")
         
         // Автоматическое переключение альтернативного сопоставления корня (/emulated/0 <-> /)
         if respType == .status, let (_, code, _) = try? packetEngine.parseStatusResponse(data: payload), code == .noSuchFile {
@@ -77,22 +77,22 @@ public final class TransportMultiplexer: @unchecked Sendable {
             }
             let altReqId = channel.allocateRequestId()
             let altPacket = packetEngine.createStatPacket(requestId: altReqId, path: altPath)
-            SSHTransportLog.write("PREPARE_READ_ALT path=\(altPath) reqId=\(altReqId)")
+            SSHTransportLog.verbose("PREPARE_READ_ALT path=\(altPath) reqId=\(altReqId)")
             if let (altResp, altPayload) = try? await channel.sendRequest(packet: altPacket, requestId: altReqId), altResp == .attrs {
                 sftpPath = altPath
                 respType = altResp
                 payload = altPayload
-                SSHTransportLog.write("PREPARE_READ_ALT_OK path=\(altPath)")
+                SSHTransportLog.verbose("PREPARE_READ_ALT_OK path=\(altPath)")
             }
         }
         
         if respType == .attrs {
             let (_, size, mtime, isDir) = try packetEngine.parseAttrsResponse(data: payload)
-            SSHTransportLog.write("PREPARE_READ_SUCCESS path=\(path) size=\(size) mtime=\(mtime) isDir=\(isDir)")
+            SSHTransportLog.verbose("PREPARE_READ_SUCCESS path=\(path) size=\(size) mtime=\(mtime) isDir=\(isDir)")
             return RemoteStat(size: size, mtime: Int64(mtime), isDirectory: isDir)
         } else if respType == .status {
             let (_, code, msg) = try packetEngine.parseStatusResponse(data: payload)
-            SSHTransportLog.write("PREPARE_READ_FAILED_STATUS path=\(path) code=\(code.rawValue) msg=\(msg)")
+            SSHTransportLog.verbose("PREPARE_READ_FAILED_STATUS path=\(path) code=\(code.rawValue) msg=\(msg)")
             throw NSError(
                 domain: "TransportMultiplexer",
                 code: Int(code.rawValue),
@@ -339,6 +339,7 @@ public final class TransportMultiplexer: @unchecked Sendable {
         startOffset: UInt64 = 0,
         rangeTracker: ConfirmedRangeTracker? = nil,
         onRangeConfirmed: (@Sendable (Range<UInt64>) -> Void)? = nil,
+        syncToDisk: Bool = true,
         onProgress: @escaping @Sendable (UInt64) -> Void
     ) async throws {
         try FileManager.default.createDirectory(at: targetURL.deletingLastPathComponent(), withIntermediateDirectories: true)
@@ -361,7 +362,8 @@ public final class TransportMultiplexer: @unchecked Sendable {
         }
         
         let budget = coordinator.budget
-        guard budget.acquireHandle() else {
+        guard await budget.acquireHandle(waitingUpTo: 30) else {
+            if Task.isCancelled { throw CancellationError() }
             throw NSError(domain: "TransportMultiplexer", code: TransportMultiplexer.localHandleLimitCode, userInfo: [NSLocalizedDescriptionKey: "Exceeded max handles in SessionBudget"])
         }
         defer { budget.releaseHandle() }
@@ -370,9 +372,9 @@ public final class TransportMultiplexer: @unchecked Sendable {
         let openReqId = channel.allocateRequestId()
         var currentSftpPath = sftpPath
         let openPacket = packetEngine.createOpenPacket(requestId: openReqId, path: currentSftpPath, pflags: 0x00000001)
-        SSHTransportLog.write("DL_OPEN_START path=\(currentSftpPath) reqId=\(openReqId) channel=\(channel.channelId)")
+        SSHTransportLog.verbose("DL_OPEN_START path=\(currentSftpPath) reqId=\(openReqId) channel=\(channel.channelId)")
         var (openRespType, openPayload) = try await channel.sendRequest(packet: openPacket, requestId: openReqId)
-        SSHTransportLog.write("DL_OPEN_DONE respType=\(openRespType) channel=\(channel.channelId)")
+        SSHTransportLog.verbose("DL_OPEN_DONE respType=\(openRespType) channel=\(channel.channelId)")
         
         if openRespType == .status,
            let (_, openCode, _) = try? packetEngine.parseStatusResponse(data: openPayload),
@@ -386,12 +388,12 @@ public final class TransportMultiplexer: @unchecked Sendable {
             }
             let altReqId = channel.allocateRequestId()
             let altPacket = packetEngine.createOpenPacket(requestId: altReqId, path: altPath, pflags: 0x00000001)
-            SSHTransportLog.write("DL_OPEN_ALT path=\(altPath) reqId=\(altReqId)")
+            SSHTransportLog.verbose("DL_OPEN_ALT path=\(altPath) reqId=\(altReqId)")
             if let (altResp, altData) = try? await channel.sendRequest(packet: altPacket, requestId: altReqId), altResp == .handle {
                 currentSftpPath = altPath
                 openRespType = altResp
                 openPayload = altData
-                SSHTransportLog.write("DL_OPEN_ALT_OK path=\(altPath)")
+                SSHTransportLog.verbose("DL_OPEN_ALT_OK path=\(altPath)")
             }
         }
         
@@ -407,7 +409,7 @@ public final class TransportMultiplexer: @unchecked Sendable {
             throw NSError(domain: "TransportMultiplexer", code: 20, userInfo: [NSLocalizedDescriptionKey: "Failed to open remote file \(sftpPath)"])
         }
         let (_, remoteHandle) = try packetEngine.parseHandleResponse(data: openPayload)
-        SSHTransportLog.write("DL_HANDLE_OK path=\(currentSftpPath) handleLen=\(remoteHandle.count)")
+        SSHTransportLog.verbose("DL_HANDLE_OK path=\(currentSftpPath) handleLen=\(remoteHandle.count)")
         
         // 2. Конвейерное чтение с учетом SessionBudget (окно до 16 запросов по 256 КиБ = 4 МиБ)
         let advertisedReadLimit = coordinator.currentServerLimits?.maxReadLen ?? UInt64(256 * 1024)
@@ -422,7 +424,7 @@ public final class TransportMultiplexer: @unchecked Sendable {
         if rangeTracker == nil && startOffset > 0 { confirmedRanges.addRange(0..<startOffset) }
         var activeInflight = 0
         
-        SSHTransportLog.write("DL_PIPELINE_START totalSize=\(totalSize) chunkSize=\(effectiveChunkSize) startOffset=\(startOffset)")
+        SSHTransportLog.verbose("DL_PIPELINE_START totalSize=\(totalSize) chunkSize=\(effectiveChunkSize) startOffset=\(startOffset)")
         
         do {
             try await withThrowingTaskGroup(of: (Range<UInt64>, Data).self) { group in
@@ -471,11 +473,11 @@ public final class TransportMultiplexer: @unchecked Sendable {
             }
             
             // 3. Закрываем дескриптор
-            SSHTransportLog.write("DL_CLOSE_START channel=\(channel.channelId)")
+            SSHTransportLog.verbose("DL_CLOSE_START channel=\(channel.channelId)")
             let closeReqId = channel.allocateRequestId()
             let closePacket = packetEngine.createClosePacket(requestId: closeReqId, handle: remoteHandle)
             _ = try? await channel.sendRequest(packet: closePacket, requestId: closeReqId)
-            SSHTransportLog.write("DL_CLOSE_DONE channel=\(channel.channelId)")
+            SSHTransportLog.verbose("DL_CLOSE_DONE channel=\(channel.channelId)")
             
         } catch {
             SSHTransportLog.write("DL_ERROR err=\(error.localizedDescription) channel=\(channel.channelId)")
@@ -483,7 +485,10 @@ public final class TransportMultiplexer: @unchecked Sendable {
             throw error
         }
         
-        try handle.synchronize()
+        // fsync — только когда вызывающему нужна гарантия на диске; оркестратор делает его сам и лишь для переноса
+        if syncToDisk {
+            try handle.synchronize()
+        }
         guard confirmedRanges.isFullyCovered(expectedSize: totalSize) else {
             throw NSError(
                 domain: "TransportMultiplexer",
@@ -632,6 +637,7 @@ public final class TransportMultiplexer: @unchecked Sendable {
         startOffset: UInt64 = 0,
         rangeTracker: ConfirmedRangeTracker? = nil,
         onRangeConfirmed: (@Sendable (Range<UInt64>) -> Void)? = nil,
+        syncToDisk: Bool = true,
         onProgress: @escaping @Sendable (UInt64) -> Void
     ) async throws {
         guard FileManager.default.fileExists(atPath: localURL.path) else {
@@ -655,7 +661,8 @@ public final class TransportMultiplexer: @unchecked Sendable {
         }
         
         let budget = coordinator.budget
-        guard budget.acquireHandle() else {
+        guard await budget.acquireHandle(waitingUpTo: 30) else {
+            if Task.isCancelled { throw CancellationError() }
             throw NSError(domain: "TransportMultiplexer", code: TransportMultiplexer.localHandleLimitCode, userInfo: [NSLocalizedDescriptionKey: "Exceeded max handles in SessionBudget"])
         }
         defer { budget.releaseHandle() }
@@ -758,8 +765,9 @@ public final class TransportMultiplexer: @unchecked Sendable {
                 }
             }
             
-            // Fsync расширение при поддержке сервером
-            if coordinator.hasServerExtension("fsync@openssh.com") {
+            // Fsync расширение при поддержке сервером. Только когда нужна гарантия на диске (перенос удаляет оригинал):
+            // для копии оригинал остаётся, а fsync каждого мелкого файла на FUSE-разделе телефона дорог.
+            if syncToDisk && coordinator.hasServerExtension("fsync@openssh.com") {
                 let fsyncReqId = channel.allocateRequestId()
                 let fsyncPacket = packetEngine.createFsyncPacket(requestId: fsyncReqId, handle: remoteHandle)
                 _ = try? await channel.sendRequest(packet: fsyncPacket, requestId: fsyncReqId)
@@ -835,6 +843,27 @@ public final class TransportMultiplexer: @unchecked Sendable {
         return false
     }
     
+    /// Переименование временного файла в финальный одним запросом. Без замены — обычный SSH_FXP_RENAME
+    /// (SFTP v3): сервер (Apache SSHD, Files.move без REPLACE_EXISTING) сам отказывает, если цель существует,
+    /// поэтому отдельная проверка цели не нужна. С заменой — posix-rename@openssh.com (атомарная замена).
+    public func commitRename(oldPath: String, newPath: String, replaceExisting: Bool) async throws -> SFTPStatusCode {
+        try await ensureConnected()
+        guard let channel = coordinator.interactiveChannel else {
+            throw NSError(domain: "TransportMultiplexer", code: 1, userInfo: [NSLocalizedDescriptionKey: "No active SFTP channel"])
+        }
+        let sftpOld = toSftpPath(oldPath)
+        let sftpNew = toSftpPath(newPath)
+        let reqId = channel.allocateRequestId()
+        let packet = replaceExisting
+            ? packetEngine.createPosixRenamePacket(requestId: reqId, oldPath: sftpOld, newPath: sftpNew)
+            : packetEngine.createRenamePacket(requestId: reqId, oldPath: sftpOld, newPath: sftpNew)
+        let (respType, payload) = try await channel.sendRequest(packet: packet, requestId: reqId)
+        guard respType == .status else {
+            throw NSError(domain: "TransportMultiplexer", code: -1, userInfo: [NSLocalizedDescriptionKey: "Rename: неожиданный ответ сервера (\(respType))"])
+        }
+        return try packetEngine.parseStatusResponse(data: payload).code
+    }
+
     public func executeDelete(actionId: String, path: String) async throws -> Bool {
         try await ensureConnected()
         guard let channel = coordinator.interactiveChannel else { return false }

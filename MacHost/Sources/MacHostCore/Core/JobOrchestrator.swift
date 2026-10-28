@@ -38,9 +38,10 @@ public enum JobOrchestratorError: LocalizedError, Sendable {
 /// Троттлинг durable-чекпоинтов передачи. Используется из @Sendable-колбэка, поэтому состояние под замком.
 private final class CheckpointThrottle: @unchecked Sendable {
     private let lock = NSLock()
-    private var last = Date.distantPast
+    private var last = Date()
 
-    /// true, если с прошлого чекпоинта прошло не меньше `interval` секунд (и отметка времени обновляется)
+    /// true, если с прошлого чекпоинта (или начала передачи) прошло не меньше `interval` секунд.
+    /// Файл, переданный быстрее interval, чекпоинтов не пишет: при обрыве он просто передаётся заново.
     func shouldCheckpoint(interval: TimeInterval) -> Bool {
         lock.lock()
         defer { lock.unlock() }
@@ -291,26 +292,26 @@ public final class JobOrchestrator: @unchecked Sendable {
     ) async throws -> TransferExecutionResult {
         let actionId = UUID().uuidString
         let sm = JobUnitStateMachine(initialState: .planned)
-        SSHTransportLog.write("ORCH_TRANSFER_START remotePath=\(remotePath) targetDir=\(localTargetDir.path) isMove=\(isMove)")
+        SSHTransportLog.verbose("ORCH_TRANSFER_START remotePath=\(remotePath) targetDir=\(localTargetDir.path) isMove=\(isMove)")
         
         // 0. Гарантируем существование целевой директории
         try FileManager.default.createDirectory(at: localTargetDir, withIntermediateDirectories: true)
         
         let stat = try await transport.prepareRead(actionId: actionId, path: remotePath)
-        SSHTransportLog.write("ORCH_PREPARE_READ_OK remotePath=\(remotePath) size=\(stat.size) isDir=\(stat.isDirectory)")
+        SSHTransportLog.verbose("ORCH_PREPARE_READ_OK remotePath=\(remotePath) size=\(stat.size) isDir=\(stat.isDirectory)")
         let reqHash = "\(remotePath):\(stat.size):\(stat.mtime)"
         
         // 1. Pre-flight проверка свободного места (+ 5% запас надежности)
         // nil = объём неизвестен: не блокируем, но и не считаем это нулём свободного места
         let requiredWithMargin = stat.size + (stat.size / 20)
         if let free = localFS.availableFreeSpace(at: localTargetDir.path) {
-            SSHTransportLog.write("ORCH_FREE_SPACE_OK free=\(free)")
+            SSHTransportLog.verbose("ORCH_FREE_SPACE_OK free=\(free)")
             if free < requiredWithMargin {
                 SSHTransportLog.write("ORCH_INSUFFICIENT_SPACE required=\(requiredWithMargin) available=\(free)")
                 throw JobOrchestratorError.insufficientSpace(required: requiredWithMargin, available: free)
             }
         } else {
-            SSHTransportLog.write("ORCH_FREE_SPACE_UNKNOWN path=\(localTargetDir.path) проверка места пропущена")
+            SSHTransportLog.verbose("ORCH_FREE_SPACE_UNKNOWN path=\(localTargetDir.path) проверка места пропущена")
         }
         
         var name = (destinationFileName ?? URL(fileURLWithPath: remotePath).lastPathComponent).precomposedStringWithCanonicalMapping
@@ -476,6 +477,7 @@ public final class JobOrchestrator: @unchecked Sendable {
                             durabilityEvidence: true
                         )
                     },
+                    syncToDisk: false,
                     onProgress: { bytes in
                         let pct = Double(bytes) / Double(max(1, stat.size)) * 0.85
                         progress(progressFloor.raise(pct))
@@ -549,8 +551,11 @@ public final class JobOrchestrator: @unchecked Sendable {
             throw JobOrchestratorError.indeterminate(reason: "не удалось повторно проверить источник перед коммитом: \(error.localizedDescription)")
         }
 
-        // Данные временного файла на диск до переименования (иначе после сбоя файл может оказаться с нулями)
-        Self.fsyncFile(at: tempURL)
+        // Перенос удаляет оригинал на телефоне: данные временного файла — на диск до переименования
+        // (иначе после сбоя файл может оказаться с нулями). Для копии оригинал остаётся, fsync каждого файла не нужен.
+        if isMove {
+            Self.fsyncFile(at: tempURL)
+        }
 
         // 4. Commit: COMMITTING
         sm.transition(to: .committing)
@@ -694,8 +699,11 @@ public final class JobOrchestrator: @unchecked Sendable {
         var fileName = (destinationFileName ?? localSourceURL.lastPathComponent).precomposedStringWithCanonicalMapping
         var remoteFinalPath = (remoteTargetDir as NSString).appendingPathComponent(fileName).precomposedStringWithCanonicalMapping
         
-        // Проверка конфликтов на удалённом устройстве (только если стратегия не .overwrite)
-        if strategy != .overwrite, let existingStat = try await remoteStatIfExists(actionId: actionId, path: remoteFinalPath) {
+        // Проверка конфликтов на удалённом устройстве — только для стратегий, которым нужны размер и дата цели.
+        // .skip и .customRename решены вызывающим по листингу папки, а коммит без замены не затрёт цель,
+        // появившуюся позже (см. commitRename ниже).
+        let needsTargetStat = strategy == .skipIfIdentical || strategy == .overwriteIfNewer || strategy == .autoRename
+        if needsTargetStat, let existingStat = try await remoteStatIfExists(actionId: actionId, path: remoteFinalPath) {
             switch strategy {
             case .skip:
                 progress(1.0)
@@ -787,10 +795,8 @@ public final class JobOrchestrator: @unchecked Sendable {
                 startOffset = frontier
             }
         }
-        if !resumeAccepted {
-            // Удалённая часть без подтверждённого журналом покрытия не доверяем: удаляем и начинаем заново
-            _ = try? await transport.executeDelete(actionId: actionId, path: remoteTempPath)
-        }
+        // Удалённой части без подтверждённого журналом покрытия не доверяем: без докачки файл открывается
+        // с TRUNC (uploadFileStreaming), отдельное удаление не нужно.
 
         try? journal.registerTransfer(
             transferId: actionId,
@@ -813,6 +819,7 @@ public final class JobOrchestrator: @unchecked Sendable {
             // Верификация и коммит ниже повторов не имеют.
             var retryBudget = TransferRetryBudget()
             let progressFloor = MonotonicProgressFloor()
+            let checkpointThrottle = CheckpointThrottle()
             var resumeCheckPending = false
             while true {
                 let frontierBefore = rangeTracker.contiguousFrontier
@@ -846,6 +853,8 @@ public final class JobOrchestrator: @unchecked Sendable {
                         rangeTracker: rangeTracker,
                         onRangeConfirmed: { confirmedRange in
                             rangeTracker.addRange(confirmedRange)
+                            // Не чаще раза в секунду (раньше — запись в журнал на каждый чанк 256 КБ)
+                            guard checkpointThrottle.shouldCheckpoint(interval: 1.0) else { return }
                             try? journal.checkpointProgress(
                                 transferId: actionId,
                                 frontier: rangeTracker.contiguousFrontier,
@@ -853,6 +862,7 @@ public final class JobOrchestrator: @unchecked Sendable {
                                 durabilityEvidence: true
                             )
                         },
+                        syncToDisk: isMove,
                         onProgress: { bytes in
                             let pct = Double(bytes) / Double(max(1, fileSize)) * 0.90
                             progress(progressFloor.raise(pct))
@@ -889,17 +899,15 @@ public final class JobOrchestrator: @unchecked Sendable {
                 throw JobOrchestratorError.transferInterrupted(reason: "Обнаружены непокрытые диапазоны при выгрузке (дыры)")
             }
             
-            guard let tempStat = try? await transport.prepareRead(actionId: actionId, path: remoteTempPath),
-                  tempStat.size == fileSize else {
-                throw JobOrchestratorError.transferInterrupted(reason: "Размер загруженного на телефон файла не совпадает с оригиналом")
+            // Каждый WRITE подтверждён сервером, покрытие полное. При докачке временный файл мог остаться
+            // длиннее оригинала (открыт без TRUNC) — тогда размер сверяем.
+            if startOffset > 0 {
+                guard let tempStat = try? await transport.prepareRead(actionId: actionId, path: remoteTempPath),
+                      tempStat.size == fileSize else {
+                    throw JobOrchestratorError.transferInterrupted(reason: "Размер загруженного на телефон файла не совпадает с оригиналом")
+                }
             }
-            
-            // Проверка поддержки атомарного замещения при существовании целевого файла
-            let targetExists = try await remoteStatIfExists(actionId: actionId, path: remoteFinalPath) != nil
-            if targetExists && transport.coordinator.serverExtensions["posix-rename@openssh.com"] == nil {
-                throw JobOrchestratorError.unsupportedAtomicReplace(path: remoteFinalPath)
-            }
-            
+
             // 4. Commit: переименовываем временный .mcdpart файл в финальный
             sm.transition(to: .committing)
             try? journal.updateState(transferId: actionId, state: "committing")
@@ -914,19 +922,39 @@ public final class JobOrchestrator: @unchecked Sendable {
                 mtime: mtime
             )
             
-            let renameSuccess = try await transport.executeRename(oldPath: remoteTempPath, newPath: remoteFinalPath)
-            guard renameSuccess else {
+            // Замена существующей цели допустима, только если стратегия её уже разрешила
+            let mayReplace = strategy == .overwrite || strategy == .overwriteIfNewer || strategy == .skipIfIdentical
+            let hasAtomicReplace = transport.coordinator.hasServerExtension("posix-rename@openssh.com")
+            var renameCode = try await transport.commitRename(oldPath: remoteTempPath, newPath: remoteFinalPath, replaceExisting: mayReplace && hasAtomicReplace)
+            if renameCode != .ok, let _ = try await remoteStatIfExists(actionId: actionId, path: remoteFinalPath) {
+                if mayReplace && !hasAtomicReplace {
+                    // Без posix-rename заменить цель атомарно нельзя
+                    throw JobOrchestratorError.unsupportedAtomicReplace(path: remoteFinalPath)
+                }
+                if strategy == .skip {
+                    // Цель появилась во время передачи: не затираем её, временную часть убираем
+                    _ = try? await transport.executeDelete(actionId: actionId, path: remoteTempPath)
+                    try? journal.updateState(transferId: actionId, state: "completed")
+                    sm.transition(to: .completed)
+                    ledger.recordItemState(
+                        itemId: itemId,
+                        jobId: jobId,
+                        actionId: actionId,
+                        requestHash: reqHash,
+                        state: .completed,
+                        bytes: 0,
+                        total: fileSize,
+                        mtime: mtime
+                    )
+                    progress(1.0)
+                    return .skipped(reason: "Файл уже существует на телефоне")
+                }
+                renameCode = .failure
+            }
+            guard renameCode == .ok else {
                 sm.transition(to: .indeterminate, error: "Не удалось переименовать временный файл на телефоне")
                 try? journal.updateState(transferId: actionId, state: "indeterminate", errorMessage: "Remote rename failed")
                 throw NSError(domain: "JobOrchestrator", code: 500, userInfo: [NSLocalizedDescriptionKey: "Remote commit (rename) failed for: \(remoteFinalPath)"])
-            }
-            
-            // 5. Верификация размера файла на телефоне после переименования
-            guard let verifiedStat = try? await transport.prepareRead(actionId: actionId, path: remoteFinalPath),
-                  verifiedStat.size == fileSize else {
-                sm.transition(to: .indeterminate, error: "Целевой файл на телефоне не прошел проверку целостности размера")
-                try? journal.updateState(transferId: actionId, state: "indeterminate", errorMessage: "Commit verification failed")
-                throw JobOrchestratorError.commitVerificationFailed(path: remoteFinalPath)
             }
             
             // Восстанавливаем оригинальный mtime на телефоне для консистентности и быстрого пропуска идентичных файлов
