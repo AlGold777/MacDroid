@@ -7,6 +7,7 @@ import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
 import android.net.ConnectivityManager
 import android.net.LinkProperties
@@ -15,6 +16,7 @@ import android.net.NetworkCapabilities
 import android.net.NetworkRequest
 import android.net.wifi.WifiManager
 import android.os.Build
+import android.os.Environment
 import android.os.IBinder
 import android.os.PowerManager
 import android.util.Log
@@ -68,6 +70,39 @@ class FileDaemonService : Service() {
                 .edit()
                 .putBoolean(KEY_USER_STOPPED, value)
                 .apply()
+        }
+
+        /**
+         * Есть ли доступ ко всем файлам: MANAGE_EXTERNAL_STORAGE (API 30+) или runtime-разрешения (API 26-29).
+         * Единая проверка для MainActivity и автозапуска после перезагрузки/обновления.
+         */
+        fun hasStoragePermission(context: Context): Boolean =
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                Environment.isExternalStorageManager()
+            } else {
+                context.checkSelfPermission(android.Manifest.permission.READ_EXTERNAL_STORAGE) == PackageManager.PERMISSION_GRANTED &&
+                    context.checkSelfPermission(android.Manifest.permission.WRITE_EXTERNAL_STORAGE) == PackageManager.PERMISSION_GRANTED
+            }
+
+        /** Условия автозапуска: доступ к файлам есть и пользователь не останавливал демон вручную. */
+        fun shouldAutostart(context: Context): Boolean =
+            hasStoragePermission(context) && !isUserStopped(context)
+
+        /**
+         * Автозапуск демона без открытия приложения (BOOT_COMPLETED, MY_PACKAGE_REPLACED).
+         * Исключения запуска логируются и не пробрасываются, чтобы не уронить процесс приёмника.
+         */
+        fun autostartIfAllowed(context: Context, reason: String) {
+            if (!shouldAutostart(context)) {
+                Log.i(TAG, "Автозапуск пропущен ($reason): нет доступа к файлам или демон остановлен пользователем")
+                return
+            }
+            try {
+                context.startForegroundService(Intent(context, FileDaemonService::class.java))
+                Log.i(TAG, "Автозапуск демона выполнен ($reason)")
+            } catch (e: Exception) {
+                Log.e(TAG, "Автозапуск демона не выполнен ($reason)", e)
+            }
         }
     }
 

@@ -681,15 +681,7 @@ class MainActivity : Activity() {
     /**
      * Проверка наличия разрешения MANAGE_EXTERNAL_STORAGE (Android 11+) или READ_EXTERNAL_STORAGE (до Android 11).
      */
-    private fun hasStoragePermission(): Boolean {
-        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            Environment.isExternalStorageManager()
-        } else {
-            // API 26-29: обычные runtime-разрешения на хранилище
-            checkSelfPermission(android.Manifest.permission.READ_EXTERNAL_STORAGE) == PackageManager.PERMISSION_GRANTED &&
-                    checkSelfPermission(android.Manifest.permission.WRITE_EXTERNAL_STORAGE) == PackageManager.PERMISSION_GRANTED
-        }
-    }
+    private fun hasStoragePermission(): Boolean = FileDaemonService.hasStoragePermission(this)
 
     /**
      * Запрос доступа к файлам: MANAGE_EXTERNAL_STORAGE (API 30+) или runtime-разрешения (API 26-29).
