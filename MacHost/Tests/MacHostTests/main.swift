@@ -3531,6 +3531,48 @@ func runAllAsyncTests() async {
         }
 
         // =========================================================================
+        // [TEST 42d] Explicit autoConnect choice is never overwritten automatically
+        // =========================================================================
+        print("\n[TEST 42d] Explicit autoConnect choice survives automatic paths:")
+        do {
+            let regURL = FileManager.default.temporaryDirectory.appendingPathComponent("test_autoconnect_choice_\(UUID().uuidString).json")
+            let markerURL = regURL.appendingPathExtension("autoconnect-v1")
+            defer {
+                try? FileManager.default.removeItem(at: regURL)
+                try? FileManager.default.removeItem(at: markerURL)
+            }
+            let reg = DeviceRegistry(storageURL: regURL)
+            // Пользователь выключил автоподключение у записи без ключа; затем появился подтверждённый ключ
+            reg.registerOrUpdate(id: "chosen-off", name: "Legacy", fingerprint: "", host: "192.168.1.70", port: 2222)
+            reg.setAutoConnect(id: "chosen-off", enabled: false)
+            reg.registerOrUpdate(id: "chosen-off", name: "Legacy", fingerprint: "SHA256:chosen-off", host: "192.168.1.70", port: 2222)
+            assertCondition(reg.device(withId: "chosen-off")?.autoConnect == false, "Explicit opt-out survives the first confirmed key")
+            assertCondition(reg.device(withId: "chosen-off")?.autoConnectSetByUser == true, "Explicit choice is recorded in the registry")
+
+            // Без явного выбора первый подтверждённый ключ по-прежнему включает автоподключение
+            reg.registerOrUpdate(id: "no-choice", name: "Legacy", fingerprint: "", host: "192.168.1.71", port: 2222)
+            reg.registerOrUpdate(id: "no-choice", name: "Legacy", fingerprint: "SHA256:no-choice", host: "192.168.1.71", port: 2222)
+            assertCondition(reg.device(withId: "no-choice")?.autoConnect == true, "Without an explicit choice the first confirmed key enables autoConnect")
+            assertCondition(reg.device(withId: "no-choice")?.autoConnectSetByUser == nil, "No explicit choice is recorded without a user action")
+        }
+        do {
+            // Файл со старым и новым признаком: миграция не включает запись с явным выбором «не подключаться»
+            let regURL = FileManager.default.temporaryDirectory.appendingPathComponent("test_autoconnect_choice_mig_\(UUID().uuidString).json")
+            let markerURL = regURL.appendingPathExtension("autoconnect-v1")
+            defer {
+                try? FileManager.default.removeItem(at: regURL)
+                try? FileManager.default.removeItem(at: markerURL)
+            }
+            let json = #"[{"id":"opted-out","name":"Tablet","pinnedFingerprint":"SHA256:opted","lastKnownHost":"10.0.0.5","lastKnownPort":2222,"lastSeenDate":700000000,"autoConnect":false,"isMigratedToDedicatedKey":true,"autoConnectSetByUser":true},{"id":"plain","name":"Phone","pinnedFingerprint":"SHA256:plain","lastKnownHost":"10.0.0.6","lastKnownPort":2222,"lastSeenDate":700000000,"autoConnect":false,"isMigratedToDedicatedKey":true}]"#
+            try? Data(json.utf8).write(to: regURL)
+            let reg = DeviceRegistry(storageURL: regURL)
+            assertCondition(reg.device(withId: "opted-out")?.autoConnect == false, "Migration keeps autoConnect off for a device with an explicit opt-out")
+            assertCondition(reg.device(withId: "opted-out")?.autoConnectSetByUser == true, "Explicit choice field is read from the file")
+            assertCondition(reg.device(withId: "plain")?.autoConnect == true, "Migration still enables autoConnect for a paired device without an explicit choice")
+            assertCondition(reg.device(withId: "plain")?.autoConnectSetByUser == nil, "File without the new field reads with no explicit choice")
+        }
+
+        // =========================================================================
         // [TEST 43] Connection Architecture: Strict Fallback, Instant Kill & Scope
         // =========================================================================
         print("\n--- [TEST 43] Connection Architecture: Strict Fallback, Instant Kill & Scope ---")

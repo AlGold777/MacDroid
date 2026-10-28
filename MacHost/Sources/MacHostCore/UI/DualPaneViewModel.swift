@@ -780,11 +780,12 @@ public final class DualPaneViewModel: ObservableObject {
         }
         
         // Автоматическое обнаружение и подключение смартфона при старте
-        if !isRunningTests && (leftSource == .remotePhone || rightSource == .remotePhone) {
-            leftIsStale = false
-            rightIsStale = false
-            connectPhone(preferredDeviceId: savedDeviceId, forceActivate: false, isExplicit: false)
-        } else if !isRunningTests {
+        if !isRunningTests {
+            // Восстановленная вкладка телефона не подключается напрямую: соединение идёт по общему пути
+            // автоподключения (autoConnect устройства, пауза повторов, подавление после ручного отключения).
+            // Пока связи нет, панель помечается как офлайн; успешное подключение снимает пометку.
+            if leftSource == .remotePhone { leftIsStale = true }
+            if rightSource == .remotePhone { rightIsStale = true }
             // Сопряжённый телефон с autoConnect подключается сразу, не дожидаясь первого тика монитора.
             autoConnectPhoneIfAvailable()
         }
@@ -3550,7 +3551,13 @@ public final class DualPaneViewModel: ObservableObject {
                 updateActiveTab(side: side)
             }
             if !remoteDriver.isConnected && !isConnectingPhone && !isRunningTests {
-                connectPhone(forceActivate: false, isExplicit: true)
+                // Автоматический путь (монитор связи, отключение): не сбрасывает подавление после «Отключить»,
+                // соблюдает autoConnect устройства и паузу повторов. Успешное подключение обновит панель само.
+                if side == .left { leftIsStale = true } else { rightIsStale = true }
+                // Подсказка для пользователя, которое действие (навигация, своп панелей) не подключает телефон явно.
+                // Успешное автоподключение перезапишет её собственным статусом «✓ Подключено…».
+                statusMessage = "Телефон не подключен — нажмите PHONE"
+                autoConnectPhoneIfAvailable()
                 return
             }
         }

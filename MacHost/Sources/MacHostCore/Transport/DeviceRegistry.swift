@@ -13,6 +13,10 @@ public struct TrustedDevice: Codable, Identifiable, Sendable, Equatable {
     /// USB-серийники ADB, по которым это устройство уже подключалось (маршруты, не идентичность).
     /// Optional: файлы реестра без этого поля читаются как раньше.
     public var usbSerials: [String]?
+    /// Явный выбор пользователя в окне сопряжения (true = значение autoConnect выбрано пользователем).
+    /// Автоматические пути (первый подтверждённый ключ, однократная миграция) его не перезаписывают.
+    /// Optional: файлы реестра без этого поля читаются как раньше (nil = выбора не было).
+    public var autoConnectSetByUser: Bool?
     
     public init(
         id: String,
@@ -23,7 +27,8 @@ public struct TrustedDevice: Codable, Identifiable, Sendable, Equatable {
         lastSeenDate: Date = Date(),
         autoConnect: Bool = false,
         isMigratedToDedicatedKey: Bool = false,
-        usbSerials: [String]? = nil
+        usbSerials: [String]? = nil,
+        autoConnectSetByUser: Bool? = nil
     ) {
         self.id = id
         self.name = name
@@ -34,6 +39,7 @@ public struct TrustedDevice: Codable, Identifiable, Sendable, Equatable {
         self.autoConnect = autoConnect
         self.isMigratedToDedicatedKey = isMigratedToDedicatedKey
         self.usbSerials = usbSerials
+        self.autoConnectSetByUser = autoConnectSetByUser
     }
 
     /// Маршрут через ADB forward (127.0.0.1) — не Wi-Fi адрес устройства.
@@ -167,8 +173,9 @@ public final class DeviceRegistry: @unchecked Sendable {
             existing.lastSeenDate = Date()
             if let ac = autoConnect {
                 existing.autoConnect = ac
-            } else if existing.pinnedFingerprint.isEmpty && !fingerprint.isEmpty {
+            } else if existing.pinnedFingerprint.isEmpty && !fingerprint.isEmpty && existing.autoConnectSetByUser != true {
                 // Запись без ключа (из старой истории) впервые получает подтверждённый ключ — это сопряжение.
+                // Если пользователь уже выбрал настройку вручную, она не перезаписывается.
                 existing.autoConnect = true
             }
             if !fingerprint.isEmpty {
@@ -200,10 +207,12 @@ public final class DeviceRegistry: @unchecked Sendable {
         TrustedDevice.isLoopbackHost(host)
     }
 
+    /// Явный выбор пользователя (переключатель в окне сопряжения): запоминается и защищён от автоматической перезаписи.
     public func setAutoConnect(id: String, enabled: Bool) {
         lock.lock()
         defer { lock.unlock() }
         devices[id]?.autoConnect = enabled
+        devices[id]?.autoConnectSetByUser = true
         saveUnderLock()
     }
     
@@ -235,7 +244,8 @@ public final class DeviceRegistry: @unchecked Sendable {
         let marker = autoConnectMigrationMarkerURL
         guard !FileManager.default.fileExists(atPath: marker.path) else { return }
         var changed = false
-        for (id, var dev) in devices where !dev.pinnedFingerprint.isEmpty && !dev.autoConnect {
+        // Запись с явным выбором пользователя (в т.ч. «не подключаться») не трогается.
+        for (id, var dev) in devices where !dev.pinnedFingerprint.isEmpty && !dev.autoConnect && dev.autoConnectSetByUser != true {
             dev.autoConnect = true
             devices[id] = dev
             changed = true
