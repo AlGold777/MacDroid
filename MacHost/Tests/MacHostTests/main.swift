@@ -4797,6 +4797,42 @@ func runTest58() async {
     await MainActor.run {
         KeyCommandMonitor.activeViewModel = vm
         
+        // Shift+Ctrl+Cmd+C (code 8, mods: control + command + shift)
+        if let eventShiftCtrlCmdC = NSEvent.keyEvent(
+            with: .keyDown,
+            location: .zero,
+            modifierFlags: [.control, .command, .shift],
+            timestamp: 0,
+            windowNumber: 0,
+            context: nil,
+            characters: "c",
+            charactersIgnoringModifiers: "c",
+            isARepeat: false,
+            keyCode: 8
+        ) {
+            let handled = KeyCommandMonitor.handleEvent(eventShiftCtrlCmdC)
+            assertCondition(handled == nil, "KeyCommandMonitor intercepts Shift+Ctrl+Cmd+C and returns nil (consumed)")
+            let clipboardStr = NSPasteboard.general.string(forType: .string)
+            assertCondition(clipboardStr != nil && !clipboardStr!.isEmpty, "Shift+Ctrl+Cmd+C copied path to NSPasteboard: \(clipboardStr ?? "")")
+        }
+
+        // Test copySelectedPath directly
+        let pathTestItem1 = FileItem(name: "test1.txt", path: "/tmp/test1.txt", isDirectory: false, size: 10, modificationDate: Date(), permissions: "-rw-r--r--")
+        let pathTestItem2 = FileItem(name: "test2.txt", path: "/tmp/test2.txt", isDirectory: false, size: 20, modificationDate: Date(), permissions: "-rw-r--r--")
+        vm.leftItems = [pathTestItem1, pathTestItem2]
+        vm.leftSelection = [pathTestItem1.id]
+        let path1 = vm.copySelectedPath(side: .left)
+        assertCondition(path1 == "/tmp/test1.txt", "copySelectedPath copies single selected item path")
+        assertCondition(NSPasteboard.general.string(forType: .string) == "/tmp/test1.txt", "NSPasteboard has single item path")
+        
+        vm.leftSelection = [pathTestItem1.id, pathTestItem2.id]
+        let multiPath = vm.copySelectedPath(side: .left)
+        assertCondition(multiPath == "/tmp/test1.txt\n/tmp/test2.txt" || multiPath == "/tmp/test2.txt\n/tmp/test1.txt", "copySelectedPath copies multiple items separated by newline")
+        assertCondition(NSPasteboard.general.string(forType: .string) == multiPath, "NSPasteboard has multi items path")
+
+        let explicitPath = vm.copySelectedPath(items: [pathTestItem2], side: .left)
+        assertCondition(explicitPath == "/tmp/test2.txt", "copySelectedPath with explicit items copies explicit item path")
+        
         // Ctrl+Shift+C (code 8, mods: control + shift)
         if let eventCtrlShiftC = NSEvent.keyEvent(
             with: .keyDown,

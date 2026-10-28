@@ -21,7 +21,7 @@ public struct FileTag: Identifiable, Hashable, Sendable, Codable {
         case "yellow": return .yellow
         case "green", "greem": return .green
         case "blue": return .blue
-        case "gray", "grey": return .gray
+        case "gray", "grey": return Color(nsColor: .systemGray).opacity(0.48)
         case "purple": return .purple
         default: return .secondary
         }
@@ -34,7 +34,7 @@ public struct FileTag: Identifiable, Hashable, Sendable, Codable {
         case "yellow": return .systemYellow
         case "green", "greem": return .systemGreen
         case "blue": return .systemBlue
-        case "gray", "grey": return .systemGray
+        case "gray", "grey": return NSColor.systemGray.withAlphaComponent(0.48)
         case "purple": return .systemPurple
         default: return .secondaryLabelColor
         }
@@ -51,7 +51,37 @@ public struct FileTag: Identifiable, Hashable, Sendable, Codable {
     
     public static func tag(for idOrName: String) -> FileTag? {
         let lower = idOrName.lowercased()
-        return allTags.first { $0.id.lowercased() == lower || $0.name.lowercased() == lower || ($0.id == "Green" && lower == "greem") }
+        if let direct = allTags.first(where: { $0.id.lowercased() == lower || $0.name.lowercased() == lower }) {
+            return direct
+        }
+        for tag in allTags {
+            if isTagMatching(idOrName, tagIdOrName: tag.id) {
+                return tag
+            }
+        }
+        return nil
+    }
+
+    public static func isTagMatching(_ a: String, tagIdOrName b: String) -> Bool {
+        let aLower = a.lowercased()
+        let bLower = b.lowercased()
+        if aLower == bLower { return true }
+        
+        let redSynonyms = ["red", "красный", "червоний"]
+        let orangeSynonyms = ["orange", "оранжевый", "оранжевий", "помаранчевий"]
+        let yellowSynonyms = ["yellow", "желтый", "жовтий"]
+        let greenSynonyms = ["green", "greem", "зеленый", "зелений"]
+        let blueSynonyms = ["blue", "синий", "синій", "голубой", "блакитний"]
+        let greySynonyms = ["grey", "gray", "серый", "сірий"]
+        let purpleSynonyms = ["purple", "фиолетовый", "бузковий"]
+        
+        let groups = [redSynonyms, orangeSynonyms, yellowSynonyms, greenSynonyms, blueSynonyms, greySynonyms, purpleSynonyms]
+        for g in groups {
+            if g.contains(aLower) && g.contains(bLower) {
+                return true
+            }
+        }
+        return false
     }
 }
 
@@ -220,7 +250,7 @@ public final class TagsManager: @unchecked Sendable {
     @discardableResult
     public func toggleTag(_ tag: String, for item: FileItem) -> [String] {
         var current = getTags(for: item)
-        if let idx = current.firstIndex(where: { $0.caseInsensitiveCompare(tag) == .orderedSame || ($0 == "Greem" && tag == "Green") || ($0 == "Green" && tag == "Greem") }) {
+        if let idx = current.firstIndex(where: { FileTag.isTagMatching($0, tagIdOrName: tag) }) {
             current.remove(at: idx)
         } else {
             current.append(tag)
@@ -235,13 +265,13 @@ public final class TagsManager: @unchecked Sendable {
     public func applyTagToggle(_ tag: String, to items: [FileItem]) -> [String: [String]] {
         let allHaveTag = items.allSatisfy { item in
             let tags = getTags(for: item)
-            return tags.contains(where: { $0.caseInsensitiveCompare(tag) == .orderedSame || ($0 == "Greem" && tag == "Green") || ($0 == "Green" && tag == "Greem") })
+            return tags.contains(where: { FileTag.isTagMatching($0, tagIdOrName: tag) })
         }
         
         var result: [String: [String]] = [:]
         for item in items {
             var tags = getTags(for: item)
-            let existingIdx = tags.firstIndex(where: { $0.caseInsensitiveCompare(tag) == .orderedSame || ($0 == "Greem" && tag == "Green") || ($0 == "Green" && tag == "Greem") })
+            let existingIdx = tags.firstIndex(where: { FileTag.isTagMatching($0, tagIdOrName: tag) })
             
             if allHaveTag {
                 if let idx = existingIdx {

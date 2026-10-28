@@ -1502,7 +1502,7 @@ public struct FileGridCell: View {
         let combinedTags = Array(Set(contextItems.flatMap { $0.tags }))
         ControlGroup {
             ForEach(FileTag.allTags) { tag in
-                let isSelected = combinedTags.contains(tag.id) || combinedTags.contains(tag.name)
+                let isSelected = combinedTags.contains { FileTag.isTagMatching($0, tagIdOrName: tag.id) }
                 Button(action: {
                     vm.toggleTag(tag.id, for: contextItems, side: side)
                 }) {
@@ -1576,6 +1576,7 @@ public struct FileGridCell: View {
             vm.triggerDelete()
         }
         Button("Копировать (Cmd+C)") { vm.copyToClipboard(items: contextItems, side: side) }
+        Button("Скопировать полный путь (Shift+Ctrl+Cmd+C)") { vm.copySelectedPath(items: contextItems, side: side) }
         Button("Вставить (Cmd+V)") { vm.pasteFromClipboard(targetSide: side) }
             .disabled(!vm.canPaste)
         Button("Дублировать (Cmd+Shift+D)") { vm.duplicateItem(item: item, side: side) }

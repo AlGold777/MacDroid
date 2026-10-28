@@ -1206,7 +1206,7 @@ public struct PaneView: View {
         
         ControlGroup {
             ForEach(FileTag.allTags) { tag in
-                let isSelected = combinedTags.contains(tag.id) || combinedTags.contains(tag.name)
+                let isSelected = combinedTags.contains { FileTag.isTagMatching($0, tagIdOrName: tag.id) }
                 Button(action: {
                     vm.toggleTag(tag.id, for: contextItems, side: side)
                 }) {
@@ -1280,6 +1280,7 @@ public struct PaneView: View {
             vm.triggerDelete()
         }
         Button("Копировать (Cmd+C)") { vm.copyToClipboard(items: contextItems, side: side) }
+        Button("Скопировать полный путь (Shift+Ctrl+Cmd+C)") { vm.copySelectedPath(items: contextItems, side: side) }
         Button("Вставить (Cmd+V)") { vm.pasteFromClipboard(targetSide: side) }
             .disabled(!vm.canPaste)
         Button("Дублировать (Cmd+Shift+D)") { vm.duplicateItem(item: item, side: side) }
@@ -3274,7 +3275,7 @@ final class TagRowMenuView: NSView {
         ])
         
         for tag in tags {
-            let isSelected = itemTags.contains(tag.id.lowercased()) || (tag.id == "Green" && itemTags.contains("greem"))
+            let isSelected = itemTags.contains { FileTag.isTagMatching($0, tagIdOrName: tag.id) }
             let btn = TagCircleButton(tag: tag, isSelected: isSelected) { [weak self] in
                 self?.enclosingMenuItem?.menu?.cancelTracking()
                 self?.onSelectTag?(tag.id)

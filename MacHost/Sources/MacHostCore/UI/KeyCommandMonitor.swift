@@ -237,6 +237,14 @@ public final class KeyCommandMonitor {
             let isX = (code == 7 || charsNoMods == "x" || charsNoMods == "ч" || chars == "x" || chars == "ч" || chars == "\u{18}")
             let isV = (code == 9 || charsNoMods == "v" || charsNoMods == "м" || chars == "v" || chars == "м" || chars == "\u{16}")
 
+            // Shift+Ctrl+Cmd+C: Копирование полного пути элемента
+            let isShiftCtrlCmd = mods.contains(.shift) && mods.contains(.control) && mods.contains(.command) && !mods.contains(.option)
+            if isShiftCtrlCmd && isC {
+                print("KEY_MONITOR: Intercepted Copy Full Path (Shift+Ctrl+Cmd+C) on side \(vm.activePane)")
+                vm.copySelectedPath(side: vm.activePane)
+                return nil
+            }
+
             // Ctrl+Shift+C или Cmd+Shift+C: Копирование имени объектов (с расширением)
             if isCtrlOrCmd && hasShift && isC {
                 print("KEY_MONITOR: Intercepted Copy Names (Ctrl+Shift+C / Cmd+Shift+C) on side \(vm.activePane)")

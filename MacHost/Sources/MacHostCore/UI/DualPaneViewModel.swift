@@ -2479,10 +2479,7 @@ public final class DualPaneViewModel: ObservableObject {
     }
     
     private static func isTagEquivalent(_ a: String, _ b: String) -> Bool {
-        if let synonyms = synonymsForTag(a) {
-            return synonyms.contains(b)
-        }
-        return false
+        FileTag.isTagMatching(a, tagIdOrName: b)
     }
     
     private static func synonymsForTag(_ tag: String) -> [String]? {
@@ -4574,21 +4571,30 @@ public final class DualPaneViewModel: ObservableObject {
     
     // MARK: - Copy Path of Selected Item
     @discardableResult
-    public func copySelectedPath(side: PaneSide? = nil) -> String? {
+    public func copySelectedPath(items: [FileItem]? = nil, side: PaneSide? = nil) -> String? {
         let currentSide = side ?? activePane
-        let items = (currentSide == .left) ? leftItems : rightItems
+        let allItems = (currentSide == .left) ? leftItems : rightItems
         let selection = (currentSide == .left) ? leftSelection : rightSelection
         
-        let selectedItems = items.filter { item in
-            selection.contains(item.id) || selection.contains(item.path) || selection.contains(item.name)
+        let targetItems: [FileItem]
+        if let explicitItems = items, !explicitItems.isEmpty {
+            targetItems = explicitItems
+        } else if !selection.isEmpty {
+            targetItems = allItems.filter { item in
+                selection.contains(item.id) || selection.contains(item.path) || selection.contains(item.name)
+            }
+        } else if let first = allItems.first {
+            targetItems = [first]
+        } else {
+            targetItems = []
         }
         
         let pathToCopy: String?
-        if selectedItems.count > 1 {
-            let combined = selectedItems.map(\.path).joined(separator: "\n")
+        if targetItems.count > 1 {
+            let combined = targetItems.map(\.path).joined(separator: "\n")
             pathToCopy = combined
-            statusMessage = "Скопированы пути \(selectedItems.count) объектов"
-        } else if let single = selectedItems.first ?? items.first {
+            statusMessage = "Скопированы пути \(targetItems.count) объектов"
+        } else if let single = targetItems.first {
             pathToCopy = single.path
             statusMessage = "Скопирован путь: \(single.path)"
         } else {

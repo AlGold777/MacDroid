@@ -309,6 +309,16 @@ struct MacFileManagerApp: App {
                 }
                 .keyboardShortcut("c", modifiers: [.control])
                 
+                Button("Скопировать полный путь (Shift+Ctrl+Cmd+C)") {
+                    viewModel.copySelectedPath()
+                }
+                .keyboardShortcut("c", modifiers: [.command, .control, .shift])
+
+                Button("Скопировать имя (Cmd+Shift+C)") {
+                    viewModel.copySelectedNamesToClipboard()
+                }
+                .keyboardShortcut("c", modifiers: [.command, .shift])
+                
                 Button("Вставить из буфера (Cmd+V)") {
                     if !KeyCommandMonitor.performTextShortcut(keyCode: 9) {
                         viewModel.pasteFromClipboard()
