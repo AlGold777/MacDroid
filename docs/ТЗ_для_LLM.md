@@ -70,7 +70,7 @@ docs/Анализ платформенных ограничений Mac ↔ Andr
 
 - **JobUnitStateMachine**: `PLANNED → RUNNING → COMMITTING → COMPLETED`, с ветками `→ INDETERMINATE`, `→ FAILED`
 - **IntentLedger**: SQLite WAL + `NSRecursiveLock`, поддерживает `withTransaction {}`
-- **JobOrchestrator**: pre-flight check (+5%), exponential backoff (3 попытки), `.part` temp files, атомарный rename, верификация после commit
+- **JobOrchestrator**: pre-flight check (+5%), повторы при сетевом сбое (паузы 1–15 с, окно ≈60 с, продолжение с подтверждённого frontier; ошибки-ответы сервера не повторяются), `.part` temp files, атомарный rename, верификация после commit
 - **TOFU**: Mac хранит fingerprint Android-сервера в `HostKeyStore`; Android хранит public key Mac в `authorized_keys`
 - **ConflictResolutionStrategy**: `.skip`, `.skipIfIdentical`, `.overwriteIfNewer`, `.autoRename`, `.overwrite`
 

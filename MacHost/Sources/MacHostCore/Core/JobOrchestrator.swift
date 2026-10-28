@@ -51,6 +51,20 @@ private final class CheckpointThrottle: @unchecked Sendable {
     }
 }
 
+/// Прогресс не откатывается назад при повторе: после обрыва процент держится на достигнутом максимуме,
+/// пока продолжение с подтверждённой границы не догонит его.
+private final class MonotonicProgressFloor: @unchecked Sendable {
+    private let lock = NSLock()
+    private var highest: Double = 0
+
+    func raise(_ value: Double) -> Double {
+        lock.lock()
+        defer { lock.unlock() }
+        highest = max(highest, value)
+        return highest
+    }
+}
+
 public final class JobOrchestrator: @unchecked Sendable {
     private let ledger: IntentLedger
     public let transport: TransportMultiplexer
@@ -201,6 +215,11 @@ public final class JobOrchestrator: @unchecked Sendable {
            dir == src || dir.hasPrefix(src + "/") {
             throw JobOrchestratorError.invalidPlacement(reason: "нельзя перенести или скопировать папку «\(sourceURL.lastPathComponent)» внутрь неё самой")
         }
+    }
+
+    /// Явное «Отключить» пользователем: автоматические повторы передачи не должны переподключать сессию
+    private static func manualDisconnectActive() async -> Bool {
+        await MainActor.run { ConnectionController.shared.isManualDisconnectSuppressed }
     }
 
     /// Чтение размера файла (0, если недоступен)
@@ -411,18 +430,31 @@ public final class JobOrchestrator: @unchecked Sendable {
             state: "transferring"
         )
         
-        // 2. Transfer: Потоковая загрузка с отслеживанием диапазонов
-        var attempts = 0
-        let maxAttempts = 3
+        // 2. Transfer: Потоковая загрузка с отслеживанием диапазонов.
+        // Сетевой сбой повторяется с продолжением с подтверждённой границы (TransferRetryPolicy).
+        var retryBudget = TransferRetryBudget()
         var downloadSuccess = false
         var lastError: Error?
         let checkpointThrottle = CheckpointThrottle()
+        let progressFloor = MonotonicProgressFloor()
 
-        while attempts < maxAttempts && !downloadSuccess {
+        while !downloadSuccess {
             if Task.isCancelled {
                 throw CancellationError()
             }
-            attempts += 1
+            // Продолжаем с границы только если локальная часть на месте и не короче неё; иначе начинаем с нуля
+            if currentOffset > 0 && Self.fileSize(at: tempURL) < currentOffset {
+                SSHTransportLog.write("ORCH_DOWNLOAD_RESTART_FROM_ZERO localSize=\(Self.fileSize(at: tempURL)) frontier=\(currentOffset)")
+                currentOffset = 0
+                rangeTracker = ConfirmedRangeTracker()
+                try? journal.checkpointProgress(
+                    transferId: actionId,
+                    frontier: 0,
+                    ranges: rangeTracker.serialize(),
+                    durabilityEvidence: true
+                )
+            }
+            let frontierBefore = rangeTracker.contiguousFrontier
             do {
                 try await transport.downloadFileStreaming(
                     actionId: actionId,
@@ -446,25 +478,36 @@ public final class JobOrchestrator: @unchecked Sendable {
                     },
                     onProgress: { bytes in
                         let pct = Double(bytes) / Double(max(1, stat.size)) * 0.85
-                        progress(pct)
+                        progress(progressFloor.raise(pct))
                     }
                 )
                 downloadSuccess = true
             } catch {
-                if Task.isCancelled || error is CancellationError {
+                let decision = TransferRetryPolicy.classify(error, taskCancelled: Task.isCancelled)
+                if decision == .cancelled {
                     throw CancellationError()
                 }
                 lastError = error
                 currentOffset = rangeTracker.contiguousFrontier
-                if attempts < maxAttempts {
-                    let delaySec = UInt64(attempts)
-                    try? await Task.sleep(nanoseconds: delaySec * 1_000_000_000)
+                // Явное «Отключить» пользователем: повторы не переподключают сессию сами
+                guard decision == .retryable,
+                      !(await Self.manualDisconnectActive()),
+                      let pauseNs = retryBudget.nextPauseNanoseconds(
+                        now: Date(),
+                        progressed: rangeTracker.contiguousFrontier > frontierBefore
+                      ) else {
+                    break
                 }
+                SSHTransportLog.write("ORCH_DOWNLOAD_RETRY remotePath=\(remotePath) frontier=\(currentOffset) retry=\(retryBudget.retriesUsed) error=\(error.localizedDescription)")
+                // Пауза прерывается отменой задачи: Task.sleep бросает CancellationError
+                try await Task.sleep(nanoseconds: pauseNs)
+                // После паузы пользователь мог нажать «Отключить»: повтора не делаем
+                if await Self.manualDisconnectActive() { break }
             }
         }
-        
+
         guard downloadSuccess else {
-            let finalError = lastError ?? NSError(domain: "JobOrchestrator", code: 2, userInfo: [NSLocalizedDescriptionKey: "Download failed after \(maxAttempts) attempts"])
+            let finalError = lastError ?? NSError(domain: "JobOrchestrator", code: 2, userInfo: [NSLocalizedDescriptionKey: "Download failed"])
             sm.transition(to: .failed, error: finalError.localizedDescription)
             try? journal.updateState(transferId: actionId, state: "failed", errorMessage: finalError.localizedDescription)
             ledger.recordItemState(
@@ -766,27 +809,81 @@ public final class JobOrchestrator: @unchecked Sendable {
         )
         
         do {
-            try await transport.uploadFileStreaming(
-                actionId: actionId,
-                localURL: localSourceURL,
-                remotePath: remoteTempPath,
-                startOffset: startOffset,
-                rangeTracker: rangeTracker,
-                onRangeConfirmed: { confirmedRange in
-                    rangeTracker.addRange(confirmedRange)
-                    try? journal.checkpointProgress(
-                        transferId: actionId,
-                        frontier: rangeTracker.contiguousFrontier,
-                        ranges: rangeTracker.serialize(),
-                        durabilityEvidence: true
+            // Фаза передачи повторяется с продолжением с подтверждённой границы (TransferRetryPolicy).
+            // Верификация и коммит ниже повторов не имеют.
+            var retryBudget = TransferRetryBudget()
+            let progressFloor = MonotonicProgressFloor()
+            var resumeCheckPending = false
+            while true {
+                let frontierBefore = rangeTracker.contiguousFrontier
+                do {
+                    if resumeCheckPending && startOffset > 0 {
+                        // Продолжаем с границы только если удалённая часть на месте и не короче неё; иначе с нуля
+                        let partSize: UInt64?
+                        do {
+                            partSize = try await transport.prepareRead(actionId: actionId, path: remoteTempPath).size
+                        } catch where Self.isNoSuchFile(error) {
+                            partSize = nil
+                        }
+                        if (partSize ?? 0) < startOffset {
+                            SSHTransportLog.write("ORCH_UPLOAD_RESTART_FROM_ZERO remotePartSize=\(partSize.map { String($0) } ?? "nil") frontier=\(startOffset)")
+                            startOffset = 0
+                            rangeTracker = ConfirmedRangeTracker()
+                            try? journal.checkpointProgress(
+                                transferId: actionId,
+                                frontier: 0,
+                                ranges: rangeTracker.serialize(),
+                                durabilityEvidence: true
+                            )
+                        }
+                    }
+                    resumeCheckPending = false
+                    try await transport.uploadFileStreaming(
+                        actionId: actionId,
+                        localURL: localSourceURL,
+                        remotePath: remoteTempPath,
+                        startOffset: startOffset,
+                        rangeTracker: rangeTracker,
+                        onRangeConfirmed: { confirmedRange in
+                            rangeTracker.addRange(confirmedRange)
+                            try? journal.checkpointProgress(
+                                transferId: actionId,
+                                frontier: rangeTracker.contiguousFrontier,
+                                ranges: rangeTracker.serialize(),
+                                durabilityEvidence: true
+                            )
+                        },
+                        onProgress: { bytes in
+                            let pct = Double(bytes) / Double(max(1, fileSize)) * 0.90
+                            progress(progressFloor.raise(pct))
+                        }
                     )
-                },
-                onProgress: { bytes in
-                    let pct = Double(bytes) / Double(max(1, fileSize)) * 0.90
-                    progress(pct)
+                    break
+                } catch {
+                    let decision = TransferRetryPolicy.classify(error, taskCancelled: Task.isCancelled)
+                    if decision == .cancelled {
+                        throw CancellationError()
+                    }
+                    // Явное «Отключить» пользователем: повторы не переподключают сессию сами
+                    let manualDisconnect = await Self.manualDisconnectActive()
+                    guard decision == .retryable,
+                          !manualDisconnect,
+                          let pauseNs = retryBudget.nextPauseNanoseconds(
+                            now: Date(),
+                            progressed: rangeTracker.contiguousFrontier > frontierBefore
+                          ) else {
+                        throw error
+                    }
+                    startOffset = rangeTracker.contiguousFrontier
+                    resumeCheckPending = true
+                    SSHTransportLog.write("ORCH_UPLOAD_RETRY remotePath=\(remoteTempPath) frontier=\(startOffset) retry=\(retryBudget.retriesUsed) error=\(error.localizedDescription)")
+                    // Пауза прерывается отменой задачи: Task.sleep бросает CancellationError
+                    try await Task.sleep(nanoseconds: pauseNs)
+                    // После паузы пользователь мог нажать «Отключить»: повтора не делаем
+                    if await Self.manualDisconnectActive() { throw error }
                 }
-            )
-            
+            }
+
             // 3. Verify: Проверка покрытия перед коммитом
             guard rangeTracker.isFullyCovered(expectedSize: fileSize) else {
                 throw JobOrchestratorError.transferInterrupted(reason: "Обнаружены непокрытые диапазоны при выгрузке (дыры)")

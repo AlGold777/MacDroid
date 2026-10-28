@@ -3813,6 +3813,81 @@ func runAllAsyncTests() async {
         }
 
         // =========================================================================
+        // [TEST 42i] Transfer resilience: retry pauses, error classification, budget after a session reset
+        // =========================================================================
+        print("\n[TEST 42i] Transfer retry policy and SessionBudget release after a session reset:")
+        do {
+            // Каждая попытка падает сразу после паузы: паузы 1,2,4,8,15,15,15 с, всего 7 повторов
+            var retry = TransferRetryBudget()
+            var clock = Date(timeIntervalSince1970: 1_000_000)
+            var pauses: [UInt64] = []
+            while let ns = retry.nextPauseNanoseconds(now: clock, progressed: false) {
+                pauses.append(ns / 1_000_000_000)
+                clock = clock.addingTimeInterval(Double(ns) / 1_000_000_000)
+            }
+            assertCondition(pauses == [1, 2, 4, 8, 15, 15, 15], "Retry pauses are 1,2,4,8,15,15,15 s (7 retries after the first attempt)")
+            assertCondition(retry.retriesUsed == 7, "Retry budget is exhausted after 7 retries")
+
+            // Окно 60 с от первого сбоя: сбой на 59-й секунде со следующей паузой 2 с уже не повторяется
+            var late = TransferRetryBudget()
+            let windowStart = Date(timeIntervalSince1970: 2_000_000)
+            _ = late.nextPauseNanoseconds(now: windowStart, progressed: false)
+            assertCondition(late.nextPauseNanoseconds(now: windowStart.addingTimeInterval(59), progressed: false) == nil, "Failure at 59 s with a 2 s pause falls outside the 60 s window")
+
+            // Продвижение передачи перед сбоем начинает окно заново
+            var progressing = TransferRetryBudget()
+            var t = windowStart
+            for _ in 0..<7 {
+                if let ns = progressing.nextPauseNanoseconds(now: t, progressed: false) {
+                    t = t.addingTimeInterval(Double(ns) / 1_000_000_000)
+                }
+            }
+            assertCondition(progressing.nextPauseNanoseconds(now: t, progressed: false) == nil, "Exhausted window refuses another pause without progress")
+            assertCondition(progressing.nextPauseNanoseconds(now: t, progressed: true) == 1_000_000_000, "Progress before the failure restarts the window at the first 1 s pause")
+
+            // Классификация: отмена пользователя — единственная «отмена»; разрыв и сетевые ошибки повторяются
+            let sftpDropped = NSError(domain: "SFTPChannel", code: 3, userInfo: nil)
+            // Ответы сервера (статус SFTP) помечены ключом serverStatusKey, как их создаёт TransportMultiplexer
+            func serverStatus(_ status: SFTPStatusCode) -> NSError {
+                NSError(domain: "TransportMultiplexer", code: Int(status.rawValue),
+                        userInfo: [NSLocalizedDescriptionKey: "SFTP error (code \(status.rawValue))",
+                                   TransportMultiplexer.serverStatusKey: true])
+            }
+            let remoteNoSuchFile = serverStatus(.noSuchFile)
+            let remoteNoRights = serverStatus(.permissionDenied)
+            let remoteFailure = serverStatus(.failure)
+            let remoteConnectionLost = serverStatus(.connectionLost)
+            let openUnexpected = NSError(domain: "TransportMultiplexer", code: 20, userInfo: nil)
+            let localHandleLimit = NSError(domain: "TransportMultiplexer", code: TransportMultiplexer.localHandleLimitCode, userInfo: nil)
+            let localDiskFull = NSError(domain: NSPOSIXErrorDomain, code: Int(ENOSPC), userInfo: nil)
+            assertCondition(TransferRetryPolicy.classify(CancellationError(), taskCancelled: true) == .cancelled, "Cancellation of the task is never retried")
+            assertCondition(TransferRetryPolicy.classify(sftpDropped, taskCancelled: true) == .cancelled, "Any error of a cancelled task is a cancellation")
+            assertCondition(TransferRetryPolicy.classify(CancellationError(), taskCancelled: false) == .retryable, "CancellationError without task cancellation (session reset) is retried")
+            assertCondition(TransferRetryPolicy.classify(sftpDropped, taskCancelled: false) == .retryable, "Dropped SFTP channel is retried")
+            assertCondition(TransferRetryPolicy.classify(NSError(domain: "TransportMultiplexer", code: 416, userInfo: nil), taskCancelled: false) == .retryable, "Incomplete transport read is retried")
+            assertCondition(TransferRetryPolicy.classify(NSError(domain: "Unknown", code: 9, userInfo: nil), taskCancelled: false) == .retryable, "Unrecognized transport error is retried within the window")
+            assertCondition(TransferRetryPolicy.classify(remoteNoSuchFile, taskCancelled: false) == .fatal, "Remote file that vanished is not retried")
+            assertCondition(TransferRetryPolicy.classify(remoteNoRights, taskCancelled: false) == .fatal, "Remote permission denied is not retried")
+            assertCondition(TransferRetryPolicy.classify(localDiskFull, taskCancelled: false) == .fatal, "Local disk full is not retried")
+            assertCondition(TransferRetryPolicy.classify(remoteFailure, taskCancelled: false) == .fatal, "Server status failure (e.g. no space on the phone) is not retried")
+            assertCondition(TransferRetryPolicy.classify(remoteConnectionLost, taskCancelled: false) == .retryable, "Server connectionLost status is a transport drop and is retried")
+            assertCondition(TransferRetryPolicy.classify(openUnexpected, taskCancelled: false) == .retryable, "Open with an unexpected response type (no server status) is retried")
+            assertCondition(TransferRetryPolicy.classify(localHandleLimit, taskCancelled: false) == .retryable, "Local handle limit (own code, not a server answer) is retried")
+            assertCondition(JobOrchestrator.isNoSuchFile(remoteNoSuchFile), "isNoSuchFile still recognizes a server noSuchFile status")
+            assertCondition(!JobOrchestrator.isNoSuchFile(localHandleLimit), "Local handle limit is not mistaken for noSuchFile")
+            assertCondition(TransferRetryPolicy.classify(JobOrchestratorError.commitVerificationFailed(path: "/x"), taskCancelled: false) == .fatal, "Commit verification failure is not retried")
+            assertCondition(TransferRetryPolicy.classify(JobOrchestratorError.unsupportedAtomicReplace(path: "/x"), taskCancelled: false) == .fatal, "Unsupported atomic replace is not retried")
+            assertCondition(TransferRetryPolicy.classify(NSError(domain: "JobOrchestrator", code: 404, userInfo: nil), taskCancelled: false) == .fatal, "Missing local source is not retried")
+
+            // Release после reset на пустом бюджете не уводит счётчики ниже нуля
+            let emptyReset = SessionBudget(maxNetworkPayload: 10, maxWriteBuffers: 10, maxHandles: 1, interactiveReserve: 0)
+            emptyReset.reset()
+            emptyReset.releasePayload(bytes: 5)
+            emptyReset.releaseHandle()
+            assertCondition(emptyReset.currentSnapshot.networkBytes == 0 && emptyReset.currentSnapshot.handles == 0, "Release after an empty reset never drives counters below zero")
+        }
+
+        // =========================================================================
         // [TEST 43] Connection Architecture: Strict Fallback, Instant Kill & Scope
         // =========================================================================
         print("\n--- [TEST 43] Connection Architecture: Strict Fallback, Instant Kill & Scope ---")

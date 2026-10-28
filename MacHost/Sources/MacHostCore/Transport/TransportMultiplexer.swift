@@ -14,9 +14,15 @@ public struct RemoteStat: Sendable {
 }
 
 public final class TransportMultiplexer: @unchecked Sendable {
+    /// Ключ userInfo в NSError: ошибка — статус, который сервер вернул на запрос (код = SFTPStatusCode.rawValue).
+    /// Такие ошибки повтор передачи не лечит (кроме транспортных статусов noConnection/connectionLost).
+    public static let serverStatusKey = "SFTPServerStatus"
+    /// Локальный лимит дескрипторов SessionBudget (не ответ сервера): повторяемая ошибка
+    public static let localHandleLimitCode = 30
+
     public let coordinator: SessionCoordinator
     private let packetEngine: SFTPPacketEngine
-    
+
     public init(host: String = "127.0.0.1", port: UInt16 = 2222, coordinator: SessionCoordinator = .shared) {
         self.coordinator = coordinator
         self.packetEngine = coordinator.packetEngine
@@ -90,7 +96,8 @@ public final class TransportMultiplexer: @unchecked Sendable {
             throw NSError(
                 domain: "TransportMultiplexer",
                 code: Int(code.rawValue),
-                userInfo: [NSLocalizedDescriptionKey: "SFTP Stat error: \(msg) (code \(code.rawValue))"]
+                userInfo: [NSLocalizedDescriptionKey: "SFTP Stat error: \(msg) (code \(code.rawValue))",
+                           TransportMultiplexer.serverStatusKey: true]
             )
         } else {
             SSHTransportLog.write("PREPARE_READ_UNEXPECTED path=\(path) respType=\(respType)")
@@ -355,7 +362,7 @@ public final class TransportMultiplexer: @unchecked Sendable {
         
         let budget = coordinator.budget
         guard budget.acquireHandle() else {
-            throw NSError(domain: "TransportMultiplexer", code: 2, userInfo: [NSLocalizedDescriptionKey: "Exceeded max handles in SessionBudget"])
+            throw NSError(domain: "TransportMultiplexer", code: TransportMultiplexer.localHandleLimitCode, userInfo: [NSLocalizedDescriptionKey: "Exceeded max handles in SessionBudget"])
         }
         defer { budget.releaseHandle() }
         
@@ -390,6 +397,13 @@ public final class TransportMultiplexer: @unchecked Sendable {
         
         guard openRespType == .handle else {
             SSHTransportLog.write("DL_OPEN_FAILED respType=\(openRespType) path=\(sftpPath)")
+            // Сервер ответил статусом (нет файла, нет прав и т.п.) — это ответ, а не сбой транспорта
+            if openRespType == .status, let (_, code, msg) = try? packetEngine.parseStatusResponse(data: openPayload) {
+                throw NSError(domain: "TransportMultiplexer", code: Int(code.rawValue),
+                              userInfo: [NSLocalizedDescriptionKey: "Failed to open remote file \(sftpPath): \(msg) (code \(code.rawValue))",
+                                         TransportMultiplexer.serverStatusKey: true])
+            }
+            // Неожиданный тип ответа — рассогласование протокола, повторяется в окне
             throw NSError(domain: "TransportMultiplexer", code: 20, userInfo: [NSLocalizedDescriptionKey: "Failed to open remote file \(sftpPath)"])
         }
         let (_, remoteHandle) = try packetEngine.parseHandleResponse(data: openPayload)
@@ -505,7 +519,9 @@ public final class TransportMultiplexer: @unchecked Sendable {
                 if code == .eof {
                     break
                 }
-                throw NSError(domain: "TransportMultiplexer", code: Int(code.rawValue), userInfo: [NSLocalizedDescriptionKey: "SFTP READ ended before the requested range was complete: \(message)"])
+                throw NSError(domain: "TransportMultiplexer", code: Int(code.rawValue),
+                              userInfo: [NSLocalizedDescriptionKey: "SFTP READ ended before the requested range was complete: \(message)",
+                                         TransportMultiplexer.serverStatusKey: true])
             } else {
                 throw NSError(domain: "TransportMultiplexer", code: 23, userInfo: [NSLocalizedDescriptionKey: "Unexpected SFTP READ response \(response)"])
             }
@@ -640,7 +656,7 @@ public final class TransportMultiplexer: @unchecked Sendable {
         
         let budget = coordinator.budget
         guard budget.acquireHandle() else {
-            throw NSError(domain: "TransportMultiplexer", code: 2, userInfo: [NSLocalizedDescriptionKey: "Exceeded max handles in SessionBudget"])
+            throw NSError(domain: "TransportMultiplexer", code: TransportMultiplexer.localHandleLimitCode, userInfo: [NSLocalizedDescriptionKey: "Exceeded max handles in SessionBudget"])
         }
         defer { budget.releaseHandle() }
         
@@ -654,6 +670,11 @@ public final class TransportMultiplexer: @unchecked Sendable {
         let (openRespType, openPayload) = try await channel.sendRequest(packet: openPacket, requestId: openReqId)
         
         guard openRespType == .handle else {
+            if openRespType == .status, let (_, code, msg) = try? packetEngine.parseStatusResponse(data: openPayload) {
+                throw NSError(domain: "TransportMultiplexer", code: Int(code.rawValue),
+                              userInfo: [NSLocalizedDescriptionKey: "Failed to open remote file for writing: \(sftpPath): \(msg) (code \(code.rawValue))",
+                                         TransportMultiplexer.serverStatusKey: true])
+            }
             throw NSError(domain: "TransportMultiplexer", code: 20, userInfo: [NSLocalizedDescriptionKey: "Failed to open remote file for writing: \(sftpPath)"])
         }
         let (_, remoteHandle) = try packetEngine.parseHandleResponse(data: openPayload)
@@ -689,7 +710,7 @@ public final class TransportMultiplexer: @unchecked Sendable {
                         if wType == .status {
                             let (_, code, msg) = try self.packetEngine.parseStatusResponse(data: wPayload)
                             if code != .ok {
-                                throw NSError(domain: "TransportMultiplexer", code: Int(code.rawValue), userInfo: [NSLocalizedDescriptionKey: "SFTP write error: \(msg)"])
+                                throw NSError(domain: "TransportMultiplexer", code: Int(code.rawValue), userInfo: [NSLocalizedDescriptionKey: "SFTP write error: \(msg)", TransportMultiplexer.serverStatusKey: true])
                             }
                             return writeOffset..<(writeOffset + UInt64(chunk.count))
                         } else {
@@ -724,7 +745,7 @@ public final class TransportMultiplexer: @unchecked Sendable {
                                 if wType == .status {
                                     let (_, code, msg) = try self.packetEngine.parseStatusResponse(data: wPayload)
                                     if code != .ok {
-                                        throw NSError(domain: "TransportMultiplexer", code: Int(code.rawValue), userInfo: [NSLocalizedDescriptionKey: "SFTP write error: \(msg)"])
+                                        throw NSError(domain: "TransportMultiplexer", code: Int(code.rawValue), userInfo: [NSLocalizedDescriptionKey: "SFTP write error: \(msg)", TransportMultiplexer.serverStatusKey: true])
                                     }
                                     return writeOffset..<(writeOffset + UInt64(chunk.count))
                                 } else {
