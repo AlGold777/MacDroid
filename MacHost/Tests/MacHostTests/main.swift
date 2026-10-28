@@ -3782,6 +3782,37 @@ func runAllAsyncTests() async {
         }
 
         // =========================================================================
+        // [TEST 42h] Phone session monitor: one adb miss or adb failure does not drop a live session
+        // =========================================================================
+        print("\n[TEST 42h] Phone session liveness: adb misses, adb failure and dead SSH:")
+        do {
+            // Серийник виден: сессия живёт, счётчик пропусков сбрасывается
+            let seen = decidePhoneSessionLiveness(sshAlive: true, usbSerial: "S1", adbListing: ["S1"], previousMisses: 1)
+            assertCondition(!seen.disconnect && seen.adbMisses == 0, "Visible serial keeps the USB session and resets misses")
+
+            // Первый пропуск серийника не рвёт живую USB-сессию
+            let firstMiss = decidePhoneSessionLiveness(sshAlive: true, usbSerial: "S1", adbListing: [], previousMisses: 0)
+            assertCondition(!firstMiss.disconnect && firstMiss.adbMisses == 1, "One missing serial does not drop a live USB session")
+
+            // Второй пропуск подряд рвёт сессию и обнуляет счётчик
+            let secondMiss = decidePhoneSessionLiveness(sshAlive: true, usbSerial: "S1", adbListing: ["X"], previousMisses: firstMiss.adbMisses)
+            assertCondition(secondMiss.disconnect && secondMiss.adbMisses == 0, "Two missing serials in a row drop the session")
+
+            // Сбой самого adb (nil) не промах: состояние не меняется
+            let adbDown = decidePhoneSessionLiveness(sshAlive: true, usbSerial: "S1", adbListing: nil, previousMisses: 1)
+            assertCondition(!adbDown.disconnect && adbDown.adbMisses == 1, "adb failure neither drops the session nor counts as a miss")
+
+            // Мёртвый SSH-процесс: отключение сразу, без ожидания промахов
+            let dead = decidePhoneSessionLiveness(sshAlive: false, usbSerial: "S1", adbListing: ["S1"], previousMisses: 0)
+            assertCondition(dead.disconnect && dead.adbMisses == 0, "Dead SSH process drops the USB session at once")
+
+            // Wi-Fi маршрут (без серийника): решает только SSH-процесс, adb не учитывается
+            let wifiAlive = decidePhoneSessionLiveness(sshAlive: true, usbSerial: nil, adbListing: nil, previousMisses: 0)
+            let wifiDead = decidePhoneSessionLiveness(sshAlive: false, usbSerial: nil, adbListing: nil, previousMisses: 0)
+            assertCondition(!wifiAlive.disconnect && wifiDead.disconnect, "Wi-Fi route is decided by the SSH process alone")
+        }
+
+        // =========================================================================
         // [TEST 43] Connection Architecture: Strict Fallback, Instant Kill & Scope
         // =========================================================================
         print("\n--- [TEST 43] Connection Architecture: Strict Fallback, Instant Kill & Scope ---")

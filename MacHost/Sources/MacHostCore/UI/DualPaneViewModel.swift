@@ -66,6 +66,40 @@ public struct BatchRenameSession: Identifiable, Equatable, Sendable {
     }
 }
 
+/// Решение монитора связи для активного SSH-сеанса.
+public struct PhoneSessionLivenessDecision: Equatable, Sendable {
+    /// Нужно ли отключить сеанс.
+    public let disconnect: Bool
+    /// Счётчик подряд идущих пропусков серийника в ответах adb после решения.
+    public let adbMisses: Int
+}
+
+/// Чистая логика монитора. Мёртвый SSH-процесс — отключение сразу.
+/// Для USB-маршрута: `adbListing == nil` — adb не ответил, это не пропуск и состояние не меняется;
+/// серийника нет в списке — пропуск; отключение после `adbMissLimit` пропусков подряд.
+/// `usbSerial == nil` — Wi-Fi маршрут, решает только SSH-процесс.
+public func decidePhoneSessionLiveness(
+    sshAlive: Bool,
+    usbSerial: String?,
+    adbListing: [String]?,
+    previousMisses: Int,
+    adbMissLimit: Int = 2
+) -> PhoneSessionLivenessDecision {
+    guard sshAlive else { return PhoneSessionLivenessDecision(disconnect: true, adbMisses: 0) }
+    guard let serial = usbSerial else { return PhoneSessionLivenessDecision(disconnect: false, adbMisses: 0) }
+    guard let listing = adbListing else {
+        return PhoneSessionLivenessDecision(disconnect: false, adbMisses: previousMisses)
+    }
+    if listing.contains(serial) {
+        return PhoneSessionLivenessDecision(disconnect: false, adbMisses: 0)
+    }
+    let misses = previousMisses + 1
+    if misses >= adbMissLimit {
+        return PhoneSessionLivenessDecision(disconnect: true, adbMisses: 0)
+    }
+    return PhoneSessionLivenessDecision(disconnect: false, adbMisses: misses)
+}
+
 @MainActor
 public final class DualPaneViewModel: ObservableObject {
     public static weak var shared: DualPaneViewModel?
@@ -628,9 +662,11 @@ public final class DualPaneViewModel: ObservableObject {
     private var connectionMonitorTimer: Timer?
     /// Между willSleep и didWake проверки связи не запускаем (W16)
     private var isSystemAsleep = false
-    private var wifiReachabilityMisses: Int = 0
+    /// Подряд идущие пропуски серийника USB-маршрута в ответах adb (сбой самого adb не считается)
+    private var adbMisses: Int = 0
+    /// Эпоха сеанса, к которой относится adbMisses: пропуски прежнего сеанса не переносятся в новый
+    private var adbMissesEpoch: UInt64 = 0
     private var connectionProbeRunning = false
-    private let wifiReachabilityMissLimit = 3
     
     // Вычисление размера папок по нажатию Space и при выделении
     @Published public var calculatedFolderSizes: [String: UInt64] = [:]
@@ -857,6 +893,8 @@ public final class DualPaneViewModel: ObservableObject {
         ) { [weak self] _ in
             Task { @MainActor [weak self] in
                 self?.isSystemAsleep = false
+                // Промах adb до сна и промах после пробуждения — не «два подряд»
+                self?.adbMisses = 0
                 // Пробуждение снимает паузы повторов по всем маршрутам (Wi-Fi и USB)
                 self?.resetAutoConnectTiming(group: "wake", force: true, where: { _ in true })
                 try? await Task.sleep(nanoseconds: 2_000_000_000)
@@ -3176,7 +3214,8 @@ public final class DualPaneViewModel: ObservableObject {
     public func checkPhoneConnectionState() {
         guard !isConnectingPhone && !connectionProbeRunning && !isSystemAsleep else { return }
         if !remoteDriver.isConnected {
-            wifiReachabilityMisses = 0
+            adbMisses = 0
+            remoteDriver.coordinator.releaseDeadSession()
             if isPhoneConnected {
                 isPhoneConnected = false
                 refreshUsbDrives()
@@ -3191,27 +3230,41 @@ public final class DualPaneViewModel: ObservableObject {
         
         Task.detached(priority: .utility) { [weak self] in
             guard let self = self else { return }
-            let adbDeviceIds = PhoneConnectionManager.shared.authorizedAdbDeviceIds()
+            // nil — adb не ответил: для монитора это не пропуск серийника
+            let adbListing = PhoneConnectionManager.shared.authorizedAdbDeviceIdsIfAvailable()
             let monitoredUsbDeviceId: String? = {
                 guard let path = monitoredPath, case .usb(let deviceId, _) = path else { return nil }
                 return deviceId
             }()
-            let isAdbConnected = monitoredUsbDeviceId.map(adbDeviceIds.contains) ?? false
-            
-            let adbDetected = isAdbConnected
+            let adbDetected = monitoredUsbDeviceId.map { adbListing?.contains($0) ?? false } ?? false
             let sshProcessAlive = activeSSHChannel?.isRunning == true
-            
+
             await MainActor.run {
                 self.connectionProbeRunning = false
-                guard !self.isConnectingPhone,
-                      self.remoteDriver.coordinator.sessionEpoch == probeEpoch,
-                      ConnectionController.shared.currentPath == monitoredPath else { return }
+                guard !self.isConnectingPhone else { return }
+                guard self.remoteDriver.coordinator.sessionEpoch == probeEpoch,
+                      ConnectionController.shared.currentPath == monitoredPath else {
+                    // Сеанс или маршрут сменились: пропуски adb относятся к прежнему сеансу
+                    self.adbMisses = 0
+                    return
+                }
                 if self.remoteDriver.isConnected {
+                    // Счётчик привязан к эпохе: переподключение между тиками (или пропущенные тики) не переносит пропуски
+                    if self.adbMissesEpoch != probeEpoch {
+                        self.adbMisses = 0
+                        self.adbMissesEpoch = probeEpoch
+                    }
                     // Check the authenticated SSH process itself. An ADB forward or
                     // an unrelated listener on port 2222 does not prove SFTP is alive.
-                    let sessionTransportAlive = sshProcessAlive && (monitoredUsbDeviceId == nil || adbDetected)
-                    if !sessionTransportAlive {
-                        self.wifiReachabilityMisses = 0
+                    // Один пропуск adb или сбой adb не рвут сессию (см. decidePhoneSessionLiveness).
+                    let decision = decidePhoneSessionLiveness(
+                        sshAlive: sshProcessAlive,
+                        usbSerial: monitoredUsbDeviceId,
+                        adbListing: adbListing,
+                        previousMisses: self.adbMisses
+                    )
+                    self.adbMisses = decision.adbMisses
+                    if decision.disconnect {
                         self.isPhoneConnected = false
                         self.remoteDriver.disconnect()
                         self.refreshUsbDrives()
@@ -3219,14 +3272,11 @@ public final class DualPaneViewModel: ObservableObject {
                         if self.rightSource == .remotePhone { self.refreshPane(side: .right) }
                         self.statusMessage = "Телефон отключен (связь потеряна)"
                     } else if !self.isPhoneConnected {
-                        self.wifiReachabilityMisses = 0
                         self.isPhoneConnected = true
                         self.refreshUsbDrives()
-                    } else {
-                        self.wifiReachabilityMisses = 0
                     }
                 } else {
-                    self.wifiReachabilityMisses = 0
+                    self.adbMisses = 0
                     // Если SFTP драйвер не подключен, индикатор ОБЯЗАН быть серым (не подключен)
                     if self.isPhoneConnected {
                         self.isPhoneConnected = false

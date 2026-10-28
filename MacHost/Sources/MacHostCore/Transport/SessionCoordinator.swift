@@ -18,7 +18,9 @@ public final class SessionCoordinator: @unchecked Sendable {
     private let lock = NSRecursiveLock()
     /// Выставляется по NSWorkspace.didWakeNotification; сбрасывается после health probe.
     private var needsProbeAfterWake = false
-    
+    /// Единственная активная проба живости: канал и общая задача (под lock; см. sharedHealthProbe).
+    private var activeProbe: (channel: ObjectIdentifier, task: Task<Bool, Never>)?
+
     public private(set) var host: String = "127.0.0.1"
     public private(set) var port: UInt16 = 2222
     public private(set) var deviceId: String? = nil
@@ -143,17 +145,17 @@ public final class SessionCoordinator: @unchecked Sendable {
             needsProbeAfterWake = false
             lock.unlock()
             if shouldProbe {
-                do {
-                    let requestId = chan.allocateRequestId()
-                    let packet = packetEngine.createStatPacket(requestId: requestId, path: "/")
-                    // Короткий таймаут: мёртвая связь должна обнаруживаться за секунды, а не за 5+ с.
-                    _ = try await chan.sendRequest(packet: packet, requestId: requestId, timeoutSeconds: 2)
-                } catch {
-                    // Отмена вызывающего не означает разрыв связи: здоровую сессию не рвём.
-                    if error is CancellationError || Task.isCancelled { throw CancellationError() }
-                    SSHTransportLog.write("SFTP health probe failed channel=\(chan.channelId) error=\(error.localizedDescription)")
-                    // Полная очистка (каналы + ControlMaster), иначе ssh-процесс остаётся висеть (W8).
-                    disconnect()
+                // Одна общая проба на канал: параллельные вызовы ждут её результат и не запускают свою.
+                let alive = try await sharedHealthProbe(chan)
+                if !alive {
+                    // Compare-and-disconnect: рвём, только если проверенный канал всё ещё текущий.
+                    // Иначе сессию уже заменили, и повторный вызов просто использует новую.
+                    lock.lock()
+                    if _interactiveChannel === chan {
+                        // Полная очистка (каналы + ControlMaster), иначе ssh-процесс остаётся висеть (W8).
+                        disconnect()
+                    }
+                    lock.unlock()
                     try await ensureConnected()
                 }
             }
@@ -166,7 +168,10 @@ public final class SessionCoordinator: @unchecked Sendable {
                 return
             }
             disconnect()
-        } else if _interactiveChannel?.isRunning == true {
+        } else if _interactiveChannel != nil {
+            // Мёртвый канал (isRunning == false) тоже очищаем до нового подключения:
+            // иначе старые ControlMaster, bulk-слейв и сокет остаются висеть, а budget не сбрасывается.
+            // disconnect() увеличивает sessionEpoch, поэтому epoch ниже берётся уже после очистки.
             disconnect()
         }
 
@@ -207,6 +212,72 @@ public final class SessionCoordinator: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         return serverLimits
+    }
+
+    /// Проба живости канала: stat("/") с заданным таймаутом; бросает ошибку, если ответа нет.
+    private func probeChannelAlive(_ chan: SFTPChannel, timeoutSeconds: TimeInterval) async throws {
+        let requestId = chan.allocateRequestId()
+        let packet = packetEngine.createStatPacket(requestId: requestId, path: "/")
+        _ = try await chan.sendRequest(packet: packet, requestId: requestId, timeoutSeconds: timeoutSeconds)
+    }
+
+    /// Single-flight проба: одна задача на канал, её результат получают все вызывающие.
+    /// Задача не привязана к вызывающему и не отменяется вместе с ним: отмена вызывающего
+    /// даёт ему CancellationError, но не прерывает общую пробу и не рвёт сессию.
+    /// Lock не удерживается через await.
+    private func sharedHealthProbe(_ chan: SFTPChannel) async throws -> Bool {
+        let id = ObjectIdentifier(chan)
+        lock.lock()
+        let probe: Task<Bool, Never>
+        if let active = activeProbe, active.channel == id {
+            probe = active.task
+        } else {
+            probe = Task { [weak self] () -> Bool in
+                let alive = await self?.runHealthProbeRounds(chan) ?? false
+                self?.finishHealthProbe(id)
+                return alive
+            }
+            activeProbe = (id, probe)
+        }
+        lock.unlock()
+        // Отмена вызывающего сразу прерывает его ожидание (T2), но не общую пробу.
+        let waiter = HealthProbeWaiter()
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Bool, Error>) in
+                waiter.install(continuation)
+                Task { waiter.resume(.success(await probe.value)) }
+            }
+        } onCancel: {
+            waiter.resume(.failure(CancellationError()))
+        }
+    }
+
+    /// Два раунда пробы: 2 с; при неудаче и живом канале — повтор с 5 с. Возвращает, жив ли канал.
+    private func runHealthProbeRounds(_ chan: SFTPChannel) async -> Bool {
+        do {
+            // Короткий таймаут: мёртвая связь должна обнаруживаться за секунды, а не за 5+ с.
+            try await probeChannelAlive(chan, timeoutSeconds: 2)
+            return true
+        } catch {
+            SSHTransportLog.write("SFTP health probe failed channel=\(chan.channelId) error=\(error.localizedDescription)")
+        }
+        // Один медленный ответ (энергосбережение телефона, передача под нагрузкой) не означает разрыв.
+        guard chan.isRunning else { return false }
+        do {
+            try await probeChannelAlive(chan, timeoutSeconds: 5)
+            SSHTransportLog.write("SFTP health probe recovered on retry channel=\(chan.channelId)")
+            return true
+        } catch let retryError {
+            SSHTransportLog.write("SFTP health probe retry failed channel=\(chan.channelId) error=\(retryError.localizedDescription)")
+            return false
+        }
+    }
+
+    /// Снимает активную пробу, если она всё ещё та же (вызывается из задачи пробы).
+    private func finishHealthProbe(_ id: ObjectIdentifier) {
+        lock.lock()
+        defer { lock.unlock() }
+        if activeProbe?.channel == id { activeProbe = nil }
     }
 
     private func performConnect(allowLegacyFallback: Bool, epoch: UInt64) async throws {
@@ -613,6 +684,17 @@ public final class SessionCoordinator: @unchecked Sendable {
         }
     }
     
+    /// Снимает процессы сессии, чей interactive-канал умер, если подключение сейчас не идёт
+    /// и по второму каналу не идёт передача (её не рвём: сессия снимется на следующем тике после неё).
+    /// Вызывает монитор связи: иначе ControlMaster и сокет висят до следующей попытки подключения.
+    public func releaseDeadSession() {
+        lock.lock()
+        defer { lock.unlock() }
+        guard activeConnectTask == nil, let chan = _interactiveChannel, !chan.isRunning,
+              _bulkChannel?.isRunning != true else { return }
+        disconnect()
+    }
+
     public func disconnect() {
         lock.lock()
         sessionEpoch &+= 1
@@ -665,5 +747,40 @@ public final class SessionCoordinator: @unchecked Sendable {
             p = "/" + p
         }
         return p
+    }
+}
+
+/// Одноразовое ожидание общей пробы: результат или отмена — что придёт раньше.
+/// Отмена до `install` запоминается и применяется при установке continuation.
+private final class HealthProbeWaiter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<Bool, Error>?
+    private var pending: Result<Bool, Error>?
+    private var finished = false
+
+    func install(_ continuation: CheckedContinuation<Bool, Error>) {
+        lock.lock()
+        if let pending {
+            finished = true
+            lock.unlock()
+            continuation.resume(with: pending)
+            return
+        }
+        self.continuation = continuation
+        lock.unlock()
+    }
+
+    func resume(_ result: Result<Bool, Error>) {
+        lock.lock()
+        guard !finished else { lock.unlock(); return }
+        guard let continuation else {
+            if pending == nil { pending = result }
+            lock.unlock()
+            return
+        }
+        finished = true
+        self.continuation = nil
+        lock.unlock()
+        continuation.resume(with: result)
     }
 }
