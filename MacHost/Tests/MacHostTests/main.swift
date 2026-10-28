@@ -3573,6 +3573,170 @@ func runAllAsyncTests() async {
         }
 
         // =========================================================================
+        // [TEST 42e] Auto-connect backoff: capped growth, route events lift the pause
+        // =========================================================================
+        print("\n[TEST 42e] Auto-connect backoff caps at 60 s and route events lift it:")
+        do {
+            let t0 = Date(timeIntervalSince1970: 1_000_000)
+            var table = AutoConnectBackoffTable()
+            let hostKey = AutoConnectBackoffTable.lanKey(host: "192.168.1.50")
+            var pauses: [Int] = []
+            for _ in 0..<6 {
+                table.recordFailure(hostKey, now: t0)
+                pauses.append(Int(table.entry(for: hostKey)!.nextAttemptAt.timeIntervalSince(t0).rounded()))
+            }
+            assertCondition(pauses == [5, 10, 20, 40, 60, 60], "Pause grows 5, 10, 20, 40 and stays at the 60 s cap (got \(pauses))")
+            assertCondition(AutoConnectBackoffTable.maxPause == 60, "Pause cap constant is 60 seconds")
+            assertCondition(!table.allowed(hostKey, now: t0), "Paused key is not allowed before its pause ends")
+            assertCondition(table.allowed(hostKey, now: t0.addingTimeInterval(60)), "Paused key is allowed once the pause ends")
+
+            // Route event over Wi-Fi: lan-scan and lan:* lift their pause, usb:* keeps its own
+            let scanKey = AutoConnectBackoffTable.lanScanKey
+            let usbKey = AutoConnectBackoffTable.usbKey(serial: "SERIAL123")
+            table.recordFailure(scanKey, now: t0)
+            table.recordFailure(usbKey, now: t0)
+            table.resetTiming(where: AutoConnectBackoffTable.isLanRouteKey)
+            assertCondition(table.allowed(scanKey, now: t0), "Route event lets lan-scan run at once, without waiting")
+            assertCondition(table.allowed(hostKey, now: t0) && table.entry(for: hostKey)?.failures == 6, "Route event lifts the lan:<host> timing and keeps its failure count")
+            assertCondition(!table.allowed(usbKey, now: t0), "Route event does not touch the usb:<serial> pause")
+
+            // A route event keeps the failure count: the next failure is the next pause step (10 s), not 5 s
+            assertCondition(table.entry(for: scanKey)?.failures == 1, "Route event keeps the failure count")
+            table.recordFailure(scanKey, now: t0)
+            assertCondition(table.entry(for: scanKey)?.nextAttemptAt == t0.addingTimeInterval(10), "After a route event the next failure continues the growth to 10 s")
+
+            // Wake: every route key lifts its pause, USB included
+            table.resetTiming(where: { _ in true })
+            assertCondition(table.allowed(usbKey, now: t0) && table.allowed(scanKey, now: t0), "Wake lifts the pause of every route key")
+
+            // Suppression after a key or auth error is not a timing pause and survives route events
+            var suppressedTable = AutoConnectBackoffTable()
+            suppressedTable.suppress(hostKey)
+            suppressedTable.recordFailure(hostKey, now: t0)
+            suppressedTable.resetTiming(where: AutoConnectBackoffTable.isLanRouteKey)
+            assertCondition(suppressedTable.isSuppressed(hostKey), "Route event does not lift a suppressed key")
+            assertCondition(!suppressedTable.allowed(hostKey, now: t0.addingTimeInterval(3600)), "Suppressed key stays blocked after a route event and after any time")
+            let suppressedLift = suppressedTable.resetTiming(where: AutoConnectBackoffTable.isLanRouteKey)
+            assertCondition(!suppressedLift, "A suppressed record is not reported as a lifted pause")
+
+            // Successful connection clears the entry; lan-key helper keeps the documented prefix
+            table.clear(scanKey)
+            assertCondition(table.entry(for: scanKey) == nil, "Successful connection clears the route entry")
+            assertCondition(AutoConnectBackoffTable.isLanRouteKey("lan:10.0.0.2") && !AutoConnectBackoffTable.isLanRouteKey("usb:10.0.0.2"), "Only lan keys count as Wi-Fi route keys")
+        }
+
+        // =========================================================================
+        // [TEST 42f] ADB serial presence (flap, empty poll) and route-event cooldown
+        // =========================================================================
+        print("\n[TEST 42f] ADB serial presence and route-event cooldown:")
+        do {
+            let p0 = Date(timeIntervalSince1970: 4_000_000)
+
+            // Флап: серийник A пропадает на 5 с и возвращается; B остаётся, поэтому опросы непустые
+            var flapping = AdbSerialPresenceTracker()
+            var newAppearances = 0
+            for step in 0...24 {
+                let serials = step % 2 == 0 ? ["A", "B"] : ["B"]
+                if flapping.update(listing: serials, now: p0.addingTimeInterval(Double(step) * 5)).contains("A") {
+                    newAppearances += 1
+                }
+            }
+            assertCondition(newAppearances == 1, "Flapping serial is new only at first sighting over 120 s (got \(newAppearances))")
+
+            // Отсутствие дольше 60 с: при возвращении серийник снова новый
+            var longGone = AdbSerialPresenceTracker()
+            _ = longGone.update(listing: ["A", "B"], now: p0)
+            _ = longGone.update(listing: ["B"], now: p0.addingTimeInterval(10))
+            let returnedLate = longGone.update(listing: ["A", "B"], now: p0.addingTimeInterval(71))
+            assertCondition(returnedLate.contains("A"), "Serial absent for more than 60 s is new when it returns")
+
+            // Отсутствие 30 с: не новый
+            var briefGone = AdbSerialPresenceTracker()
+            _ = briefGone.update(listing: ["A", "B"], now: p0)
+            _ = briefGone.update(listing: ["B"], now: p0.addingTimeInterval(10))
+            let returnedSoon = briefGone.update(listing: ["A", "B"], now: p0.addingTimeInterval(40))
+            assertCondition(!returnedSoon.contains("A"), "Serial absent for 30 s is not new when it returns")
+
+            // Ответ adb без устройств ([]) — отсутствие: кабель вынут, единственный телефон пропал
+            var unplugged = AdbSerialPresenceTracker()
+            _ = unplugged.update(listing: ["A"], now: p0)
+            let emptyAnswer = unplugged.update(listing: [], now: p0.addingTimeInterval(5))
+            let replugSoon = unplugged.update(listing: ["A"], now: p0.addingTimeInterval(40))
+            assertCondition(emptyAnswer.isEmpty && !replugSoon.contains("A"), "Empty adb answer counts as absence; a replug within 60 s is not new")
+            var unpluggedLong = AdbSerialPresenceTracker()
+            _ = unpluggedLong.update(listing: ["A"], now: p0)
+            _ = unpluggedLong.update(listing: [], now: p0.addingTimeInterval(5))
+            let replugLate = unpluggedLong.update(listing: ["A"], now: p0.addingTimeInterval(70))
+            assertCondition(replugLate.contains("A"), "Single phone unplugged for more than 60 s is new when the cable returns")
+
+            // Сбой adb (nil: нет ответа, таймаут, adb не найден) учёт не меняет
+            var adbFailure = AdbSerialPresenceTracker()
+            _ = adbFailure.update(listing: ["A"], now: p0)
+            let failedPoll = adbFailure.update(listing: nil, now: p0.addingTimeInterval(5))
+            let afterFailure = adbFailure.update(listing: ["A"], now: p0.addingTimeInterval(10))
+            assertCondition(failedPoll.isEmpty && !afterFailure.contains("A"), "adb failure (nil) reports nothing and does not mark the serial as absent")
+            var failureThenEmpty = AdbSerialPresenceTracker()
+            _ = failureThenEmpty.update(listing: ["A"], now: p0)
+            _ = failureThenEmpty.update(listing: nil, now: p0.addingTimeInterval(200))
+            let afterLongFailure = failureThenEmpty.update(listing: ["A"], now: p0.addingTimeInterval(205))
+            assertCondition(!afterLongFailure.contains("A"), "adb failure lasting over 60 s is not counted as absence")
+
+            // Ограничение частоты: два события за 3 с дают один сброс, через 11 с снова сброс
+            var table = AutoConnectBackoffTable()
+            let t0 = Date(timeIntervalSince1970: 5_000_000)
+            let scanKey = AutoConnectBackoffTable.lanScanKey
+            let lanGroup = AutoConnectBackoffTable.lanGroup
+            table.recordFailure(scanKey, now: t0)
+            let firstLift = table.resetTiming(group: lanGroup, now: t0, where: AutoConnectBackoffTable.isLanRouteKey)
+            table.recordFailure(scanKey, now: t0.addingTimeInterval(0.5))
+            let burstLift = table.resetTiming(group: lanGroup, now: t0.addingTimeInterval(3), where: AutoConnectBackoffTable.isLanRouteKey)
+            assertCondition(firstLift && !burstLift, "Two route events within 3 s produce one reset")
+            assertCondition(!table.allowed(scanKey, now: t0.addingTimeInterval(3)), "An ignored route event leaves the pause running")
+            let laterLift = table.resetTiming(group: lanGroup, now: t0.addingTimeInterval(11), where: AutoConnectBackoffTable.isLanRouteKey)
+            assertCondition(laterLift && table.allowed(scanKey, now: t0.addingTimeInterval(11)), "After 11 s a route event resets the pause again")
+
+            // Событие без паузы не запускает интервал
+            var quiet = AutoConnectBackoffTable()
+            let emptyLift = quiet.resetTiming(group: lanGroup, now: t0, where: AutoConnectBackoffTable.isLanRouteKey)
+            quiet.recordFailure(scanKey, now: t0.addingTimeInterval(1))
+            let afterQuiet = quiet.resetTiming(group: lanGroup, now: t0.addingTimeInterval(2), where: AutoConnectBackoffTable.isLanRouteKey)
+            assertCondition(!emptyLift && afterQuiet, "A route event with no pause to lift does not start the cooldown")
+
+            // Пробуждение (force) сбрасывает всегда и не блокируется интервалом
+            let forcedLift = table.resetTiming(group: lanGroup, now: t0.addingTimeInterval(11.5), force: true, where: { _ in true })
+            table.recordFailure(scanKey, now: t0.addingTimeInterval(11.5))
+            let forcedAgain = table.resetTiming(group: lanGroup, now: t0.addingTimeInterval(12), force: true, where: { _ in true })
+            assertCondition(forcedAgain && table.allowed(scanKey, now: t0.addingTimeInterval(12)), "Forced wake reset ignores the cooldown")
+            assertCondition(!forcedLift, "Forced reset with nothing paused reports no lift")
+
+            // Событие сохраняет счётчик: после сброса следующая неудача даёт следующую ступень
+            var stepped = AutoConnectBackoffTable()
+            let stepKey = AutoConnectBackoffTable.lanKey(host: "10.0.0.8")
+            stepped.recordFailure(stepKey, now: t0)
+            _ = stepped.resetTiming(group: lanGroup, now: t0.addingTimeInterval(1), where: AutoConnectBackoffTable.isLanRouteKey)
+            assertCondition(stepped.allowed(stepKey, now: t0.addingTimeInterval(1)), "After a route event the key is allowed at once")
+            stepped.recordFailure(stepKey, now: t0.addingTimeInterval(1))
+            assertCondition(stepped.entry(for: stepKey)?.nextAttemptAt == t0.addingTimeInterval(11), "Failure after a route event pauses for the next step (10 s)")
+
+            // Подавленная запись не запускает интервал группы и не считается снятой паузой
+            var suppressedGroup = AutoConnectBackoffTable()
+            suppressedGroup.suppress(scanKey)
+            let suppressedGroupLift = suppressedGroup.resetTiming(group: lanGroup, now: t0, where: AutoConnectBackoffTable.isLanRouteKey)
+            suppressedGroup.recordFailure(stepKey, now: t0.addingTimeInterval(1))
+            let afterSuppressed = suppressedGroup.resetTiming(group: lanGroup, now: t0.addingTimeInterval(2), where: AutoConnectBackoffTable.isLanRouteKey)
+            assertCondition(!suppressedGroupLift && afterSuppressed, "Suppressed record does not start the group cooldown")
+
+            // Группы независимы: серийник не ждёт интервала lan-группы, и наоборот
+            var groups = AutoConnectBackoffTable()
+            let usbKey = AutoConnectBackoffTable.usbKey(serial: "S1")
+            groups.recordFailure(scanKey, now: t0)
+            _ = groups.resetTiming(group: lanGroup, now: t0, where: AutoConnectBackoffTable.isLanRouteKey)
+            groups.recordFailure(usbKey, now: t0.addingTimeInterval(1))
+            let usbLift = groups.resetTiming(group: usbKey, now: t0.addingTimeInterval(1), where: { $0 == usbKey })
+            assertCondition(usbLift && groups.allowed(usbKey, now: t0.addingTimeInterval(1)), "Per-serial group is not blocked by the LAN group cooldown")
+        }
+
+        // =========================================================================
         // [TEST 43] Connection Architecture: Strict Fallback, Instant Kill & Scope
         // =========================================================================
         print("\n--- [TEST 43] Connection Architecture: Strict Fallback, Instant Kill & Scope ---")

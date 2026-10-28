@@ -286,9 +286,15 @@ public final class PhoneConnectionManager: @unchecked Sendable {
 
     /// Авторизованные serial-номера из текущего ADB server snapshot.
     public func authorizedAdbDeviceIds() -> [String] {
-        guard let adb = findAdbBinary() else { return [] }
+        authorizedAdbDeviceIdsIfAvailable() ?? []
+    }
+
+    /// Авторизованные serial-номера, если adb ответил. `[]` — adb ответил и устройств нет;
+    /// `nil` — adb не найден, завершился с ошибкой или не уложился в таймаут (ответа нет).
+    public func authorizedAdbDeviceIdsIfAvailable() -> [String]? {
+        guard let adb = findAdbBinary() else { return nil }
         let (status, output) = runCommand(executable: adb, arguments: ["devices"], timeoutSeconds: 8)
-        guard status == 0 else { return [] }
+        guard status == 0 else { return nil }
         return output.split(separator: "\n").compactMap { line in
             let fields = line.split(separator: "\t")
             guard fields.count >= 2, fields[1] == "device" else { return nil }

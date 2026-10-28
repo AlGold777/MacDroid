@@ -786,6 +786,12 @@ public final class DualPaneViewModel: ObservableObject {
             // Пока связи нет, панель помечается как офлайн; успешное подключение снимает пометку.
             if leftSource == .remotePhone { leftIsStale = true }
             if rightSource == .remotePhone { rightIsStale = true }
+            // Смена сети Mac (появление пути или интерфейсов) снимает паузу Wi-Fi поиска
+            let pathWatcher = NetworkPathWatcher { [weak self] in
+                self?.handleLanRouteEvent()
+            }
+            pathWatcher.start()
+            networkPathWatcher = pathWatcher
             // Сопряжённый телефон с autoConnect подключается сразу, не дожидаясь первого тика монитора.
             autoConnectPhoneIfAvailable()
         }
@@ -851,8 +857,20 @@ public final class DualPaneViewModel: ObservableObject {
         ) { [weak self] _ in
             Task { @MainActor [weak self] in
                 self?.isSystemAsleep = false
+                // Пробуждение снимает паузы повторов по всем маршрутам (Wi-Fi и USB)
+                self?.resetAutoConnectTiming(group: "wake", force: true, where: { _ in true })
                 try? await Task.sleep(nanoseconds: 2_000_000_000)
                 self?.checkPhoneConnectionState()
+            }
+        }
+        // Появился новый Bonjour-сервис или сменился адрес телефона: пауза Wi-Fi поиска снимается
+        NotificationCenter.default.addObserver(
+            forName: DiscoveryService.routeAppearedNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.handleLanRouteEvent()
             }
         }
 
@@ -2880,19 +2898,19 @@ public final class DualPaneViewModel: ObservableObject {
             // W7: учёт backoff автоподключения. Ручное действие снимает паузы и подавление.
             let autoKey = self.autoConnectKey(targetPath: targetPath, preferredDeviceId: preferredDeviceId)
             if isExplicit {
-                self.autoConnectBackoff[DualPaneViewModel.lanScanBackoffKey] = nil
-                if let key = autoKey { self.autoConnectBackoff[key] = nil }
+                self.autoConnectBackoff.clear(AutoConnectBackoffTable.lanScanKey)
+                if let key = autoKey { self.autoConnectBackoff.clear(key) }
                 if let customHost {
-                    self.autoConnectBackoff["lan:\(ConnectionHostAddress.normalized(customHost))"] = nil
+                    self.autoConnectBackoff.clear(AutoConnectBackoffTable.lanKey(host: ConnectionHostAddress.normalized(customHost)))
                 }
             } else if let key = autoKey {
                 if success {
-                    self.autoConnectBackoff[key] = nil
+                    self.autoConnectBackoff.clear(key)
                 } else if case .authFailed = ConnectionController.shared.phase {
                     // Неверный ключ/отладка не подтверждена: повторять автоматически нельзя до ручного подключения
-                    self.suppressAutoConnect(key: key)
+                    self.autoConnectBackoff.suppress(key)
                 } else {
-                    self.recordAutoConnectFailure(key: key)
+                    self.autoConnectBackoff.recordFailure(key)
                 }
             }
             if success {
@@ -2902,8 +2920,8 @@ public final class DualPaneViewModel: ObservableObject {
                 if isExplicit,
                    let currentPath = ConnectionController.shared.currentPath,
                    case .lan(let host, _, _) = currentPath {
-                    self.autoConnectBackoff["lan:\(host)"] = nil
-                    self.autoConnectBackoff["lan:\(ConnectionHostAddress.normalized(host))"] = nil
+                    self.autoConnectBackoff.clear(AutoConnectBackoffTable.lanKey(host: host))
+                    self.autoConnectBackoff.clear(AutoConnectBackoffTable.lanKey(host: ConnectionHostAddress.normalized(host)))
                 }
                 self.leftIsStale = false
                 self.rightIsStale = false
@@ -2944,47 +2962,38 @@ public final class DualPaneViewModel: ObservableObject {
         }
     }
     
-    // MARK: - Backoff автоподключения (W7)
-    
-    /// Состояние повторных попыток автоподключения по endpoint (USB-серийник, IP, или общий поиск в LAN)
-    private struct AutoConnectBackoff: Sendable {
-        var failures: Int = 0
-        var nextAttemptAt: Date = .distantPast
-        /// После authFailed автоподключение по endpoint не повторяется до ручного действия пользователя
-        var suppressed: Bool = false
+    // MARK: - Backoff автоподключения (W7) и события маршрутов
+
+    /// Пауза повторов фонового автоподключения по маршрутам (см. AutoConnectBackoffTable)
+    private var autoConnectBackoff = AutoConnectBackoffTable()
+    /// Учёт присутствия серийников ADB между фоновыми опросами (новый серийник снимает свою паузу)
+    private var adbPresenceTracker = AdbSerialPresenceTracker()
+    private var networkPathWatcher: NetworkPathWatcher?
+
+    /// Событие Wi-Fi маршрута (новый или сменившийся сервис Bonjour, смена сети Mac):
+    /// снимает паузу общего поиска и известных адресов, затем запрашивает проверку состояния.
+    /// Подавление после ошибки ключа и после ручного отключения не снимается.
+    private func handleLanRouteEvent() {
+        // Событие внутри интервала группы (AutoConnectBackoffTable.resetCooldown) игнорируется
+        guard resetAutoConnectTiming(group: AutoConnectBackoffTable.lanGroup, where: AutoConnectBackoffTable.isLanRouteKey) else { return }
+        checkPhoneConnectionState()
     }
-    
-    private static let lanScanBackoffKey = "lan-scan"
-    private var autoConnectBackoff: [String: AutoConnectBackoff] = [:]
-    
-    private nonisolated static func autoConnectAllowed(_ key: String, state: [String: AutoConnectBackoff], now: Date = Date()) -> Bool {
-        guard let entry = state[key] else { return true }
-        return !entry.suppressed && now >= entry.nextAttemptAt
+
+    /// Снимает срок паузы повторов по группе события (счётчик неудач сохраняется).
+    /// force: без ограничения частоты (пробуждение).
+    @discardableResult
+    private func resetAutoConnectTiming(group: String, force: Bool = false, where matches: (String) -> Bool) -> Bool {
+        autoConnectBackoff.resetTiming(group: group, force: force, where: matches)
     }
-    
-    /// Экспоненциальная пауза после неудачи: 5, 10, 20 … 300 секунд
-    private func recordAutoConnectFailure(key: String) {
-        var entry = autoConnectBackoff[key] ?? AutoConnectBackoff()
-        entry.failures += 1
-        let delay = min(2.5 * pow(2.0, Double(min(entry.failures, 8))), 300)
-        entry.nextAttemptAt = Date().addingTimeInterval(delay)
-        autoConnectBackoff[key] = entry
-    }
-    
-    private func suppressAutoConnect(key: String) {
-        var entry = autoConnectBackoff[key] ?? AutoConnectBackoff()
-        entry.suppressed = true
-        autoConnectBackoff[key] = entry
-    }
-    
+
     private func autoConnectKey(targetPath: CandidatePath?, preferredDeviceId: String?) -> String? {
         if let path = targetPath {
             switch path {
-            case .lan(let host, _, _): return "lan:\(ConnectionHostAddress.normalized(host))"
-            case .usb(let deviceId, _): return "usb:\(deviceId)"
+            case .lan(let host, _, _): return AutoConnectBackoffTable.lanKey(host: ConnectionHostAddress.normalized(host))
+            case .usb(let deviceId, _): return AutoConnectBackoffTable.usbKey(serial: deviceId)
             }
         }
-        if let id = preferredDeviceId { return "usb:\(id)" }
+        if let id = preferredDeviceId { return AutoConnectBackoffTable.usbKey(serial: id) }
         return nil
     }
     
@@ -3001,16 +3010,26 @@ public final class DualPaneViewModel: ObservableObject {
         }
         isAutoConnecting = true
         
-        // Снимок состояния backoff передаём в фоновую задачу: проверки делаются до дорогих операций (adb, nc-пробы)
+        // Снимок паузы и серийников передаём в фоновую задачу: проверки делаются до дорогих операций (adb, nc-пробы)
         let backoffState = autoConnectBackoff
+        let presenceBefore = adbPresenceTracker
         Task.detached(priority: .userInitiated) { [weak self] in
             guard let self = self else { return }
             // 1. Проверяем наличие USB-устройства через ADB и его политику autoConnect
+            // nil (adb недоступен) — для выбора кандидата то же, что пустой список; учёт присутствия не меняется
+            let adbListing = PhoneConnectionManager.shared.authorizedAdbDeviceIdsIfAvailable()
+            let polledSerials = adbListing ?? []
+            // Новый серийник (не видели или отсутствовал дольше минуты по ответам adb) пробуется без паузы.
+            // Подавление после ошибки ключа действует и для него.
+            var presence = presenceBefore
+            let newSerials = presence.update(listing: adbListing, now: Date())
+            let updatedPresence = presence
             var chosenUsbDeviceId: String? = nil
             var usbProbePaused: [String] = []
-            for id in PhoneConnectionManager.shared.authorizedAdbDeviceIds() {
-                // Пауза по серийнику действует и на пробу: проба не запускается чаще паузы.
-                guard DualPaneViewModel.autoConnectAllowed("usb:\(id)", state: backoffState) else { continue }
+            for id in polledSerials {
+                let key = AutoConnectBackoffTable.usbKey(serial: id)
+                let allowed = newSerials.contains(id) ? !backoffState.isSuppressed(key) : backoffState.allowed(key)
+                guard allowed else { continue }
                 // Серийник — маршрут: известный реестру находится по нему (даже если сопряжён по Wi-Fi);
                 // неизвестный опознаётся пробой ключа узла.
                 let decision = UsbRoutePolicy.backgroundDecision(
@@ -3034,14 +3053,15 @@ public final class DualPaneViewModel: ObservableObject {
             // 2. Если по USB не обнаружен, сканируем Wi-Fi для доверенных устройств с autoConnect == true
             var chosenCandidate: CandidatePath? = nil
             var scanAttempted = false
-            if chosenUsbDeviceId == nil && DualPaneViewModel.autoConnectAllowed(DualPaneViewModel.lanScanBackoffKey, state: backoffState) {
+            let scanKey = AutoConnectBackoffTable.lanScanKey
+            if chosenUsbDeviceId == nil && backoffState.allowed(scanKey) {
                 scanAttempted = true
                 // Политика и backoff применяются до выбора первого доверенного телефона:
                 // отключённое устройство не должно скрывать следующий доступный endpoint.
-                let excludedHosts = Set(backoffState.keys.compactMap { key -> String? in
-                    guard key.hasPrefix("lan:"),
-                          !DualPaneViewModel.autoConnectAllowed(key, state: backoffState) else { return nil }
-                    return ConnectionHostAddress.normalized(String(key.dropFirst(4)))
+                let lanPrefix = AutoConnectBackoffTable.lanHostKeyPrefix
+                let excludedHosts = Set(backoffState.entries.keys.compactMap { key -> String? in
+                    guard key.hasPrefix(lanPrefix), !backoffState.allowed(key) else { return nil }
+                    return ConnectionHostAddress.normalized(String(key.dropFirst(lanPrefix.count)))
                 })
                 if case .paired(let foundIp, let foundPort, _, _) = await PhoneConnectionManager.shared.findPairedPhoneOnLan(
                     deep: false,
@@ -3057,15 +3077,21 @@ public final class DualPaneViewModel: ObservableObject {
             let scanProducedCandidate = chosenCandidate != nil
             await MainActor.run {
                 self.isAutoConnecting = false
-                // Неопознанный серийник (проба не совпала): пауза повторов по его ключу usb:<серийник>.
+                self.adbPresenceTracker = updatedPresence
+                // Срок паузы новых серийников сброшен: их проба шла без паузы выше; неудача пробы ниже поставит паузу заново
+                for serial in newSerials {
+                    let key = AutoConnectBackoffTable.usbKey(serial: serial)
+                    self.autoConnectBackoff.resetTiming(group: key, where: { $0 == key })
+                }
+                // Неопознанный серийник (проба не совпала): пауза повторов по его ключу usb:<серийник>
                 for serial in usbPausedSerials {
-                    self.recordAutoConnectFailure(key: "usb:\(serial)")
+                    self.autoConnectBackoff.recordFailure(AutoConnectBackoffTable.usbKey(serial: serial))
                 }
                 if scanAttempted {
                     if scanProducedCandidate {
-                        self.autoConnectBackoff[DualPaneViewModel.lanScanBackoffKey] = nil
+                        self.autoConnectBackoff.clear(scanKey)
                     } else {
-                        self.recordAutoConnectFailure(key: DualPaneViewModel.lanScanBackoffKey)
+                        self.autoConnectBackoff.recordFailure(scanKey)
                     }
                 }
                 // Важно: повторная проверка подавления прямо перед коннектом

@@ -59,6 +59,9 @@ public struct SavedConnection: Codable, Identifiable, Hashable, Sendable {
 public final class DiscoveryService: ObservableObject {
     public static let shared = DiscoveryService()
     
+    /// Появился новый Bonjour-сервис или сменился адрес/порт у известного. Без userInfo.
+    public static let routeAppearedNotification = Notification.Name("MacHost.DiscoveryService.routeAppeared")
+
     @Published public var discoveredDevices: [DiscoveredDevice] = []
     @Published public var isSearching: Bool = false
     
@@ -272,12 +275,17 @@ public final class DiscoveryService: ObservableObject {
               ConnectionHostAddress.isIPv4(host) else { return }
 
         let device = DiscoveredDevice(id: serviceId, name: name, host: host, port: port)
+        let previous = discoveredDevices.first(where: { $0.id == device.id })
         if let index = discoveredDevices.firstIndex(where: { $0.id == device.id }) {
             discoveredDevices[index] = device
         } else {
             discoveredDevices.append(device)
         }
         publishDiscoveredDevices()
+        // Новый сервис или новый адрес/порт: маршрут к телефону появился, пауза автоподключения можно снять
+        if previous == nil || previous?.host != host || previous?.port != port {
+            NotificationCenter.default.post(name: Self.routeAppearedNotification, object: self)
+        }
     }
 
     private func publishDiscoveredDevices() {
