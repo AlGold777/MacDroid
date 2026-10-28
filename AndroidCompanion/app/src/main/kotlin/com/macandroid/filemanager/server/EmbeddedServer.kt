@@ -225,6 +225,13 @@ class EmbeddedServer(
         try {
             server.start()
         } catch (e: Exception) {
+            // Частично поднятый sshd (например, Wi-Fi-адрес открыт, loopback — нет) держит порт.
+            // Освобождаем его, иначе следующая попытка упадёт с EADDRINUSE.
+            try {
+                server.stop(true)
+            } catch (stopError: Exception) {
+                Log.w(TAG, "Не удалось освободить частично запущенный sshd", stopError)
+            }
             sftpListener?.dispose()
             sftpListener = null
             throw e

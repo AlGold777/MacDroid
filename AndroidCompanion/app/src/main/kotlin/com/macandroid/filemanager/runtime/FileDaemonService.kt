@@ -25,8 +25,10 @@ import com.macandroid.filemanager.server.EmbeddedServer
 import com.macandroid.filemanager.ui.MainActivity
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
 class FileDaemonService : Service() {
@@ -39,10 +41,17 @@ class FileDaemonService : Service() {
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
 
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-    /** Все переходы сервера (старт, стоп, перепривязка к сети) выполняются под этим lock. */
+    /** Все переходы сервера (старт, стоп, перепривязка к сети, повтор) выполняются под этим lock. */
     private val lifecycleLock = Any()
     @Volatile
     private var stopped = false
+
+    /** Единственный ожидающий повтор запуска сервера. Доступ только под lifecycleLock. */
+    private var retryJob: Job? = null
+    /** Неудачные попытки подряд; сбрасывается при успешном старте. Доступ только под lifecycleLock. */
+    private var retryAttempt = 0
+    /** Пауза ожидающего повтора, мс (для текста уведомления). Доступ только под lifecycleLock. */
+    private var retryDelayMs = 0L
 
     companion object {
         private const val TAG = "FileDaemonService"
@@ -53,12 +62,20 @@ class FileDaemonService : Service() {
         private const val PREFS_NAME = "daemon_prefs"
         private const val KEY_USER_STOPPED = "user_stopped"
 
+        /** Паузы повтора после неудачного старта: 5, 10, 20, 40, 60 с, далее 60 с без ограничения попыток. */
+        private val RETRY_DELAYS_MS = longArrayOf(5_000L, 10_000L, 20_000L, 40_000L, 60_000L)
+
         const val ACTION_STOP = "com.macandroid.filemanager.ACTION_STOP"
         const val ACTION_ACTIVE_SYNC_START = "com.macandroid.filemanager.ACTION_ACTIVE_SYNC_START"
         const val ACTION_ACTIVE_SYNC_STOP = "com.macandroid.filemanager.ACTION_ACTIVE_SYNC_STOP"
 
         @Volatile
         var isRunning: Boolean = false
+            internal set
+
+        /** true, пока sshd реально слушает порт. Сбрасывается при остановке и неудачном старте. */
+        @Volatile
+        var isServerListening: Boolean = false
             internal set
 
         /** true, если пользователь остановил демон вручную: автозапуск при возврате в приложение не выполняется. */
@@ -140,6 +157,8 @@ class FileDaemonService : Service() {
         when (intent?.action) {
             ACTION_STOP -> {
                 setUserStopped(this, true)
+                // Повторы не должны стартовать сервер между этим событием и onDestroy
+                stopped = true
                 stopSelf()
                 return START_NOT_STICKY
             }
@@ -173,17 +192,55 @@ class FileDaemonService : Service() {
             newServer.start()
             server = newServer
             boundHost = wanted
+            isServerListening = true
+            // Сервер поднят: ожидающий повтор и счётчик неудач больше не нужны
+            retryAttempt = 0
+            cancelRetryLocked()
             registerDiscoveryLocked()
             updateNotification(statusText(wanted))
+            // Оповещение о прошлом сбое больше не актуально
+            getSystemService(NotificationManager::class.java).cancel(ALERT_NOTIFICATION_ID)
         } catch (e: Exception) {
             // Ошибку показываем пользователю, а не падаем: иначе START_STICKY даст крэш-цикл
             Log.e(TAG, "Не удалось запустить SFTP-сервер", e)
-            server = null
-            boundHost = null
+            // Гасим всё, что могло подняться до сбоя (частично занятый порт, mDNS)
+            stopServerLocked()
             val reason = e.message ?: e.javaClass.simpleName
-            updateNotification("Сервер не запущен: $reason")
-            postAlert("SFTP-сервер не запущен", reason)
+            // Alert — только на первый сбой серии; повторы обновляют уведомление
+            if (retryAttempt == 0) postAlert("SFTP-сервер не запущен", reason)
+            scheduleRetryLocked(reason)
         }
+    }
+
+    /**
+     * Планирует один повтор запуска сервера с паузой 5, 10, 20, 40, 60 с (далее 60 с).
+     * Уже ожидающий повтор не дублируется. Вызывать только под lifecycleLock.
+     */
+    private fun scheduleRetryLocked(reason: String) {
+        if (stopped) return
+        if (retryJob == null) {
+            val delayMs = RETRY_DELAYS_MS[minOf(retryAttempt, RETRY_DELAYS_MS.lastIndex)]
+            retryAttempt++
+            retryDelayMs = delayMs
+            // Job пишется под тем же lock, что и проверка ниже: повтор не увидит «себя» раньше времени
+            retryJob = serviceScope.launch {
+                val self = coroutineContext[Job]
+                delay(delayMs)
+                synchronized(lifecycleLock) {
+                    // Повтор отменён (сеть подняла сервер, служба остановлена) — ничего не делаем
+                    if (retryJob !== self) return@synchronized
+                    retryJob = null
+                    ensureServerLocked(refreshDiscovery = true)
+                }
+            }
+        }
+        updateNotification("Сервер не запущен: $reason. Повтор через ${retryDelayMs / 1000} с")
+    }
+
+    /** Отменяет ожидающий повтор. Вызывать только под lifecycleLock. */
+    private fun cancelRetryLocked() {
+        retryJob?.cancel()
+        retryJob = null
     }
 
     /** Останавливает sshd и mDNS. Вызывать только под lifecycleLock. */
@@ -197,6 +254,7 @@ class FileDaemonService : Service() {
         }
         server = null
         boundHost = null
+        isServerListening = false
     }
 
     private fun registerDiscoveryLocked() {
@@ -273,6 +331,7 @@ class FileDaemonService : Service() {
         }
         networkCallback = null
         synchronized(lifecycleLock) {
+            cancelRetryLocked()
             stopServerLocked()
         }
         releaseTransferLocks()

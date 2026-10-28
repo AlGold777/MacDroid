@@ -16,6 +16,8 @@ import android.os.BatteryManager
 import android.os.Build
 import android.os.Bundle
 import android.os.Environment
+import android.os.Handler
+import android.os.Looper
 import android.os.PowerManager
 import android.os.StatFs
 import android.provider.Settings
@@ -42,6 +44,7 @@ class MainActivity : Activity() {
     companion object {
         private const val TAG = "MainActivity"
         private const val REQUEST_LEGACY_STORAGE = 1002
+        private const val STATUS_TICK_MS = 1_000L
     }
 
     // Экземпляр EmbeddedServer для проверки статуса сопряжения и сброса ключа
@@ -101,6 +104,9 @@ class MainActivity : Activity() {
         if (hasStoragePermission()) {
             if (!isServerRunning() && !FileDaemonService.isUserStopped(this)) {
                 startDaemonService()
+            } else if (!FileDaemonService.isServerListening && !FileDaemonService.isUserStopped(this)) {
+                // Служба жива, но sshd не слушает (сбой старта): запуск без action поднимает сервер сразу
+                startService(Intent(this, FileDaemonService::class.java))
             }
             // Если доступ к файлам уже есть, проверяем уведомления для Android 13+
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
@@ -110,6 +116,26 @@ class MainActivity : Activity() {
         }
 
         refreshDisplay()
+        statusHandler.removeCallbacks(statusTick)
+        statusHandler.postDelayed(statusTick, STATUS_TICK_MS)
+    }
+
+    override fun onPause() {
+        statusHandler.removeCallbacks(statusTick)
+        super.onPause()
+    }
+
+    /** Старт sshd асинхронный (и при повторах после сбоя): обновляем статус, пока сервер не слушает. */
+    private val statusHandler = Handler(Looper.getMainLooper())
+    private val statusTick = object : Runnable {
+        override fun run() {
+            // Условие — до refreshDisplay: сервер, поднявшийся во время отрисовки, получит ещё один тик
+            val keepTicking = hasStoragePermission() &&
+                !FileDaemonService.isServerListening &&
+                !FileDaemonService.isUserStopped(this@MainActivity)
+            refreshDisplay()
+            if (keepTicking) statusHandler.postDelayed(this, STATUS_TICK_MS)
+        }
     }
 
     /** IP-адрес меняется при смене сети: подписываемся на изменения, пока экран видим. */
@@ -477,8 +503,14 @@ class MainActivity : Activity() {
         // 2. Статус сервера
         val running = isServerRunning()
         if (running) {
-            tvServerStatus.text = "Статус сервера: Запущен"
-            tvServerStatus.setTextColor(0xFF81C784.toInt()) // Светло-зеленый
+            if (FileDaemonService.isServerListening) {
+                tvServerStatus.text = "Статус сервера: Запущен"
+                tvServerStatus.setTextColor(0xFF81C784.toInt()) // Светло-зеленый
+            } else {
+                // Служба работает, sshd ещё не слушает: старт или повтор после сбоя (причина — в уведомлении)
+                tvServerStatus.text = "Статус сервера: Запускается…"
+                tvServerStatus.setTextColor(0xFFFFB74D.toInt()) // Светло-оранжевый
+            }
             btnToggleServer.text = "Остановить сервер"
             btnToggleServer.background = createButtonDrawable(0xFFC62828.toInt())
         } else {
