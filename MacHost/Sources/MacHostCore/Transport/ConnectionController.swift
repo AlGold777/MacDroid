@@ -301,15 +301,33 @@ public final class ConnectionController: ObservableObject {
             return true
         } catch {
             guard isAttemptValid(attemptId) else { return false }
-            lastConnectionDiagnostics = "Endpoint: \(candidate.displayString) (\(host):\(port))\nSSH/SFTP setup failed: \(error.localizedDescription)"
-            phase = .authFailed(reason: error.localizedDescription)
-            if isExplicit {
-                viewModel.statusMessage = "⚠️ Ошибка авторизации SFTP: \(error.localizedDescription)"
+            let reason = error.localizedDescription
+            lastConnectionDiagnostics = "Endpoint: \(candidate.displayString) (\(host):\(port))\nSSH/SFTP setup failed: \(reason)"
+            if Self.isTrustFailure(error) {
+                // Решение о доверии: фон не повторяет попытку до ручного действия (см. DualPaneViewModel.connectPhone)
+                phase = .authFailed(reason: reason)
+                if isExplicit {
+                    viewModel.statusMessage = "⚠️ Ошибка авторизации SFTP: \(reason)"
+                }
+            } else {
+                // Временный сбой (ключ узла не получен, SSH/SFTP, таймаут): фон повторит по паузе
+                phase = .disconnected(reason: reason)
+                if isExplicit {
+                    viewModel.statusMessage = "⚠️ Не удалось подключиться: \(reason)"
+                }
             }
             return false
         }
     }
     
+    /// Решение о доверии: отпечаток не закреплён, не совпал или устройство не сопряжено (NSError code 403).
+    /// Только такой сбой переводит фазу в `.authFailed` и блокирует фоновое автоподключение до ручного действия.
+    /// Временные сбои (401 — ключ узла не получен, SSH/SFTP, таймауты, отмена попытки) — не trust-сбой.
+    nonisolated static func isTrustFailure(_ error: Error) -> Bool {
+        let nsError = error as NSError
+        return nsError.domain == "ConnectionController" && nsError.code == 403
+    }
+
     /// Аутентификация, строгая валидация Host Key и активная миграция на изолированный ключ
     private func authenticateAndWarmUp(
         host: String,

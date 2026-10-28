@@ -76,6 +76,11 @@ public struct AutoConnectBackoffTable: Sendable {
         entries[key] = nil
     }
 
+    /// Явное успешное подключение: убирает все паузы и подавления. `lastResetAt` не трогается.
+    public mutating func clearAll() {
+        entries.removeAll()
+    }
+
     /// Событие маршрута: снимает срок паузы у подходящих ключей (`nextAttemptAt`), счётчик неудач сохраняется,
     /// поэтому следующая неудача даёт следующую ступень паузы, а не начальную.
     /// Подавление (`suppressed`) не трогается и паузой не считается.

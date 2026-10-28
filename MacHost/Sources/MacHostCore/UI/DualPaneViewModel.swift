@@ -2903,6 +2903,10 @@ public final class DualPaneViewModel: ObservableObject {
                 if let customHost {
                     self.autoConnectBackoff.clear(AutoConnectBackoffTable.lanKey(host: ConnectionHostAddress.normalized(customHost)))
                 }
+                // Явный успех снимает все паузы и подавления
+                if success {
+                    self.autoConnectBackoff.clearAll()
+                }
             } else if let key = autoKey {
                 if success {
                     self.autoConnectBackoff.clear(key)

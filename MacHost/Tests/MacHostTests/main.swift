@@ -3744,6 +3744,44 @@ func runAllAsyncTests() async {
         }
 
         // =========================================================================
+        // [TEST 42g] Only trust failures suppress auto-connect; temporary failures back off; explicit success clears all
+        // =========================================================================
+        print("\n[TEST 42g] Auto-connect trust classification and explicit-success reset:")
+        do {
+            // Классификация: только решение о доверии (403 ConnectionController) блокирует фон
+            let trustError = NSError(domain: "ConnectionController", code: 403, userInfo: nil)
+            let keyscanError = NSError(domain: "ConnectionController", code: 401, userInfo: nil)
+            let cancelledError = NSError(domain: "ConnectionController", code: -1, userInfo: nil)
+            let foreignError = NSError(domain: "SomeOtherDomain", code: 403, userInfo: nil)
+            assertCondition(ConnectionController.isTrustFailure(trustError), "Code 403 of ConnectionController is a trust failure")
+            assertCondition(!ConnectionController.isTrustFailure(keyscanError), "Code 401 (host key not fetched) is a temporary failure, not a trust failure")
+            assertCondition(!ConnectionController.isTrustFailure(cancelledError), "Cancelled attempt (-1) is not a trust failure")
+            assertCondition(!ConnectionController.isTrustFailure(foreignError), "Error of another domain is not a trust failure")
+            assertCondition(!ConnectionController.isTrustFailure(URLError(.timedOut)), "Timeout is not a trust failure")
+
+            // Временный сбой: пауза по времени, подавления нет; доверие: подавление до ручного действия
+            let t0 = Date(timeIntervalSince1970: 6_000_000)
+            let lanKey = AutoConnectBackoffTable.lanKey(host: "192.168.1.90")
+            let usbKey = AutoConnectBackoffTable.usbKey(serial: "SERIAL77")
+            let scanKey = AutoConnectBackoffTable.lanScanKey
+            var table = AutoConnectBackoffTable()
+            table.recordFailure(lanKey, now: t0)
+            assertCondition(!table.isSuppressed(lanKey) && !table.allowed(lanKey, now: t0), "Temporary failure pauses the key without suppressing it")
+            assertCondition(table.allowed(lanKey, now: t0.addingTimeInterval(5)), "Temporarily failed key is allowed again once its pause ends")
+            table.suppress(usbKey)
+            table.recordFailure(scanKey, now: t0)
+            table.suppress(scanKey)
+            assertCondition(table.isSuppressed(usbKey) && !table.allowed(usbKey, now: t0.addingTimeInterval(3600)), "Trust failure keeps the key blocked after any time")
+
+            // Явный успех: очищается вся таблица, включая подавления и паузы
+            table.clearAll()
+            assertCondition(table.entries.isEmpty, "clearAll removes every pause and suppression entry")
+            assertCondition(table.allowed(lanKey, now: t0) && table.allowed(usbKey, now: t0) && table.allowed(scanKey, now: t0),
+                            "After clearAll every route key is allowed at once")
+            assertCondition(!table.isSuppressed(usbKey) && table.entry(for: usbKey) == nil, "clearAll lifts a suppressed key")
+        }
+
+        // =========================================================================
         // [TEST 43] Connection Architecture: Strict Fallback, Instant Kill & Scope
         // =========================================================================
         print("\n--- [TEST 43] Connection Architecture: Strict Fallback, Instant Kill & Scope ---")

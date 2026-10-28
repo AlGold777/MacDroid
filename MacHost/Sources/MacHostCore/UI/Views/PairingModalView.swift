@@ -655,6 +655,8 @@ public struct PairingModalView: View {
             } else {
                 if case .authFailed(let reason) = ConnectionController.shared.phase {
                     pairingStatus = "⚠️ Ошибка авторизации: \(reason)"
+                } else if case .disconnected(let reason?) = ConnectionController.shared.phase {
+                    pairingStatus = "⚠️ Не удалось подключиться к \(host):\(port): \(reason)"
                 } else {
                     pairingStatus = "⚠️ Не удалось подключиться к \(host):\(port)"
                 }
