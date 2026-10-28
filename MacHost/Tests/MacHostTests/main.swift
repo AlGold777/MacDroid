@@ -3401,6 +3401,136 @@ func runAllAsyncTests() async {
         }
 
         // =========================================================================
+        // [TEST 42c] One phone, many routes: USB serial and Wi-Fi share an identity
+        // =========================================================================
+        print("\n[TEST 42c] USB and Wi-Fi routes resolve to one trusted device:")
+        do {
+            // Политика ключа закрепления
+            let wifiPaired = HostKeyStore.resolvePinKey(deviceId: "SERIAL1", deviceIdHasOwnPin: false,
+                                                        pinnedIdForFingerprint: "bonjour-pixel", registryIdForHost: { nil })
+            assertCondition(wifiPaired == "bonjour-pixel", "USB serial without its own pin resolves to the device pinned with the same key")
+            let ownPin = HostKeyStore.resolvePinKey(deviceId: "SERIAL1", deviceIdHasOwnPin: true,
+                                                    pinnedIdForFingerprint: "bonjour-pixel", registryIdForHost: { nil })
+            assertCondition(ownPin == "SERIAL1", "A serial with its own pin keeps it (mismatch is then refused by verifyPinned)")
+            let unknown = HostKeyStore.resolvePinKey(deviceId: "SERIAL1", deviceIdHasOwnPin: false,
+                                                     pinnedIdForFingerprint: nil, registryIdForHost: { "by-host" })
+            assertCondition(unknown == "SERIAL1", "Unknown key over USB stays unpaired under the serial, not under an address")
+            let wifiOnly = HostKeyStore.resolvePinKey(deviceId: nil, deviceIdHasOwnPin: false,
+                                                      pinnedIdForFingerprint: nil, registryIdForHost: { "by-host" })
+            assertCondition(wifiOnly == "by-host", "Wi-Fi route without a key match still falls back to the registry address")
+
+            // Реестр: USB-маршрут не затирает Wi-Fi адрес и запоминает серийник
+            let regURL = FileManager.default.temporaryDirectory.appendingPathComponent("test_routes_\(UUID().uuidString).json")
+            defer {
+                try? FileManager.default.removeItem(at: regURL)
+                try? FileManager.default.removeItem(at: regURL.appendingPathExtension("autoconnect-v1"))
+            }
+            let reg = DeviceRegistry(storageURL: regURL)
+            reg.registerOrUpdate(id: "bonjour-pixel", name: "Pixel", fingerprint: "SHA256:pixel", host: "192.168.1.60", port: 2222)
+            reg.registerOrUpdate(id: "bonjour-pixel", name: "Pixel", fingerprint: "SHA256:pixel", host: "127.0.0.1", port: 50123, usbSerial: "SERIAL1")
+            let pixel = reg.device(withId: "bonjour-pixel")
+            assertCondition(pixel?.lastKnownHost == "192.168.1.60" && pixel?.lastKnownPort == 2222, "USB connection keeps the last Wi-Fi route")
+            assertCondition(pixel?.usbSerials == ["SERIAL1"], "USB serial is remembered as a route of the same device")
+            assertCondition(reg.device(matchingUsbSerial: "SERIAL1")?.id == "bonjour-pixel", "Device is found by its USB serial")
+            assertCondition(reg.device(matchingUsbSerial: "OTHER") == nil, "Unknown serial matches no device")
+            assertCondition(reg.allDevices().count == 1, "No duplicate device is created for the USB route")
+            reg.registerOrUpdate(id: "bonjour-pixel", name: "Pixel", fingerprint: "SHA256:pixel", host: "127.0.0.1", port: 50124, usbSerial: "SERIAL1")
+            assertCondition(reg.device(withId: "bonjour-pixel")?.usbSerials == ["SERIAL1"], "Repeated USB connection does not duplicate the serial")
+            assertCondition(reg.device(withId: "bonjour-pixel")?.lastKnownHost == "192.168.1.60", "Repeated USB connection keeps the Wi-Fi route")
+            let reloaded = DeviceRegistry(storageURL: regURL)
+            assertCondition(reloaded.device(matchingUsbSerial: "SERIAL1")?.id == "bonjour-pixel" && reloaded.device(matchingUsbSerial: "SERIAL1")?.lastKnownHost == "192.168.1.60", "USB serial route and Wi-Fi route survive a registry reload")
+            reg.registerOrUpdate(id: "SERIAL3", name: "Watch", fingerprint: "SHA256:third", host: "127.0.0.1", port: 2222, usbSerial: "SERIAL3")
+            assertCondition(reg.device(matchingUsbSerial: "SERIAL3")?.id == "SERIAL3", "Device whose id is the serial is found by that serial")
+            assertCondition(TrustedDevice.isLoopbackHost("127.0.0.1") && !TrustedDevice.isLoopbackHost("192.168.1.60") && !TrustedDevice.isLoopbackHost(""), "Loopback check distinguishes ADB forward from Wi-Fi routes")
+            reg.registerOrUpdate(id: "usb-only", name: "Tab", fingerprint: "SHA256:tab", host: "127.0.0.1", port: 2222, usbSerial: "SERIAL2")
+            reg.registerOrUpdate(id: "usb-only", name: "Tab", fingerprint: "SHA256:tab", host: "192.168.1.61", port: 2222)
+            assertCondition(reg.device(withId: "usb-only")?.lastKnownHost == "192.168.1.61", "A USB-only device learns its first Wi-Fi route")
+            reg.registerOrUpdate(id: "no-host", name: "Blank", fingerprint: "SHA256:blank", host: "", port: 2222)
+            assertCondition(reg.device(matchingHost: "") == nil, "Empty host matches no device, even when a stored device has an empty address")
+
+            // Один отпечаток — одна запись: поиск по id, иначе по закреплённому отпечатку
+            assertCondition(reg.device(withId: "manual_127.0.0.1_50123", orFingerprint: "SHA256:pixel")?.id == "bonjour-pixel", "A pin under another id with the same key finds the registry record by fingerprint")
+            assertCondition(reg.device(withId: "bonjour-pixel", orFingerprint: "SHA256:other")?.id == "bonjour-pixel", "An existing id wins over the fingerprint lookup")
+            assertCondition(reg.device(withId: "nobody", orFingerprint: "SHA256:none") == nil, "Unknown id and unknown key match no device")
+            assertCondition(reg.device(withId: "nobody", orFingerprint: "") == nil, "Empty fingerprint never matches a device by key")
+
+            // USB-опознание по ключу (без adb и сети: ввод-вывод подставлен)
+            var probeCalls = 0
+            let countingProbe: () -> UsbRoutePolicy.ProbeOutcome = { probeCalls += 1; return .notPinned }
+            let knownOn = UsbRoutePolicy.backgroundDecision(serial: "SERIAL1", knownAutoConnect: true,
+                                                            probe: countingProbe, autoConnectFor: { _, _ in nil })
+            assertCondition(knownOn == .connect(serial: "SERIAL1") && probeCalls == 0, "Known serial with autoConnect connects without a probe")
+            let knownOff = UsbRoutePolicy.backgroundDecision(serial: "SERIAL1", knownAutoConnect: false,
+                                                             probe: countingProbe, autoConnectFor: { _, _ in nil })
+            assertCondition(knownOff == .skip && probeCalls == 0, "Known serial with autoConnect off is skipped without a probe")
+            let unmatched = UsbRoutePolicy.backgroundDecision(serial: "SERIAL7", knownAutoConnect: nil,
+                                                              probe: countingProbe, autoConnectFor: { _, _ in true })
+            assertCondition(unmatched == .pause && probeCalls == 1, "Unknown serial whose key is not pinned pauses retries")
+            let pinnedNoRecord = UsbRoutePolicy.backgroundDecision(serial: "SERIAL7", knownAutoConnect: nil,
+                                                                   probe: { .pinned(pinKey: "ghost", fingerprint: "SHA256:ghost") },
+                                                                   autoConnectFor: { pinKey, fp in reg.device(withId: pinKey, orFingerprint: fp)?.autoConnect })
+            assertCondition(pinnedNoRecord == .pause, "A pinned key without a registry record does not connect")
+
+            // Трасса: первое подключение кабелем телефона, сопряжённого по Wi-Fi, записывает серийник
+            let firstUsb = UsbRoutePolicy.backgroundDecision(serial: "SERIAL9", knownAutoConnect: nil,
+                                                             probe: { .pinned(pinKey: "manual_127.0.0.1_50123", fingerprint: "SHA256:pixel") },
+                                                             autoConnectFor: { pinKey, fp in reg.device(withId: pinKey, orFingerprint: fp)?.autoConnect })
+            assertCondition(firstUsb == .connect(serial: "SERIAL9"), "Cable connection of a Wi-Fi paired phone is chosen by its key")
+            reg.registerOrUpdate(id: "manual_127.0.0.1_50123", name: "Pixel", fingerprint: "SHA256:pixel", host: "127.0.0.1", port: 50125, usbSerial: "SERIAL9")
+            assertCondition(reg.device(matchingUsbSerial: "SERIAL9")?.id == "bonjour-pixel", "After the cable connection the serial is stored on the same device")
+            assertCondition(reg.device(withId: "bonjour-pixel")?.lastKnownHost == "192.168.1.60", "The cable connection keeps the Wi-Fi route")
+            var secondProbes = 0
+            let second = UsbRoutePolicy.backgroundDecision(serial: "SERIAL9", knownAutoConnect: reg.device(matchingUsbSerial: "SERIAL9")?.autoConnect,
+                                                           probe: { secondProbes += 1; return .notPinned }, autoConnectFor: { _, _ in nil })
+            assertCondition(second == .connect(serial: "SERIAL9") && secondProbes == 0, "Next cable connection is recognized by the stored serial, without a probe")
+
+            // Выключенное автоподключение у совпавшего ключа не подключается
+            reg.setAutoConnect(id: "no-host", enabled: false)
+            let disabledMatch = UsbRoutePolicy.backgroundDecision(serial: "SERIAL8", knownAutoConnect: nil,
+                                                                  probe: { .pinned(pinKey: "no-host", fingerprint: "SHA256:blank") },
+                                                                  autoConnectFor: { pinKey, fp in reg.device(withId: pinKey, orFingerprint: fp)?.autoConnect })
+            assertCondition(disabledMatch == .pause, "A matched key with autoConnect off pauses instead of connecting")
+
+            // PHONE по USB, когда Wi-Fi не нашёл телефон: опознанный серийник предпочтительнее первого
+            var establishCalls = 0
+            let pinnedB2: (String) -> UsbRoutePolicy.ProbeOutcome = { serial in
+                serial == "B2" ? .pinned(pinKey: "bonjour-pixel", fingerprint: "SHA256:pixel") : .notPinned
+            }
+            let autoOn: (String, String) -> Bool? = { _, _ in true }
+            let autoOff: (String, String) -> Bool? = { _, _ in false }
+            let phoneChoice = UsbRoutePolicy.phoneUsbSerial(authorized: ["A1", "B2"], requireAutoConnect: true,
+                                                            probe: pinnedB2, autoConnectFor: autoOn)
+            assertCondition(phoneChoice == "B2", "Phone over USB without an explicit action chooses a pinned serial whose record has autoConnect")
+            let implicitOff = UsbRoutePolicy.phoneUsbSerial(authorized: ["A1", "B2"], requireAutoConnect: true,
+                                                            probe: pinnedB2, autoConnectFor: autoOff)
+            if implicitOff != nil { establishCalls += 1 }
+            assertCondition(implicitOff == nil && establishCalls == 0, "Without an explicit action a pinned serial with autoConnect off is not chosen")
+            let explicitOff = UsbRoutePolicy.phoneUsbSerial(authorized: ["A1", "B2"], requireAutoConnect: false,
+                                                            probe: pinnedB2, autoConnectFor: autoOff)
+            assertCondition(explicitOff == "B2", "An explicit PHONE chooses a pinned serial even with autoConnect off")
+            // Неопознанный серийник не выбирается никогда: establishConnection для него не вызывается
+            let unverifiedExplicit = UsbRoutePolicy.phoneUsbSerial(authorized: ["A1", "B2"], requireAutoConnect: false,
+                                                                   probe: { _ in .notPinned }, autoConnectFor: autoOn)
+            let unverifiedImplicit = UsbRoutePolicy.phoneUsbSerial(authorized: ["A1", "B2"], requireAutoConnect: true,
+                                                                   probe: { _ in .notPinned }, autoConnectFor: autoOn)
+            if unverifiedExplicit != nil || unverifiedImplicit != nil { establishCalls += 1 }
+            assertCondition(unverifiedExplicit == nil && unverifiedImplicit == nil && establishCalls == 0, "An unidentified serial is never chosen, so no install or launch on it")
+            assertCondition(UsbRoutePolicy.phoneUsbSerial(authorized: [], requireAutoConnect: false,
+                                                          probe: { _ in .notPinned }, autoConnectFor: autoOn) == nil, "No authorized device gives no USB choice")
+
+            // Старый файл реестра без usbSerials читается
+            let oldURL = FileManager.default.temporaryDirectory.appendingPathComponent("test_routes_old_\(UUID().uuidString).json")
+            defer {
+                try? FileManager.default.removeItem(at: oldURL)
+                try? FileManager.default.removeItem(at: oldURL.appendingPathExtension("autoconnect-v1"))
+            }
+            let oldJSON = #"[{"id":"x","name":"X","pinnedFingerprint":"SHA256:x","lastKnownHost":"10.0.0.9","lastKnownPort":2222,"lastSeenDate":700000000,"autoConnect":true,"isMigratedToDedicatedKey":true}]"#
+            try? Data(oldJSON.utf8).write(to: oldURL)
+            let oldReg = DeviceRegistry(storageURL: oldURL)
+            assertCondition(oldReg.device(withId: "x")?.lastKnownHost == "10.0.0.9" && oldReg.device(withId: "x")?.usbSerials == nil, "Registry file without usbSerials still loads")
+        }
+
+        // =========================================================================
         // [TEST 43] Connection Architecture: Strict Fallback, Instant Kill & Scope
         // =========================================================================
         print("\n--- [TEST 43] Connection Architecture: Strict Fallback, Instant Kill & Scope ---")

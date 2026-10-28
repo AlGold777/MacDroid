@@ -300,19 +300,19 @@ public struct PairingModalView: View {
                 
                 Toggle("Автоматически подключаться при запуске", isOn: Binding(
                     get: {
-                        DeviceRegistry.shared.device(matchingHost: inputHost)?.autoConnect ?? false
+                        registeredDeviceForCurrentInput?.autoConnect ?? false
                     },
                     set: { newValue in
                         // Только для уже сопряжённого устройства: непроверенный адрес не сохраняется
-                        if let dev = DeviceRegistry.shared.device(matchingHost: inputHost) {
+                        if let dev = registeredDeviceForCurrentInput {
                             DeviceRegistry.shared.setAutoConnect(id: dev.id, enabled: newValue)
                         }
                     }
                 ))
-                .disabled(DeviceRegistry.shared.device(matchingHost: inputHost) == nil)
+                .disabled(registeredDeviceForCurrentInput == nil)
                 .font(.system(size: 13))
-                
-                if DeviceRegistry.shared.device(matchingHost: inputHost) == nil {
+
+                if registeredDeviceForCurrentInput == nil {
                     Text("Станет доступно после подтверждённого сопряжения")
                         .font(.system(size: 11))
                         .foregroundColor(.secondary)
@@ -705,18 +705,41 @@ public struct PairingModalView: View {
         }
     }
     
+    /// Запись реестра для текущего ввода: по адресу, а при известном отпечатке — по нему
+    /// (тот же телефон по другому маршруту). nil — сопряжения ещё нет.
+    private var registeredDeviceForCurrentInput: TrustedDevice? {
+        let host = ConnectionHostAddress.normalized(inputHost)
+        guard !host.isEmpty else { return nil }
+        guard let port = Int(inputPort), port > 0 else {
+            return DeviceRegistry.shared.device(matchingHost: host)
+        }
+        let id = pairingDeviceId(host: host, port: port, fingerprint: observedFingerprint)
+        return DeviceRegistry.shared.device(withId: id, orFingerprint: observedFingerprint ?? "")
+    }
+
     /// Ключ, закреплённый за этим телефоном (nil — сопряжения ещё нет)
     private var pinnedFingerprintForCurrentHost: String? {
         guard let port = Int(inputPort), let validPort = UInt16(exactly: port), validPort > 0 else { return nil }
         return HostKeyStore.shared.pinnedFingerprint(deviceId: pairingDeviceId(
             host: ConnectionHostAddress.normalized(inputHost),
-            port: Int(validPort)
+            port: Int(validPort),
+            fingerprint: observedFingerprint
         ))
     }
     
     /// Стабильный идентификатор телефона для закрепления ключа: зарегистрированное устройство по адресу,
     /// иначе экземпляр mDNS на этом адресе, иначе адрес, введённый вручную.
-    private func pairingDeviceId(host: String, port: Int) -> String {
+    /// Если наблюдаемый отпечаток уже известен (закреплён или записан в реестре), берётся его id:
+    /// тот же телефон по другому маршруту не получает второго id.
+    private func pairingDeviceId(host: String, port: Int, fingerprint: String? = nil) -> String {
+        if let fp = fingerprint, !fp.isEmpty {
+            if let dev = DeviceRegistry.shared.device(matchingFingerprint: fp) {
+                return dev.id
+            }
+            if let pinned = HostKeyStore.shared.pinnedDeviceId(matchingFingerprint: fp) {
+                return pinned
+            }
+        }
         if let dev = DeviceRegistry.shared.device(matchingHost: host) {
             return dev.id
         }
@@ -741,7 +764,7 @@ public struct PairingModalView: View {
         guard let expected = observedFingerprint, !inputHost.isEmpty, let port = validatedInputPort() else { return }
         let host = ConnectionHostAddress.normalized(inputHost)
         let portInt = Int(port)
-        let deviceId = pairingDeviceId(host: host, port: portInt)
+        let deviceId = pairingDeviceId(host: host, port: portInt, fingerprint: expected)
         isConnecting = true
         pairingStatus = "Закрепляю подтверждённый ключ..."
         Task { @MainActor in

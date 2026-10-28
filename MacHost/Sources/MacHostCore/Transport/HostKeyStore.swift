@@ -122,13 +122,31 @@ public final class HostKeyStore: @unchecked Sendable {
     }
 
     /// Определяет ключ закрепления для подключения. Адрес сам по себе доверия не даёт:
-    /// порядок — явный deviceId (USB serial / NSD instance), затем закреплённый ключ с тем же отпечатком,
-    /// затем устройство реестра с этим адресом. Окончательное решение принимает `verifyPinned`.
+    /// порядок — явный deviceId (USB serial / NSD instance) с собственным закреплением, затем закреплённый ключ
+    /// с тем же отпечатком (тот же телефон по другому маршруту, например сопряжённый по Wi-Fi и подключённый кабелем),
+    /// затем явный deviceId без закрепления, затем устройство реестра с этим адресом.
+    /// Окончательное решение принимает `verifyPinned`.
     public func resolvePinKey(deviceId: String?, host: String, observedFingerprint: String) -> String? {
+        let ownPinExists = deviceId.map { !$0.isEmpty && pinnedFingerprint(deviceId: $0) != nil } ?? false
+        return Self.resolvePinKey(
+            deviceId: deviceId,
+            deviceIdHasOwnPin: ownPinExists,
+            pinnedIdForFingerprint: pinnedDeviceId(matchingFingerprint: observedFingerprint),
+            registryIdForHost: { DeviceRegistry.shared.device(matchingHost: host)?.id }
+        )
+    }
+
+    /// Чистая политика выбора ключа закрепления (вынесена для проверки без хранилища).
+    public static func resolvePinKey(
+        deviceId: String?,
+        deviceIdHasOwnPin: Bool,
+        pinnedIdForFingerprint: String?,
+        registryIdForHost: () -> String?
+    ) -> String? {
+        if let id = deviceId, !id.isEmpty, deviceIdHasOwnPin { return id }
+        if let id = pinnedIdForFingerprint { return id }
         if let id = deviceId, !id.isEmpty { return id }
-        if let id = pinnedDeviceId(matchingFingerprint: observedFingerprint) { return id }
-        if let dev = DeviceRegistry.shared.device(matchingHost: host) { return dev.id }
-        return nil
+        return registryIdForHost()
     }
 
     /// Сверка наблюдаемого отпечатка с закреплённым. Ничего не записывает:

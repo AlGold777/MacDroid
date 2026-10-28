@@ -10,6 +10,9 @@ public struct TrustedDevice: Codable, Identifiable, Sendable, Equatable {
     public var lastSeenDate: Date
     public var autoConnect: Bool
     public var isMigratedToDedicatedKey: Bool
+    /// USB-серийники ADB, по которым это устройство уже подключалось (маршруты, не идентичность).
+    /// Optional: файлы реестра без этого поля читаются как раньше.
+    public var usbSerials: [String]?
     
     public init(
         id: String,
@@ -19,7 +22,8 @@ public struct TrustedDevice: Codable, Identifiable, Sendable, Equatable {
         lastKnownPort: UInt16 = 2222,
         lastSeenDate: Date = Date(),
         autoConnect: Bool = false,
-        isMigratedToDedicatedKey: Bool = false
+        isMigratedToDedicatedKey: Bool = false,
+        usbSerials: [String]? = nil
     ) {
         self.id = id
         self.name = name
@@ -29,6 +33,13 @@ public struct TrustedDevice: Codable, Identifiable, Sendable, Equatable {
         self.lastSeenDate = lastSeenDate
         self.autoConnect = autoConnect
         self.isMigratedToDedicatedKey = isMigratedToDedicatedKey
+        self.usbSerials = usbSerials
+    }
+
+    /// Маршрут через ADB forward (127.0.0.1) — не Wi-Fi адрес устройства.
+    public static func isLoopbackHost(_ host: String) -> Bool {
+        let norm = ConnectionHostAddress.normalized(host)
+        return norm.hasPrefix("127.") || norm == "localhost" || norm == "::1"
     }
 }
 
@@ -66,6 +77,15 @@ public final class DeviceRegistry: @unchecked Sendable {
         return devices[id]
     }
     
+    /// Запись по id; если её нет — запись с тем же закреплённым отпечатком (тот же телефон под другим id).
+    public func device(withId id: String, orFingerprint fp: String) -> TrustedDevice? {
+        lock.lock()
+        defer { lock.unlock() }
+        if let byId = devices[id] { return byId }
+        guard !fp.isEmpty else { return nil }
+        return devices.values.first(where: { $0.pinnedFingerprint == fp })
+    }
+
     public func device(matchingFingerprint fp: String) -> TrustedDevice? {
         guard !fp.isEmpty else { return nil }
         lock.lock()
@@ -73,10 +93,22 @@ public final class DeviceRegistry: @unchecked Sendable {
         return devices.values.first(where: { $0.pinnedFingerprint == fp })
     }
     
+    /// Устройство, которое подключалось по этому USB-серийнику (или было закреплено под ним).
+    public func device(matchingUsbSerial serial: String) -> TrustedDevice? {
+        guard !serial.isEmpty else { return nil }
+        lock.lock()
+        defer { lock.unlock() }
+        if let byId = devices[serial] { return byId }
+        return devices.values
+            .filter { $0.usbSerials?.contains(serial) == true }
+            .max(by: { $0.lastSeenDate < $1.lastSeenDate })
+    }
+
     public func device(matchingHost host: String) -> TrustedDevice? {
         lock.lock()
         defer { lock.unlock() }
         let norm = ConnectionHostAddress.normalized(host)
+        guard !norm.isEmpty else { return nil }
         return devices.values.first(where: { ConnectionHostAddress.normalized($0.lastKnownHost) == norm })
     }
     
@@ -104,7 +136,8 @@ public final class DeviceRegistry: @unchecked Sendable {
         host: String,
         port: UInt16,
         autoConnect: Bool? = nil,
-        isMigrated: Bool? = nil
+        isMigrated: Bool? = nil,
+        usbSerial: String? = nil
     ) {
         lock.lock()
         defer { lock.unlock() }
@@ -121,8 +154,16 @@ public final class DeviceRegistry: @unchecked Sendable {
             if name != "Телефон Android" && name != "Android" && !name.isEmpty {
                 existing.name = name
             }
-            existing.lastKnownHost = host
-            existing.lastKnownPort = port
+            // USB-подключение не затирает последний Wi-Fi маршрут: 127.0.0.1 — адрес ADB forward.
+            if !Self.isLoopbackHostValue(host) || Self.isLoopbackHostValue(existing.lastKnownHost) || existing.lastKnownHost.isEmpty {
+                existing.lastKnownHost = host
+                existing.lastKnownPort = port
+            }
+            if let serial = usbSerial, !serial.isEmpty {
+                var serials = existing.usbSerials ?? []
+                if !serials.contains(serial) { serials.append(serial) }
+                existing.usbSerials = serials
+            }
             existing.lastSeenDate = Date()
             if let ac = autoConnect {
                 existing.autoConnect = ac
@@ -147,13 +188,18 @@ public final class DeviceRegistry: @unchecked Sendable {
                 lastSeenDate: Date(),
                 // Подтверждённое сопряжение (есть отпечаток) разрешает и автоподключение.
                 autoConnect: autoConnect ?? !fingerprint.isEmpty,
-                isMigratedToDedicatedKey: isMigrated ?? false
+                isMigratedToDedicatedKey: isMigrated ?? false,
+                usbSerials: usbSerial.flatMap { $0.isEmpty ? nil : [$0] }
             )
             devices[effectiveId] = newDev
         }
         saveUnderLock()
     }
     
+    private static func isLoopbackHostValue(_ host: String) -> Bool {
+        TrustedDevice.isLoopbackHost(host)
+    }
+
     public func setAutoConnect(id: String, enabled: Bool) {
         lock.lock()
         defer { lock.unlock() }

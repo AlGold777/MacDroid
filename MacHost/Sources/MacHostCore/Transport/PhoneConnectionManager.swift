@@ -29,6 +29,62 @@ public struct SSHHostKeyObservation: Sendable {
     }
 }
 
+/// Опознание USB-маршрута по ключу узла, как у Wi-Fi. Чистая политика: adb и ssh-keyscan передаются снаружи,
+/// поэтому решения проверяются тестами без сети и без adb.
+public enum UsbRoutePolicy {
+    public enum ProbeOutcome: Equatable, Sendable {
+        /// Ключ узла совпал с закреплённым: pinKey и отпечаток.
+        case pinned(pinKey: String, fingerprint: String)
+        /// Ключ не закреплён или сервис на телефоне не отвечает.
+        case notPinned
+    }
+
+    public enum BackgroundDecision: Equatable, Sendable {
+        case connect(serial: String)
+        /// Пауза повторов по ключу usb:<серийник>.
+        case pause
+        /// Запись известна и автоподключение выключено.
+        case skip
+    }
+
+    /// Фоновое автоподключение для одного авторизованного серийника.
+    /// knownAutoConnect: nil — серийник не известен реестру, тогда нужна проба; иначе флаг записи.
+    public static func backgroundDecision(
+        serial: String,
+        knownAutoConnect: Bool?,
+        probe: () -> ProbeOutcome,
+        autoConnectFor: (_ pinKey: String, _ fingerprint: String) -> Bool?
+    ) -> BackgroundDecision {
+        if let known = knownAutoConnect {
+            return known ? .connect(serial: serial) : .skip
+        }
+        switch probe() {
+        case .notPinned:
+            return .pause
+        case .pinned(let pinKey, let fingerprint):
+            return autoConnectFor(pinKey, fingerprint) == true ? .connect(serial: serial) : .pause
+        }
+    }
+
+    /// PHONE после пустого Wi-Fi поиска: первый серийник, опознанный пробой по закреплённому ключу.
+    /// Неопознанный серийник никогда не выбирается: establishConnection (установка APK, appops, am start)
+    /// запускается только для опознанного телефона. При requireAutoConnect (без явного действия пользователя)
+    /// опознанный телефон выбирается только если его запись реестра имеет autoConnect == true.
+    public static func phoneUsbSerial(
+        authorized: [String],
+        requireAutoConnect: Bool,
+        probe: (String) -> ProbeOutcome,
+        autoConnectFor: (_ pinKey: String, _ fingerprint: String) -> Bool?
+    ) -> String? {
+        for serial in authorized {
+            guard case .pinned(let pinKey, let fingerprint) = probe(serial) else { continue }
+            if !requireAutoConnect { return serial }
+            if autoConnectFor(pinKey, fingerprint) == true { return serial }
+        }
+        return nil
+    }
+}
+
 public final class PhoneConnectionManager: @unchecked Sendable {
     public static let shared = PhoneConnectionManager()
     
@@ -239,7 +295,37 @@ public final class PhoneConnectionManager: @unchecked Sendable {
             return String(fields[0])
         }
     }
-    
+
+    /// Неинвазивная проба USB: временный adb forward на свободный порт, ключ узла, сверка с закреплением.
+    /// Не ставит APK, не меняет appops и не запускает экран. Forward снимается сразу после пробы.
+    public func probeUsbRoute(serial: String) -> UsbRoutePolicy.ProbeOutcome {
+        guard let adb = findAdbBinary() else { return .notPinned }
+        let (status, out) = runCommand(executable: adb, arguments: ["-s", serial, "forward", "tcp:0", "tcp:2222"], timeoutSeconds: 8)
+        guard status == 0, let port = UInt16(out.trimmingCharacters(in: .whitespacesAndNewlines)) else { return .notPinned }
+        defer {
+            runCommand(executable: adb, arguments: ["-s", serial, "forward", "--remove", "tcp:\(port)"], timeoutSeconds: 8)
+        }
+        guard let observation = fetchHostKeyObservation(host: "127.0.0.1", port: port),
+              let pinKey = HostKeyStore.shared.pinnedDeviceId(matchingFingerprint: observation.fingerprint),
+              case .trusted = HostKeyStore.shared.verifyPinned(deviceId: pinKey, fingerprint: observation.fingerprint) else {
+            return .notPinned
+        }
+        return .pinned(pinKey: pinKey, fingerprint: observation.fingerprint)
+    }
+
+    /// Серийник для PHONE по USB, когда Wi-Fi не нашёл телефон: только опознанный пробой по закреплённому ключу.
+    /// requireAutoConnect == true (без явного действия) — дополнительно требуется autoConnect записи реестра.
+    public func chooseUsbSerialForPhone(requireAutoConnect: Bool) -> String? {
+        UsbRoutePolicy.phoneUsbSerial(
+            authorized: authorizedAdbDeviceIds(),
+            requireAutoConnect: requireAutoConnect,
+            probe: { self.probeUsbRoute(serial: $0) },
+            autoConnectFor: { pinKey, fingerprint in
+                DeviceRegistry.shared.device(withId: pinKey, orFingerprint: fingerprint)?.autoConnect
+            }
+        )
+    }
+
     /// Выполнение произвольной команды adb shell
     @discardableResult
     public func executeAdbShell(command: String, deviceId: String? = nil) -> (status: Int32, output: String) {
@@ -803,7 +889,8 @@ public final class PhoneConnectionManager: @unchecked Sendable {
                       case .trusted = HostKeyStore.shared.verifyPinned(deviceId: pinKey, fingerprint: observation.fingerprint) else {
                     return .unpaired
                 }
-                let device = DeviceRegistry.shared.device(withId: pinKey)
+                // pinKey может быть другим id того же отпечатка: запись реестра ищется и по отпечатку.
+                let device = DeviceRegistry.shared.device(withId: pinKey, orFingerprint: observation.fingerprint)
                 if autoConnectOnly && device?.autoConnect != true { return .unavailable }
                 let name = device?.name ?? self.deviceNameForHost(endpoint.host) ?? "Телефон Android"
                 return .paired(pinKey: pinKey, name: name)

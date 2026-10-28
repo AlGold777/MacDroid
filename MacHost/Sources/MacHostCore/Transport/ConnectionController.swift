@@ -68,7 +68,8 @@ public final class ConnectionController: ObservableObject {
     /// Проверка, разрешено ли автоподключение для данного устройства с учетом подавления после ручного отключения
     public func shouldAttemptAutoConnect(for deviceId: String?) -> Bool {
         guard !isManualDisconnectSuppressed else { return false }
-        guard let id = deviceId, let dev = DeviceRegistry.shared.device(withId: id) else { return false }
+        guard let id = deviceId,
+              let dev = DeviceRegistry.shared.device(withId: id) ?? DeviceRegistry.shared.device(matchingUsbSerial: id) else { return false }
         return dev.autoConnect
     }
     
@@ -136,10 +137,21 @@ public final class ConnectionController: ObservableObject {
             case .unpaired(let hosts):
                 res = .wifiUnpaired(hosts: hosts, log: "Wi-Fi endpoints require pairing: \(hosts.joined(separator: ", "))")
             case .notFound:
-                res = .failure(
-                    reason: "Телефон не найден по Wi-Fi. Проверьте общую сеть и откройте MacDroid Companion на телефоне.",
-                    log: "Wi-Fi discovery finished without a reachable paired endpoint."
-                )
+                // Wi-Fi не нашёл телефон: кабель — следующий маршрут, но только для серийника,
+                // опознанного пробой по закреплённому ключу. Без явного действия пользователя — ещё и с autoConnect.
+                let requireAutoConnect = !isExplicitUserAction
+                let usbSerial = await Task.detached(priority: .userInitiated) {
+                    PhoneConnectionManager.shared.chooseUsbSerialForPhone(requireAutoConnect: requireAutoConnect)
+                }.value
+                guard isAttemptValid(attemptId) else { return false }
+                if let serial = usbSerial {
+                    res = await PhoneConnectionManager.shared.establishConnection(preferredDeviceId: serial)
+                } else {
+                    res = .failure(
+                        reason: "Телефон не найден по Wi-Fi. Проверьте общую сеть и откройте MacDroid Companion на телефоне.",
+                        log: "Wi-Fi discovery finished without a reachable paired endpoint; no authorized USB device."
+                    )
+                }
             }
         } else {
             // Явно выбранное устройство сохраняет существующий путь подключения.
@@ -267,7 +279,8 @@ public final class ConnectionController: ObservableObject {
                 fingerprint: fp,
                 host: host,
                 port: port,
-                isMigrated: isMigrated
+                isMigrated: isMigrated,
+                usbSerial: deviceId
             )
             // Сохраняем фактически использованный endpoint, включая адрес,
             // найденный через Bonjour/ARP. Это позволяет восстановить Wi‑Fi
@@ -365,7 +378,8 @@ public final class ConnectionController: ObservableObject {
         viewModel.remoteDriver.coordinator.setSessionIdentity(fingerprint: fp, isMigrated: false)
 
         // Личный ключ (legacy fallback) допускается только для устройства с подтверждённым закреплённым отпечатком.
-        let existingDev = DeviceRegistry.shared.device(withId: pinKey)
+        // pinKey может быть другим id того же отпечатка: запись реестра ищется и по отпечатку.
+        let existingDev = DeviceRegistry.shared.device(withId: pinKey, orFingerprint: fp)
         let isKnownLegacyDevice = existingDev.map { !$0.isMigratedToDedicatedKey } ?? false
 
         // 2. Слой 3: Проверка статуса сопряжения и миграции

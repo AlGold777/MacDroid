@@ -3006,13 +3006,29 @@ public final class DualPaneViewModel: ObservableObject {
             guard let self = self else { return }
             // 1. Проверяем наличие USB-устройства через ADB и его политику autoConnect
             var chosenUsbDeviceId: String? = nil
+            var usbProbePaused: [String] = []
             for id in PhoneConnectionManager.shared.authorizedAdbDeviceIds() {
-                if let dev = DeviceRegistry.shared.device(withId: id), dev.autoConnect,
-                   DualPaneViewModel.autoConnectAllowed("usb:\(id)", state: backoffState) {
-                    chosenUsbDeviceId = id
+                // Пауза по серийнику действует и на пробу: проба не запускается чаще паузы.
+                guard DualPaneViewModel.autoConnectAllowed("usb:\(id)", state: backoffState) else { continue }
+                // Серийник — маршрут: известный реестру находится по нему (даже если сопряжён по Wi-Fi);
+                // неизвестный опознаётся пробой ключа узла.
+                let decision = UsbRoutePolicy.backgroundDecision(
+                    serial: id,
+                    knownAutoConnect: DeviceRegistry.shared.device(matchingUsbSerial: id)?.autoConnect,
+                    probe: { PhoneConnectionManager.shared.probeUsbRoute(serial: id) },
+                    autoConnectFor: { pinKey, fp in DeviceRegistry.shared.device(withId: pinKey, orFingerprint: fp)?.autoConnect }
+                )
+                switch decision {
+                case .connect(let serial):
+                    chosenUsbDeviceId = serial
+                case .pause:
+                    usbProbePaused.append(id)
+                case .skip:
                     break
                 }
+                if chosenUsbDeviceId != nil { break }
             }
+            let usbPausedSerials = usbProbePaused
             
             // 2. Если по USB не обнаружен, сканируем Wi-Fi для доверенных устройств с autoConnect == true
             var chosenCandidate: CandidatePath? = nil
@@ -3040,6 +3056,10 @@ public final class DualPaneViewModel: ObservableObject {
             let scanProducedCandidate = chosenCandidate != nil
             await MainActor.run {
                 self.isAutoConnecting = false
+                // Неопознанный серийник (проба не совпала): пауза повторов по его ключу usb:<серийник>.
+                for serial in usbPausedSerials {
+                    self.recordAutoConnectFailure(key: "usb:\(serial)")
+                }
                 if scanAttempted {
                     if scanProducedCandidate {
                         self.autoConnectBackoff[DualPaneViewModel.lanScanBackoffKey] = nil
