@@ -4817,8 +4817,8 @@ func runTest58() async {
         }
 
         // Test copySelectedPath directly
-        let pathTestItem1 = FileItem(name: "test1.txt", path: "/tmp/test1.txt", isDirectory: false, size: 10, modificationDate: Date(), permissions: "-rw-r--r--")
-        let pathTestItem2 = FileItem(name: "test2.txt", path: "/tmp/test2.txt", isDirectory: false, size: 20, modificationDate: Date(), permissions: "-rw-r--r--")
+        let pathTestItem1 = FileItem(id: "/tmp/test1.txt", name: "test1.txt", path: "/tmp/test1.txt", size: 10, mtime: 0, isDirectory: false)
+        let pathTestItem2 = FileItem(id: "/tmp/test2.txt", name: "test2.txt", path: "/tmp/test2.txt", size: 20, mtime: 0, isDirectory: false)
         vm.leftItems = [pathTestItem1, pathTestItem2]
         vm.leftSelection = [pathTestItem1.id]
         let path1 = vm.copySelectedPath(side: .left)
