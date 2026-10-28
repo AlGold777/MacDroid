@@ -3354,6 +3354,53 @@ func runAllAsyncTests() async {
         }
         
         // =========================================================================
+        // [TEST 42b] Auto-connect is granted by pairing; one-time migration
+        // =========================================================================
+        print("\n[TEST 42b] Auto-connect granted by confirmed pairing:")
+        do {
+            let regURL = FileManager.default.temporaryDirectory.appendingPathComponent("test_autoconnect_\(UUID().uuidString).json")
+            let markerURL = regURL.appendingPathExtension("autoconnect-v1")
+            defer {
+                try? FileManager.default.removeItem(at: regURL)
+                try? FileManager.default.removeItem(at: markerURL)
+            }
+            let reg = DeviceRegistry(storageURL: regURL)
+            reg.registerOrUpdate(id: "paired", name: "Pixel", fingerprint: "SHA256:paired", host: "192.168.1.40", port: 2222)
+            reg.registerOrUpdate(id: "nokey", name: "Legacy", fingerprint: "", host: "192.168.1.41", port: 2222)
+            reg.registerOrUpdate(id: "optout", name: "Tablet", fingerprint: "SHA256:optout", host: "192.168.1.42", port: 2222, autoConnect: false)
+            assertCondition(reg.device(withId: "paired")?.autoConnect == true, "New device with a pinned key gets autoConnect")
+            assertCondition(reg.device(withId: "nokey")?.autoConnect == false, "Device without a key stays without autoConnect")
+            assertCondition(reg.device(withId: "optout")?.autoConnect == false, "Explicit autoConnect: false is kept")
+
+            reg.setAutoConnect(id: "paired", enabled: false)
+            reg.registerOrUpdate(id: "paired", name: "Pixel", fingerprint: "SHA256:paired", host: "192.168.1.50", port: 2222)
+            assertCondition(reg.device(withId: "paired")?.autoConnect == false, "Address update does not re-enable autoConnect")
+
+            reg.registerOrUpdate(id: "nokey", name: "Legacy", fingerprint: "SHA256:nokey", host: "192.168.1.41", port: 2222)
+            assertCondition(reg.device(withId: "nokey")?.autoConnect == true, "First confirmed key on a legacy record enables autoConnect")
+        }
+        do {
+            // Реестр, сохранённый до появления автоподключения по умолчанию
+            let regURL = FileManager.default.temporaryDirectory.appendingPathComponent("test_autoconnect_mig_\(UUID().uuidString).json")
+            let markerURL = regURL.appendingPathExtension("autoconnect-v1")
+            defer {
+                try? FileManager.default.removeItem(at: regURL)
+                try? FileManager.default.removeItem(at: markerURL)
+            }
+            let old = [
+                TrustedDevice(id: "a", name: "A", pinnedFingerprint: "SHA256:a", lastKnownHost: "10.0.0.2", autoConnect: false),
+                TrustedDevice(id: "b", name: "B", pinnedFingerprint: "", lastKnownHost: "10.0.0.3", autoConnect: false)
+            ]
+            try? JSONEncoder().encode(old).write(to: regURL)
+            let first = DeviceRegistry(storageURL: regURL)
+            assertCondition(first.device(withId: "a")?.autoConnect == true, "Migration enables autoConnect for a previously paired device")
+            assertCondition(first.device(withId: "b")?.autoConnect == false, "Migration skips a device without a pinned key")
+            first.setAutoConnect(id: "a", enabled: false)
+            let second = DeviceRegistry(storageURL: regURL)
+            assertCondition(second.device(withId: "a")?.autoConnect == false, "Migration runs once: a later opt-out survives restart")
+        }
+
+        // =========================================================================
         // [TEST 43] Connection Architecture: Strict Fallback, Instant Kill & Scope
         // =========================================================================
         print("\n--- [TEST 43] Connection Architecture: Strict Fallback, Instant Kill & Scope ---")

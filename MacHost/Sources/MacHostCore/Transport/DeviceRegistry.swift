@@ -51,6 +51,7 @@ public final class DeviceRegistry: @unchecked Sendable {
         }
         load()
         migrateLegacyDataIfNeeded()
+        enableAutoConnectForPairedDevicesOnce()
     }
     
     public func allDevices() -> [TrustedDevice] {
@@ -123,11 +124,14 @@ public final class DeviceRegistry: @unchecked Sendable {
             existing.lastKnownHost = host
             existing.lastKnownPort = port
             existing.lastSeenDate = Date()
-            if !fingerprint.isEmpty {
-                existing.pinnedFingerprint = fingerprint
-            }
             if let ac = autoConnect {
                 existing.autoConnect = ac
+            } else if existing.pinnedFingerprint.isEmpty && !fingerprint.isEmpty {
+                // Запись без ключа (из старой истории) впервые получает подтверждённый ключ — это сопряжение.
+                existing.autoConnect = true
+            }
+            if !fingerprint.isEmpty {
+                existing.pinnedFingerprint = fingerprint
             }
             if let mig = isMigrated {
                 existing.isMigratedToDedicatedKey = mig
@@ -141,7 +145,8 @@ public final class DeviceRegistry: @unchecked Sendable {
                 lastKnownHost: host,
                 lastKnownPort: port,
                 lastSeenDate: Date(),
-                autoConnect: autoConnect ?? false,
+                // Подтверждённое сопряжение (есть отпечаток) разрешает и автоподключение.
+                autoConnect: autoConnect ?? !fingerprint.isEmpty,
                 isMigratedToDedicatedKey: isMigrated ?? false
             )
             devices[effectiveId] = newDev
@@ -170,6 +175,29 @@ public final class DeviceRegistry: @unchecked Sendable {
         saveUnderLock()
     }
     
+    /// Маркер однократного включения автоподключения лежит рядом с файлом реестра,
+    /// чтобы тестовые реестры с собственным storageURL не зависели от настроек приложения.
+    private var autoConnectMigrationMarkerURL: URL {
+        storageURL.appendingPathExtension("autoconnect-v1")
+    }
+
+    /// Однократно: ранее сопряжённые устройства получают autoConnect = true.
+    /// Повторно не выполняется, поэтому ручное выключение после миграции сохраняется.
+    private func enableAutoConnectForPairedDevicesOnce() {
+        lock.lock()
+        defer { lock.unlock() }
+        let marker = autoConnectMigrationMarkerURL
+        guard !FileManager.default.fileExists(atPath: marker.path) else { return }
+        var changed = false
+        for (id, var dev) in devices where !dev.pinnedFingerprint.isEmpty && !dev.autoConnect {
+            dev.autoConnect = true
+            devices[id] = dev
+            changed = true
+        }
+        if changed { saveUnderLock() }
+        FileManager.default.createFile(atPath: marker.path, contents: Data())
+    }
+
     // MARK: - Persistence (выполняется строго внутри захваченного lock)
     
     private func saveUnderLock() {

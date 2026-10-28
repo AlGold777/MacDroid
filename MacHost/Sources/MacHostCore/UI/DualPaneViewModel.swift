@@ -784,7 +784,8 @@ public final class DualPaneViewModel: ObservableObject {
             leftIsStale = false
             rightIsStale = false
             connectPhone(preferredDeviceId: savedDeviceId, forceActivate: false, isExplicit: false)
-        } else if UserDefaults.standard.bool(forKey: "autoConnectEnabled") {
+        } else if !isRunningTests {
+            // Сопряжённый телефон с autoConnect подключается сразу, не дожидаясь первого тика монитора.
             autoConnectPhoneIfAvailable()
         }
         
