@@ -1576,6 +1576,7 @@ public struct FileGridCell: View {
             vm.triggerDelete()
         }
         Button("Копировать (Cmd+C)") { vm.copyToClipboard(items: contextItems, side: side) }
+        Button("Вырезать (Ctrl+X)") { vm.cutToClipboard(items: contextItems, side: side) }
         Button("Скопировать полный путь (Shift+Ctrl+Cmd+C)") { vm.copySelectedPath(items: contextItems, side: side) }
         Button("Вставить (Cmd+V)") { vm.pasteFromClipboard(targetSide: side) }
             .disabled(!vm.canPaste)

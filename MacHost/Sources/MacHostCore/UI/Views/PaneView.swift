@@ -1280,6 +1280,7 @@ public struct PaneView: View {
             vm.triggerDelete()
         }
         Button("Копировать (Cmd+C)") { vm.copyToClipboard(items: contextItems, side: side) }
+        Button("Вырезать (Ctrl+X)") { vm.cutToClipboard(items: contextItems, side: side) }
         Button("Скопировать полный путь (Shift+Ctrl+Cmd+C)") { vm.copySelectedPath(items: contextItems, side: side) }
         Button("Вставить (Cmd+V)") { vm.pasteFromClipboard(targetSide: side) }
             .disabled(!vm.canPaste)
@@ -3005,6 +3006,11 @@ public struct TableDoubleClickHandler: NSViewRepresentable {
             copyItem.target = self
             copyItem.representedObject = contextItems
             menu.addItem(copyItem)
+
+            let cutItem = NSMenuItem(title: "Вырезать (Ctrl+X)", action: #selector(menuActionCut(_:)), keyEquivalent: "")
+            cutItem.target = self
+            cutItem.representedObject = contextItems
+            menu.addItem(cutItem)
             
             let pasteItem = NSMenuItem(title: "Вставить (Cmd+V)", action: #selector(menuActionPaste(_:)), keyEquivalent: "")
             pasteItem.target = self
@@ -3129,6 +3135,11 @@ public struct TableDoubleClickHandler: NSViewRepresentable {
         @objc private func menuActionCopy(_ sender: NSMenuItem) {
             guard let items = sender.representedObject as? [FileItem], let vm = self.vm else { return }
             vm.copyToClipboard(items: items, side: self.side)
+        }
+
+        @objc private func menuActionCut(_ sender: NSMenuItem) {
+            guard let items = sender.representedObject as? [FileItem], let vm = self.vm else { return }
+            vm.cutToClipboard(items: items, side: self.side)
         }
         
         @objc private func menuActionPaste(_ sender: NSMenuItem) {

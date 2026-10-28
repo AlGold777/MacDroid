@@ -334,12 +334,16 @@ struct MacFileManagerApp: App {
                 .keyboardShortcut("v", modifiers: [.control])
 
                 Button("Вырезать (Cmd+X)") {
-                    _ = KeyCommandMonitor.performTextShortcut(keyCode: 7)
+                    if !KeyCommandMonitor.performTextShortcut(keyCode: 7) {
+                        viewModel.cutToClipboard()
+                    }
                 }
                 .keyboardShortcut("x", modifiers: [.command])
 
                 Button("Вырезать (Ctrl+X)") {
-                    _ = KeyCommandMonitor.performTextShortcut(keyCode: 7)
+                    if !KeyCommandMonitor.performTextShortcut(keyCode: 7) {
+                        viewModel.cutToClipboard()
+                    }
                 }
                 .keyboardShortcut("x", modifiers: [.control])
                 
