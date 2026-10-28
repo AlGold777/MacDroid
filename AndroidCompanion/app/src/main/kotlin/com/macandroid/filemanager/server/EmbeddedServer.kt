@@ -207,14 +207,16 @@ class EmbeddedServer(
             sftpFactory.addSftpEventListener(listener)
             subsystemFactories = Collections.singletonList(sftpFactory)
 
-            // Perf & FS Limiter: Увеличиваем буферы I/O и SSH channel window, ограничиваем дескрипторы для защиты памяти
-            // Apache SSHD: пакет 320 КБ (для 256 КБ SFTP чанка + SFTP и SSH заголовки),
-            // окно 8 МБ для непрерывного pipelining без частых ожиданий window-adjust ACK.
+            // Perf & FS Limiter: Увеличиваем буферы I/O и SSH channel window, ограничиваем дескрипторы для защиты памяти.
+            // Имена сверены с Apache MINA SSHD 2.12.0 (CoreModuleProperties, SftpModuleProperties): прежние
+            // "io-buffer-size" и "max-packet-length" в библиотеке не существуют и молча игнорировались.
+            // Окно 8 МБ — для непрерывного pipelining без частых ожиданий window-adjust ACK.
+            // Пакет канала 64 КБ (по умолчанию 32 КБ): крупнее нельзя — OpenSSH-клиент не принимает
+            // SSH-пакеты длиннее 256 КБ, а запас нужен на заголовки.
             val serverProps = this.properties
-            serverProps["io-buffer-size"] = (320 * 1024).toString()
+            serverProps["nio2-read-buf-size"] = (256 * 1024).toString()
             serverProps["window-size"] = (8L * 1024 * 1024).toString()
-            serverProps["max-packet-length"] = (320 * 1024).toString()
-            // Property names verified against Apache MINA SSHD 2.12.0 SftpModuleProperties.
+            serverProps["packet-size"] = (64 * 1024).toString()
             serverProps["max-open-handles-per-session"] = "32"
             serverProps["sftp-fs-read-buffer-size"] = (256 * 1024).toString()
             serverProps["sftp-fs-write-buffer-size"] = (256 * 1024).toString()
