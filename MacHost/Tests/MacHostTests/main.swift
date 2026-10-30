@@ -3246,6 +3246,38 @@ func runAllAsyncTests() async {
             vm.cancelInlineRename()
             assertCondition(vm.editingItemId == nil, "cancelInlineRename clears editingItemId")
             assertCondition(vm.editingItemSide == nil, "cancelInlineRename clears editingItemSide")
+            
+            // 6. File Path in Breadcrumbs / Manual Navigation: Opens Parent Directory & Focuses File
+            let testDir = FileManager.default.temporaryDirectory.appendingPathComponent("BreadcrumbFileTest_\(UUID().uuidString)")
+            try? FileManager.default.createDirectory(at: testDir, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: testDir) }
+            
+            let testFile = testDir.appendingPathComponent("target-document.md")
+            try? "Hello World".write(to: testFile, atomically: true, encoding: .utf8)
+            
+            vm.navigateTo(path: testFile.path, side: .left)
+            assertCondition(vm.leftPath == testDir.path, "Navigating to file path sets leftPath to parent directory: \(testDir.path) (got \(vm.leftPath))")
+            
+            vm.manualPathInput = testFile.path
+            vm.commitManualPath(side: .left)
+            assertCondition(vm.leftPath == testDir.path, "commitManualPath with file path opens parent folder")
+            
+            let quotedPath = "\"\(testFile.path)\""
+            vm.manualPathInput = quotedPath
+            vm.commitManualPath(side: .left)
+            assertCondition(vm.leftPath == testDir.path, "commitManualPath with quoted path opens parent folder")
+            
+            let fileURLPath = "file://\(testFile.path)"
+            vm.manualPathInput = fileURLPath
+            vm.commitManualPath(side: .left)
+            assertCondition(vm.leftPath == testDir.path, "commitManualPath with file:// URI opens parent folder")
+            
+            let userExamplePath = "/Users/restart/Documents/GitHub/AutoOrchestr/.claude/worktrees/basic-system-testing-392069/docs/Pipeline scenarios/remote-viewfinder-architecture.md"
+            if FileManager.default.fileExists(atPath: userExamplePath) {
+                vm.manualPathInput = userExamplePath
+                vm.commitManualPath(side: .left)
+                assertCondition(vm.leftPath == "/Users/restart/Documents/GitHub/AutoOrchestr/.claude/worktrees/basic-system-testing-392069/docs/Pipeline scenarios", "User example path opens Pipeline scenarios folder")
+            }
         }
         
         // =========================================================================

@@ -3553,12 +3553,12 @@ public final class DualPaneViewModel: ObservableObject {
         let trimmed = manualPathInput.trimmingCharacters(in: .whitespacesAndNewlines)
         if side == .left {
             isEditingLeftPath = false
-            if !trimmed.isEmpty && trimmed != leftPath {
+            if !trimmed.isEmpty {
                 navigateTo(path: trimmed, side: .left)
             }
         } else {
             isEditingRightPath = false
-            if !trimmed.isEmpty && trimmed != rightPath {
+            if !trimmed.isEmpty {
                 navigateTo(path: trimmed, side: .right)
             }
         }
@@ -3572,13 +3572,67 @@ public final class DualPaneViewModel: ObservableObject {
         statusMessage = "Добавлено в Избранное: \(name)"
     }
     
-    /// Прямая навигация по пути с валидацией платформы
-    public func navigateTo(path: String, side: PaneSide) {
-        let source = (side == .left) ? leftSource : rightSource
-        var targetPath = path
+    /// Прямая навигация по пути с валидацией платформы и фокусировкой на файле при необходимости
+    public func navigateTo(path: String, side: PaneSide, selectPath: String? = nil) {
+        var cleanPath = path.trimmingCharacters(in: .whitespacesAndNewlines)
+        cleanPath = cleanPath.trimmingCharacters(in: CharacterSet(charactersIn: "\"'"))
+        if cleanPath.hasPrefix("file://") {
+            if let url = URL(string: cleanPath), url.isFileURL {
+                cleanPath = url.path
+            } else {
+                cleanPath = String(cleanPath.dropFirst("file://".count))
+            }
+        }
+        cleanPath = cleanPath.removingPercentEncoding ?? cleanPath
+        
+        let initialSource = (side == .left) ? leftSource : rightSource
+        var source = initialSource
+        
+        // Автоматическое переключение источника, если вставлен путь другой платформы
+        if source == .remotePhone && (cleanPath.hasPrefix("/Users/") || cleanPath.hasPrefix("/Volumes/") || cleanPath.hasPrefix("/System/") || cleanPath.hasPrefix("/Applications/") || cleanPath.hasPrefix("/Library/") || cleanPath.hasPrefix("/private/")) {
+            changeSource(to: .localMac, side: side)
+            source = .localMac
+        } else if source == .localMac && (cleanPath.hasPrefix("/storage/") || cleanPath.hasPrefix("/sdcard/")) {
+            changeSource(to: .remotePhone, side: side)
+            source = .remotePhone
+        }
+        
+        var targetPath = cleanPath
+        var itemToSelect: String? = selectPath
+        
         if source == .localMac {
-            if targetPath.hasPrefix("/storage") || targetPath.hasPrefix("/sdcard") || !FileManager.default.fileExists(atPath: targetPath) {
-                targetPath = FileManager.default.homeDirectoryForCurrentUser.path
+            var expandedPath = (targetPath as NSString).expandingTildeInPath
+            if expandedPath.contains("\\ ") && !FileManager.default.fileExists(atPath: expandedPath) {
+                let unescaped = expandedPath.replacingOccurrences(of: "\\ ", with: " ")
+                if FileManager.default.fileExists(atPath: unescaped) {
+                    expandedPath = unescaped
+                }
+            }
+            
+            var isDirectory: ObjCBool = false
+            if FileManager.default.fileExists(atPath: expandedPath, isDirectory: &isDirectory) {
+                if !isDirectory.boolValue {
+                    let fileURL = URL(fileURLWithPath: expandedPath)
+                    targetPath = fileURL.deletingLastPathComponent().path
+                    if itemToSelect == nil {
+                        itemToSelect = expandedPath
+                    }
+                } else {
+                    targetPath = expandedPath
+                }
+            } else {
+                let fileURL = URL(fileURLWithPath: expandedPath)
+                let parentDir = fileURL.deletingLastPathComponent().path
+                if FileManager.default.fileExists(atPath: parentDir, isDirectory: &isDirectory) && isDirectory.boolValue {
+                    targetPath = parentDir
+                    if itemToSelect == nil {
+                        itemToSelect = expandedPath
+                    }
+                } else if targetPath.hasPrefix("/storage") || targetPath.hasPrefix("/sdcard") || !FileManager.default.fileExists(atPath: targetPath) {
+                    targetPath = FileManager.default.homeDirectoryForCurrentUser.path
+                } else {
+                    targetPath = expandedPath
+                }
             }
         } else if source == .remotePhone {
             if targetPath.hasPrefix("/sdcard") {
@@ -3586,21 +3640,79 @@ public final class DualPaneViewModel: ObservableObject {
             } else if targetPath.hasPrefix("/Users/") || targetPath.hasPrefix("/System/") || targetPath.hasPrefix("/Applications/") || targetPath.hasPrefix("/Library/") || targetPath.hasPrefix("/private/") || targetPath.isEmpty {
                 targetPath = "/storage/emulated/0"
             }
+            
+            let phoneURL = URL(fileURLWithPath: targetPath)
+            if !phoneURL.pathExtension.isEmpty {
+                let parentDir = phoneURL.deletingLastPathComponent().path
+                if parentDir != "/" && parentDir != "/storage" && parentDir != "/storage/emulated" {
+                    targetPath = parentDir
+                    if itemToSelect == nil {
+                        itemToSelect = phoneURL.lastPathComponent
+                    }
+                }
+            }
         }
+        
         recordHistory(path: targetPath, side: side)
         if activePane != side {
             activePane = side
         }
+        TableDoubleClickHandler.HandlerView.setActiveSide(side)
+        
         if side == .left {
+            let pathChanged = (leftPath != targetPath)
             leftPath = targetPath
-            leftSelection.removeAll()
             updateActiveTab(side: .left)
-            refreshPane(side: .left)
+            if pathChanged {
+                leftSelection.removeAll()
+                refreshPane(side: .left, selectPath: itemToSelect)
+            } else if let select = itemToSelect {
+                let normSelectPath = select.precomposedStringWithCanonicalMapping
+                let selectName = URL(fileURLWithPath: select).lastPathComponent.precomposedStringWithCanonicalMapping
+                if selectName.hasPrefix(".") {
+                    leftShowHidden = true
+                }
+                if let target = leftItems.first(where: {
+                    $0.path == normSelectPath ||
+                    $0.name == selectName ||
+                    $0.path.precomposedStringWithCanonicalMapping == normSelectPath ||
+                    $0.name.precomposedStringWithCanonicalMapping == selectName
+                }) {
+                    leftSelection = [target.id]
+                    TableDoubleClickHandler.HandlerView.focusAndScrollToItem(id: target.id, side: .left)
+                } else {
+                    refreshPane(side: .left, selectPath: select)
+                }
+            } else {
+                refreshPane(side: .left)
+            }
         } else {
+            let pathChanged = (rightPath != targetPath)
             rightPath = targetPath
-            rightSelection.removeAll()
             updateActiveTab(side: .right)
-            refreshPane(side: .right)
+            if pathChanged {
+                rightSelection.removeAll()
+                refreshPane(side: .right, selectPath: itemToSelect)
+            } else if let select = itemToSelect {
+                let normSelectPath = select.precomposedStringWithCanonicalMapping
+                let selectName = URL(fileURLWithPath: select).lastPathComponent.precomposedStringWithCanonicalMapping
+                if selectName.hasPrefix(".") {
+                    rightShowHidden = true
+                }
+                if let target = rightItems.first(where: {
+                    $0.path == normSelectPath ||
+                    $0.name == selectName ||
+                    $0.path.precomposedStringWithCanonicalMapping == normSelectPath ||
+                    $0.name.precomposedStringWithCanonicalMapping == selectName
+                }) {
+                    rightSelection = [target.id]
+                    TableDoubleClickHandler.HandlerView.focusAndScrollToItem(id: target.id, side: .right)
+                } else {
+                    refreshPane(side: .right, selectPath: select)
+                }
+            } else {
+                refreshPane(side: .right)
+            }
         }
     }
     
@@ -3611,8 +3723,18 @@ public final class DualPaneViewModel: ObservableObject {
         let source = (side == .left) ? leftSource : rightSource
         
         // Автокоррекция пути при несоответствии платформе: для Mac всегда реальный локальный путь
+        var effectiveSelectPath = selectPath
         if source == .localMac {
-            if path.hasPrefix("/storage") || path.hasPrefix("/sdcard") || !FileManager.default.fileExists(atPath: path) {
+            var isDir: ObjCBool = false
+            if FileManager.default.fileExists(atPath: path, isDirectory: &isDir) {
+                if !isDir.boolValue {
+                    let fileURL = URL(fileURLWithPath: path)
+                    if effectiveSelectPath == nil { effectiveSelectPath = path }
+                    path = fileURL.deletingLastPathComponent().path
+                    if side == .left { leftPath = path } else { rightPath = path }
+                    updateActiveTab(side: side)
+                }
+            } else if path.hasPrefix("/storage") || path.hasPrefix("/sdcard") || !FileManager.default.fileExists(atPath: path) {
                 path = FileManager.default.homeDirectoryForCurrentUser.path
                 if side == .left { leftPath = path } else { rightPath = path }
                 updateActiveTab(side: side)
@@ -3693,10 +3815,18 @@ public final class DualPaneViewModel: ObservableObject {
                 if side == .left {
                     self.leftItems = items
                     self.leftIsStale = isRemoteOffline && !self.isConnectingPhone
-                    if let selectPath = selectPath {
+                    if let selectPath = effectiveSelectPath {
                         let normSelectPath = selectPath.precomposedStringWithCanonicalMapping
                         let selectName = URL(fileURLWithPath: selectPath).lastPathComponent.precomposedStringWithCanonicalMapping
-                        if let target = items.first(where: { $0.path == normSelectPath || $0.name == selectName }) {
+                        if selectName.hasPrefix(".") {
+                            self.leftShowHidden = true
+                        }
+                        if let target = items.first(where: {
+                            $0.path == normSelectPath ||
+                            $0.name == selectName ||
+                            $0.path.precomposedStringWithCanonicalMapping == normSelectPath ||
+                            $0.name.precomposedStringWithCanonicalMapping == selectName
+                        }) {
                             self.activePane = .left
                             self.leftSelection = [target.id]
                             TableDoubleClickHandler.HandlerView.focusAndScrollToItem(id: target.id, side: .left)
@@ -3705,10 +3835,18 @@ public final class DualPaneViewModel: ObservableObject {
                 } else {
                     self.rightItems = items
                     self.rightIsStale = isRemoteOffline && !self.isConnectingPhone
-                    if let selectPath = selectPath {
+                    if let selectPath = effectiveSelectPath {
                         let normSelectPath = selectPath.precomposedStringWithCanonicalMapping
                         let selectName = URL(fileURLWithPath: selectPath).lastPathComponent.precomposedStringWithCanonicalMapping
-                        if let target = items.first(where: { $0.path == normSelectPath || $0.name == selectName }) {
+                        if selectName.hasPrefix(".") {
+                            self.rightShowHidden = true
+                        }
+                        if let target = items.first(where: {
+                            $0.path == normSelectPath ||
+                            $0.name == selectName ||
+                            $0.path.precomposedStringWithCanonicalMapping == normSelectPath ||
+                            $0.name.precomposedStringWithCanonicalMapping == selectName
+                        }) {
                             self.activePane = .right
                             self.rightSelection = [target.id]
                             TableDoubleClickHandler.HandlerView.focusAndScrollToItem(id: target.id, side: .right)

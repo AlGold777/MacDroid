@@ -562,6 +562,13 @@ public struct FileGridPaneView: View {
                     vm.activePane = side
                 }
             })
+            .onChange(of: selection) { newSel in
+                if let targetId = newSel.first {
+                    withAnimation(.easeInOut(duration: 0.15)) {
+                        scrollProxy.scrollTo(targetId, anchor: .center)
+                    }
+                }
+            }
         }
     }
     

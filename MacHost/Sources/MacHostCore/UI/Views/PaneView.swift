@@ -1312,11 +1312,11 @@ public struct PaneView: View {
             NSPasteboard.general.setString(currentPath, forType: .string)
         }
         Button("Вставить") {
-            guard let pastedPath = NSPasteboard.general.string(forType: .string), !pastedPath.isEmpty else { return }
-            vm.startEditingPath(side: side)
+            guard let pastedPath = NSPasteboard.general.string(forType: .string)?.trimmingCharacters(in: .whitespacesAndNewlines), !pastedPath.isEmpty else { return }
             vm.manualPathInput = pastedPath
+            vm.commitManualPath(side: side)
         }
-        .disabled(NSPasteboard.general.string(forType: .string)?.isEmpty != false)
+        .disabled(NSPasteboard.general.string(forType: .string)?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty != false)
     }
 
     private func beginPathEditing() {
@@ -2210,18 +2210,35 @@ public struct TableDoubleClickHandler: NSViewRepresentable {
         
         public static func focusAndScrollToItem(id: String, side: PaneSide) {
             ensureTableViewsDiscovered()
-            DispatchQueue.main.async {
+            setActiveSide(side)
+            let performSelect = {
                 ensureTableViewsDiscovered()
                 let tv = (side == .left) ? leftTableView : rightTableView
-                // Индекс строки таблицы — в порядке отображения (сортировка/фильтр), а не в сыром списке
                 let items = activeVM(for: side)?.displayItems(for: side) ?? []
-                guard let index = items.firstIndex(where: { $0.id == id || $0.path == id }) else { return }
-                tv?.selectRowIndexes(IndexSet(integer: index), byExtendingSelection: false)
-                tv?.scrollRowToVisible(index)
-                let win = tv?.window ?? NSApplication.shared.keyWindow ?? NSApplication.shared.mainWindow
+                let normId = id.precomposedStringWithCanonicalMapping
+                guard let index = items.firstIndex(where: {
+                    $0.id == id ||
+                    $0.path == id ||
+                    $0.name == id ||
+                    $0.id.precomposedStringWithCanonicalMapping == normId ||
+                    $0.path.precomposedStringWithCanonicalMapping == normId ||
+                    $0.name.precomposedStringWithCanonicalMapping == normId
+                }) else { return }
                 if let tv = tv {
+                    tv.selectRowIndexes(IndexSet(integer: index), byExtendingSelection: false)
+                    tv.scrollRowToVisible(index)
+                    let win = tv.window ?? NSApplication.shared.keyWindow ?? NSApplication.shared.mainWindow
                     win?.makeFirstResponder(tv)
                 }
+            }
+            DispatchQueue.main.async {
+                performSelect()
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                performSelect()
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
+                performSelect()
             }
         }
         
