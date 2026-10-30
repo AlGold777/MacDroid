@@ -15,11 +15,11 @@
 	<key>CFBundleInfoDictionaryVersion</key>
 	<string>6.0</string>
 	<key>CFBundleName</key>
-	<string>MacDroid Commander 2.1.306</string>
+	<string>MacDroid Commander 2.1.308</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
-	<string>2.1.306</string>
+	<string>2.1.308</string>
 	<key>CFBundleVersion</key>
 	<string>35</string>
 	<key>LSMinimumSystemVersion</key>

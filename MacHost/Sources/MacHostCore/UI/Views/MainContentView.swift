@@ -436,10 +436,68 @@ private struct TopToolbarTrailingActionsView: View {
     }
 }
 
+private final class SplitViewCoordinator: NSObject, NSSplitViewDelegate {
+    var isFinderMode: Bool = false
+    var sidebarWidth: CGFloat = 166
+    var minimumPaneWidth: CGFloat = TableDoubleClickHandler.TableColumnLayoutEngine.minimumPaneWidth
+    var lastResetId: UUID? = nil
+    
+    func splitView(_ splitView: NSSplitView, canCollapseSubview subview: NSView) -> Bool {
+        return false
+    }
+    
+    func splitView(_ splitView: NSSplitView, shouldHideDividerAt dividerIndex: Int) -> Bool {
+        return false
+    }
+    
+    func splitView(_ splitView: NSSplitView, constrainMinCoordinate proposedMinimumPosition: CGFloat, ofSubviewAt dividerIndex: Int) -> CGFloat {
+        if isFinderMode {
+            return 145
+        } else {
+            let total = splitView.bounds.width
+            let limit = min(minimumPaneWidth, max(120, total / 2.0))
+            return limit
+        }
+    }
+    
+    func splitView(_ splitView: NSSplitView, constrainMaxCoordinate proposedMaximumPosition: CGFloat, ofSubviewAt dividerIndex: Int) -> CGFloat {
+        let total = splitView.bounds.width
+        if isFinderMode {
+            let maxSidebar = min(220, max(145, total - minimumPaneWidth))
+            return maxSidebar
+        } else {
+            let limit = min(minimumPaneWidth, max(120, total / 2.0))
+            return max(limit, total - limit)
+        }
+    }
+    
+    func splitView(_ splitView: NSSplitView, constrainSplitPosition proposedPosition: CGFloat, ofSubviewAt dividerIndex: Int) -> CGFloat {
+        let total = splitView.bounds.width
+        if isFinderMode {
+            let minPos: CGFloat = 145
+            let maxPos: CGFloat = min(220, max(145, total - minimumPaneWidth))
+            return max(minPos, min(maxPos, proposedPosition))
+        } else {
+            let limit = min(minimumPaneWidth, max(120, total / 2.0))
+            let minPos = limit
+            let maxPos = max(limit, total - limit)
+            return max(minPos, min(maxPos, proposedPosition))
+        }
+    }
+}
+
 private struct SplitViewCenterResetHelper: NSViewRepresentable {
     let resetId: UUID
     let isFinderMode: Bool
     let sidebarWidth: CGFloat
+    
+    func makeCoordinator() -> SplitViewCoordinator {
+        let coordinator = SplitViewCoordinator()
+        coordinator.isFinderMode = isFinderMode
+        coordinator.sidebarWidth = sidebarWidth
+        coordinator.minimumPaneWidth = TableDoubleClickHandler.TableColumnLayoutEngine.minimumPaneWidth
+        return coordinator
+    }
     
     func makeNSView(context: Context) -> NSView {
         let view = NSView()
@@ -447,22 +505,36 @@ private struct SplitViewCenterResetHelper: NSViewRepresentable {
     }
     
     func updateNSView(_ nsView: NSView, context: Context) {
+        context.coordinator.isFinderMode = isFinderMode
+        context.coordinator.sidebarWidth = sidebarWidth
+        context.coordinator.minimumPaneWidth = TableDoubleClickHandler.TableColumnLayoutEngine.minimumPaneWidth
+        
+        let needsInitialPosition = (context.coordinator.lastResetId != resetId)
+        if needsInitialPosition {
+            context.coordinator.lastResetId = resetId
+        }
+        
         DispatchQueue.main.async {
             guard let splitView = findSplitView(in: nsView) else { return }
+            if splitView.delegate !== context.coordinator {
+                splitView.delegate = context.coordinator
+            }
             let boundsWidth = splitView.bounds.width
             guard boundsWidth > 100 else { return }
             
-            if isFinderMode {
-                if splitView.subviews.count >= 2 {
-                    splitView.setPosition(sidebarWidth, ofDividerAt: 0)
+            if needsInitialPosition {
+                if isFinderMode {
+                    if splitView.subviews.count >= 2 {
+                        splitView.setPosition(sidebarWidth, ofDividerAt: 0)
+                    }
+                } else {
+                    let divider0X = boundsWidth / 2.0
+                    if splitView.subviews.count >= 2 {
+                        splitView.setPosition(divider0X, ofDividerAt: 0)
+                    }
                 }
-            } else {
-                let divider0X = boundsWidth / 2.0
-                if splitView.subviews.count >= 2 {
-                    splitView.setPosition(divider0X, ofDividerAt: 0)
-                }
+                splitView.adjustSubviews()
             }
-            splitView.adjustSubviews()
         }
     }
     

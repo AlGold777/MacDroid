@@ -2289,6 +2289,7 @@ public struct TableDoubleClickHandler: NSViewRepresentable {
         private var pendingSingleClickSelection: (id: String, side: PaneSide)? = nil
         private var isAdjustingColumns = false
         private weak var columnResizeView: ColumnResizeView?
+        private var lastAdjustedClipWidth: CGFloat = 0
         private var preferredMetadataWidths: [CGFloat] = [
             TableColumnLayoutEngine.defaultWidths[1],
             TableColumnLayoutEngine.defaultWidths[2],
@@ -2478,15 +2479,7 @@ public struct TableDoubleClickHandler: NSViewRepresentable {
             )
             
             if let clipView = tv.enclosingScrollView?.contentView {
-                clipView.postsBoundsChangedNotifications = true
                 clipView.postsFrameChangedNotifications = true
-                NotificationCenter.default.removeObserver(self, name: NSView.boundsDidChangeNotification, object: clipView)
-                NotificationCenter.default.addObserver(
-                    self,
-                    selector: #selector(onTableFrameDidChange(_:)),
-                    name: NSView.boundsDidChangeNotification,
-                    object: clipView
-                )
                 NotificationCenter.default.removeObserver(self, name: NSView.frameDidChangeNotification, object: clipView)
                 NotificationCenter.default.addObserver(
                     self,
@@ -2495,14 +2488,6 @@ public struct TableDoubleClickHandler: NSViewRepresentable {
                     object: clipView
                 )
             }
-            
-            NotificationCenter.default.removeObserver(self, name: NSTableView.columnDidResizeNotification, object: tv)
-            NotificationCenter.default.addObserver(
-                self,
-                selector: #selector(onTableColumnDidResize(_:)),
-                name: NSTableView.columnDidResizeNotification,
-                object: tv
-            )
             
             adjustTableColumns()
             setupEventMonitor()
@@ -2526,7 +2511,10 @@ public struct TableDoubleClickHandler: NSViewRepresentable {
                 self.preferredMetadataWidths = [widths[1], widths[2], widths[3]]
                 table.headerView?.needsDisplay = true
             }
-            overlay.onBoundaryDragEnded = { [weak self] in self?.adjustTableColumns() }
+            overlay.onBoundaryDragEnded = { [weak self] in
+                self?.lastAdjustedClipWidth = 0
+                self?.adjustTableColumns()
+            }
             if overlay.superview !== nativeHeader { nativeHeader.addSubview(overlay) }
             columnResizeView = overlay
             table.allowsColumnResizing = false
@@ -2536,28 +2524,51 @@ public struct TableDoubleClickHandler: NSViewRepresentable {
             guard !isAdjustingColumns else { return }
             guard let tv = hookedTableView else { return }
             guard columnResizeView?.isResizingBoundary != true else { return }
+            
+            // Во время Drag & Drop не меняем размеры колонок во избежание дёргания строк
+            if let vm = self.vm, vm.dragHoverSide != nil || vm.currentDragPayload != nil {
+                return
+            }
+            
             let columns = tv.tableColumns
             guard columns.count == 5 else { return }
 
             let clipWidth = tv.enclosingScrollView?.contentView.bounds.width ?? tv.bounds.width
             guard clipWidth >= TableColumnLayoutEngine.minimumTableWidth else { return }
             
+            let targetWidth = clipWidth
+            let preferredSum = preferredMetadataWidths.reduce(0, +) + TableColumnLayoutEngine.fixedTypeWidth
+            
+            // Если ширина не изменилась и колонки уже соответствуют preferred, не пересчитывать
+            if abs(lastAdjustedClipWidth - targetWidth) < 0.5 &&
+               abs(columns[4].width - TableColumnLayoutEngine.fixedTypeWidth) < 0.01 &&
+               abs(columns[1].width - preferredMetadataWidths[0]) < 0.01 &&
+               abs(columns[2].width - preferredMetadataWidths[1]) < 0.01 &&
+               abs(columns[3].width - preferredMetadataWidths[2]) < 0.01 {
+                return
+            }
+            
             isAdjustingColumns = true
             defer { isAdjustingColumns = false }
+            lastAdjustedClipWidth = targetWidth
             
-            let targetWidth = floor(clipWidth)
-            if columns[4].width != TableColumnLayoutEngine.fixedTypeWidth || columns[4].resizingMask != [] {
+            if abs(columns[4].width - TableColumnLayoutEngine.fixedTypeWidth) > 0.001 || columns[4].resizingMask != [] {
                 columns[4].minWidth = TableColumnLayoutEngine.fixedTypeWidth
                 columns[4].maxWidth = TableColumnLayoutEngine.fixedTypeWidth
                 columns[4].width = TableColumnLayoutEngine.fixedTypeWidth
                 columns[4].resizingMask = []
                 tv.headerView?.needsDisplay = true
             }
-            let preferredSum = preferredMetadataWidths.reduce(0, +) + TableColumnLayoutEngine.fixedTypeWidth
             if targetWidth >= TableColumnLayoutEngine.constraints[0].min + preferredSum {
-                columns[1].width = preferredMetadataWidths[0]
-                columns[2].width = preferredMetadataWidths[1]
-                columns[3].width = preferredMetadataWidths[2]
+                if abs(columns[1].width - preferredMetadataWidths[0]) > 0.001 {
+                    columns[1].width = preferredMetadataWidths[0]
+                }
+                if abs(columns[2].width - preferredMetadataWidths[1]) > 0.001 {
+                    columns[2].width = preferredMetadataWidths[1]
+                }
+                if abs(columns[3].width - preferredMetadataWidths[2]) > 0.001 {
+                    columns[3].width = preferredMetadataWidths[2]
+                }
             }
             TableColumnLayoutEngine.adjust(columns: columns, targetWidth: targetWidth)
             
@@ -2567,11 +2578,6 @@ public struct TableDoubleClickHandler: NSViewRepresentable {
         }
         
         @objc private func onTableFrameDidChange(_ notification: Notification) {
-            adjustTableColumns()
-        }
-        
-        @objc private func onTableColumnDidResize(_ notification: Notification) {
-            // Programmatic/SwiftUI changes are not user boundary drags.
             adjustTableColumns()
         }
         
