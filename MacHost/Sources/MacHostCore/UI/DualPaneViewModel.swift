@@ -1057,7 +1057,7 @@ public final class DualPaneViewModel: ObservableObject {
                 activePane = .right
                 TableDoubleClickHandler.HandlerView.leftTableView = nil
                 TableDoubleClickHandler.HandlerView.leftVM = nil
-                TableDoubleClickHandler.HandlerView.setActiveSide(.right, forceRedraw: true)
+                TableDoubleClickHandler.HandlerView.setActiveSide(.right)
             }
         }
         if let savedLeftFolderSort = defaults.string(forKey: SessionKey.leftFolderSortMode),
@@ -3438,7 +3438,7 @@ public final class DualPaneViewModel: ObservableObject {
             activePane = .right
             TableDoubleClickHandler.HandlerView.leftTableView = nil
             TableDoubleClickHandler.HandlerView.leftVM = nil
-            TableDoubleClickHandler.HandlerView.setActiveSide(.right, forceRedraw: true)
+            TableDoubleClickHandler.HandlerView.setActiveSide(.right)
         }
         splitViewResetId = UUID()
         saveSession()

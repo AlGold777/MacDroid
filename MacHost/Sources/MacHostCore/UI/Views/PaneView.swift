@@ -1961,12 +1961,6 @@ public struct TableDoubleClickHandler: NSViewRepresentable {
             nsView.hookTableView()
         }
         if let tv = nsView.hookedTableView {
-            if #available(macOS 11.0, *) {
-                let targetStyle: NSTableView.Style = (vm.panelLayoutMode == .finder) ? .inset : .plain
-                if tv.style != targetStyle {
-                    tv.style = targetStyle
-                }
-            }
             nsView.installColumnHeader(on: tv)
             for col in tv.tableColumns {
                 if col.headerCell.font?.pointSize != 12 {
@@ -1982,7 +1976,7 @@ public struct TableDoubleClickHandler: NSViewRepresentable {
             }
         }
         if vm.activePane == side {
-            HandlerView.setActiveSide(side, forceRedraw: true)
+            HandlerView.setActiveSide(side)
         }
     }
     
@@ -1995,13 +1989,6 @@ public struct TableDoubleClickHandler: NSViewRepresentable {
         }
 
         public static let fixedTypeWidth: CGFloat = 58
-        public static let defaultWidths: [CGFloat] = [
-            0,   // Name (dynamic)
-            60,  // Размер
-            27,  // Теги
-            110, // Дата изменения
-            fixedTypeWidth // 58 pt (Тип)
-        ]
         // Name fills the remaining space; metadata widths are independent preferences.
         public static let constraints: [Constraint] = [
             Constraint(min: 120, max: .greatestFiniteMagnitude),
@@ -2173,18 +2160,17 @@ public struct TableDoubleClickHandler: NSViewRepresentable {
             return (side == .left) ? leftVM : rightVM
         }
         
-        public static func setActiveSide(_ side: PaneSide, forceRedraw: Bool = false) {
-            if activePaneSide != side || forceRedraw {
-                activePaneSide = side
-                leftTableView?.enumerateAvailableRowViews { rowView, _ in
-                    rowView.needsDisplay = true
-                }
-                leftTableView?.needsDisplay = true
-                rightTableView?.enumerateAvailableRowViews { rowView, _ in
-                    rowView.needsDisplay = true
-                }
-                rightTableView?.needsDisplay = true
+        public static func setActiveSide(_ side: PaneSide) {
+            guard activePaneSide != side else { return }
+            activePaneSide = side
+            leftTableView?.enumerateAvailableRowViews { rowView, _ in
+                rowView.needsDisplay = true
             }
+            leftTableView?.needsDisplay = true
+            rightTableView?.enumerateAvailableRowViews { rowView, _ in
+                rowView.needsDisplay = true
+            }
+            rightTableView?.needsDisplay = true
         }
         
         public static func ensureTableViewsDiscovered() {
@@ -2289,12 +2275,6 @@ public struct TableDoubleClickHandler: NSViewRepresentable {
         private var pendingSingleClickSelection: (id: String, side: PaneSide)? = nil
         private var isAdjustingColumns = false
         private weak var columnResizeView: ColumnResizeView?
-        private var lastAdjustedClipWidth: CGFloat = 0
-        private var preferredMetadataWidths: [CGFloat] = [
-            TableColumnLayoutEngine.defaultWidths[1],
-            TableColumnLayoutEngine.defaultWidths[2],
-            TableColumnLayoutEngine.defaultWidths[3]
-        ]
         
         deinit {
             longPressWorkItem?.cancel()
@@ -2326,9 +2306,6 @@ public struct TableDoubleClickHandler: NSViewRepresentable {
             DispatchQueue.main.async { [weak self] in
                 self?.hookTableView()
                 self?.setupEventMonitor()
-                if let side = self?.side, let vm = self?.vm, vm.activePane == side {
-                    HandlerView.setActiveSide(side, forceRedraw: true)
-                }
             }
         }
         
@@ -2434,12 +2411,12 @@ public struct TableDoubleClickHandler: NSViewRepresentable {
             tv.allowsColumnResizing = false
             installColumnHeader(on: tv)
             if #available(macOS 11.0, *) {
-                tv.style = (vm?.panelLayoutMode == .finder) ? .inset : .plain
+                tv.style = .plain
             }
             tv.intercellSpacing = NSSize(width: 0, height: tv.intercellSpacing.height)
             tv.columnAutoresizingStyle = .noColumnAutoresizing
             tv.postsFrameChangedNotifications = true
-            tv.postsBoundsChangedNotifications = true
+            tv.postsBoundsChangedNotifications = false
             
             if let scroll = tv.enclosingScrollView {
                 scroll.hasHorizontalScroller = false
@@ -2452,9 +2429,9 @@ public struct TableDoubleClickHandler: NSViewRepresentable {
                 col.headerCell.font = NSFont.systemFont(ofSize: 12, weight: .regular)
             }
             if cols.count >= 5 {
-                cols[1].width = preferredMetadataWidths[0]
-                cols[2].width = preferredMetadataWidths[1]
-                cols[3].width = preferredMetadataWidths[2]
+                cols[1].width = 60
+                cols[2].width = 27
+                cols[3].width = 110
                 cols[4].minWidth = TableColumnLayoutEngine.fixedTypeWidth
                 cols[4].maxWidth = TableColumnLayoutEngine.fixedTypeWidth
                 cols[4].width = TableColumnLayoutEngine.fixedTypeWidth
@@ -2479,6 +2456,7 @@ public struct TableDoubleClickHandler: NSViewRepresentable {
             )
             
             if let clipView = tv.enclosingScrollView?.contentView {
+                clipView.postsBoundsChangedNotifications = false
                 clipView.postsFrameChangedNotifications = true
                 NotificationCenter.default.removeObserver(self, name: NSView.frameDidChangeNotification, object: clipView)
                 NotificationCenter.default.addObserver(
@@ -2508,13 +2486,9 @@ public struct TableDoubleClickHandler: NSViewRepresentable {
                     initialWidths: initialWidths, boundaryIndex: boundary, translation: translation
                 )
                 TableColumnLayoutEngine.apply(widths: widths, to: table.tableColumns)
-                self.preferredMetadataWidths = [widths[1], widths[2], widths[3]]
                 table.headerView?.needsDisplay = true
             }
-            overlay.onBoundaryDragEnded = { [weak self] in
-                self?.lastAdjustedClipWidth = 0
-                self?.adjustTableColumns()
-            }
+            overlay.onBoundaryDragEnded = { [weak self] in self?.adjustTableColumns() }
             if overlay.superview !== nativeHeader { nativeHeader.addSubview(overlay) }
             columnResizeView = overlay
             table.allowsColumnResizing = false
@@ -2524,51 +2498,22 @@ public struct TableDoubleClickHandler: NSViewRepresentable {
             guard !isAdjustingColumns else { return }
             guard let tv = hookedTableView else { return }
             guard columnResizeView?.isResizingBoundary != true else { return }
-            
-            // Во время Drag & Drop не меняем размеры колонок во избежание дёргания строк
-            if let vm = self.vm, vm.dragHoverSide != nil || vm.currentDragPayload != nil {
-                return
-            }
-            
             let columns = tv.tableColumns
             guard columns.count == 5 else { return }
 
             let clipWidth = tv.enclosingScrollView?.contentView.bounds.width ?? tv.bounds.width
             guard clipWidth >= TableColumnLayoutEngine.minimumTableWidth else { return }
             
-            let targetWidth = clipWidth
-            let preferredSum = preferredMetadataWidths.reduce(0, +) + TableColumnLayoutEngine.fixedTypeWidth
-            
-            // Если ширина не изменилась и колонки уже соответствуют preferred, не пересчитывать
-            if abs(lastAdjustedClipWidth - targetWidth) < 0.5 &&
-               abs(columns[4].width - TableColumnLayoutEngine.fixedTypeWidth) < 0.01 &&
-               abs(columns[1].width - preferredMetadataWidths[0]) < 0.01 &&
-               abs(columns[2].width - preferredMetadataWidths[1]) < 0.01 &&
-               abs(columns[3].width - preferredMetadataWidths[2]) < 0.01 {
-                return
-            }
-            
             isAdjustingColumns = true
             defer { isAdjustingColumns = false }
-            lastAdjustedClipWidth = targetWidth
             
-            if abs(columns[4].width - TableColumnLayoutEngine.fixedTypeWidth) > 0.001 || columns[4].resizingMask != [] {
+            let targetWidth = floor(clipWidth)
+            if columns[4].width != TableColumnLayoutEngine.fixedTypeWidth || columns[4].resizingMask != [] {
                 columns[4].minWidth = TableColumnLayoutEngine.fixedTypeWidth
                 columns[4].maxWidth = TableColumnLayoutEngine.fixedTypeWidth
                 columns[4].width = TableColumnLayoutEngine.fixedTypeWidth
                 columns[4].resizingMask = []
                 tv.headerView?.needsDisplay = true
-            }
-            if targetWidth >= TableColumnLayoutEngine.constraints[0].min + preferredSum {
-                if abs(columns[1].width - preferredMetadataWidths[0]) > 0.001 {
-                    columns[1].width = preferredMetadataWidths[0]
-                }
-                if abs(columns[2].width - preferredMetadataWidths[1]) > 0.001 {
-                    columns[2].width = preferredMetadataWidths[1]
-                }
-                if abs(columns[3].width - preferredMetadataWidths[2]) > 0.001 {
-                    columns[3].width = preferredMetadataWidths[2]
-                }
             }
             TableColumnLayoutEngine.adjust(columns: columns, targetWidth: targetWidth)
             
