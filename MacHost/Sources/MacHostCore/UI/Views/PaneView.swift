@@ -1962,8 +1962,9 @@ public struct TableDoubleClickHandler: NSViewRepresentable {
         }
         if let tv = nsView.hookedTableView {
             if #available(macOS 11.0, *) {
-                if tv.style != .inset {
-                    tv.style = .inset
+                let targetStyle: NSTableView.Style = (vm.panelLayoutMode == .finder) ? .inset : .plain
+                if tv.style != targetStyle {
+                    tv.style = targetStyle
                 }
             }
             nsView.installColumnHeader(on: tv)
@@ -2432,7 +2433,7 @@ public struct TableDoubleClickHandler: NSViewRepresentable {
             tv.allowsColumnResizing = false
             installColumnHeader(on: tv)
             if #available(macOS 11.0, *) {
-                tv.style = .inset
+                tv.style = (vm?.panelLayoutMode == .finder) ? .inset : .plain
             }
             tv.intercellSpacing = NSSize(width: 0, height: tv.intercellSpacing.height)
             tv.columnAutoresizingStyle = .noColumnAutoresizing
