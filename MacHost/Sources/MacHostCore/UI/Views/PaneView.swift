@@ -1976,7 +1976,7 @@ public struct TableDoubleClickHandler: NSViewRepresentable {
             }
         }
         if vm.activePane == side {
-            HandlerView.setActiveSide(side)
+            HandlerView.setActiveSide(side, forceRedraw: true)
         }
     }
     
@@ -2167,21 +2167,22 @@ public struct TableDoubleClickHandler: NSViewRepresentable {
             return (side == .left) ? leftVM : rightVM
         }
         
-        public static func setActiveSide(_ side: PaneSide) {
-            guard activePaneSide != side else { return }
-            activePaneSide = side
-            leftTableView?.enumerateAvailableRowViews { rowView, _ in
-                rowView.needsDisplay = true
+        public static func setActiveSide(_ side: PaneSide, forceRedraw: Bool = false) {
+            if activePaneSide != side || forceRedraw {
+                activePaneSide = side
+                leftTableView?.enumerateAvailableRowViews { rowView, _ in
+                    rowView.needsDisplay = true
+                }
+                leftTableView?.needsDisplay = true
+                rightTableView?.enumerateAvailableRowViews { rowView, _ in
+                    rowView.needsDisplay = true
+                }
+                rightTableView?.needsDisplay = true
             }
-            leftTableView?.needsDisplay = true
-            rightTableView?.enumerateAvailableRowViews { rowView, _ in
-                rowView.needsDisplay = true
-            }
-            rightTableView?.needsDisplay = true
         }
         
         public static func ensureTableViewsDiscovered() {
-            guard let win = NSApplication.shared.keyWindow ?? NSApplication.shared.mainWindow,
+            guard let win = NSApplication.shared.keyWindow ?? NSApplication.shared.mainWindow ?? NSApplication.shared.windows.first(where: { $0.isVisible }),
                   let contentView = win.contentView else { return }
             
             var tables: [NSTableView] = []
@@ -2206,12 +2207,24 @@ public struct TableDoubleClickHandler: NSViewRepresentable {
                 leftTableView = tables[0]
                 rightTableView = tables[1]
             } else if tables.count == 1 {
-                let rect = tables[0].convert(tables[0].bounds, to: nil)
-                if rect.origin.x < (win.frame.width / 2.0) {
-                    leftTableView = tables[0]
-                } else {
+                if DualPaneViewModel.shared?.panelLayoutMode == .finder {
+                    leftTableView = nil
+                    leftVM = nil
                     rightTableView = tables[0]
+                    rightVM = DualPaneViewModel.shared
+                } else {
+                    let rect = tables[0].convert(tables[0].bounds, to: nil)
+                    if rect.origin.x < (win.frame.width / 2.0) {
+                        leftTableView = tables[0]
+                        rightTableView = nil
+                    } else {
+                        leftTableView = nil
+                        rightTableView = tables[0]
+                    }
                 }
+            } else {
+                leftTableView = nil
+                rightTableView = nil
             }
         }
         
@@ -2282,6 +2295,21 @@ public struct TableDoubleClickHandler: NSViewRepresentable {
                 NSEvent.removeMonitor(monitor)
             }
             NotificationCenter.default.removeObserver(self)
+            if side == .left {
+                if HandlerView.leftTableView === hookedTableView {
+                    HandlerView.leftTableView = nil
+                }
+                if HandlerView.leftVM === vm {
+                    HandlerView.leftVM = nil
+                }
+            } else {
+                if HandlerView.rightTableView === hookedTableView {
+                    HandlerView.rightTableView = nil
+                }
+                if HandlerView.rightVM === vm {
+                    HandlerView.rightVM = nil
+                }
+            }
         }
         
         public override func viewDidMoveToWindow() {
@@ -2291,6 +2319,9 @@ public struct TableDoubleClickHandler: NSViewRepresentable {
             DispatchQueue.main.async { [weak self] in
                 self?.hookTableView()
                 self?.setupEventMonitor()
+                if let side = self?.side, let vm = self?.vm, vm.activePane == side {
+                    HandlerView.setActiveSide(side, forceRedraw: true)
+                }
             }
         }
         
@@ -2323,10 +2354,12 @@ public struct TableDoubleClickHandler: NSViewRepresentable {
                     break
                 }
                 if let tv = findTableView(in: v) {
-                    if (side == .right && tv === HandlerView.leftTableView) ||
-                       (side == .left && tv === HandlerView.rightTableView) {
-                        current = v.superview
-                        continue
+                    if vm?.panelLayoutMode != .finder {
+                        if (side == .right && tv === HandlerView.leftTableView) ||
+                           (side == .left && tv === HandlerView.rightTableView) {
+                            current = v.superview
+                            continue
+                        }
                     }
                     attach(to: tv)
                     return
@@ -2340,16 +2373,20 @@ public struct TableDoubleClickHandler: NSViewRepresentable {
                 return nil
             }
             if let tv = view as? NSTableView {
-                if (side == .right && tv === HandlerView.leftTableView) ||
-                   (side == .left && tv === HandlerView.rightTableView) {
-                    return nil
+                if vm?.panelLayoutMode != .finder {
+                    if (side == .right && tv === HandlerView.leftTableView) ||
+                       (side == .left && tv === HandlerView.rightTableView) {
+                        return nil
+                    }
                 }
                 return tv
             }
             if let scroll = view as? NSScrollView, let tv = scroll.documentView as? NSTableView {
-                if (side == .right && tv === HandlerView.leftTableView) ||
-                   (side == .left && tv === HandlerView.rightTableView) {
-                    return nil
+                if vm?.panelLayoutMode != .finder {
+                    if (side == .right && tv === HandlerView.leftTableView) ||
+                       (side == .left && tv === HandlerView.rightTableView) {
+                        return nil
+                    }
                 }
                 return tv
             }
@@ -2362,11 +2399,13 @@ public struct TableDoubleClickHandler: NSViewRepresentable {
         }
         
         private func attach(to tv: NSTableView) {
-            if side == .right && tv === HandlerView.leftTableView {
-                return
-            }
-            if side == .left && tv === HandlerView.rightTableView {
-                return
+            if vm?.panelLayoutMode != .finder {
+                if side == .right && tv === HandlerView.leftTableView {
+                    return
+                }
+                if side == .left && tv === HandlerView.rightTableView {
+                    return
+                }
             }
             guard hookedTableView !== tv else { return }
             hookedTableView = tv
