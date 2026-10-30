@@ -20,6 +20,10 @@ public struct TopToolbarSearchView: View {
         vm.activePane == .left ? vm.leftSearchMatchContent : vm.rightSearchMatchContent
     }
     
+    private var currentScope: SearchScope {
+        vm.activePane == .left ? vm.leftSearchScope : vm.rightSearchScope
+    }
+    
     private var isSearching: Bool {
         vm.activePane == .left ? vm.isLeftSearching : vm.isRightSearching
     }
@@ -117,7 +121,7 @@ public struct TopToolbarSearchView: View {
             }
         }
         .padding(.horizontal, 7)
-        .frame(width: 250, height: 23)
+        .frame(width: 295, height: 23)
         .background(
             RoundedRectangle(cornerRadius: 6, style: .continuous)
                 .fill(Color(nsColor: .controlBackgroundColor))
@@ -172,11 +176,17 @@ public struct TopToolbarSearchView: View {
         VStack(alignment: .leading, spacing: 0) {
             // Секция 1: Имена файлов
             VStack(alignment: .leading, spacing: 3) {
-                Text("Имена файлов")
-                    .font(.system(size: 10, weight: .semibold))
-                    .foregroundColor(.secondary)
-                    .padding(.horizontal, 10)
-                    .padding(.top, 7)
+                HStack(alignment: .center, spacing: 6) {
+                    Text("Имена файлов")
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundColor(.secondary)
+                    
+                    Spacer()
+                    
+                    scopeToggleButtons
+                }
+                .padding(.horizontal, 10)
+                .padding(.top, 7)
                 
                 DropdownRowButton(
                     title: titleFiles,
@@ -211,7 +221,7 @@ public struct TopToolbarSearchView: View {
             }
             .padding(.bottom, 6)
         }
-        .frame(width: 250)
+        .frame(width: 295)
         .background(
             RoundedRectangle(cornerRadius: 8, style: .continuous)
                 .fill(Color(nsColor: .windowBackgroundColor))
@@ -221,6 +231,56 @@ public struct TopToolbarSearchView: View {
             RoundedRectangle(cornerRadius: 8, style: .continuous)
                 .stroke(Color.secondary.opacity(0.25), lineWidth: 1)
         )
+    }
+    
+    private var scopeToggleButtons: some View {
+        HStack(spacing: 0) {
+            Button(action: {
+                vm.setSearchScope(.currentFolder, side: vm.activePane)
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+                    isFocused = true
+                }
+            }) {
+                Text("искать в папке")
+                    .font(.system(size: 9.5, weight: currentScope == .currentFolder ? .semibold : .regular))
+                    .foregroundColor(currentScope == .currentFolder ? .white : .secondary)
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 2.5)
+                    .background(
+                        RoundedRectangle(cornerRadius: 3.5, style: .continuous)
+                            .fill(currentScope == .currentFolder ? Color.accentColor : Color.clear)
+                    )
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .help("Искать только в этой папке и её подпапках (по умолчанию)")
+            
+            Button(action: {
+                vm.setSearchScope(.everywhere, side: vm.activePane)
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+                    isFocused = true
+                }
+            }) {
+                Text("искать везде")
+                    .font(.system(size: 9.5, weight: currentScope == .everywhere ? .semibold : .regular))
+                    .foregroundColor(currentScope == .everywhere ? .white : .secondary)
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 2.5)
+                    .background(
+                        RoundedRectangle(cornerRadius: 3.5, style: .continuous)
+                            .fill(currentScope == .everywhere ? Color.accentColor : Color.clear)
+                    )
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .help("Искать везде на устройстве")
+        }
+        .padding(1.5)
+        .background(
+            RoundedRectangle(cornerRadius: 5, style: .continuous)
+                .fill(Color(nsColor: .separatorColor).opacity(0.18))
+        )
+        .animation(.easeInOut(duration: 0.15), value: currentScope)
     }
     
     private func triggerDebouncedSearch() {

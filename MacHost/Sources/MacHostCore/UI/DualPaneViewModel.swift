@@ -2282,8 +2282,10 @@ public final class DualPaneViewModel: ObservableObject {
     public func openSearch(side: PaneSide) {
         if side == .left {
             isLeftSearchActive = true
+            leftSearchScope = .currentFolder
         } else {
             isRightSearchActive = true
+            rightSearchScope = .currentFolder
         }
         activePane = side
         searchFocusTrigger &+= 1
@@ -2315,6 +2317,7 @@ public final class DualPaneViewModel: ObservableObject {
             isLeftSearchActive = false
             leftSearchQuery = ""
             leftSearchResults.removeAll()
+            leftSearchScope = .currentFolder
             leftItemsVersion &+= 1
         } else {
             rightSearchTask?.cancel()
@@ -2323,6 +2326,7 @@ public final class DualPaneViewModel: ObservableObject {
             isRightSearchActive = false
             rightSearchQuery = ""
             rightSearchResults.removeAll()
+            rightSearchScope = .currentFolder
             rightItemsVersion &+= 1
         }
     }
