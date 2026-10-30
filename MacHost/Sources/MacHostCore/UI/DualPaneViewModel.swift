@@ -1053,6 +1053,9 @@ public final class DualPaneViewModel: ObservableObject {
         if let savedLayoutMode = defaults.string(forKey: SessionKey.panelLayoutMode),
            let layoutMode = PanelLayoutMode(rawValue: savedLayoutMode) {
             panelLayoutMode = layoutMode
+            if layoutMode == .finder {
+                activePane = .right
+            }
         }
         if let savedLeftFolderSort = defaults.string(forKey: SessionKey.leftFolderSortMode),
            let folderSort = FolderSortMode(rawValue: savedLeftFolderSort) {
@@ -1374,6 +1377,7 @@ public final class DualPaneViewModel: ObservableObject {
     }
     
     public func toggleActivePane() {
+        guard panelLayoutMode != .finder else { return }
         let newSide: PaneSide = (activePane == .left) ? .right : .left
         TableDoubleClickHandler.HandlerView.ensureTableViewsDiscovered()
         if !isFileDiffActive {
@@ -3427,9 +3431,10 @@ public final class DualPaneViewModel: ObservableObject {
     public func setPanelLayoutMode(_ mode: PanelLayoutMode) {
         guard panelLayoutMode != mode else { return }
         panelLayoutMode = mode
-        if mode == .finder && activePane == .right {
-            activePane = .left
+        if mode == .finder {
+            activePane = .right
         }
+        splitViewResetId = UUID()
         saveSession()
         statusMessage = (mode == .finder) ? "Режим Finder с боковой панелью" : "Двухпанельный режим"
     }
@@ -3439,7 +3444,7 @@ public final class DualPaneViewModel: ObservableObject {
     }
     
     public func connectOrNavigateToDevice(named name: String, side: PaneSide? = nil) {
-        let targetSide = side ?? (panelLayoutMode == .finder ? .left : activePane)
+        let targetSide = side ?? (panelLayoutMode == .finder ? .right : activePane)
         if isPhoneConnected && remoteDriver.isConnected {
             if (targetSide == .left ? leftSource : rightSource) != .remotePhone {
                 changeSource(to: .remotePhone, side: targetSide)

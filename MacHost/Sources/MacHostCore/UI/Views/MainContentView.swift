@@ -92,16 +92,18 @@ public struct MainContentView: View {
                 .background(Color.accentColor.opacity(0.08))
             }
             let sidebarWidth: CGFloat = 166
-            let availableWidth = max(400, fullGeo.size.width - (vm.panelLayoutMode == .finder ? sidebarWidth : 0))
-            let paneIdealWidth = availableWidth / 2
+            let isFinder = vm.panelLayoutMode == .finder
+            let availableWidth = max(400, fullGeo.size.width - (isFinder ? sidebarWidth : 0))
+            let paneIdealWidth = isFinder ? availableWidth : (availableWidth / 2)
             
             HSplitView {
-                if vm.panelLayoutMode == .finder {
+                if isFinder {
                     FinderSidebarView()
                         .frame(minWidth: 145, idealWidth: sidebarWidth, maxWidth: 220)
+                } else {
+                    PaneView(side: .left)
+                        .frame(minWidth: TableDoubleClickHandler.TableColumnLayoutEngine.minimumPaneWidth, idealWidth: paneIdealWidth)
                 }
-                PaneView(side: .left)
-                    .frame(minWidth: TableDoubleClickHandler.TableColumnLayoutEngine.minimumPaneWidth, idealWidth: paneIdealWidth)
                 PaneView(side: .right)
                     .frame(minWidth: TableDoubleClickHandler.TableColumnLayoutEngine.minimumPaneWidth, idealWidth: paneIdealWidth)
             }
@@ -109,7 +111,7 @@ public struct MainContentView: View {
             .background(
                 SplitViewCenterResetHelper(
                     resetId: vm.splitViewResetId,
-                    isFinderMode: vm.panelLayoutMode == .finder,
+                    isFinderMode: isFinder,
                     sidebarWidth: sidebarWidth
                 )
             )
@@ -451,11 +453,8 @@ private struct SplitViewCenterResetHelper: NSViewRepresentable {
             guard boundsWidth > 100 else { return }
             
             if isFinderMode {
-                let remainingWidth = max(200, boundsWidth - sidebarWidth)
-                let divider1X = sidebarWidth + (remainingWidth / 2.0)
-                if splitView.subviews.count >= 3 {
+                if splitView.subviews.count >= 2 {
                     splitView.setPosition(sidebarWidth, ofDividerAt: 0)
-                    splitView.setPosition(divider1X, ofDividerAt: 1)
                 }
             } else {
                 let divider0X = boundsWidth / 2.0
