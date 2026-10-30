@@ -772,7 +772,7 @@ public struct PaneView: View {
                             vm.openItem(item: item, side: side)
                         })
                     }
-                    .width(min: 55, ideal: 112, max: 130)
+                    .width(min: 55, ideal: 106, max: 130)
                     
                     TableColumn("", value: \FileItem.tagSortKey) { item in
                         let isHoverFolder = (item.isDirectory && vm.dragHoverSide == side && vm.dragHoverFolderId == item.id)
@@ -815,7 +815,7 @@ public struct PaneView: View {
                             rowContextMenu(for: item)
                         }
                     }
-                    .width(min: 17, ideal: 28, max: 35)
+                    .width(min: 17, ideal: 35, max: 35)
                     
                     TableColumn("Дата изменения", value: \FileItem.mtime) { item in
                         let isHoverFolder = (item.isDirectory && vm.dragHoverSide == side && vm.dragHoverFolderId == item.id)
@@ -839,7 +839,7 @@ public struct PaneView: View {
                             vm.openItem(item: item, side: side)
                         })
                     }
-                    .width(min: 90, ideal: 147, max: 180)
+                    .width(min: 90, ideal: 141, max: 180)
                     
                     TableColumn("Тип", value: \FileItem.fileType) { item in
                         let isHoverFolder = (item.isDirectory && vm.dragHoverSide == side && vm.dragHoverFolderId == item.id)
@@ -1991,9 +1991,9 @@ public struct TableDoubleClickHandler: NSViewRepresentable {
         public static let fixedTypeWidth: CGFloat = 58
         public static let defaultWidths: [CGFloat] = [
             0,   // Name (dynamic)
-            112, // Размер
-            28,  // Теги
-            147, // Дата изменения
+            106, // Размер
+            35,  // Теги
+            141, // Дата изменения
             fixedTypeWidth // 58 pt (Тип)
         ]
         // Name fills the remaining space; metadata widths are independent preferences.
