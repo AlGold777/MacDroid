@@ -1291,6 +1291,7 @@ public struct PaneView: View {
         Button("Сжать в архив... (Alt+F5)") { vm.triggerCreateArchive(item: item, side: side) }
         Button("Переименовать (F2)") { vm.triggerRename(item: item, side: side) }
         Button("Свойства (Cmd+I)") { vm.triggerProperties(item: item, side: side) }
+        Button("Рабочие копии файлов телефона...") { vm.showExternalEdits = true }
         Toggle("Показывать скрытые файлы", isOn: Binding(
             get: { side == .left ? vm.leftShowHidden : vm.rightShowHidden },
             set: { newValue in
@@ -3082,6 +3083,10 @@ public struct TableDoubleClickHandler: NSViewRepresentable {
             
             menu.addItem(NSMenuItem.separator())
             
+            let externalEditsItem = NSMenuItem(title: "Рабочие копии файлов телефона...", action: #selector(menuActionExternalEdits(_:)), keyEquivalent: "")
+            externalEditsItem.target = self
+            menu.addItem(externalEditsItem)
+            
             let showHiddenItem = NSMenuItem(title: "Показывать скрытые файлы", action: #selector(menuActionToggleHidden(_:)), keyEquivalent: "")
             showHiddenItem.target = self
             let isHiddenActive = (side == .left) ? vm.leftShowHidden : vm.rightShowHidden
@@ -3122,6 +3127,10 @@ public struct TableDoubleClickHandler: NSViewRepresentable {
             menu.addItem(selectAllItem)
             
             menu.addItem(NSMenuItem.separator())
+            
+            let externalEditsItem = NSMenuItem(title: "Рабочие копии файлов телефона...", action: #selector(menuActionExternalEdits(_:)), keyEquivalent: "")
+            externalEditsItem.target = self
+            menu.addItem(externalEditsItem)
             
             let showHiddenItem = NSMenuItem(title: "Показывать скрытые файлы", action: #selector(menuActionToggleHidden(_:)), keyEquivalent: "")
             showHiddenItem.target = self
@@ -3208,6 +3217,10 @@ public struct TableDoubleClickHandler: NSViewRepresentable {
         @objc private func menuActionProperties(_ sender: NSMenuItem) {
             guard let item = sender.representedObject as? FileItem else { return }
             self.vm?.triggerProperties(item: item, side: self.side)
+        }
+        
+        @objc private func menuActionExternalEdits(_ sender: NSMenuItem) {
+            self.vm?.showExternalEdits = true
         }
         
         @objc private func menuActionToggleHidden(_ sender: NSMenuItem) {

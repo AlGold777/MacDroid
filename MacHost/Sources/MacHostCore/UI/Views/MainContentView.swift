@@ -198,15 +198,6 @@ public struct MainContentView: View {
         }
         
         ToolbarItem(placement: .primaryAction) {
-            Button {
-                vm.showExternalEdits = true
-            } label: {
-                Label("Рабочие копии", systemImage: "doc.badge.arrow.up")
-            }
-            .help("Рабочие копии файлов телефона: изменения и сохранение обратно")
-            .accessibilityLabel("Рабочие копии файлов телефона")
-        }
-        ToolbarItem(placement: .primaryAction) {
             TopToolbarTrailingActionsView(vm: vm)
         }
     }

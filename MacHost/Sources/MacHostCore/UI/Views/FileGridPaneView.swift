@@ -721,6 +721,7 @@ public struct FileGridPaneView: View {
         Button("Выделить всё (Cmd+A)") { vm.selectAll(side: side) }
         Divider()
         Button("Обновить (Cmd+R)") { vm.refreshPaneToActiveTab(side: side) }
+        Button("Рабочие копии файлов телефона...") { vm.showExternalEdits = true }
         Toggle("Показывать скрытые файлы", isOn: Binding(
             get: { side == .left ? vm.leftShowHidden : vm.rightShowHidden },
             set: { newValue in
@@ -1595,6 +1596,7 @@ public struct FileGridCell: View {
         Button("Переименовать (F2)") { vm.triggerRename(item: item, side: side) }
         Button("Свойства (Cmd+I)") { vm.triggerProperties(item: item, side: side) }
 
+        Button("Рабочие копии файлов телефона...") { vm.showExternalEdits = true }
         Toggle("Показывать скрытые файлы", isOn: Binding(
             get: { side == .left ? vm.leftShowHidden : vm.rightShowHidden },
             set: { newValue in
