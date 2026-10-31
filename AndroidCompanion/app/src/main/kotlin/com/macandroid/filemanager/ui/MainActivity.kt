@@ -104,8 +104,8 @@ class MainActivity : Activity() {
         if (hasStoragePermission()) {
             if (!isServerRunning() && !FileDaemonService.isUserStopped(this)) {
                 startDaemonService()
-            } else if (!FileDaemonService.isServerListening && !FileDaemonService.isUserStopped(this)) {
-                // Служба жива, но sshd не слушает (сбой старта): запуск без action поднимает сервер сразу
+            } else if (!FileDaemonService.isUserStopped(this)) {
+                // Служба жива: запуск без action сразу проверяет sshd (проба порта) и поднимает сервер, если он не отвечает
                 startService(Intent(this, FileDaemonService::class.java))
             }
             // Если доступ к файлам уже есть, проверяем уведомления для Android 13+

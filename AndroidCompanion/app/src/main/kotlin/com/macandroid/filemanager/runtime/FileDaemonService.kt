@@ -23,12 +23,15 @@ import android.util.Log
 import androidx.core.app.NotificationCompat
 import com.macandroid.filemanager.server.EmbeddedServer
 import com.macandroid.filemanager.ui.MainActivity
+import java.net.InetSocketAddress
+import java.net.Socket
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 
 class FileDaemonService : Service() {
@@ -64,6 +67,13 @@ class FileDaemonService : Service() {
 
         /** Паузы повтора после неудачного старта: 5, 10, 20, 40, 60 с, далее 60 с без ограничения попыток. */
         private val RETRY_DELAYS_MS = longArrayOf(5_000L, 10_000L, 20_000L, 40_000L, 60_000L)
+
+        /** Период проверки, что sshd реально принимает подключения (пока служба работает). */
+        private const val HEALTH_CHECK_INTERVAL_MS = 30_000L
+
+        /** Таймауты TCP-пробы порта sshd: первая и повторная (перед перезапуском). */
+        private const val PROBE_TIMEOUT_MS = 1_000
+        private const val PROBE_RETRY_TIMEOUT_MS = 3_000
 
         const val ACTION_STOP = "com.macandroid.filemanager.ACTION_STOP"
         const val ACTION_ACTIVE_SYNC_START = "com.macandroid.filemanager.ACTION_ACTIVE_SYNC_START"
@@ -151,11 +161,21 @@ class FileDaemonService : Service() {
         serviceScope.launch {
             synchronized(lifecycleLock) { ensureServerLocked(refreshDiscovery = true) }
         }
+
+        // Периодическая самопроверка: сервер «запущен», но порт не принимает подключения — перезапуск
+        serviceScope.launch {
+            while (isActive) {
+                delay(HEALTH_CHECK_INTERVAL_MS)
+                if (stopped) break
+                checkServerHealth()
+            }
+        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
             ACTION_STOP -> {
+                DaemonLog.write(this, "Остановлено пользователем (ACTION_STOP)")
                 setUserStopped(this, true)
                 // Повторы не должны стартовать сервер между этим событием и onDestroy
                 stopped = true
@@ -165,25 +185,64 @@ class FileDaemonService : Service() {
             ACTION_ACTIVE_SYNC_START -> acquireTransferLocks()
             ACTION_ACTIVE_SYNC_STOP -> releaseTransferLocks()
             else -> {
-                // Запуск из приложения: поднимаем сервер, если он не работает (например, после ошибки старта)
-                serviceScope.launch {
-                    synchronized(lifecycleLock) { ensureServerLocked(refreshDiscovery = false) }
-                }
+                // Запуск из приложения: проверяем sshd и поднимаем сервер, если он не работает или не отвечает
+                serviceScope.launch { checkServerHealth(fromApp = true) }
             }
         }
         return START_STICKY
     }
 
     /**
+     * Самопроверка: sshd считается запущенным, но порт может не принимать подключения
+     * (сокет закрыт системой). Проба идёт вне lifecycleLock — её до 4 с не держат onDestroy на главном потоке;
+     * решение о перезапуске принимается под lock, только если состояние за время пробы не изменилось.
+     * [fromApp] — запуск из приложения: во время паузы повтора сервер поднимается сразу, не дожидаясь таймера.
+     */
+    private fun checkServerHealth(fromApp: Boolean = false) {
+        val host: String?
+        val probed: EmbeddedServer
+        synchronized(lifecycleLock) {
+            if (stopped) return
+            if (retryJob != null) {
+                // Периодическая проверка не опережает ожидающий повтор; приложение — поднимает сервер сразу
+                if (fromApp) ensureServerLocked(refreshDiscovery = false)
+                return
+            }
+            val current = server
+            if (current == null || EmbeddedServer.findWifiIpv4Address() != boundHost) {
+                // Сервера нет или сменился адрес — обычный путь без пробы
+                ensureServerLocked(refreshDiscovery = false)
+                return
+            }
+            host = boundHost
+            probed = current
+        }
+        // Перезапуск рвёт активные сессии: одной медленной пробы мало, нужна и вторая, с запасом
+        val failure = probeSftpPort(host, PROBE_TIMEOUT_MS)?.let { probeSftpPort(host, PROBE_RETRY_TIMEOUT_MS) } ?: return
+        synchronized(lifecycleLock) {
+            if (stopped || server !== probed) return
+            Log.w(TAG, "SFTP-порт не принимает подключения ($failure), перезапуск сервера")
+            ensureServerLocked(refreshDiscovery = false, restartReason = "проба порта ${addressLabel(host)} не прошла: $failure")
+        }
+    }
+
+    /**
      * Поднимает sshd и mDNS, если они не работают, либо перепривязывает sshd к текущему Wi-Fi адресу.
+     * [restartReason] — перезапустить работающий сервер (проба порта не прошла).
      * Вызывать только под lifecycleLock.
      */
-    private fun ensureServerLocked(refreshDiscovery: Boolean) {
+    private fun ensureServerLocked(refreshDiscovery: Boolean, restartReason: String? = null) {
         if (stopped) return
         val wanted = EmbeddedServer.findWifiIpv4Address()
-        if (server != null && wanted == boundHost) {
-            if (refreshDiscovery) registerDiscoveryLocked()
-            return
+        if (server != null) {
+            if (restartReason != null) {
+                DaemonLog.write(this, "Перезапуск сервера: $restartReason")
+            } else if (wanted == boundHost) {
+                if (refreshDiscovery) registerDiscoveryLocked()
+                return
+            } else {
+                DaemonLog.write(this, "Адрес сервера изменился: ${addressLabel(boundHost)} → ${addressLabel(wanted)}")
+            }
         }
 
         stopServerLocked()
@@ -193,6 +252,7 @@ class FileDaemonService : Service() {
             server = newServer
             boundHost = wanted
             isServerListening = true
+            DaemonLog.write(this, "SFTP-сервер запущен (адрес ${addressLabel(wanted)}, порт $SFTP_PORT)")
             // Сервер поднят: ожидающий повтор и счётчик неудач больше не нужны
             retryAttempt = 0
             cancelRetryLocked()
@@ -206,11 +266,31 @@ class FileDaemonService : Service() {
             // Гасим всё, что могло подняться до сбоя (частично занятый порт, mDNS)
             stopServerLocked()
             val reason = e.message ?: e.javaClass.simpleName
+            DaemonLog.write(this, "Сбой запуска SFTP-сервера: $reason")
             // Alert — только на первый сбой серии; повторы обновляют уведомление
             if (retryAttempt == 0) postAlert("SFTP-сервер не запущен", reason)
             scheduleRetryLocked(reason)
         }
     }
+
+    /**
+     * Проба порта sshd: TCP-подключение к [host] (или loopback, если адрес не привязан) с таймаутом [timeoutMs].
+     * Соединение сразу закрывается. Исключения не пробрасываются. Блокирующая: только вне главного потока и lock.
+     * @return null — порт принял подключение; иначе тип и текст ошибки (для daemon.log).
+     */
+    private fun probeSftpPort(host: String?, timeoutMs: Int): String? =
+        try {
+            Socket().use { socket ->
+                socket.connect(InetSocketAddress(host ?: "127.0.0.1", SFTP_PORT), timeoutMs)
+            }
+            null
+        } catch (e: Exception) {
+            "${e.javaClass.simpleName}: ${e.message}".also {
+                Log.w(TAG, "Проба порта ${addressLabel(host)}:$SFTP_PORT не прошла: $it")
+            }
+        }
+
+    private fun addressLabel(host: String?): String = host ?: "все интерфейсы"
 
     /**
      * Планирует один повтор запуска сервера с паузой 5, 10, 20, 40, 60 с (далее 60 с).
@@ -343,6 +423,7 @@ class FileDaemonService : Service() {
         super.onTimeout(startId)
         // SYS-02 FIX: Корректная обработка 6-часового лимита dataSync на Android 14+ (API 34)
         Log.w(TAG, "Лимит фоновой работы dataSync исчерпан, сервис останавливается")
+        DaemonLog.write(this, "Лимит фоновой работы dataSync исчерпан, служба остановлена системой")
         try {
             stopForeground(STOP_FOREGROUND_REMOVE)
         } catch (e: Exception) {
