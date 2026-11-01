@@ -1183,9 +1183,24 @@ public struct PaneView: View {
         return df
     }()
     
+    private static let timeFormatter: DateFormatter = {
+        let df = DateFormatter()
+        df.locale = Locale(identifier: "en_US_POSIX")
+        df.dateFormat = "HH:mm"
+        return df
+    }()
+
     private func formatDate(_ timestamp: Double) -> String {
         guard timestamp > 0 else { return "—" }
         let date = Date(timeIntervalSince1970: timestamp)
+        let calendar = Calendar.current
+        let today = calendar.startOfDay(for: Date())
+        for (offset, label) in [(0, "Сегодня"), (-1, "Вчера"), (-2, "Позавчера")] {
+            if let day = calendar.date(byAdding: .day, value: offset, to: today),
+               calendar.isDate(date, inSameDayAs: day) {
+                return "\(label), \(Self.timeFormatter.string(from: date))"
+            }
+        }
         return Self.dateFormatter.string(from: date)
     }
     
