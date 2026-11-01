@@ -5433,7 +5433,7 @@ func runTest62() async {
 private func runColumnBoundaryResizeTests() {
     print("\n[Test 69] Right-anchored column boundary resizing...")
     typealias Layout = TableDoubleClickHandler.TableColumnLayoutEngine
-    let baseline: [CGFloat] = [500, 110, 25, 90, 58]
+    let baseline: [CGFloat] = [500, 25, 110, 90, 58]
     let total = baseline.reduce(0, +)
     let close: ([CGFloat], [CGFloat]) -> Bool = { lhs, rhs in
         lhs.count == rhs.count && zip(lhs, rhs).allSatisfy { abs($0.0 - $0.1) < 0.001 }
@@ -5479,9 +5479,9 @@ private func runColumnBoundaryResizeTests() {
     }
 
     // Metadata limits clamp both directions, with Name absorbing only available space.
-    let minWidths: [CGFloat] = [200, 110, 25, 90, 58]
+    let minWidths: [CGFloat] = [200, 25, 110, 90, 58]
     let metadataLimits: [(boundary: Int, minimum: CGFloat, maximum: CGFloat)] = [
-        (0, 90, 180), (1, 17, 35), (2, 55, 130)
+        (0, 17, 35), (1, 90, 180), (2, 55, 130)
     ]
     for (boundary, minimum, maximum) in metadataLimits {
         let lower = Layout.widthsByMovingBoundary(
@@ -5504,11 +5504,11 @@ private func runColumnBoundaryResizeTests() {
     }
 
     let nameAtMinimum = Layout.widthsByMovingBoundary(
-        initialWidths: [125, 110, 25, 90, 58], boundaryIndex: 0, translation: -100
+        initialWidths: [125, 25, 110, 90, 58], boundaryIndex: 0, translation: -100
     )
     assertCondition(abs(nameAtMinimum[0] - Layout.constraints[0].min) < 0.001,
                     "Metadata expansion stops when Name reaches its 120 pt minimum")
-    assertCondition(abs(nameAtMinimum[1] - 115) < 0.001,
+    assertCondition(abs(nameAtMinimum[1] - 30) < 0.001,
                     "Name minimum limits expansion to the available 5 pt")
 
     let locked = Layout.widthsByMovingBoundary(
@@ -5564,27 +5564,27 @@ private func runColumnBoundaryResizeTests() {
     }
     func currentWidths(_ columns: [NSTableColumn]) -> [CGFloat] { columns.map(\.width) }
 
-    let tooNarrow = columns([200, 100, 25, 130, 58])
+    let tooNarrow = columns([200, 25, 100, 130, 58])
     let unchanged = currentWidths(tooNarrow)
     Layout.adjust(columns: tooNarrow, targetWidth: 339)
     assertCondition(close(currentWidths(tooNarrow), unchanged),
                     "Pane resize below the 340 pt table minimum leaves widths unchanged")
 
-    let exactMinimum = columns([200, 100, 25, 130, 58])
+    let exactMinimum = columns([200, 25, 100, 130, 58])
     Layout.adjust(columns: exactMinimum, targetWidth: 340)
-    assertCondition(close(currentWidths(exactMinimum), [120, 55, 17, 90, 58]),
+    assertCondition(close(currentWidths(exactMinimum), [120, 17, 90, 55, 58]),
                     "340 pt table uses each column's minimum width")
     assertCondition(abs(Layout.minimumPaneWidth - 360) < 0.001,
                     "Pane minimum includes 20 pt scrollbar allowance (360 pt)")
 
-    let paneMinimum = columns([200, 100, 25, 130, 58])
+    let paneMinimum = columns([200, 25, 100, 130, 58])
     Layout.adjust(columns: paneMinimum, targetWidth: 360)
-    assertCondition(close(currentWidths(paneMinimum), [120, 67, 25, 90, 58]),
+    assertCondition(close(currentWidths(paneMinimum), [120, 25, 90, 67, 58]),
                     "360 pt pane resize reaches Name minimum and compresses metadata only as needed")
 
-    let widerPane = columns([200, 100, 25, 130, 58])
+    let widerPane = columns([200, 25, 100, 130, 58])
     Layout.adjust(columns: widerPane, targetWidth: 900)
-    assertCondition(close(currentWidths(widerPane), [587, 100, 25, 130, 58]),
+    assertCondition(close(currentWidths(widerPane), [587, 25, 100, 130, 58]),
                     "Large pane resize expands Name while metadata widths stay fixed")
 }
 
