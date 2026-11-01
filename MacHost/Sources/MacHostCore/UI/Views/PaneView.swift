@@ -736,27 +736,13 @@ public struct PaneView: View {
                     }
                     .width(min: 120)
                     
-                    TableColumn("Размер", value: \FileItem.size) { item in
+                    TableColumn("Дата изменения", value: \FileItem.mtime) { item in
                         let isHoverFolder = (item.isDirectory && vm.dragHoverSide == side && vm.dragHoverFolderId == item.id)
                         
                         HStack {
-                            if item.isDirectory {
-                                if vm.calculatingFolderPaths.contains(item.path) {
-                                    ProgressView()
-                                        .controlSize(.mini)
-                                        .scaleEffect(0.7)
-                                } else if let size = vm.calculatedFolderSizes[item.path] {
-                                    Text(formatColumnBytes(size))
-                                        .font(.system(size: 12, design: .monospaced))
-                                        .foregroundColor(.primary)
-                                } else {
-                                    Text("")
-                                }
-                            } else {
-                                Text(formatColumnBytes(item.size))
-                                    .font(.system(size: 12, design: .monospaced))
-                                    .foregroundColor(.secondary)
-                            }
+                            Text(formatDate(item.mtime))
+                                .font(.system(size: 12))
+                                .foregroundColor(.secondary)
                             Spacer(minLength: 0)
                         }
                         .padding(.vertical, 2)
@@ -772,7 +758,7 @@ public struct PaneView: View {
                             vm.openItem(item: item, side: side)
                         })
                     }
-                    .width(min: 55, ideal: 60, max: 130)
+                    .width(min: 90, ideal: 110, max: 180)
                     
                     TableColumn("", value: \FileItem.tagSortKey) { item in
                         let isHoverFolder = (item.isDirectory && vm.dragHoverSide == side && vm.dragHoverFolderId == item.id)
@@ -817,13 +803,27 @@ public struct PaneView: View {
                     }
                     .width(min: 17, ideal: 27, max: 35)
                     
-                    TableColumn("Дата изменения", value: \FileItem.mtime) { item in
+                    TableColumn("Размер", value: \FileItem.size) { item in
                         let isHoverFolder = (item.isDirectory && vm.dragHoverSide == side && vm.dragHoverFolderId == item.id)
                         
                         HStack {
-                            Text(formatDate(item.mtime))
-                                .font(.system(size: 12))
-                                .foregroundColor(.secondary)
+                            if item.isDirectory {
+                                if vm.calculatingFolderPaths.contains(item.path) {
+                                    ProgressView()
+                                        .controlSize(.mini)
+                                        .scaleEffect(0.7)
+                                } else if let size = vm.calculatedFolderSizes[item.path] {
+                                    Text(formatColumnBytes(size))
+                                        .font(.system(size: 12, design: .monospaced))
+                                        .foregroundColor(.primary)
+                                } else {
+                                    Text("")
+                                }
+                            } else {
+                                Text(formatColumnBytes(item.size))
+                                    .font(.system(size: 12, design: .monospaced))
+                                    .foregroundColor(.secondary)
+                            }
                             Spacer(minLength: 0)
                         }
                         .padding(.vertical, 2)
@@ -839,7 +839,7 @@ public struct PaneView: View {
                             vm.openItem(item: item, side: side)
                         })
                     }
-                    .width(min: 90, ideal: 110, max: 180)
+                    .width(min: 55, ideal: 60, max: 130)
                     
                     TableColumn("Тип", value: \FileItem.fileType) { item in
                         let isHoverFolder = (item.isDirectory && vm.dragHoverSide == side && vm.dragHoverFolderId == item.id)
@@ -2008,9 +2008,9 @@ public struct TableDoubleClickHandler: NSViewRepresentable {
         // Name fills the remaining space; metadata widths are independent preferences.
         public static let constraints: [Constraint] = [
             Constraint(min: 120, max: .greatestFiniteMagnitude),
-            Constraint(min: 55, max: 130),
-            Constraint(min: 17, max: 35),
             Constraint(min: 90, max: 180),
+            Constraint(min: 17, max: 35),
+            Constraint(min: 55, max: 130),
             Constraint(min: fixedTypeWidth, max: fixedTypeWidth)
         ]
         public static let minimumTableWidth = constraints.reduce(CGFloat.zero) { $0 + $1.min }
@@ -2046,7 +2046,7 @@ public struct TableDoubleClickHandler: NSViewRepresentable {
             if widths[0] < constraints[0].min {
                 var deficit = constraints[0].min - widths[0]
                 // Only a panel resize may compress other metadata columns.
-                for index in [3, 1, 2] {
+                for index in [1, 3, 2] {
                     let take = min(deficit, widths[index] - constraints[index].min)
                     widths[index] -= take
                     deficit -= take
@@ -2445,9 +2445,9 @@ public struct TableDoubleClickHandler: NSViewRepresentable {
                 col.headerCell.font = NSFont.systemFont(ofSize: 12, weight: .regular)
             }
             if cols.count >= 5 {
-                cols[1].width = 60
+                cols[1].width = 110
                 cols[2].width = 27
-                cols[3].width = 110
+                cols[3].width = 60
                 cols[4].minWidth = TableColumnLayoutEngine.fixedTypeWidth
                 cols[4].maxWidth = TableColumnLayoutEngine.fixedTypeWidth
                 cols[4].width = TableColumnLayoutEngine.fixedTypeWidth

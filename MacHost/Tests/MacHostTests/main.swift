@@ -5433,7 +5433,7 @@ func runTest62() async {
 private func runColumnBoundaryResizeTests() {
     print("\n[Test 69] Right-anchored column boundary resizing...")
     typealias Layout = TableDoubleClickHandler.TableColumnLayoutEngine
-    let baseline: [CGFloat] = [500, 90, 25, 130, 58]
+    let baseline: [CGFloat] = [500, 110, 25, 90, 58]
     let total = baseline.reduce(0, +)
     let close: ([CGFloat], [CGFloat]) -> Bool = { lhs, rhs in
         lhs.count == rhs.count && zip(lhs, rhs).allSatisfy { abs($0.0 - $0.1) < 0.001 }
@@ -5479,9 +5479,9 @@ private func runColumnBoundaryResizeTests() {
     }
 
     // Metadata limits clamp both directions, with Name absorbing only available space.
-    let minWidths: [CGFloat] = [200, 90, 25, 130, 58]
+    let minWidths: [CGFloat] = [200, 110, 25, 90, 58]
     let metadataLimits: [(boundary: Int, minimum: CGFloat, maximum: CGFloat)] = [
-        (0, 55, 130), (1, 17, 35), (2, 90, 180)
+        (0, 90, 180), (1, 17, 35), (2, 55, 130)
     ]
     for (boundary, minimum, maximum) in metadataLimits {
         let lower = Layout.widthsByMovingBoundary(
@@ -5504,17 +5504,17 @@ private func runColumnBoundaryResizeTests() {
     }
 
     let nameAtMinimum = Layout.widthsByMovingBoundary(
-        initialWidths: [125, 80, 25, 130, 58], boundaryIndex: 0, translation: -100
+        initialWidths: [125, 110, 25, 90, 58], boundaryIndex: 0, translation: -100
     )
     assertCondition(abs(nameAtMinimum[0] - Layout.constraints[0].min) < 0.001,
                     "Metadata expansion stops when Name reaches its 120 pt minimum")
-    assertCondition(abs(nameAtMinimum[1] - 85) < 0.001,
+    assertCondition(abs(nameAtMinimum[1] - 115) < 0.001,
                     "Name minimum limits expansion to the available 5 pt")
 
     let locked = Layout.widthsByMovingBoundary(
         initialWidths: baseline, boundaryIndex: 3, translation: 40
     )
-    assertCondition(close(locked, baseline), "Locked Date | Type boundary cannot be moved")
+    assertCondition(close(locked, baseline), "Locked Size | Type boundary cannot be moved")
     assertCondition(close(Layout.widthsByMovingBoundary(
         initialWidths: baseline, boundaryIndex: -1, translation: 40
     ), baseline), "Invalid boundary index leaves widths unchanged")
