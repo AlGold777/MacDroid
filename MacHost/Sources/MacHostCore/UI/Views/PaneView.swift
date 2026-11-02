@@ -1008,7 +1008,8 @@ public struct PaneView: View {
             Spacer(minLength: 0)
         }
         .padding(.vertical, 2)
-        .padding(.horizontal, 4)
+        .padding(.leading, 6)
+        .padding(.trailing, 4)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(
             UnevenRoundedRectangle(topLeadingRadius: 4, bottomLeadingRadius: 4, bottomTrailingRadius: 0, topTrailingRadius: 0)
