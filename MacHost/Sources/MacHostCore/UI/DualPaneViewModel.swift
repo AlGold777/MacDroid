@@ -22,6 +22,7 @@ public enum SortField: String, CaseIterable, Sendable {
     case size = "Размер"
     case tags = "Теги"
     case date = "Дата"
+    case creationDate = "Дата создания"
     case status = "Статус"
 }
 
@@ -2262,6 +2263,15 @@ public final class DualPaneViewModel: ObservableObject {
             case .date:
                 if a.mtime != b.mtime {
                     return sortAsc ? (a.mtime < b.mtime) : (a.mtime > b.mtime)
+                } else {
+                    let cmp = a.name.localizedStandardCompare(b.name)
+                    return sortAsc ? (cmp == .orderedAscending) : (cmp == .orderedDescending)
+                }
+            case .creationDate:
+                let ctimeA = a.creationDate ?? 0
+                let ctimeB = b.creationDate ?? 0
+                if ctimeA != ctimeB {
+                    return sortAsc ? (ctimeA < ctimeB) : (ctimeA > ctimeB)
                 } else {
                     let cmp = a.name.localizedStandardCompare(b.name)
                     return sortAsc ? (cmp == .orderedAscending) : (cmp == .orderedDescending)

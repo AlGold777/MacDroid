@@ -95,6 +95,10 @@ public struct FileItem: Identifiable, Hashable, Sendable, Codable {
     public var tagSortKey: String {
         return tags.first ?? ""
     }
+    
+    public var creationDateSortKey: Double {
+        return creationDate ?? 0
+    }
 }
 
 public enum ItemState: String, Codable, Sendable {

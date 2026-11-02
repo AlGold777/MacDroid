@@ -74,6 +74,8 @@ public struct PaneView: View {
                     return [KeyPathComparator(\FileItem.size, order: order)]
                 case .date:
                     return [KeyPathComparator(\FileItem.mtime, order: order)]
+                case .creationDate:
+                    return [KeyPathComparator(\FileItem.creationDateSortKey, order: order)]
                 case .tags:
                     return [KeyPathComparator(\FileItem.tagSortKey, order: order)]
                 case .type:
@@ -89,6 +91,8 @@ public struct PaneView: View {
                     field = .size
                 } else if first.keyPath == \FileItem.mtime {
                     field = .date
+                } else if first.keyPath == \FileItem.creationDateSortKey {
+                    field = .creationDate
                 } else if first.keyPath == \FileItem.tagSortKey {
                     field = .tags
                 } else if first.keyPath == \FileItem.fileType {
@@ -101,7 +105,7 @@ public struct PaneView: View {
                 if field == currentField {
                     targetAsc = (first.order == .forward)
                 } else {
-                    targetAsc = (field == .size || field == .date) ? false : true
+                    targetAsc = (field == .size || field == .date || field == .creationDate) ? false : true
                 }
                 DispatchQueue.main.async {
                     if side == .left {
@@ -639,237 +643,8 @@ public struct PaneView: View {
                         }
                     } else {
                 // Таблица списка файлов с Drag & Drop и сравнением
-                Table(items, selection: selectionBinding, sortOrder: sortOrderBinding) {
-                    TableColumn("Имя", value: \FileItem.name) { item in
-                        let isHoverFolder = (item.isDirectory && vm.dragHoverSide == side && vm.dragHoverFolderId == item.id)
-                        
-                        HStack(spacing: 6) {
-                            FileItemIconView(isDirectory: item.isDirectory, fileName: item.name, size: 14)
-                            
-                            if vm.editingItemId == item.id && vm.editingItemSide == side {
-                                let baseName = InlineRenameHelper.baseName(for: vm.editingItemName, isDirectory: item.isDirectory)
-                                let baseNameWidth = InlineRenameHelper.textWidth(for: baseName)
-                                
-                                HStack(spacing: 0) {
-                                    InlineRenameTextField(
-                                        text: $vm.editingItemName,
-                                        isDirectory: item.isDirectory,
-                                        onCommit: {
-                                            vm.commitInlineRename(item: item, side: side)
-                                        },
-                                        onCancel: {
-                                            vm.cancelInlineRename()
-                                        }
-                                    )
-                                    .frame(height: 18)
-                                }
-                                .padding(.vertical, 2)
-                                .padding(.horizontal, 5)
-                                .background(ConflictColors.renameInputBg)
-                                .cornerRadius(4)
-                                .overlay(
-                                    RoundedRectangle(cornerRadius: 4)
-                                        .stroke(ConflictColors.inputFocusBorder, lineWidth: 1)
-                                )
-                                .overlay(alignment: .topLeading) {
-                                    CopyFragmentButtonView(baseName: baseName) {
-                                        let fragment = InlineRenameHelper.currentFragment(for: vm.editingItemName, isDirectory: item.isDirectory)
-                                        NSPasteboard.general.clearContents()
-                                        NSPasteboard.general.setString(fragment, forType: .string)
-                                        vm.statusMessage = "Скопирован фрагмент: \(fragment)"
-                                    }
-                                    .frame(width: 26, height: 26)
-                                    .offset(x: max(10, 5 + baseNameWidth + 6), y: -14)
-                                }
-                                .zIndex(100)
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                            } else {
-                                VStack(alignment: .leading, spacing: 1) {
-                                    Text(item.name)
-                                        .font(.system(size: 14))
-                                    let query = (side == .left ? vm.leftSearchQuery : vm.rightSearchQuery).trimmingCharacters(in: .whitespaces)
-                                    if vm.isSearchActive(for: side) && !query.isEmpty {
-                                        let parentPath = URL(fileURLWithPath: item.path).deletingLastPathComponent().path
-                                        Text(parentPath)
-                                            .font(.system(size: 11))
-                                            .foregroundColor(.secondary)
-                                            .lineLimit(1)
-                                            .truncationMode(.middle)
-                                    }
-                                }
-                                .onLongPressGesture(minimumDuration: 0.55) {
-                                    if vm.activePane != side { vm.activePane = side }
-                                    if side == .left {
-                                        vm.leftSelection = [item.id]
-                                    } else {
-                                        vm.rightSelection = [item.id]
-                                    }
-                                    vm.triggerRename(item: item, side: side)
-                                }
-                            }
-                            
-                            if vm.isComparing {
-                                comparisonBadge(for: item.name)
-                            }
-                            Spacer(minLength: 0)
-                        }
-                        .padding(.vertical, 2)
-                        .padding(.horizontal, 4)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .background(
-                            UnevenRoundedRectangle(topLeadingRadius: 4, bottomLeadingRadius: 4, bottomTrailingRadius: 0, topTrailingRadius: 0)
-                                .fill(isHoverFolder ? Color.accentColor.opacity(0.35) : Color.clear)
-                        )
-                        .contentShape(Rectangle())
-                        .simultaneousGesture(TapGesture(count: 2).onEnded {
-                            print("DUAL_PANE: Cell double tap on \(item.name)")
-                            vm.openItem(item: item, side: side)
-                        })
-                        .onDrag {
-                            vm.createDragItemProvider(for: item, side: side)
-                        } preview: {
-                            Color.clear.frame(width: 1, height: 1)
-                        }
-                        .contextMenu {
-                            rowContextMenu(for: item)
-                        }
-                    }
-                    .width(min: 120)
-                    
-                    
-                    TableColumn("", value: \FileItem.tagSortKey) { item in
-                        let isHoverFolder = (item.isDirectory && vm.dragHoverSide == side && vm.dragHoverFolderId == item.id)
-                        
-                        HStack(spacing: 3) {
-                            Spacer(minLength: 0)
-                            if !item.tags.isEmpty {
-                                ForEach(item.tags.prefix(3), id: \.self) { tagName in
-                                    if let tag = FileTag.tag(for: tagName) {
-                                        Circle()
-                                            .fill(tag.color)
-                                            .frame(width: 9, height: 9)
-                                    } else {
-                                        Circle()
-                                            .fill(Color.secondary)
-                                            .frame(width: 9, height: 9)
-                                    }
-                                }
-                            }
-                            Spacer(minLength: 0)
-                        }
-                        .padding(.vertical, 2)
-                        .padding(.horizontal, 2)
-                        .frame(maxWidth: .infinity, maxHeight: .infinity)
-                        .background(
-                            Rectangle()
-                                .fill(isHoverFolder ? Color.accentColor.opacity(0.35) : Color.clear)
-                        )
-                        .contentShape(Rectangle())
-                        .simultaneousGesture(TapGesture(count: 2).onEnded {
-                            print("DUAL_PANE: Cell double tap on \(item.name)")
-                            vm.openItem(item: item, side: side)
-                        })
-                        .onDrag {
-                            vm.createDragItemProvider(for: item, side: side)
-                        } preview: {
-                            Color.clear.frame(width: 1, height: 1)
-                        }
-                        .contextMenu {
-                            rowContextMenu(for: item)
-                        }
-                    }
-                    .width(min: 17, ideal: 27, max: 35)
-
-                    TableColumn("Дата изменения", value: \FileItem.mtime) { item in
-                        let isHoverFolder = (item.isDirectory && vm.dragHoverSide == side && vm.dragHoverFolderId == item.id)
-
-                        HStack {
-                            Text(formatDate(item.mtime))
-                                .font(.system(size: 12))
-                                .foregroundColor(.secondary)
-                            Spacer(minLength: 0)
-                        }
-                        .padding(.vertical, 2)
-                        .padding(.horizontal, 4)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .background(
-                            Rectangle()
-                                .fill(isHoverFolder ? Color.accentColor.opacity(0.35) : Color.clear)
-                        )
-                        .contentShape(Rectangle())
-                        .simultaneousGesture(TapGesture(count: 2).onEnded {
-                            print("DUAL_PANE: Cell double tap on \(item.name)")
-                            vm.openItem(item: item, side: side)
-                        })
-                    }
-                    .width(min: 90, ideal: 110, max: 180)
-                    
-                    TableColumn("Размер", value: \FileItem.size) { item in
-                        let isHoverFolder = (item.isDirectory && vm.dragHoverSide == side && vm.dragHoverFolderId == item.id)
-                        
-                        HStack {
-                            if item.isDirectory {
-                                if vm.calculatingFolderPaths.contains(item.path) {
-                                    ProgressView()
-                                        .controlSize(.mini)
-                                        .scaleEffect(0.7)
-                                } else if let size = vm.calculatedFolderSizes[item.path] {
-                                    Text(formatColumnBytes(size))
-                                        .font(.system(size: 12, design: .monospaced))
-                                        .foregroundColor(.primary)
-                                } else {
-                                    Text("")
-                                }
-                            } else {
-                                Text(formatColumnBytes(item.size))
-                                    .font(.system(size: 12, design: .monospaced))
-                                    .foregroundColor(.secondary)
-                            }
-                            Spacer(minLength: 0)
-                        }
-                        .padding(.vertical, 2)
-                        .padding(.horizontal, 4)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .background(
-                            Rectangle()
-                                .fill(isHoverFolder ? Color.accentColor.opacity(0.35) : Color.clear)
-                        )
-                        .contentShape(Rectangle())
-                        .simultaneousGesture(TapGesture(count: 2).onEnded {
-                            print("DUAL_PANE: Cell double tap on \(item.name)")
-                            vm.openItem(item: item, side: side)
-                        })
-                    }
-                    .width(min: 55, ideal: 60, max: 130)
-                    
-                    TableColumn("Тип", value: \FileItem.fileType) { item in
-                        let isHoverFolder = (item.isDirectory && vm.dragHoverSide == side && vm.dragHoverFolderId == item.id)
-                        
-                        HStack {
-                            Text(item.fileType)
-                                .font(.system(size: 12))
-                                .foregroundColor(.secondary)
-                                .lineLimit(1)
-                                .truncationMode(.tail)
-                            Spacer(minLength: 0)
-                        }
-                        .padding(.vertical, 2)
-                        .padding(.leading, 10.5)
-                        .padding(.trailing, 2)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .background(
-                            UnevenRoundedRectangle(topLeadingRadius: 0, bottomLeadingRadius: 0, bottomTrailingRadius: 4, topTrailingRadius: 4)
-                                .fill(isHoverFolder ? Color.accentColor.opacity(0.35) : Color.clear)
-                        )
-                        .contentShape(Rectangle())
-                        .simultaneousGesture(TapGesture(count: 2).onEnded {
-                            print("DUAL_PANE: Cell double tap on \(item.name)")
-                            vm.openItem(item: item, side: side)
-                        })
-                    }
-                    .width(58)
-                }
-                .id("\(side)-\(vm.splitViewResetId)")
+                fileTableView
+                .id("\(side)-\(vm.panelLayoutMode.rawValue)-\(vm.splitViewResetId)")
                 .onKeyPress(KeyEquivalent(Character(UnicodeScalar(NSF2FunctionKey)!)), phases: .down) { press in
                     if KeyCommandMonitor.isTextEditingActive(in: vm) {
                         return .ignored
@@ -1093,6 +868,323 @@ public struct PaneView: View {
             }
         })
     }
+
+    @ViewBuilder
+    private var fileTableView: some View {
+        if vm.panelLayoutMode == .finder {
+            Table(items, selection: selectionBinding, sortOrder: sortOrderBinding) {
+                TableColumn("Имя", value: \FileItem.name) { item in
+                    nameCell(for: item)
+                }
+                .width(min: 120)
+
+                TableColumn("", value: \FileItem.tagSortKey) { item in
+                    tagCell(for: item)
+                }
+                .width(min: 17, ideal: 27, max: 35)
+
+                TableColumn("Дата изменения", value: \FileItem.mtime) { item in
+                    mtimeCell(for: item)
+                }
+                .width(min: 90, ideal: 110, max: 180)
+
+                TableColumn("Дата создания", value: \FileItem.creationDateSortKey) { item in
+                    ctimeCell(for: item)
+                }
+                .width(min: 90, ideal: 110, max: 180)
+
+                TableColumn("Размер", value: \FileItem.size) { item in
+                    sizeCell(for: item)
+                }
+                .width(min: 55, ideal: 60, max: 130)
+
+                TableColumn("Тип", value: \FileItem.fileType) { item in
+                    typeCell(for: item)
+                }
+                .width(58)
+            }
+        } else {
+            Table(items, selection: selectionBinding, sortOrder: sortOrderBinding) {
+                TableColumn("Имя", value: \FileItem.name) { item in
+                    nameCell(for: item)
+                }
+                .width(min: 120)
+
+                TableColumn("", value: \FileItem.tagSortKey) { item in
+                    tagCell(for: item)
+                }
+                .width(min: 17, ideal: 27, max: 35)
+
+                TableColumn("Дата изменения", value: \FileItem.mtime) { item in
+                    mtimeCell(for: item)
+                }
+                .width(min: 90, ideal: 110, max: 180)
+
+                TableColumn("Размер", value: \FileItem.size) { item in
+                    sizeCell(for: item)
+                }
+                .width(min: 55, ideal: 60, max: 130)
+
+                TableColumn("Тип", value: \FileItem.fileType) { item in
+                    typeCell(for: item)
+                }
+                .width(58)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func nameCell(for item: FileItem) -> some View {
+        let isHoverFolder = (item.isDirectory && vm.dragHoverSide == side && vm.dragHoverFolderId == item.id)
+
+        HStack(spacing: 6) {
+            FileItemIconView(isDirectory: item.isDirectory, fileName: item.name, size: 14)
+
+            if vm.editingItemId == item.id && vm.editingItemSide == side {
+                let baseName = InlineRenameHelper.baseName(for: vm.editingItemName, isDirectory: item.isDirectory)
+                let baseNameWidth = InlineRenameHelper.textWidth(for: baseName)
+
+                HStack(spacing: 0) {
+                    InlineRenameTextField(
+                        text: $vm.editingItemName,
+                        isDirectory: item.isDirectory,
+                        onCommit: {
+                            vm.commitInlineRename(item: item, side: side)
+                        },
+                        onCancel: {
+                            vm.cancelInlineRename()
+                        }
+                    )
+                    .frame(height: 18)
+                }
+                .padding(.vertical, 2)
+                .padding(.horizontal, 5)
+                .background(ConflictColors.renameInputBg)
+                .cornerRadius(4)
+                .overlay(
+                    RoundedRectangle(cornerRadius: 4)
+                        .stroke(ConflictColors.inputFocusBorder, lineWidth: 1)
+                )
+                .overlay(alignment: .topLeading) {
+                    CopyFragmentButtonView(baseName: baseName) {
+                        let fragment = InlineRenameHelper.currentFragment(for: vm.editingItemName, isDirectory: item.isDirectory)
+                        NSPasteboard.general.clearContents()
+                        NSPasteboard.general.setString(fragment, forType: .string)
+                        vm.statusMessage = "Скопирован фрагмент: \(fragment)"
+                    }
+                    .frame(width: 26, height: 26)
+                    .offset(x: max(10, 5 + baseNameWidth + 6), y: -14)
+                }
+                .zIndex(100)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            } else {
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(item.name)
+                        .font(.system(size: 14))
+                    let query = (side == .left ? vm.leftSearchQuery : vm.rightSearchQuery).trimmingCharacters(in: .whitespaces)
+                    if vm.isSearchActive(for: side) && !query.isEmpty {
+                        let parentPath = URL(fileURLWithPath: item.path).deletingLastPathComponent().path
+                        Text(parentPath)
+                            .font(.system(size: 11))
+                            .foregroundColor(.secondary)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                    }
+                }
+                .onLongPressGesture(minimumDuration: 0.55) {
+                    if vm.activePane != side { vm.activePane = side }
+                    if side == .left {
+                        vm.leftSelection = [item.id]
+                    } else {
+                        vm.rightSelection = [item.id]
+                    }
+                    vm.triggerRename(item: item, side: side)
+                }
+            }
+
+            if vm.isComparing {
+                comparisonBadge(for: item.name)
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(.vertical, 2)
+        .padding(.horizontal, 4)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            UnevenRoundedRectangle(topLeadingRadius: 4, bottomLeadingRadius: 4, bottomTrailingRadius: 0, topTrailingRadius: 0)
+                .fill(isHoverFolder ? Color.accentColor.opacity(0.35) : Color.clear)
+        )
+        .contentShape(Rectangle())
+        .simultaneousGesture(TapGesture(count: 2).onEnded {
+            print("DUAL_PANE: Cell double tap on \(item.name)")
+            vm.openItem(item: item, side: side)
+        })
+        .onDrag {
+            vm.createDragItemProvider(for: item, side: side)
+        } preview: {
+            Color.clear.frame(width: 1, height: 1)
+        }
+        .contextMenu {
+            rowContextMenu(for: item)
+        }
+    }
+
+    @ViewBuilder
+    private func tagCell(for item: FileItem) -> some View {
+        let isHoverFolder = (item.isDirectory && vm.dragHoverSide == side && vm.dragHoverFolderId == item.id)
+
+        HStack(spacing: 3) {
+            Spacer(minLength: 0)
+            if !item.tags.isEmpty {
+                ForEach(item.tags.prefix(3), id: \.self) { tagName in
+                    if let tag = FileTag.tag(for: tagName) {
+                        Circle()
+                            .fill(tag.color)
+                            .frame(width: 9, height: 9)
+                    } else {
+                        Circle()
+                            .fill(Color.secondary)
+                            .frame(width: 9, height: 9)
+                    }
+                }
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(.vertical, 2)
+        .padding(.horizontal, 2)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(
+            Rectangle()
+                .fill(isHoverFolder ? Color.accentColor.opacity(0.35) : Color.clear)
+        )
+        .contentShape(Rectangle())
+        .simultaneousGesture(TapGesture(count: 2).onEnded {
+            print("DUAL_PANE: Cell double tap on \(item.name)")
+            vm.openItem(item: item, side: side)
+        })
+        .onDrag {
+            vm.createDragItemProvider(for: item, side: side)
+        } preview: {
+            Color.clear.frame(width: 1, height: 1)
+        }
+        .contextMenu {
+            rowContextMenu(for: item)
+        }
+    }
+
+    @ViewBuilder
+    private func mtimeCell(for item: FileItem) -> some View {
+        let isHoverFolder = (item.isDirectory && vm.dragHoverSide == side && vm.dragHoverFolderId == item.id)
+
+        HStack {
+            Text(formatDate(item.mtime))
+                .font(.system(size: 12))
+                .foregroundColor(.secondary)
+            Spacer(minLength: 0)
+        }
+        .padding(.vertical, 2)
+        .padding(.horizontal, 4)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            Rectangle()
+                .fill(isHoverFolder ? Color.accentColor.opacity(0.35) : Color.clear)
+        )
+        .contentShape(Rectangle())
+        .simultaneousGesture(TapGesture(count: 2).onEnded {
+            print("DUAL_PANE: Cell double tap on \(item.name)")
+            vm.openItem(item: item, side: side)
+        })
+    }
+
+    @ViewBuilder
+    private func ctimeCell(for item: FileItem) -> some View {
+        let isHoverFolder = (item.isDirectory && vm.dragHoverSide == side && vm.dragHoverFolderId == item.id)
+
+        HStack {
+            Text(formatDate(item.creationDate))
+                .font(.system(size: 12))
+                .foregroundColor(.secondary)
+            Spacer(minLength: 0)
+        }
+        .padding(.vertical, 2)
+        .padding(.horizontal, 4)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            Rectangle()
+                .fill(isHoverFolder ? Color.accentColor.opacity(0.35) : Color.clear)
+        )
+        .contentShape(Rectangle())
+        .simultaneousGesture(TapGesture(count: 2).onEnded {
+            print("DUAL_PANE: Cell double tap on \(item.name)")
+            vm.openItem(item: item, side: side)
+        })
+    }
+
+    @ViewBuilder
+    private func sizeCell(for item: FileItem) -> some View {
+        let isHoverFolder = (item.isDirectory && vm.dragHoverSide == side && vm.dragHoverFolderId == item.id)
+
+        HStack {
+            if item.isDirectory {
+                if vm.calculatingFolderPaths.contains(item.path) {
+                    ProgressView()
+                        .controlSize(.mini)
+                        .scaleEffect(0.7)
+                } else if let size = vm.calculatedFolderSizes[item.path] {
+                    Text(formatColumnBytes(size))
+                        .font(.system(size: 12, design: .monospaced))
+                        .foregroundColor(.primary)
+                } else {
+                    Text("")
+                }
+            } else {
+                Text(formatColumnBytes(item.size))
+                    .font(.system(size: 12, design: .monospaced))
+                    .foregroundColor(.secondary)
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(.vertical, 2)
+        .padding(.horizontal, 4)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            Rectangle()
+                .fill(isHoverFolder ? Color.accentColor.opacity(0.35) : Color.clear)
+        )
+        .contentShape(Rectangle())
+        .simultaneousGesture(TapGesture(count: 2).onEnded {
+            print("DUAL_PANE: Cell double tap on \(item.name)")
+            vm.openItem(item: item, side: side)
+        })
+    }
+
+    @ViewBuilder
+    private func typeCell(for item: FileItem) -> some View {
+        let isHoverFolder = (item.isDirectory && vm.dragHoverSide == side && vm.dragHoverFolderId == item.id)
+
+        HStack {
+            Text(item.fileType)
+                .font(.system(size: 12))
+                .foregroundColor(.secondary)
+                .lineLimit(1)
+                .truncationMode(.tail)
+            Spacer(minLength: 0)
+        }
+        .padding(.vertical, 2)
+        .padding(.leading, 10.5)
+        .padding(.trailing, 2)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            UnevenRoundedRectangle(topLeadingRadius: 0, bottomLeadingRadius: 0, bottomTrailingRadius: 4, topTrailingRadius: 4)
+                .fill(isHoverFolder ? Color.accentColor.opacity(0.35) : Color.clear)
+        )
+        .contentShape(Rectangle())
+        .simultaneousGesture(TapGesture(count: 2).onEnded {
+            print("DUAL_PANE: Cell double tap on \(item.name)")
+            vm.openItem(item: item, side: side)
+        })
+    }
+
     
     @ViewBuilder
     private func comparisonBadge(for name: String) -> some View {
@@ -1203,6 +1295,11 @@ public struct PaneView: View {
             }
         }
         return Self.dateFormatter.string(from: date)
+    }
+
+    private func formatDate(_ timestamp: Double?) -> String {
+        guard let ts = timestamp, ts > 0 else { return "—" }
+        return formatDate(ts)
     }
     
     @ViewBuilder
@@ -1363,7 +1460,7 @@ public struct PaneView: View {
         if currentField == field {
             newAsc = !currentAsc
         } else {
-            newAsc = (field == .size || field == .date) ? false : true
+            newAsc = (field == .size || field == .date || field == .creationDate) ? false : true
         }
         if side == .left {
             vm.leftSortField = field
@@ -2003,10 +2100,15 @@ public struct TableDoubleClickHandler: NSViewRepresentable {
         public struct Constraint {
             public let min: CGFloat
             public let max: CGFloat
+            public init(min: CGFloat, max: CGFloat) {
+                self.min = min
+                self.max = max
+            }
         }
 
         public static let fixedTypeWidth: CGFloat = 58
         // Name fills the remaining space; metadata widths are independent preferences.
+        // 5 columns (Mode T / Dual): Name, Tags, Date modified, Size, Type
         public static let constraints: [Constraint] = [
             Constraint(min: 120, max: .greatestFiniteMagnitude),
             Constraint(min: 17, max: 35),
@@ -2014,20 +2116,42 @@ public struct TableDoubleClickHandler: NSViewRepresentable {
             Constraint(min: 55, max: 130),
             Constraint(min: fixedTypeWidth, max: fixedTypeWidth)
         ]
+        // 6 columns (Mode F / Finder): Name, Tags, Date modified, Date created, Size, Type
+        public static let finderConstraints: [Constraint] = [
+            Constraint(min: 120, max: .greatestFiniteMagnitude),
+            Constraint(min: 17, max: 35),
+            Constraint(min: 90, max: 180),
+            Constraint(min: 90, max: 180),
+            Constraint(min: 55, max: 130),
+            Constraint(min: fixedTypeWidth, max: fixedTypeWidth)
+        ]
+
+        public static func constraints(for columnCount: Int) -> [Constraint] {
+            return columnCount == 6 ? finderConstraints : constraints
+        }
+
         public static let minimumTableWidth = constraints.reduce(CGFloat.zero) { $0 + $1.min }
+        public static func minimumTableWidth(for columnCount: Int) -> CGFloat {
+            return constraints(for: columnCount).reduce(CGFloat.zero) { $0 + $1.min }
+        }
+
         // Allow room for a non-overlay vertical scrollbar as well as the table.
         public static let minimumPaneWidth = minimumTableWidth + 20
+        public static func minimumPaneWidth(for columnCount: Int) -> CGFloat {
+            return minimumTableWidth(for: columnCount) + 20
+        }
 
         /// A separator controls the LEFT edge of the metadata column on its right.
         /// Always use the mouse-down snapshot, so clamping never accumulates drift.
         public static func widthsByMovingBoundary(
             initialWidths: [CGFloat], boundaryIndex: Int, translation: CGFloat
         ) -> [CGFloat] {
-            guard initialWidths.count == constraints.count,
-                  (0...2).contains(boundaryIndex), translation.isFinite else { return initialWidths }
+            let activeConstraints = constraints(for: initialWidths.count)
+            guard initialWidths.count == activeConstraints.count,
+                  boundaryIndex >= 0, boundaryIndex < activeConstraints.count - 2, translation.isFinite else { return initialWidths }
             let index = boundaryIndex + 1
-            let limit = constraints[index]
-            let available = max(0, initialWidths[0] - constraints[0].min)
+            let limit = activeConstraints[index]
+            let available = max(0, initialWidths[0] - activeConstraints[0].min)
             let upper = min(limit.max, initialWidths[index] + available)
             let width = max(limit.min, min(upper, initialWidths[index] - translation))
             var result = initialWidths
@@ -2037,22 +2161,25 @@ public struct TableDoubleClickHandler: NSViewRepresentable {
         }
 
         public static func adjust(columns: [NSTableColumn], targetWidth: CGFloat) {
-            guard columns.count == constraints.count, targetWidth >= minimumTableWidth else { return }
+            let activeConstraints = constraints(for: columns.count)
+            guard (columns.count == 5 || columns.count == 6), targetWidth >= minimumTableWidth(for: columns.count) else { return }
             var widths = columns.map(\.width)
-            widths[4] = fixedTypeWidth
-            for index in 1...3 {
-                widths[index] = max(constraints[index].min, min(constraints[index].max, widths[index]))
+            let typeIndex = columns.count - 1
+            widths[typeIndex] = fixedTypeWidth
+            for index in 1..<typeIndex {
+                widths[index] = max(activeConstraints[index].min, min(activeConstraints[index].max, widths[index]))
             }
-            widths[0] = targetWidth - widths[1...4].reduce(0, +)
-            if widths[0] < constraints[0].min {
-                var deficit = constraints[0].min - widths[0]
+            widths[0] = targetWidth - widths[1...typeIndex].reduce(0, +)
+            if widths[0] < activeConstraints[0].min {
+                var deficit = activeConstraints[0].min - widths[0]
                 // Only a panel resize may compress other metadata columns.
-                for index in [2, 3, 1] {
-                    let take = min(deficit, widths[index] - constraints[index].min)
+                let compressionOrder = (columns.count == 6) ? [2, 3, 4, 1] : [2, 3, 1]
+                for index in compressionOrder {
+                    let take = min(deficit, widths[index] - activeConstraints[index].min)
                     widths[index] -= take
                     deficit -= take
                 }
-                widths[0] = targetWidth - widths[1...4].reduce(0, +)
+                widths[0] = targetWidth - widths[1...typeIndex].reduce(0, +)
             }
             apply(widths: widths, to: columns)
         }
@@ -2084,8 +2211,8 @@ public struct TableDoubleClickHandler: NSViewRepresentable {
         }
 
         private func boundary(at point: NSPoint) -> Int? {
-            guard tableView?.tableColumns.count == 5, bounds.contains(point) else { return nil }
-            return (0...3).first { index in
+            guard let count = tableView?.tableColumns.count, (count == 5 || count == 6), bounds.contains(point) else { return nil }
+            return (0...(count - 2)).first { index in
                 guard let x = boundaryX(index) else { return false }
                 return abs(x - point.x) <= handleRadius
             }
@@ -2110,8 +2237,9 @@ public struct TableDoubleClickHandler: NSViewRepresentable {
         }
 
         override func mouseMoved(with event: NSEvent) {
+            guard let count = tableView?.tableColumns.count, (count == 5 || count == 6) else { return }
             let index = boundary(at: convert(event.locationInWindow, from: nil))
-            hoveredBoundary = index.flatMap { $0 < 3 ? $0 : nil }
+            hoveredBoundary = index.flatMap { $0 < (count - 2) ? $0 : nil }
             if hoveredBoundary != nil { NSCursor.resizeLeftRight.set() }
         }
 
@@ -2128,8 +2256,8 @@ public struct TableDoubleClickHandler: NSViewRepresentable {
         }
 
         override func resetCursorRects() {
-            guard tableView?.tableColumns.count == 5 else { return }
-            for index in 0...2 {
+            guard let count = tableView?.tableColumns.count, (count == 5 || count == 6) else { return }
+            for index in 0...(count - 3) {
                 guard let x = boundaryX(index) else { continue }
                 addCursorRect(NSRect(x: x - handleRadius, y: bounds.minY, width: handleRadius * 2, height: bounds.height), cursor: .resizeLeftRight)
             }
@@ -2137,7 +2265,8 @@ public struct TableDoubleClickHandler: NSViewRepresentable {
 
         override func mouseDown(with event: NSEvent) {
             let point = convert(event.locationInWindow, from: nil)
-            guard let boundaryIndex = boundary(at: point), boundaryIndex < 3,
+            guard let count = tableView?.tableColumns.count, (count == 5 || count == 6),
+                  let boundaryIndex = boundary(at: point), boundaryIndex < (count - 2),
                   let tableView, let window else { return }
             let initialWidths = tableView.tableColumns.map(\.width)
             let startX = event.locationInWindow.x
@@ -2441,20 +2570,7 @@ public struct TableDoubleClickHandler: NSViewRepresentable {
                 scroll.autohidesScrollers = true
             }
             
-            let cols = tv.tableColumns
-            for col in cols {
-                col.headerCell.font = NSFont.systemFont(ofSize: 12, weight: .regular)
-            }
-            if cols.count >= 5 {
-                cols[1].width = 27
-                cols[2].width = 110
-                cols[3].width = 60
-                cols[4].minWidth = TableColumnLayoutEngine.fixedTypeWidth
-                cols[4].maxWidth = TableColumnLayoutEngine.fixedTypeWidth
-                cols[4].width = TableColumnLayoutEngine.fixedTypeWidth
-                cols[4].resizingMask = []
-                tv.headerView?.needsDisplay = true
-            }
+            setupTableColumns(for: tv)
             
             NotificationCenter.default.removeObserver(self, name: NSTableView.selectionDidChangeNotification, object: tv)
             NotificationCenter.default.addObserver(
@@ -2511,25 +2627,54 @@ public struct TableDoubleClickHandler: NSViewRepresentable {
             table.allowsColumnResizing = false
         }
 
+        public func setupTableColumns(for tv: NSTableView) {
+            let cols = tv.tableColumns
+            for col in cols {
+                col.headerCell.font = NSFont.systemFont(ofSize: 12, weight: .regular)
+            }
+            if cols.count == 6 {
+                cols[1].width = 27
+                cols[2].width = 110
+                cols[3].width = 110
+                cols[4].width = 60
+                cols[5].minWidth = TableColumnLayoutEngine.fixedTypeWidth
+                cols[5].maxWidth = TableColumnLayoutEngine.fixedTypeWidth
+                cols[5].width = TableColumnLayoutEngine.fixedTypeWidth
+                cols[5].resizingMask = []
+                tv.headerView?.needsDisplay = true
+            } else if cols.count == 5 {
+                cols[1].width = 27
+                cols[2].width = 110
+                cols[3].width = 60
+                cols[4].minWidth = TableColumnLayoutEngine.fixedTypeWidth
+                cols[4].maxWidth = TableColumnLayoutEngine.fixedTypeWidth
+                cols[4].width = TableColumnLayoutEngine.fixedTypeWidth
+                cols[4].resizingMask = []
+                tv.headerView?.needsDisplay = true
+            }
+        }
+
         @objc public func adjustTableColumns() {
             guard !isAdjustingColumns else { return }
             guard let tv = hookedTableView else { return }
             guard columnResizeView?.isResizingBoundary != true else { return }
             let columns = tv.tableColumns
-            guard columns.count == 5 else { return }
+            guard columns.count == 5 || columns.count == 6 else { return }
 
+            let minTableWidth = TableColumnLayoutEngine.minimumTableWidth(for: columns.count)
             let clipWidth = tv.enclosingScrollView?.contentView.bounds.width ?? tv.bounds.width
-            guard clipWidth >= TableColumnLayoutEngine.minimumTableWidth else { return }
+            guard clipWidth >= minTableWidth else { return }
             
             isAdjustingColumns = true
             defer { isAdjustingColumns = false }
             
             let targetWidth = floor(clipWidth)
-            if columns[4].width != TableColumnLayoutEngine.fixedTypeWidth || columns[4].resizingMask != [] {
-                columns[4].minWidth = TableColumnLayoutEngine.fixedTypeWidth
-                columns[4].maxWidth = TableColumnLayoutEngine.fixedTypeWidth
-                columns[4].width = TableColumnLayoutEngine.fixedTypeWidth
-                columns[4].resizingMask = []
+            let typeCol = columns[columns.count - 1]
+            if typeCol.width != TableColumnLayoutEngine.fixedTypeWidth || typeCol.resizingMask != [] {
+                typeCol.minWidth = TableColumnLayoutEngine.fixedTypeWidth
+                typeCol.maxWidth = TableColumnLayoutEngine.fixedTypeWidth
+                typeCol.width = TableColumnLayoutEngine.fixedTypeWidth
+                typeCol.resizingMask = []
                 tv.headerView?.needsDisplay = true
             }
             TableColumnLayoutEngine.adjust(columns: columns, targetWidth: targetWidth)

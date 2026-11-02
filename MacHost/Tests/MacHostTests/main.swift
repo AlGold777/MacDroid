@@ -618,6 +618,7 @@ func runTest53() async {
 
 @MainActor
 func runAllAsyncTests() async {
+    runFinderCreationDateColumnTests()
     do {
         let testDirName = "Каталог_Проверки"
         let testDirURL = tempDir.appendingPathComponent(testDirName)
@@ -5586,6 +5587,109 @@ private func runColumnBoundaryResizeTests() {
     Layout.adjust(columns: widerPane, targetWidth: 900)
     assertCondition(close(currentWidths(widerPane), [587, 25, 100, 130, 58]),
                     "Large pane resize expands Name while metadata widths stay fixed")
+}
+
+@MainActor
+private func runFinderCreationDateColumnTests() {
+    print("\n[Test 70] Finder Mode (F) Date Created column & Dual Mode (T) verification...")
+    typealias Layout = TableDoubleClickHandler.TableColumnLayoutEngine
+
+    // 1. In Dual Mode (T), constraints count must be 5: Name, Tags, Date Modified, Size, Type
+    let dualConstraints = Layout.constraints(for: 5)
+    assertCondition(dualConstraints.count == 5, "Dual mode (T) has exactly 5 column constraints")
+    assertCondition(dualConstraints[2].min == 90 && dualConstraints[2].max == 180, "Dual mode col 2 is Date Modified [90..180]")
+    assertCondition(dualConstraints[3].min == 55 && dualConstraints[3].max == 130, "Dual mode col 3 is Size [55..130]")
+    assertCondition(dualConstraints[4].min == 58 && dualConstraints[4].max == 58, "Dual mode col 4 is Type [58]")
+
+    // 2. In Finder Mode (F), constraints count must be 6: Name, Tags, Date Modified, Date Created, Size, Type
+    let finderConstraints = Layout.constraints(for: 6)
+    assertCondition(finderConstraints.count == 6, "Finder mode (F) has exactly 6 column constraints")
+    assertCondition(finderConstraints[2].min == 90 && finderConstraints[2].max == 180, "Finder mode col 2 is Date Modified [90..180]")
+    assertCondition(finderConstraints[3].min == 90 && finderConstraints[3].max == 180, "Finder mode col 3 is Date Created [90..180] (same as Date Modified)")
+    assertCondition(finderConstraints[4].min == 55 && finderConstraints[4].max == 130, "Finder mode col 4 is Size [55..130]")
+    assertCondition(finderConstraints[5].min == 58 && finderConstraints[5].max == 58, "Finder mode col 5 is Type [58]")
+
+    // 3. Test 6-column resizing with boundary 2 (controlling Date Created):
+    // Columns: [Name(0), Tags(1), Date Modified(2), Date Created(3), Size(4), Type(5)]
+    let baseline6: [CGFloat] = [500, 25, 110, 110, 60, 58]
+    let total6 = baseline6.reduce(0, +)
+    
+    // Boundary 2 controls Date Created (index 3)
+    let movedMinus5 = Layout.widthsByMovingBoundary(initialWidths: baseline6, boundaryIndex: 2, translation: -5)
+    assertCondition(abs(movedMinus5[3] - 115) < 0.001, "Moving boundary 2 by -5 expands Date Created to 115")
+    assertCondition(abs(movedMinus5[0] - 495) < 0.001, "Moving boundary 2 by -5 reduces Name by 5")
+    assertCondition(abs(movedMinus5.reduce(0, +) - total6) < 0.001, "Total width preserved during 6-column drag")
+
+    let movedPlus5 = Layout.widthsByMovingBoundary(initialWidths: baseline6, boundaryIndex: 2, translation: 5)
+    assertCondition(abs(movedPlus5[3] - 105) < 0.001, "Moving boundary 2 by +5 shrinks Date Created to 105")
+    assertCondition(abs(movedPlus5[0] - 505) < 0.001, "Moving boundary 2 by +5 expands Name by 5")
+
+    // Clamping to minimum (90) and maximum (180) for Date Created
+    let clampedMin = Layout.widthsByMovingBoundary(initialWidths: baseline6, boundaryIndex: 2, translation: 1_000)
+    assertCondition(abs(clampedMin[3] - 90) < 0.001, "Date Created clamps at minimum width 90")
+    
+    let clampedMax = Layout.widthsByMovingBoundary(initialWidths: baseline6, boundaryIndex: 2, translation: -1_000)
+    assertCondition(abs(clampedMax[3] - 180) < 0.001, "Date Created clamps at maximum width 180")
+
+    // Boundary 4 (before fixed Type column) cannot be resized
+    let lockedType = Layout.widthsByMovingBoundary(initialWidths: baseline6, boundaryIndex: 4, translation: 20)
+    assertCondition(lockedType == baseline6, "Locked Type boundary cannot be moved in 6-column mode")
+
+    // 4. Test TableColumnLayoutEngine.adjust for 6 columns
+    func columns6(_ widths: [CGFloat]) -> [NSTableColumn] {
+        widths.enumerated().map { index, width in
+            let col = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("col6-\(index)"))
+            col.width = width
+            return col
+        }
+    }
+    let cols6 = columns6([200, 25, 110, 110, 60, 58])
+    Layout.adjust(columns: cols6, targetWidth: 900)
+    let adjustedWidths = cols6.map(\.width)
+    assertCondition(abs(adjustedWidths[1] - 25) < 0.001, "Tags width unchanged in 6-column adjust")
+    assertCondition(abs(adjustedWidths[2] - 110) < 0.001, "Date Modified width unchanged at 110")
+    assertCondition(abs(adjustedWidths[3] - 110) < 0.001, "Date Created width unchanged at 110 (same width as Date Modified)")
+    assertCondition(abs(adjustedWidths[4] - 60) < 0.001, "Size width unchanged at 60")
+    assertCondition(abs(adjustedWidths[5] - 58) < 0.001, "Type width unchanged at 58")
+    assertCondition(abs(adjustedWidths.reduce(0, +) - 900) < 0.001, "Total width equals target 900 pt")
+
+    // 5. Test FileItem creationDate & sorting
+    let item1 = FileItem(id: "1", name: "Doc1.txt", path: "/Doc1.txt", size: 100, mtime: 1000, isDirectory: false, creationDate: 500)
+    let item2 = FileItem(id: "2", name: "Doc2.txt", path: "/Doc2.txt", size: 100, mtime: 2000, isDirectory: false, creationDate: 1500)
+    let item3 = FileItem(id: "3", name: "Doc3.txt", path: "/Doc3.txt", size: 100, mtime: 1500, isDirectory: false, creationDate: nil)
+    
+    assertCondition(item1.creationDateSortKey == 500, "item1 creationDateSortKey is 500")
+    assertCondition(item2.creationDateSortKey == 1500, "item2 creationDateSortKey is 1500")
+    assertCondition(item3.creationDateSortKey == 0, "item3 creationDateSortKey defaults to 0 when nil")
+
+    let vm = DualPaneViewModel()
+    let sortedAsc: [FileItem] = vm.sortFiles([item1, item2, item3], sortField: .creationDate, sortAsc: true, folderSortMode: .separate, comparing: false, side: .left)
+    assertCondition(sortedAsc.map(\.id) == ["3", "1", "2"], "Sort by creationDate ascending puts 0, 500, 1500 in order")
+    
+    let sortedDesc: [FileItem] = vm.sortFiles([item1, item2, item3], sortField: .creationDate, sortAsc: false, folderSortMode: .separate, comparing: false, side: .left)
+    assertCondition(sortedDesc.map(\.id) == ["2", "1", "3"], "Sort by creationDate descending puts 1500, 500, 0 in order")
+
+    // 6. Test NSTableView columns setup in HandlerView
+    let tvDual = NSTableView()
+    for i in 0..<5 { tvDual.addTableColumn(NSTableColumn(identifier: NSUserInterfaceItemIdentifier("col-\(i)"))) }
+    let handlerDual = TableDoubleClickHandler.HandlerView()
+    handlerDual.setupTableColumns(for: tvDual)
+    assertCondition(tvDual.tableColumns.count == 5, "Dual mode table has 5 columns")
+    assertCondition(tvDual.tableColumns[2].width == 110, "Dual mode col 2 is Date Modified with width 110")
+    assertCondition(tvDual.tableColumns[3].width == 60, "Dual mode col 3 is Size with width 60")
+    assertCondition(tvDual.tableColumns[4].width == 58, "Dual mode col 4 is Type with width 58")
+
+    let tvFinder = NSTableView()
+    for i in 0..<6 { tvFinder.addTableColumn(NSTableColumn(identifier: NSUserInterfaceItemIdentifier("col-\(i)"))) }
+    let handlerFinder = TableDoubleClickHandler.HandlerView()
+    handlerFinder.setupTableColumns(for: tvFinder)
+    assertCondition(tvFinder.tableColumns.count == 6, "Finder mode table has 6 columns")
+    assertCondition(tvFinder.tableColumns[2].width == 110, "Finder mode col 2 is Date Modified with width 110")
+    assertCondition(tvFinder.tableColumns[3].width == 110, "Finder mode col 3 is Date Created with width 110 (same width as Date Modified!)")
+    assertCondition(tvFinder.tableColumns[4].width == 60, "Finder mode col 4 is Size with width 60")
+    assertCondition(tvFinder.tableColumns[5].width == 58, "Finder mode col 5 is Type with width 58")
+
+    print("  ✓ All Finder Mode (F) Date Created column & Dual Mode (T) checks passed successfully!")
 }
 
 func runTest63() async {
