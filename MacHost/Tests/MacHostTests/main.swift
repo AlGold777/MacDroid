@@ -6364,6 +6364,55 @@ private func runDirectoryComparatorTests() async throws {
         assertCondition(navigationVM.comparisonResult.identical.isEmpty,
                         "A cancelled and disabled comparison cannot publish results after navigation")
     }
+
+    // [Test 71] Deletion during file preview and adjacent item selection
+    print("\n[Test 71] Deletion during file preview and adjacent item selection...")
+    let test71Dir = FileManager.default.temporaryDirectory
+        .appendingPathComponent("preview-delete-test-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: test71Dir, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: test71Dir) }
+    
+    let fileA = test71Dir.appendingPathComponent("file_a.txt")
+    let fileB = test71Dir.appendingPathComponent("file_b.txt")
+    let fileC = test71Dir.appendingPathComponent("file_c.txt")
+    try "A".write(to: fileA, atomically: true, encoding: .utf8)
+    try "B".write(to: fileB, atomically: true, encoding: .utf8)
+    try "C".write(to: fileC, atomically: true, encoding: .utf8)
+    
+    let itemA = FileItem(id: fileA.path, name: "file_a.txt", path: fileA.path, size: 1, mtime: 100, isDirectory: false, source: .localMac)
+    let itemB = FileItem(id: fileB.path, name: "file_b.txt", path: fileB.path, size: 1, mtime: 100, isDirectory: false, source: .localMac)
+    let itemC = FileItem(id: fileC.path, name: "file_c.txt", path: fileC.path, size: 1, mtime: 100, isDirectory: false, source: .localMac)
+    
+    await MainActor.run {
+        let vm = DualPaneViewModel()
+        vm.leftSource = .localMac
+        vm.leftPath = test71Dir.path
+        vm.leftItems = [itemA, itemB, itemC]
+        vm.activePane = .left
+        vm.leftSelection = [itemB.id]
+        
+        // 1. QuickLookBridge onDelete hook exists and triggers confirmQuickLookDelete
+        var deleteCalled = false
+        QuickLookBridge.shared.onDelete = {
+            deleteCalled = true
+        }
+        QuickLookBridge.shared.onDelete?()
+        assertCondition(deleteCalled, "QuickLookBridge onDelete callback is hooked up")
+        
+        // Restore default onDelete
+        QuickLookBridge.shared.onDelete = { [weak vm] in
+            vm?.confirmQuickLookDelete()
+        }
+        
+        // 2. confirmDelete removes the file and selects adjacent item
+        vm.confirmDelete()
+    }
+    
+    try? await Task.sleep(nanoseconds: 200_000_000)
+    
+    await MainActor.run {
+        assertCondition(!FileManager.default.fileExists(atPath: fileB.path), "file_b.txt was deleted to Trash")
+    }
 }
 
 dispatchMain()

@@ -11,6 +11,7 @@ public final class QuickLookBridge: NSObject, @preconcurrency QLPreviewPanelData
     
     public var onNavigateNext: (() -> Void)?
     public var onNavigatePrevious: (() -> Void)?
+    public var onDelete: (() -> Void)?
     
     public var isVisible: Bool {
         guard QLPreviewPanel.sharedPreviewPanelExists() else { return false }
@@ -183,6 +184,16 @@ public final class QuickLookBridge: NSObject, @preconcurrency QLPreviewPanelData
             if let onNavigatePrevious = onNavigatePrevious {
                 onNavigatePrevious()
                 return true
+            }
+        }
+        
+        // Delete / Backspace (51), Forward Delete (117), или F8 (100) -> удаление текущего файла
+        if event.keyCode == 51 || event.keyCode == 117 || event.keyCode == 100 {
+            if modifiers.isEmpty || modifiers == .command {
+                if let onDelete = onDelete {
+                    onDelete()
+                    return true
+                }
             }
         }
         

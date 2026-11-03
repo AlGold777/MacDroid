@@ -815,6 +815,9 @@ public final class DualPaneViewModel: ObservableObject {
         QuickLookBridge.shared.onNavigatePrevious = { [weak self] in
             self?.selectPrevious()
         }
+        QuickLookBridge.shared.onDelete = { [weak self] in
+            self?.confirmQuickLookDelete()
+        }
         
         // Автоматическое обнаружение и подключение смартфона при старте
         if !isRunningTests {
@@ -3741,7 +3744,7 @@ public final class DualPaneViewModel: ObservableObject {
         }
     }
     
-    public func refreshPane(side: PaneSide, selectPath: String? = nil) {
+    public func refreshPane(side: PaneSide, selectPath: String? = nil, selectNextAfterIndex: Int? = nil) {
         if isComparing { cancelDirectoryComparison() }
         if side == .left { leftComparisonReady = false } else { rightComparisonReady = false }
         var path = (side == .left) ? leftPath : rightPath
@@ -3856,6 +3859,20 @@ public final class DualPaneViewModel: ObservableObject {
                             self.leftSelection = [target.id]
                             TableDoubleClickHandler.HandlerView.focusAndScrollToItem(id: target.id, side: .left)
                         }
+                    } else if let nextIdx = selectNextAfterIndex {
+                        let display = self.displayItems(for: .left)
+                        if !display.isEmpty {
+                            let clampedIdx = max(0, min(nextIdx, display.count - 1))
+                            let target = display[clampedIdx]
+                            self.activePane = .left
+                            self.leftSelection = [target.id]
+                            TableDoubleClickHandler.HandlerView.focusAndScrollToItem(id: target.id, side: .left)
+                        } else {
+                            self.leftSelection.removeAll()
+                            if QuickLookBridge.shared.isVisible {
+                                QuickLookBridge.shared.close()
+                            }
+                        }
                     }
                 } else {
                     self.rightItems = items
@@ -3875,6 +3892,20 @@ public final class DualPaneViewModel: ObservableObject {
                             self.activePane = .right
                             self.rightSelection = [target.id]
                             TableDoubleClickHandler.HandlerView.focusAndScrollToItem(id: target.id, side: .right)
+                        }
+                    } else if let nextIdx = selectNextAfterIndex {
+                        let display = self.displayItems(for: .right)
+                        if !display.isEmpty {
+                            let clampedIdx = max(0, min(nextIdx, display.count - 1))
+                            let target = display[clampedIdx]
+                            self.activePane = .right
+                            self.rightSelection = [target.id]
+                            TableDoubleClickHandler.HandlerView.focusAndScrollToItem(id: target.id, side: .right)
+                        } else {
+                            self.rightSelection.removeAll()
+                            if QuickLookBridge.shared.isVisible {
+                                QuickLookBridge.shared.close()
+                            }
                         }
                     }
                 }
@@ -4869,12 +4900,62 @@ public final class DualPaneViewModel: ObservableObject {
         showDeleteConfirmDialog = true
     }
     
+    public func confirmQuickLookDelete() {
+        guard QuickLookBridge.shared.isVisible else {
+            triggerDelete()
+            return
+        }
+        let side = activePane
+        let selected = (side == .left) ? leftSelection : rightSelection
+        let currentItems = (side == .left) ? leftItems : rightItems
+        guard let first = selected.first,
+              let item = currentItems.first(where: { $0.id == first || $0.path == first }) ?? currentItems.first(where: { selected.contains($0.id) || selected.contains($0.path) }) else {
+            return
+        }
+        
+        let (isTagged, _) = TagsManager.shared.isItemOrContentsTagged(item: item)
+        if isTagged {
+            errorAlertTitle = "Удаление невозможно"
+            errorAlertButtonTitle = "OK"
+            errorMessage = "Чтобы удалить файл, вам необходимо снять тег."
+            showErrorAlert = true
+            statusMessage = "Удаление отменено: необходимо снять тег"
+            return
+        }
+        
+        // В тестах не вызываем runModal
+        if ProcessInfo.processInfo.processName.contains("MacHostTests") || NSApp.activationPolicy() == .prohibited {
+            confirmDelete()
+            return
+        }
+        
+        let alert = NSAlert()
+        alert.messageText = "Подтверждение удаления"
+        let source = (side == .left) ? leftSource : rightSource
+        if source == .localMac {
+            alert.informativeText = "Вы действительно хотите переместить «\(item.name)» в Корзину?"
+        } else {
+            alert.informativeText = "Переместить «\(item.name)» в Корзину телефона? Файл можно восстановить через меню «Корзина телефона…»."
+        }
+        alert.alertStyle = .warning
+        let deleteBtn = alert.addButton(withTitle: "Удалить")
+        deleteBtn.hasDestructiveAction = true
+        alert.addButton(withTitle: "Отмена")
+        
+        let response = alert.runModal()
+        if response == .alertFirstButtonReturn {
+            confirmDelete()
+        }
+    }
+    
     public func confirmDelete() {
         let side = activePane
         let selectedIds = (side == .left) ? leftSelection : rightSelection
         let source = (side == .left) ? leftSource : rightSource
         let driver: FileSystemDriver = (source == .localMac) ? localDriver : remoteDriver
         let items = (side == .left) ? leftItems : rightItems
+        let display = self.displayItems(for: side)
+        let deletedIndex = display.firstIndex(where: { selectedIds.contains($0.id) || selectedIds.contains($0.path) })
         
         Task {
             var failedCount = 0
@@ -4921,7 +5002,8 @@ public final class DualPaneViewModel: ObservableObject {
             } else {
                 self.rightSelection.subtract(successfullyDeletedIds)
             }
-            self.refreshPane(side: side)
+            let nextIndex = !successfullyDeletedIds.isEmpty ? deletedIndex : nil
+            self.refreshPane(side: side, selectNextAfterIndex: nextIndex)
             
             if skippedTaggedCount > 0 || failedCount > 0 {
                 self.statusMessage = "В корзине: \(successfullyDeletedIds.count), пропущено из-за тегов: \(skippedTaggedCount), с ошибкой: \(failedCount)"

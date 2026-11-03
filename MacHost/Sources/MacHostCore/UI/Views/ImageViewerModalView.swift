@@ -1,8 +1,13 @@
 import SwiftUI
 import ImageIO
 
+extension KeyEquivalent {
+    fileprivate static let f8Key = KeyEquivalent(Character(Unicode.Scalar(Int(NSF8FunctionKey))!))
+}
+
 public struct ImageViewerModalView: View {
     public let images: [FileItem]
+    @State private var currentImages: [FileItem]
     @State public var currentIndex: Int
     @Environment(\.dismiss) var dismiss
     @EnvironmentObject var vm: DualPaneViewModel
@@ -10,11 +15,17 @@ public struct ImageViewerModalView: View {
     @State private var currentImage: NSImage?
     @State private var scale: CGFloat = 1.0
     @State private var preloadedImages: [Int: NSImage] = [:]
+    @State private var showDeleteConfirm: Bool = false
+    @State private var showTaggedError: Bool = false
+    @State private var showDeleteError: Bool = false
+    @State private var deleteErrorMessage: String = ""
+    @State private var isDeleting: Bool = false
     /// Окно предзагрузки: только текущее изображение ±2, остальное вытесняется (защита от OOM).
     private static let preloadRadius = 2
 
     public init(images: [FileItem], startIndex: Int) {
         self.images = images
+        self._currentImages = State(initialValue: images)
         self._currentIndex = State(initialValue: startIndex)
     }
     
@@ -62,20 +73,20 @@ public struct ImageViewerModalView: View {
                 .buttonStyle(.plain)
                 .keyboardShortcut(.rightArrow, modifiers: [])
                 .padding(.trailing, 20)
-                .opacity(currentIndex + 1 < images.count ? 1.0 : 0.2)
-                .disabled(currentIndex + 1 >= images.count)
+                .opacity(currentIndex + 1 < currentImages.count ? 1.0 : 0.2)
+                .disabled(currentIndex + 1 >= currentImages.count)
             }
             
             // Верхняя плашка
             VStack {
                 HStack(spacing: 12) {
-                    if currentIndex < images.count {
+                    if currentIndex < currentImages.count {
                         VStack(alignment: .leading, spacing: 2) {
-                            Text(images[currentIndex].name)
+                            Text(currentImages[currentIndex].name)
                                 .foregroundColor(.white)
                                 .font(.headline)
                                 .shadow(radius: 2)
-                            Text("\(currentIndex + 1) из \(images.count)")
+                            Text("\(currentIndex + 1) из \(currentImages.count)")
                                 .foregroundColor(.white.opacity(0.7))
                                 .font(.caption2)
                         }
@@ -100,6 +111,35 @@ public struct ImageViewerModalView: View {
                     .keyboardShortcut(.space, modifiers: [])
                     .help("Открыть в системном Quick Look macOS (Пробел)")
                     
+                    // Кнопка удаления файла
+                    Button(action: promptDelete) {
+                        HStack(spacing: 4) {
+                            Image(systemName: "trash.fill")
+                            Text("Удалить")
+                        }
+                        .font(.system(size: 13, weight: .medium))
+                        .foregroundColor(.white)
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 4)
+                        .background(Color.red.opacity(0.7))
+                        .cornerRadius(6)
+                    }
+                    .buttonStyle(.plain)
+                    .keyboardShortcut(.delete, modifiers: [])
+                    .help("Удалить файл (⌫)")
+                    .disabled(isDeleting || currentImages.isEmpty)
+                    
+                    // Дополнительные комбинации клавиш для удаления (Cmd+Delete и F8)
+                    Button(action: promptDelete) { EmptyView() }
+                        .keyboardShortcut(.delete, modifiers: [.command])
+                        .frame(width: 0, height: 0)
+                        .opacity(0)
+
+                    Button(action: promptDelete) { EmptyView() }
+                        .keyboardShortcut(.f8Key, modifiers: [])
+                        .frame(width: 0, height: 0)
+                        .opacity(0)
+                    
                     Button(action: { dismiss() }) {
                         Image(systemName: "xmark.circle.fill")
                             .font(.system(size: 24))
@@ -117,10 +157,112 @@ public struct ImageViewerModalView: View {
             loadCurrentImage()
             prefetchNeighbors()
         }
+        .alert("Подтверждение удаления", isPresented: $showDeleteConfirm) {
+            Button("Удалить", role: .destructive) {
+                deleteCurrentItem()
+            }
+            Button("Отмена", role: .cancel) {}
+        } message: {
+            if currentIndex < currentImages.count {
+                let item = currentImages[currentIndex]
+                if item.source == .localMac {
+                    Text("Вы действительно хотите переместить «\(item.name)» в Корзину?")
+                } else {
+                    Text("Переместить «\(item.name)» в Корзину телефона? Файл можно восстановить через меню «Корзина телефона…».")
+                }
+            }
+        }
+        .alert("Удаление невозможно", isPresented: $showTaggedError) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text("Чтобы удалить файл, вам необходимо снять тег.")
+        }
+        .alert("Ошибка удаления", isPresented: $showDeleteError) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text(deleteErrorMessage)
+        }
+    }
+    
+    private func promptDelete() {
+        guard !isDeleting, currentIndex >= 0, currentIndex < currentImages.count else { return }
+        let item = currentImages[currentIndex]
+        let (isTagged, _) = TagsManager.shared.isItemOrContentsTagged(item: item)
+        if isTagged {
+            showTaggedError = true
+            return
+        }
+        showDeleteConfirm = true
+    }
+    
+    private func deleteCurrentItem() {
+        guard !isDeleting, currentIndex >= 0, currentIndex < currentImages.count else { return }
+        let item = currentImages[currentIndex]
+        isDeleting = true
+        let driver: FileSystemDriver = (item.source == .localMac) ? vm.localDriver : vm.remoteDriver
+        
+        Task {
+            do {
+                try await driver.deleteItem(at: item.path, moveToTrash: true)
+                await MainActor.run {
+                    isDeleting = false
+                    preloadedImages.removeValue(forKey: currentIndex)
+                    var shifted: [Int: NSImage] = [:]
+                    for (k, v) in preloadedImages {
+                        if k < currentIndex {
+                            shifted[k] = v
+                        } else if k > currentIndex {
+                            shifted[k - 1] = v
+                        }
+                    }
+                    preloadedImages = shifted
+                    
+                    currentImages.remove(at: currentIndex)
+                    vm.viewerImages = currentImages
+                    
+                    if vm.activePane == .left {
+                        vm.leftSelection.remove(item.id)
+                        vm.leftSelection.remove(item.path)
+                    } else {
+                        vm.rightSelection.remove(item.id)
+                        vm.rightSelection.remove(item.path)
+                    }
+                    
+                    if currentImages.isEmpty {
+                        vm.showImageViewer = false
+                        vm.refreshPane(side: vm.activePane)
+                        if QuickLookBridge.shared.isVisible {
+                            QuickLookBridge.shared.close()
+                        }
+                        dismiss()
+                    } else {
+                        if currentIndex >= currentImages.count {
+                            currentIndex = currentImages.count - 1
+                        }
+                        vm.viewerStartIndex = currentIndex
+                        vm.refreshPane(side: vm.activePane, selectNextAfterIndex: currentIndex)
+                        scale = 1.0
+                        pruneOutsideWindow()
+                        loadCurrentImage()
+                        prefetchNeighbors()
+                        
+                        if QuickLookBridge.shared.isVisible {
+                            openInSystemQuickLook()
+                        }
+                    }
+                }
+            } catch {
+                await MainActor.run {
+                    isDeleting = false
+                    deleteErrorMessage = error.localizedDescription
+                    showDeleteError = true
+                }
+            }
+        }
     }
     
     private func next() {
-        if currentIndex + 1 < images.count {
+        if currentIndex + 1 < currentImages.count {
             currentIndex += 1
             scale = 1.0
             pruneOutsideWindow()
@@ -157,8 +299,8 @@ public struct ImageViewerModalView: View {
             self.currentImage = preloaded
             return
         }
-        guard currentIndex < images.count else { return }
-        let item = images[currentIndex]
+        guard currentIndex < currentImages.count else { return }
+        let item = currentImages[currentIndex]
         self.currentImage = nil
 
         if FileManager.default.fileExists(atPath: item.path) {
@@ -200,8 +342,8 @@ public struct ImageViewerModalView: View {
         Task {
             for offset in [-1, 1, -2, 2] {
                 let idx = self.currentIndex + offset
-                guard idx >= 0 && idx < self.images.count && self.preloadedImages[idx] == nil else { continue }
-                let item = self.images[idx]
+                guard idx >= 0 && idx < self.currentImages.count && self.preloadedImages[idx] == nil else { continue }
+                let item = self.currentImages[idx]
 
                 let localURL: URL?
                 if FileManager.default.fileExists(atPath: item.path) {
@@ -222,8 +364,8 @@ public struct ImageViewerModalView: View {
     }
     
     private func openInSystemQuickLook() {
-        guard currentIndex < images.count else { return }
-        let item = images[currentIndex]
+        guard currentIndex < currentImages.count else { return }
+        let item = currentImages[currentIndex]
         if FileManager.default.fileExists(atPath: item.path) {
             QuickLookBridge.shared.preview(url: URL(fileURLWithPath: item.path))
         } else if let cached = QuickLookCacheManager.shared.isCached(for: item) {

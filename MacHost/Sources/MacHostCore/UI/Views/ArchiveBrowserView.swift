@@ -272,11 +272,13 @@ private final class ArchiveBrowserModel: ObservableObject {
 
     private let previousNext: (() -> Void)?
     private let previousPrevious: (() -> Void)?
+    private let previousDelete: (() -> Void)?
 
     init(archiveURL: URL) {
         self.archiveURL = archiveURL
         previousNext = QuickLookBridge.shared.onNavigateNext
         previousPrevious = QuickLookBridge.shared.onNavigatePrevious
+        previousDelete = QuickLookBridge.shared.onDelete
     }
 
     var isBusy: Bool { isLoading || isExtracting || isPreparingFile }
@@ -371,6 +373,7 @@ private final class ArchiveBrowserModel: ObservableObject {
             previewCopy = copy
             QuickLookBridge.shared.onNavigateNext = { [weak self] in self?.movePreview(by: 1) }
             QuickLookBridge.shared.onNavigatePrevious = { [weak self] in self?.movePreview(by: -1) }
+            QuickLookBridge.shared.onDelete = nil
             QuickLookBridge.shared.preview(url: copy.url, title: entry.name, onClose: {
                 try? copy.cleanup()
             })
@@ -394,6 +397,7 @@ private final class ArchiveBrowserModel: ObservableObject {
         closePreview()
         QuickLookBridge.shared.onNavigateNext = previousNext
         QuickLookBridge.shared.onNavigatePrevious = previousPrevious
+        QuickLookBridge.shared.onDelete = previousDelete
     }
 
     private func movePreview(by offset: Int) {
