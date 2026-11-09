@@ -85,10 +85,82 @@ else
     echo "⚠️  Внимание: Android Companion APK не найден ни в AndroidCompanion, ни в MacHost/Resources!"
 fi
 
-# 4. Ad-hoc подпись кода (требуется на Apple Silicon)
+# 4. Подпись кода постоянным локальным сертификатом (подпись обязательна на Apple Silicon).
+# Ad-hoc подпись меняется с каждой сборкой, и macOS теряет разрешения приложения («Локальная сеть»):
+# приложение перестаёт видеть телефон в домашней сети. С постоянным сертификатом требование подписи
+# (identifier + certificate leaf) одно и то же у всех сборок. Самоподписанный сертификат лежит в
+# отдельной связке ключей без пароля и создаётся при первой сборке; связка входа не затрагивается.
+SIGN_KEYCHAIN="$HOME/Library/Keychains/macdroid-codesign.keychain-db"
+SIGN_NAME="MacDroid Commander Local Signing"
+
+signing_identity_hash() {
+    security find-identity -p codesigning "$SIGN_KEYCHAIN" 2>/dev/null \
+        | awk -v name="\"$SIGN_NAME\"" 'index($0, name) { print $2; exit }'
+}
+
+create_signing_identity() {
+    local tmp
+    tmp="$(mktemp -d)" || return 1
+    cat > "$tmp/cert.cnf" <<EOF
+[req]
+distinguished_name = dn
+x509_extensions = ext
+prompt = no
+[dn]
+CN = $SIGN_NAME
+[ext]
+basicConstraints = critical,CA:false
+keyUsage = critical,digitalSignature
+extendedKeyUsage = critical,codeSigning
+EOF
+    # Пароль p12 нужен только для импорта во временном файле
+    openssl req -x509 -newkey rsa:2048 -nodes -keyout "$tmp/key.pem" -out "$tmp/cert.pem" \
+        -days 3650 -config "$tmp/cert.cnf" >/dev/null 2>&1 \
+    && openssl pkcs12 -export -inkey "$tmp/key.pem" -in "$tmp/cert.pem" -out "$tmp/id.p12" \
+        -passout pass:macdroid -name "$SIGN_NAME" >/dev/null 2>&1 \
+    && { [ -f "$SIGN_KEYCHAIN" ] || security create-keychain -p "" "$SIGN_KEYCHAIN"; } \
+    && security unlock-keychain -p "" "$SIGN_KEYCHAIN" \
+    && security set-keychain-settings "$SIGN_KEYCHAIN" \
+    && security import "$tmp/id.p12" -k "$SIGN_KEYCHAIN" -P macdroid -T /usr/bin/codesign >/dev/null
+    local rc=$?
+    # Разрешает codesign брать ключ без запроса; сбой не мешает подписи, если запрос не возникнет
+    [ $rc -eq 0 ] && { security set-key-partition-list -S apple-tool:,apple: -s -k "" "$SIGN_KEYCHAIN" >/dev/null 2>&1 || true; }
+    rm -rf "$tmp"
+    return $rc
+}
+
+# codesign ищет сертификат только в списке связок пользователя: связка добавляется на время подписи,
+# затем список восстанавливается как был.
+sign_with_local_identity() {
+    local hash="$1" rc line
+    local original=()
+    while IFS= read -r line; do
+        line="$(echo "$line" | sed 's/^[[:space:]]*"//; s/"[[:space:]]*$//')"
+        [ -n "$line" ] && original+=("$line")
+    done < <(security list-keychains -d user)
+    # Пустой список восстановить нельзя: без этой проверки в нём осталась бы только связка подписи
+    [ ${#original[@]} -gt 0 ] || return 1
+    security unlock-keychain -p "" "$SIGN_KEYCHAIN" || return 1
+    security list-keychains -d user -s "${original[@]}" "$SIGN_KEYCHAIN" || return 1
+    codesign --force --deep --sign "$hash" "$APP_BUNDLE"
+    rc=$?
+    security list-keychains -d user -s "${original[@]}" \
+        || echo "⚠️  Не удалось восстановить список связок ключей: проверьте «security list-keychains -d user»."
+    return $rc
+}
+
 if command -v codesign &> /dev/null; then
-    echo "Выполняется ad-hoc подпись бандла..."
-    codesign --force --deep --sign - "$APP_BUNDLE" || true
+    SIGN_HASH="$(signing_identity_hash)"
+    if [ -z "$SIGN_HASH" ]; then
+        echo "Создаётся локальный сертификат подписи «$SIGN_NAME»..."
+        create_signing_identity && SIGN_HASH="$(signing_identity_hash)"
+    fi
+    if [ -n "$SIGN_HASH" ] && sign_with_local_identity "$SIGN_HASH"; then
+        echo "Бандл подписан локальным сертификатом «$SIGN_NAME»."
+    else
+        echo "⚠️  Локальный сертификат недоступен — ad-hoc подпись (разрешение «Локальная сеть» может сбрасываться)."
+        codesign --force --deep --sign - "$APP_BUNDLE" || true
+    fi
 fi
 
 echo "=================================================="
