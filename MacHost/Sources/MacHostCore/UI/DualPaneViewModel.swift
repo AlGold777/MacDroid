@@ -2185,11 +2185,11 @@ public final class DualPaneViewModel: ObservableObject {
         let rawItems = side == .left ? leftItems : rightItems
         guard rawItems.contains(where: { $0.path == sourcePath }), rawItems.contains(where: { $0.path == targetPath }) else { return }
         let key = manualOrderKey(for: side)
-        var order = manualFileOrderByDirectory[key]
+        let sortField = side == .left ? leftSortField : rightSortField
+        var order = sortField == .manual ? manualFileOrderByDirectory[key] : nil
         if order == nil {
             let visibleOrder = displayItems(for: side).map(\.path)
             let visiblePaths = Set(visibleOrder)
-            let sortField = side == .left ? leftSortField : rightSortField
             let sortAscending = side == .left ? leftSortAscending : rightSortAscending
             let folderSortMode = side == .left ? leftFolderSortMode : rightFolderSortMode
             let completeOrder = sortFiles(rawItems, sortField: sortField, sortAsc: sortAscending,

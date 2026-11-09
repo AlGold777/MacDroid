@@ -1206,7 +1206,7 @@ public struct FileGridCell: View {
                 if vm.isFilePinned(item, side: side) {
                     Image(systemName: "lock.fill")
                         .font(.system(size: 11, weight: .semibold))
-                        .foregroundColor(Color(nsColor: .lightGray))
+                        .foregroundColor(.secondary.opacity(0.55))
                         .padding(5)
                         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
                         .allowsHitTesting(false)
@@ -1219,7 +1219,6 @@ public struct FileGridCell: View {
                         .background(Circle().fill(Color.black.opacity(0.58)))
                         .contentShape(Circle())
                         .onDrag { vm.createFileReorderProvider(for: item, side: side) }
-                        .onDrop(of: [DualPaneViewModel.reorderUTType], delegate: FileReorderDropDelegate(item: item, side: side, vm: vm))
                         .help("Перетащите маркер, чтобы изменить порядок")
                         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
                 }
@@ -1262,6 +1261,7 @@ public struct FileGridCell: View {
                 .padding(spacing <= 3 ? 3 : 5)
             }
             .frame(width: size, height: size)
+            .onDrop(of: [DualPaneViewModel.reorderUTType], delegate: FileReorderDropDelegate(item: item, side: side, vm: vm))
             
             // 2 & 3. Имя файла / папки и метаданные (размер)
             VStack(spacing: 1) {

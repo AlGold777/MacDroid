@@ -940,14 +940,15 @@ public struct PaneView: View {
         let isHoverFolder = (item.isDirectory && vm.dragHoverSide == side && vm.dragHoverFolderId == item.id)
 
         HStack(spacing: 6) {
-            Image(systemName: "line.3.horizontal")
-                .font(.system(size: 10, weight: .medium))
-                .foregroundColor(.secondary.opacity(0.7))
-                .frame(width: 12)
-                .help("Перетащите за значок, чтобы изменить порядок")
-                .onDrag {
-                    vm.createFileReorderProvider(for: item, side: side)
-                }
+            if vm.canReorderFiles(in: side) {
+                Image(systemName: "line.3.horizontal")
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundColor(.secondary.opacity(0.7))
+                    .frame(width: 12)
+                    .help("Перетащите за значок, чтобы изменить порядок")
+            } else {
+                Color.clear.frame(width: 12)
+            }
             FileItemIconView(isDirectory: item.isDirectory, fileName: item.name, size: 14)
                 .onDrag { vm.createDragItemProvider(for: item, side: side) }
 
@@ -1003,15 +1004,6 @@ public struct PaneView: View {
                     }
                 }
                 .onDrag { vm.createDragItemProvider(for: item, side: side) }
-                .onLongPressGesture(minimumDuration: 0.55) {
-                    if vm.activePane != side { vm.activePane = side }
-                    if side == .left {
-                        vm.leftSelection = [item.id]
-                    } else {
-                        vm.rightSelection = [item.id]
-                    }
-                    vm.triggerRename(item: item, side: side)
-                }
             }
 
             if vm.isComparing {
@@ -1020,7 +1012,7 @@ public struct PaneView: View {
             Spacer(minLength: 0)
             Image(systemName: "lock.fill")
                 .font(.system(size: 10))
-                .foregroundColor(Color(nsColor: .lightGray))
+                .foregroundColor(.secondary.opacity(0.55))
                 .opacity(vm.isFilePinned(item, side: side) ? 1 : 0)
                 .frame(width: 16)
                 .help(vm.isFilePinned(item, side: side) ? "Закреплённый файл" : "")
@@ -1082,6 +1074,7 @@ public struct PaneView: View {
         } preview: {
             Color.clear.frame(width: 1, height: 1)
         }
+        .onDrop(of: [DualPaneViewModel.reorderUTType], delegate: FileReorderDropDelegate(item: item, side: side, vm: vm))
         .contextMenu {
             rowContextMenu(for: item)
         }
@@ -1109,6 +1102,7 @@ public struct PaneView: View {
             print("DUAL_PANE: Cell double tap on \(item.name)")
             vm.openItem(item: item, side: side)
         })
+        .onDrop(of: [DualPaneViewModel.reorderUTType], delegate: FileReorderDropDelegate(item: item, side: side, vm: vm))
     }
 
     @ViewBuilder
@@ -1133,6 +1127,7 @@ public struct PaneView: View {
             print("DUAL_PANE: Cell double tap on \(item.name)")
             vm.openItem(item: item, side: side)
         })
+        .onDrop(of: [DualPaneViewModel.reorderUTType], delegate: FileReorderDropDelegate(item: item, side: side, vm: vm))
     }
 
     @ViewBuilder
@@ -1171,6 +1166,7 @@ public struct PaneView: View {
             print("DUAL_PANE: Cell double tap on \(item.name)")
             vm.openItem(item: item, side: side)
         })
+        .onDrop(of: [DualPaneViewModel.reorderUTType], delegate: FileReorderDropDelegate(item: item, side: side, vm: vm))
     }
 
     @ViewBuilder
@@ -1198,6 +1194,7 @@ public struct PaneView: View {
             print("DUAL_PANE: Cell double tap on \(item.name)")
             vm.openItem(item: item, side: side)
         })
+        .onDrop(of: [DualPaneViewModel.reorderUTType], delegate: FileReorderDropDelegate(item: item, side: side, vm: vm))
     }
 
     
@@ -2438,14 +2435,16 @@ public struct TableDoubleClickHandler: NSViewRepresentable {
         var onDoubleClick: ((Int) -> Void)?
         weak var hookedTableView: NSTableView?
         private var eventMonitor: Any?
-        private var longPressWorkItem: DispatchWorkItem?
         private var mouseDownLocation: NSPoint = .zero
+        private var reorderMouseDownItem: FileItem?
+        private var reorderSourceDirectoryKey: String?
+        private var isManualReorderDragging = false
+        private var isManualReorderCancelled = false
         private var pendingSingleClickSelection: (id: String, side: PaneSide)? = nil
         private var isAdjustingColumns = false
         private weak var columnResizeView: ColumnResizeView?
         
         deinit {
-            longPressWorkItem?.cancel()
             if let monitor = eventMonitor {
                 NSEvent.removeMonitor(monitor)
             }
@@ -2750,8 +2749,11 @@ public struct TableDoubleClickHandler: NSViewRepresentable {
                 
                 // KeyDown handling
                 if event.type == .keyDown {
-                    self.longPressWorkItem?.cancel()
-                    self.longPressWorkItem = nil
+                    if event.keyCode == 53 && self.reorderMouseDownItem != nil {
+                        self.isManualReorderCancelled = true
+                        self.pendingSingleClickSelection = nil
+                        return nil
+                    }
                     
                     // Если фокус находится в любом поле ввода текста (поле фильтра, пути, модальном окне, переименовании),
                     // передаем событие в KeyCommandMonitor (для Ctrl+C/V/X/A и Cmd+C/V/X/A в тексте)
@@ -2875,8 +2877,43 @@ public struct TableDoubleClickHandler: NSViewRepresentable {
                 }
                 
                 if event.type == .leftMouseUp {
-                    self.longPressWorkItem?.cancel()
-                    self.longPressWorkItem = nil
+                    if let sourceItem = self.reorderMouseDownItem {
+                        let wasReordering = self.isManualReorderDragging
+                        defer {
+                            self.reorderMouseDownItem = nil
+                            self.reorderSourceDirectoryKey = nil
+                            self.isManualReorderDragging = false
+                            self.isManualReorderCancelled = false
+                        }
+
+                        if wasReordering {
+                            if !self.isManualReorderCancelled {
+                                let location = tv.convert(event.locationInWindow, from: nil)
+                                let targetRow = tv.row(at: location)
+                                if let vm = self.vm,
+                                   let directoryKey = self.reorderSourceDirectoryKey,
+                                   targetRow >= 0 && targetRow < self.items.count {
+                                    let targetItem = self.items[targetRow]
+                                    if targetItem.path != sourceItem.path {
+                                        let rowRect = tv.rect(ofRow: targetRow)
+                                        let isInLowerHalf = tv.isFlipped
+                                            ? location.y >= rowRect.midY
+                                            : location.y <= rowRect.midY
+                                        vm.reorderFile(
+                                            sourceItem.path,
+                                            fromDirectoryKey: directoryKey,
+                                            relativeTo: targetItem.path,
+                                            after: isInLowerHalf,
+                                            side: self.side
+                                        )
+                                    }
+                                }
+                            }
+                            self.pendingSingleClickSelection = nil
+                            return nil
+                        }
+                    }
+
                     if let pending = self.pendingSingleClickSelection, let vm = self.vm {
                         if pending.side == .left {
                             vm.leftSelection = [pending.id]
@@ -2889,12 +2926,25 @@ public struct TableDoubleClickHandler: NSViewRepresentable {
                 }
                 
                 if event.type == .leftMouseDragged {
+                    if self.reorderMouseDownItem != nil {
+                        if self.isManualReorderCancelled {
+                            return nil
+                        }
+                        let currLoc = event.locationInWindow
+                        let dist = hypot(currLoc.x - self.mouseDownLocation.x, currLoc.y - self.mouseDownLocation.y)
+                        if dist > 5 {
+                            self.isManualReorderDragging = true
+                        }
+                        if self.isManualReorderDragging {
+                            self.pendingSingleClickSelection = nil
+                            return nil
+                        }
+                    }
+
                     self.pendingSingleClickSelection = nil
                     let currLoc = event.locationInWindow
                     let dist = hypot(currLoc.x - self.mouseDownLocation.x, currLoc.y - self.mouseDownLocation.y)
                     if dist > 4 {
-                        self.longPressWorkItem?.cancel()
-                        self.longPressWorkItem = nil
                         
                         // Если начался Drag & Drop выделенных файлов — гарантируем, что в NSPasteboard drag
                         // записан полный список системных путей/URL для внешних приложений (Finder, Desktop, Telegram и т.д.)
@@ -2928,9 +2978,24 @@ public struct TableDoubleClickHandler: NSViewRepresentable {
                 let clickedRow = tv.row(at: locationInTable)
                 
                 if event.type == .leftMouseDown {
-                    self.longPressWorkItem?.cancel()
-                    self.longPressWorkItem = nil
                     self.mouseDownLocation = event.locationInWindow
+                    self.reorderMouseDownItem = nil
+                    self.reorderSourceDirectoryKey = nil
+                    self.isManualReorderDragging = false
+                    self.isManualReorderCancelled = false
+
+                    if clickedRow >= 0 && clickedRow < self.items.count,
+                       tv.column(at: locationInTable) == 0,
+                       let vm = self.vm,
+                       vm.canReorderFiles(in: self.side) {
+                        let nameColumnRect = tv.rect(ofColumn: 0)
+                        let gripMinX = nameColumnRect.minX + 6
+                        let gripMaxX = gripMinX + 12
+                        if locationInTable.x >= gripMinX && locationInTable.x <= gripMaxX {
+                            self.reorderMouseDownItem = self.items[clickedRow]
+                            self.reorderSourceDirectoryKey = vm.fileOrderDirectoryKey(for: self.side)
+                        }
+                    }
                     
                     // Если пользователь кликает по элементу, имя которого сейчас редактируется:
                     if let editingId = self.vm?.editingItemId, clickedRow >= 0 && clickedRow < self.items.count, self.items[clickedRow].id == editingId {
@@ -2958,8 +3023,6 @@ public struct TableDoubleClickHandler: NSViewRepresentable {
                         
                         // Check for Double Click
                         if event.clickCount == 2 {
-                            self.longPressWorkItem?.cancel()
-                            self.longPressWorkItem = nil
                             print("DUAL_PANE: LeftMouseDown clickCount == 2 on row \(clickedRow), item: \(item.name)")
                             if self.side == .left {
                                 self.vm?.leftSelection = [item.id]
@@ -2968,27 +3031,6 @@ public struct TableDoubleClickHandler: NSViewRepresentable {
                             }
                             self.vm?.openItem(item: item, side: self.side)
                             return nil
-                        } else if event.clickCount == 1 {
-                            // Проверяем клик на колонку с именем файла (колонка 0)
-                            let clickedCol = tv.column(at: locationInTable)
-                            if clickedCol <= 0 {
-                                let itemToRename = item
-                                let currentPaneSide = self.side
-                                let work = DispatchWorkItem { [weak self] in
-                                    guard let self = self, let vm = self.vm else { return }
-                                    print("DUAL_PANE: Long press detected on file name '\(itemToRename.name)' -> triggering rename")
-                                    DispatchQueue.main.async {
-                                        if currentPaneSide == .left {
-                                            vm.leftSelection = [itemToRename.id]
-                                        } else {
-                                            vm.rightSelection = [itemToRename.id]
-                                        }
-                                        vm.triggerRename(item: itemToRename, side: currentPaneSide)
-                                    }
-                                }
-                                self.longPressWorkItem = work
-                                DispatchQueue.main.asyncAfter(deadline: .now() + 0.55, execute: work)
-                            }
                         }
                         
                         if let vm = self.vm {
@@ -3048,8 +3090,6 @@ public struct TableDoubleClickHandler: NSViewRepresentable {
                         }
                     }
                 } else if event.type == .rightMouseDown {
-                    self.longPressWorkItem?.cancel()
-                    self.longPressWorkItem = nil
                     
                     if tv.window?.firstResponder != tv {
                         tv.window?.makeFirstResponder(tv)
@@ -3576,6 +3616,7 @@ public struct PaneTableDropDelegate: DropDelegate {
         Self.currentSpringLoadFolderId = nil
         
         let targetFolderId = vm.dragHoverFolderId
+        let targetInsertionIndex = vm.dragInsertionIndex
         cleanDropState()
         
         let targetDirPath: String?
@@ -3598,6 +3639,43 @@ public struct PaneTableDropDelegate: DropDelegate {
             .item
         ]
         let providers = info.itemProviders(for: utTypes)
+        let isInternalDrop = DualPaneViewModel.providersCarryInternalPayload(providers)
+            || info.hasItemsConforming(to: [DualPaneViewModel.dragUTType])
+        let hasInternalPayload = vm.consumeInternalDragPayload(isInternalDrop: isInternalDrop)
+
+        // Dropping a file onto another row in the same pane means manual reorder.
+        // Folder targets continue through the normal transfer path below.
+        if hasInternalPayload,
+           isInternalDrop,
+           vm.canReorderFiles(in: side),
+           let payload = vm.currentDragPayload,
+           payload.paths.count == 1,
+           items.contains(where: { $0.path == payload.paths[0] }),
+           payload.sourceSide == (side == .left ? "left" : "right"),
+           payload.sourceKind == (((side == .left ? vm.leftSource : vm.rightSource) == .localMac) ? "localMac" : "remotePhone"),
+           (payload.sourceDirPath as NSString).standardizingPath == ((side == .left ? vm.leftPath : vm.rightPath) as NSString).standardizingPath,
+           targetFolderId == nil,
+           let insertionIndex = targetInsertionIndex,
+           !items.isEmpty {
+            let boundedIndex = min(max(0, insertionIndex), items.count)
+            let target: (path: String, after: Bool)
+            if boundedIndex < items.count {
+                target = (items[boundedIndex].path, false)
+            } else if let lastItem = items.last {
+                target = (lastItem.path, true)
+            } else {
+                target = (payload.paths[0], false)
+            }
+            vm.currentDragPayload = nil
+            vm.reorderFile(
+                payload.paths[0],
+                fromDirectoryKey: vm.fileOrderDirectoryKey(for: side),
+                relativeTo: target.path,
+                after: target.after,
+                side: side
+            )
+            return true
+        }
 
         // 1. Приоритетный путь для внутреннего Drag & Drop между панелями
         // Если payload активен, обрабатываем напрямую без запроса провайдеров из AppKit/NSPasteboard,
@@ -3605,9 +3683,7 @@ public struct PaneTableDropDelegate: DropDelegate {
         // Внутренний drag опознаём по провайдерам: hasItemsConforming(to:) для нашего нестандартного UTI
         // возвращает false, и payload сбрасывался до того, как перенос успевал выполниться.
         // Внешний drop (Finder) сбрасывает устаревший payload и идёт обычным путём (D11).
-        let isInternalDrop = DualPaneViewModel.providersCarryInternalPayload(providers)
-            || info.hasItemsConforming(to: [DualPaneViewModel.dragUTType])
-        if vm.consumeInternalDragPayload(isInternalDrop: isInternalDrop) {
+        if hasInternalPayload {
             return vm.handleDroppedProviders([], toSide: side, targetDirPath: targetDirPath, isMove: isMove)
         }
 
