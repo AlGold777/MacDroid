@@ -436,11 +436,15 @@ public final class DualPaneViewModel: ObservableObject {
     @Published public var dragHoverSide: PaneSide? = nil
     @Published public var dragHoverFolderId: String? = nil
     @Published public var dragInsertionIndex: Int? = nil
+    @Published public var dragReorderSourceId: String? = nil
+    @Published public var dragReorderBlocked: Bool = false
     
     public func clearDragHoverState() {
         dragHoverSide = nil
         dragHoverFolderId = nil
         dragInsertionIndex = nil
+        dragReorderSourceId = nil
+        dragReorderBlocked = false
     }
 
     /// Есть ли среди провайдеров наш внутренний тип перетаскивания (drop из этого же приложения)
@@ -2179,9 +2183,17 @@ public final class DualPaneViewModel: ObservableObject {
         return !isSearchActive(for: side) && query.isEmpty && filter.isEmpty && selectedTagFilter?.isEmpty != false && !isComparing
     }
 
+    public func canReorderFileWithinPinnedGroup(_ sourcePath: String, relativeTo targetPath: String, side: PaneSide) -> Bool {
+        let rawItems = side == .left ? leftItems : rightItems
+        guard let source = rawItems.first(where: { $0.path == sourcePath }),
+              let target = rawItems.first(where: { $0.path == targetPath }) else { return false }
+        return isFilePinned(source, side: side) == isFilePinned(target, side: side)
+    }
+
     public func reorderFile(_ sourcePath: String, fromDirectoryKey: String, relativeTo targetPath: String, after: Bool = false, side: PaneSide) {
         guard canReorderFiles(in: side), fromDirectoryKey == manualOrderKey(for: side) else { return }
-        guard sourcePath != targetPath else { return }
+        guard sourcePath != targetPath,
+              canReorderFileWithinPinnedGroup(sourcePath, relativeTo: targetPath, side: side) else { return }
         let rawItems = side == .left ? leftItems : rightItems
         guard rawItems.contains(where: { $0.path == sourcePath }), rawItems.contains(where: { $0.path == targetPath }) else { return }
         let key = manualOrderKey(for: side)

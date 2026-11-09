@@ -1030,7 +1030,6 @@ public struct PaneView: View {
             print("DUAL_PANE: Cell double tap on \(item.name)")
             vm.openItem(item: item, side: side)
         })
-        .onDrop(of: [DualPaneViewModel.reorderUTType], delegate: FileReorderDropDelegate(item: item, side: side, vm: vm))
         .contextMenu {
             rowContextMenu(for: item)
         }
@@ -1074,7 +1073,6 @@ public struct PaneView: View {
         } preview: {
             Color.clear.frame(width: 1, height: 1)
         }
-        .onDrop(of: [DualPaneViewModel.reorderUTType], delegate: FileReorderDropDelegate(item: item, side: side, vm: vm))
         .contextMenu {
             rowContextMenu(for: item)
         }
@@ -1102,7 +1100,6 @@ public struct PaneView: View {
             print("DUAL_PANE: Cell double tap on \(item.name)")
             vm.openItem(item: item, side: side)
         })
-        .onDrop(of: [DualPaneViewModel.reorderUTType], delegate: FileReorderDropDelegate(item: item, side: side, vm: vm))
     }
 
     @ViewBuilder
@@ -1127,7 +1124,6 @@ public struct PaneView: View {
             print("DUAL_PANE: Cell double tap on \(item.name)")
             vm.openItem(item: item, side: side)
         })
-        .onDrop(of: [DualPaneViewModel.reorderUTType], delegate: FileReorderDropDelegate(item: item, side: side, vm: vm))
     }
 
     @ViewBuilder
@@ -1166,7 +1162,6 @@ public struct PaneView: View {
             print("DUAL_PANE: Cell double tap on \(item.name)")
             vm.openItem(item: item, side: side)
         })
-        .onDrop(of: [DualPaneViewModel.reorderUTType], delegate: FileReorderDropDelegate(item: item, side: side, vm: vm))
     }
 
     @ViewBuilder
@@ -1194,7 +1189,6 @@ public struct PaneView: View {
             print("DUAL_PANE: Cell double tap on \(item.name)")
             vm.openItem(item: item, side: side)
         })
-        .onDrop(of: [DualPaneViewModel.reorderUTType], delegate: FileReorderDropDelegate(item: item, side: side, vm: vm))
     }
 
     
@@ -1941,7 +1935,7 @@ extension NSTableRowView {
                 }
                 
                 if vm.dragHoverSide == side, rowIndex >= 0 {
-                    let items = (side == .left) ? vm.leftItems : vm.rightItems
+                    let items = vm.displayItems(for: side)
                     if rowIndex < items.count && items[rowIndex].isDirectory && vm.dragHoverFolderId == items[rowIndex].id {
                         // Цельная синяя плашка без разрывов между колонками
                         NSGraphicsContext.saveGraphicsState()
@@ -1949,6 +1943,18 @@ extension NSTableRowView {
                         let path = NSBezierPath(roundedRect: highlightRect, xRadius: 4, yRadius: 4)
                         NSColor.controlAccentColor.withAlphaComponent(0.35).setFill()
                         path.fill()
+                        NSGraphicsContext.restoreGraphicsState()
+                        return
+                    }
+                    if rowIndex < items.count && vm.dragReorderSourceId == items[rowIndex].id {
+                        NSGraphicsContext.saveGraphicsState()
+                        let sourceRect = NSRect(x: 2, y: 1, width: self.bounds.width - 4, height: self.bounds.height - 2)
+                        let sourcePath = NSBezierPath(roundedRect: sourceRect, xRadius: 4, yRadius: 4)
+                        NSColor.controlAccentColor.withAlphaComponent(0.18).setFill()
+                        sourcePath.fill()
+                        NSColor.controlAccentColor.withAlphaComponent(0.8).setStroke()
+                        sourcePath.lineWidth = 1.5
+                        sourcePath.stroke()
                         NSGraphicsContext.restoreGraphicsState()
                         return
                     }
@@ -1977,7 +1983,7 @@ extension NSTableRowView {
             return
         }
         
-        let items = (side == .left) ? vm.leftItems : vm.rightItems
+        let items = vm.displayItems(for: side)
         guard rowIndex < items.count else { return }
         let item = items[rowIndex]
         
@@ -1990,9 +1996,22 @@ extension NSTableRowView {
             path.fill()
             NSGraphicsContext.restoreGraphicsState()
         }
+
+        // 2. Источник ручной перестановки остаётся заметным, пока пользователь держит его.
+        if vm.dragReorderSourceId == item.id {
+            NSGraphicsContext.saveGraphicsState()
+            let sourceRect = NSRect(x: 2, y: 1, width: self.bounds.width - 4, height: self.bounds.height - 2)
+            let sourcePath = NSBezierPath(roundedRect: sourceRect, xRadius: 4, yRadius: 4)
+            NSColor.controlAccentColor.withAlphaComponent(0.18).setFill()
+            sourcePath.fill()
+            NSColor.controlAccentColor.withAlphaComponent(0.8).setStroke()
+            sourcePath.lineWidth = 1.5
+            sourcePath.stroke()
+            NSGraphicsContext.restoreGraphicsState()
+        }
         
-        // 2. Синяя линия вставки между строками (цельная линия на всю ширину таблицы)
-        if vm.dragHoverFolderId == nil {
+        // 3. Синяя линия вставки между строками (цельная линия на всю ширину таблицы)
+        if vm.dragHoverFolderId == nil && !vm.dragReorderBlocked {
             if vm.dragInsertionIndex == rowIndex {
                 NSGraphicsContext.saveGraphicsState()
                 let lineRect = NSRect(x: 0, y: 0, width: self.bounds.width, height: 2)
@@ -2752,6 +2771,8 @@ public struct TableDoubleClickHandler: NSViewRepresentable {
                     if event.keyCode == 53 && self.reorderMouseDownItem != nil {
                         self.isManualReorderCancelled = true
                         self.pendingSingleClickSelection = nil
+                        self.vm?.clearDragHoverState()
+                        self.refreshDragFeedback(in: self.hookedTableView)
                         return nil
                     }
                     
@@ -2887,6 +2908,8 @@ public struct TableDoubleClickHandler: NSViewRepresentable {
                         }
 
                         if wasReordering {
+                            self.vm?.clearDragHoverState()
+                            self.refreshDragFeedback(in: tv)
                             if !self.isManualReorderCancelled {
                                 let location = tv.convert(event.locationInWindow, from: nil)
                                 let targetRow = tv.row(at: location)
@@ -2937,6 +2960,7 @@ public struct TableDoubleClickHandler: NSViewRepresentable {
                         }
                         if self.isManualReorderDragging {
                             self.pendingSingleClickSelection = nil
+                            self.updateManualReorderFeedback(at: event.locationInWindow, in: tv)
                             return nil
                         }
                     }
@@ -3162,6 +3186,36 @@ public struct TableDoubleClickHandler: NSViewRepresentable {
             }
         }
         
+        private func updateManualReorderFeedback(at windowPoint: NSPoint, in tableView: NSTableView) {
+            guard let vm = vm, let sourceItem = reorderMouseDownItem else { return }
+            let point = tableView.convert(windowPoint, from: nil)
+            let row = tableView.row(at: point)
+            let insertionIndex: Int?
+            if row >= 0 && row < items.count,
+               vm.canReorderFileWithinPinnedGroup(sourceItem.path, relativeTo: items[row].path, side: side) {
+                let rowRect = tableView.rect(ofRow: row)
+                let isInLowerHalf = tableView.isFlipped
+                    ? point.y >= rowRect.midY
+                    : point.y <= rowRect.midY
+                insertionIndex = isInLowerHalf ? row + 1 : row
+            } else {
+                insertionIndex = nil
+            }
+            vm.dragHoverSide = side
+            vm.dragHoverFolderId = nil
+            vm.dragInsertionIndex = insertionIndex
+            vm.dragReorderSourceId = sourceItem.id
+            refreshDragFeedback(in: tableView)
+        }
+
+        private func refreshDragFeedback(in tableView: NSTableView?) {
+            guard let tableView = tableView else { return }
+            tableView.enumerateAvailableRowViews { rowView, _ in
+                rowView.needsDisplay = true
+            }
+            tableView.needsDisplay = true
+        }
+
         @objc private func onTableDoubleClick(_ sender: NSTableView) {
             HandlerView.setActiveSide(self.side)
             let row = sender.clickedRow
@@ -3617,6 +3671,7 @@ public struct PaneTableDropDelegate: DropDelegate {
         
         let targetFolderId = vm.dragHoverFolderId
         let targetInsertionIndex = vm.dragInsertionIndex
+        let isBlockedReorderDrop = vm.dragReorderBlocked
         cleanDropState()
         
         let targetDirPath: String?
@@ -3642,6 +3697,10 @@ public struct PaneTableDropDelegate: DropDelegate {
         let isInternalDrop = DualPaneViewModel.providersCarryInternalPayload(providers)
             || info.hasItemsConforming(to: [DualPaneViewModel.dragUTType])
         let hasInternalPayload = vm.consumeInternalDragPayload(isInternalDrop: isInternalDrop)
+        if hasInternalPayload && isInternalDrop && isBlockedReorderDrop {
+            vm.currentDragPayload = nil
+            return true
+        }
 
         // Dropping a file onto another row in the same pane means manual reorder.
         // Folder targets continue through the normal transfer path below.
@@ -3704,6 +3763,19 @@ public struct PaneTableDropDelegate: DropDelegate {
         vm.clearDragHoverState()
     }
     
+    private func isCrossPinnedGroupReorderTarget(row: Int, isOverFolder: Bool) -> Bool {
+        guard !isOverFolder,
+              row >= 0 && row < items.count,
+              vm.canReorderFiles(in: side),
+              let payload = vm.currentDragPayload,
+              payload.paths.count == 1,
+              payload.sourceSide == (side == .left ? "left" : "right"),
+              payload.sourceKind == (((side == .left ? vm.leftSource : vm.rightSource) == .localMac) ? "localMac" : "remotePhone"),
+              (payload.sourceDirPath as NSString).standardizingPath == ((side == .left ? vm.leftPath : vm.rightPath) as NSString).standardizingPath,
+              items.contains(where: { $0.path == payload.paths[0] }) else { return false }
+        return !vm.canReorderFileWithinPinnedGroup(payload.paths[0], relativeTo: items[row].path, side: side)
+    }
+
     private func updateHover(at location: CGPoint) {
         let tv = (side == .left ? TableDoubleClickHandler.HandlerView.leftTableView : TableDoubleClickHandler.HandlerView.rightTableView)
         
@@ -3711,6 +3783,7 @@ public struct PaneTableDropDelegate: DropDelegate {
         let isOverFolder: Bool
         let isInsertTop: Bool
         
+        var isBlockedReorderTarget = false
         if let tv = tv {
             let screenLoc = NSEvent.mouseLocation
             let windowLoc = tv.window?.convertPoint(fromScreen: screenLoc) ?? .zero
@@ -3736,7 +3809,8 @@ public struct PaneTableDropDelegate: DropDelegate {
                 isOverFolder = false
                 isInsertTop = false
             }
-            tv.setDropRow(isOverFolder ? targetRow : (isInsertTop ? targetRow : targetRow + 1), dropOperation: isOverFolder ? .on : .above)
+            isBlockedReorderTarget = isCrossPinnedGroupReorderTarget(row: targetRow, isOverFolder: isOverFolder)
+            tv.setDropRow(isBlockedReorderTarget ? -1 : (isOverFolder ? targetRow : (isInsertTop ? targetRow : targetRow + 1)), dropOperation: isOverFolder ? .on : .above)
             tv.enumerateAvailableRowViews { rowView, _ in
                 rowView.needsDisplay = true
             }
@@ -3772,6 +3846,10 @@ public struct PaneTableDropDelegate: DropDelegate {
             }
         }
         
+        if tv == nil {
+            isBlockedReorderTarget = isCrossPinnedGroupReorderTarget(row: targetRow, isOverFolder: isOverFolder)
+        }
+
         if targetRow >= 0 && targetRow < items.count {
             let item = items[targetRow]
             if isOverFolder && item.isDirectory {
@@ -3823,6 +3901,8 @@ public struct PaneTableDropDelegate: DropDelegate {
             vm.dragInsertionIndex = insertRow
         }
         
+        vm.dragReorderBlocked = isBlockedReorderTarget
+
         // Гарантируем немедленную перерисовку всех строк AppKit NSTableView,
         // чтобы снять подсветку с ранее подсвеченной папки и нарисовать только на текущей
         if let tv = tv {
