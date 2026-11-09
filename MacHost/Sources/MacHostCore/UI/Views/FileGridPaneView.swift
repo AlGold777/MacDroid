@@ -1204,9 +1204,9 @@ public struct FileGridCell: View {
                 })
 
                 if vm.isFilePinned(item, side: side) {
-                    Image(systemName: "pin.fill")
+                    Image(systemName: "lock.fill")
                         .font(.system(size: 11, weight: .semibold))
-                        .foregroundColor(.accentColor)
+                        .foregroundColor(Color(nsColor: .lightGray))
                         .padding(5)
                         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
                         .allowsHitTesting(false)

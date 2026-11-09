@@ -948,12 +948,6 @@ public struct PaneView: View {
                 .onDrag {
                     vm.createFileReorderProvider(for: item, side: side)
                 }
-            if vm.isFilePinned(item, side: side) {
-                Image(systemName: "pin.fill")
-                    .font(.system(size: 9))
-                    .foregroundColor(.accentColor)
-                    .help("Закреплённый файл")
-            }
             FileItemIconView(isDirectory: item.isDirectory, fileName: item.name, size: 14)
                 .onDrag { vm.createDragItemProvider(for: item, side: side) }
 
@@ -1024,6 +1018,12 @@ public struct PaneView: View {
                 comparisonBadge(for: item.name)
             }
             Spacer(minLength: 0)
+            Image(systemName: "lock.fill")
+                .font(.system(size: 10))
+                .foregroundColor(Color(nsColor: .lightGray))
+                .opacity(vm.isFilePinned(item, side: side) ? 1 : 0)
+                .frame(width: 16)
+                .help(vm.isFilePinned(item, side: side) ? "Закреплённый файл" : "")
         }
         .padding(.vertical, 2)
         .padding(.leading, 6)
