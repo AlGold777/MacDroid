@@ -24,6 +24,7 @@ public enum SortField: String, CaseIterable, Sendable {
     case date = "Дата"
     case creationDate = "Дата создания"
     case status = "Статус"
+    case manual = "Вручную"
 }
 
 public enum PaneSide: String, Sendable {
@@ -193,6 +194,16 @@ public final class DualPaneViewModel: ObservableObject {
     }
     @Published public var leftSortAscending: Bool = true {
         didSet { UserDefaults.standard.set(leftSortAscending, forKey: SessionKey.leftSortAscending) }
+    }
+    @Published public var pinnedFileKeys: Set<String> = [] {
+        didSet { UserDefaults.standard.set(Array(pinnedFileKeys), forKey: "files.pinnedKeys") }
+    }
+    @Published public var manualFileOrderByDirectory: [String: [String]] = [:] {
+        didSet {
+            if let data = try? JSONEncoder().encode(manualFileOrderByDirectory) {
+                UserDefaults.standard.set(data, forKey: "files.manualOrder")
+            }
+        }
     }
     @Published public var leftFreeSpace: (free: UInt64, total: UInt64) = (0, 0)
     @Published public var leftIsStale: Bool = false
@@ -1013,6 +1024,11 @@ public final class DualPaneViewModel: ObservableObject {
     /// Восстановление состояния панелей из UserDefaults
     public func restoreSession() {
         let defaults = UserDefaults.standard
+        pinnedFileKeys = Set(defaults.stringArray(forKey: "files.pinnedKeys") ?? [])
+        if let orderData = defaults.data(forKey: "files.manualOrder"),
+           let savedOrder = try? JSONDecoder().decode([String: [String]].self, from: orderData) {
+            manualFileOrderByDirectory = savedOrder
+        }
         
         if let savedLeftSource = defaults.string(forKey: SessionKey.leftSource) {
             if savedLeftSource == "MacBook (Локально)" || savedLeftSource == "MacBook" || savedLeftSource == "Mac" {
@@ -2131,6 +2147,70 @@ public final class DualPaneViewModel: ObservableObject {
         
         return sorted
     }
+
+    public func filePreferenceKey(_ item: FileItem) -> String {
+        "\(item.source.rawValue)|\(item.path)"
+    }
+
+    public func isFilePinned(_ item: FileItem, side: PaneSide) -> Bool {
+        pinnedFileKeys.contains(filePreferenceKey(item))
+    }
+
+    public func toggleFilePin(_ item: FileItem, side: PaneSide) {
+        let key = filePreferenceKey(item)
+        if !pinnedFileKeys.insert(key).inserted { pinnedFileKeys.remove(key) }
+        leftItemsVersion &+= 1
+        rightItemsVersion &+= 1
+    }
+
+    private func manualOrderKey(for side: PaneSide) -> String {
+        let source = (side == .left ? leftSource : rightSource).rawValue
+        let path = side == .left ? leftPath : rightPath
+        return "\(source)|\(path)"
+    }
+
+    public func fileOrderDirectoryKey(for side: PaneSide) -> String {
+        manualOrderKey(for: side)
+    }
+
+    public func canReorderFiles(in side: PaneSide) -> Bool {
+        let filter = (side == .left ? leftFilter : rightFilter).trimmingCharacters(in: .whitespacesAndNewlines)
+        let query = side == .left ? leftSearchQuery : rightSearchQuery
+        return !isSearchActive(for: side) && query.isEmpty && filter.isEmpty && selectedTagFilter?.isEmpty != false && !isComparing
+    }
+
+    public func reorderFile(_ sourcePath: String, fromDirectoryKey: String, relativeTo targetPath: String, after: Bool = false, side: PaneSide) {
+        guard canReorderFiles(in: side), fromDirectoryKey == manualOrderKey(for: side) else { return }
+        guard sourcePath != targetPath else { return }
+        let rawItems = side == .left ? leftItems : rightItems
+        guard rawItems.contains(where: { $0.path == sourcePath }), rawItems.contains(where: { $0.path == targetPath }) else { return }
+        let key = manualOrderKey(for: side)
+        var order = manualFileOrderByDirectory[key]
+        if order == nil {
+            let visibleOrder = displayItems(for: side).map(\.path)
+            let visiblePaths = Set(visibleOrder)
+            let sortField = side == .left ? leftSortField : rightSortField
+            let sortAscending = side == .left ? leftSortAscending : rightSortAscending
+            let folderSortMode = side == .left ? leftFolderSortMode : rightFolderSortMode
+            let completeOrder = sortFiles(rawItems, sortField: sortField, sortAsc: sortAscending,
+                                          folderSortMode: folderSortMode, comparing: false, side: side).map(\.path)
+            order = visibleOrder + completeOrder.filter { !visiblePaths.contains($0) }
+        }
+        var orderPaths = order ?? []
+        for path in rawItems.map(\.path) where !orderPaths.contains(path) { orderPaths.append(path) }
+        orderPaths.removeAll { $0 == sourcePath }
+        if let index = orderPaths.firstIndex(of: targetPath) {
+            orderPaths.insert(sourcePath, at: index + (after ? 1 : 0))
+        } else {
+            if after { orderPaths.append(targetPath) }
+            orderPaths.append(sourcePath)
+            if !after { orderPaths.append(targetPath) }
+        }
+        manualFileOrderByDirectory[key] = orderPaths
+        leftItemsVersion &+= 1
+        rightItemsVersion &+= 1
+        if side == .left { leftSortField = .manual } else { rightSortField = .manual }
+    }
     
     // MARK: - Сортировка файлов для панели и поиска
     public func sortFiles(
@@ -2142,6 +2222,24 @@ public final class DualPaneViewModel: ObservableObject {
         side: PaneSide
     ) -> [FileItem] {
         return items.sorted { a, b in
+            let pinnedA = pinnedFileKeys.contains(filePreferenceKey(a))
+            let pinnedB = pinnedFileKeys.contains(filePreferenceKey(b))
+            if pinnedA != pinnedB { return pinnedA }
+
+            if sortField == .manual {
+                let orderKey = manualOrderKey(for: side)
+                let order = manualFileOrderByDirectory[orderKey] ?? []
+                let rankA = order.firstIndex(of: a.path)
+                let rankB = order.firstIndex(of: b.path)
+                if rankA != rankB {
+                    if let rankA { return rankB == nil || rankA < rankB! }
+                    return false
+                }
+                let cmp = a.name.localizedStandardCompare(b.name)
+                if cmp != .orderedSame { return cmp == .orderedAscending }
+                return a.path < b.path
+            }
+
             if comparing && sortField == .name {
                 let isRedA = (side == .left ? comparisonResult.onlyLeft : comparisonResult.onlyRight).contains(a.name)
                 let isRedB = (side == .left ? comparisonResult.onlyLeft : comparisonResult.onlyRight).contains(b.name)
@@ -2289,6 +2387,8 @@ public final class DualPaneViewModel: ObservableObject {
                 }
                 let cmp = a.name.localizedStandardCompare(b.name)
                 return sortAsc ? (cmp == .orderedAscending) : (cmp == .orderedDescending)
+            case .manual:
+                return a.name.localizedStandardCompare(b.name) == .orderedAscending
             }
         }
     }
@@ -7000,6 +7100,28 @@ public final class DualPaneViewModel: ObservableObject {
     }
     
     public static let dragUTType = "com.macdroid.dragitem"
+    public static let reorderUTType = "com.macdroid.file-reorder"
+
+    public struct FileOrderDragPayload: Codable {
+        public let directoryKey: String
+        public let path: String
+
+        public init(directoryKey: String, path: String) {
+            self.directoryKey = directoryKey
+            self.path = path
+        }
+    }
+
+    public func createFileReorderProvider(for item: FileItem, side: PaneSide) -> NSItemProvider {
+        let payload = FileOrderDragPayload(directoryKey: fileOrderDirectoryKey(for: side), path: item.path)
+        let data = (try? JSONEncoder().encode(payload)) ?? Data()
+        let provider = NSItemProvider()
+        provider.registerDataRepresentation(forTypeIdentifier: Self.reorderUTType, visibility: .all) { completion in
+            completion(data, nil)
+            return nil
+        }
+        return provider
+    }
     
     public struct DragPayload: Codable, Sendable {
         public let sourceSide: String

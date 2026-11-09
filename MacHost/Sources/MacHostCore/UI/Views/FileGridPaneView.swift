@@ -1202,6 +1202,27 @@ public struct FileGridCell: View {
                 .simultaneousGesture(TapGesture(count: 2).onEnded {
                     onDoubleTap?()
                 })
+
+                if vm.isFilePinned(item, side: side) {
+                    Image(systemName: "pin.fill")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundColor(.accentColor)
+                        .padding(5)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                        .allowsHitTesting(false)
+                }
+                if vm.canReorderFiles(in: side) {
+                    Image(systemName: "line.3.horizontal")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundColor(.white)
+                        .frame(width: 23, height: 23)
+                        .background(Circle().fill(Color.black.opacity(0.58)))
+                        .contentShape(Circle())
+                        .onDrag { vm.createFileReorderProvider(for: item, side: side) }
+                        .onDrop(of: [DualPaneViewModel.reorderUTType], delegate: FileReorderDropDelegate(item: item, side: side, vm: vm))
+                        .help("Перетащите маркер, чтобы изменить порядок")
+                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
+                }
                 
                 // Чекбокс / кружочек выделения справа снизу
                 let checkboxSize: CGFloat = min(22, max(16, size * 0.16))
@@ -1508,6 +1529,13 @@ public struct FileGridCell: View {
     private func gridContextMenu(for item: FileItem) -> some View {
         let contextItems = vm.contextMenuItems(for: item, side: side)
         let combinedTags = Array(Set(contextItems.flatMap { $0.tags }))
+        Button {
+            vm.toggleFilePin(item, side: side)
+        } label: {
+            Label(vm.isFilePinned(item, side: side) ? "Открепить" : "Закрепить сверху",
+                  systemImage: vm.isFilePinned(item, side: side) ? "pin.slash" : "pin")
+        }
+        Divider()
         ControlGroup {
             ForEach(FileTag.allTags) { tag in
                 let isSelected = combinedTags.contains { FileTag.isTagMatching($0, tagIdOrName: tag.id) }

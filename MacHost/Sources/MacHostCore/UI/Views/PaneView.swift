@@ -82,6 +82,8 @@ public struct PaneView: View {
                     return [KeyPathComparator(\FileItem.fileType, order: order)]
                 case .status:
                     return [KeyPathComparator(\FileItem.name, order: order)]
+                case .manual:
+                    return []
                 }
             },
             set: { newOrder in
@@ -938,7 +940,22 @@ public struct PaneView: View {
         let isHoverFolder = (item.isDirectory && vm.dragHoverSide == side && vm.dragHoverFolderId == item.id)
 
         HStack(spacing: 6) {
+            Image(systemName: "line.3.horizontal")
+                .font(.system(size: 10, weight: .medium))
+                .foregroundColor(.secondary.opacity(0.7))
+                .frame(width: 12)
+                .help("Перетащите за значок, чтобы изменить порядок")
+                .onDrag {
+                    vm.createFileReorderProvider(for: item, side: side)
+                }
+            if vm.isFilePinned(item, side: side) {
+                Image(systemName: "pin.fill")
+                    .font(.system(size: 9))
+                    .foregroundColor(.accentColor)
+                    .help("Закреплённый файл")
+            }
             FileItemIconView(isDirectory: item.isDirectory, fileName: item.name, size: 14)
+                .onDrag { vm.createDragItemProvider(for: item, side: side) }
 
             if vm.editingItemId == item.id && vm.editingItemSide == side {
                 let baseName = InlineRenameHelper.baseName(for: vm.editingItemName, isDirectory: item.isDirectory)
@@ -991,6 +1008,7 @@ public struct PaneView: View {
                             .truncationMode(.middle)
                     }
                 }
+                .onDrag { vm.createDragItemProvider(for: item, side: side) }
                 .onLongPressGesture(minimumDuration: 0.55) {
                     if vm.activePane != side { vm.activePane = side }
                     if side == .left {
@@ -1020,11 +1038,7 @@ public struct PaneView: View {
             print("DUAL_PANE: Cell double tap on \(item.name)")
             vm.openItem(item: item, side: side)
         })
-        .onDrag {
-            vm.createDragItemProvider(for: item, side: side)
-        } preview: {
-            Color.clear.frame(width: 1, height: 1)
-        }
+        .onDrop(of: [DualPaneViewModel.reorderUTType], delegate: FileReorderDropDelegate(item: item, side: side, vm: vm))
         .contextMenu {
             rowContextMenu(for: item)
         }
@@ -1307,6 +1321,13 @@ public struct PaneView: View {
     private func rowContextMenu(for item: FileItem) -> some View {
         let contextItems = vm.contextMenuItems(for: item, side: side)
         let combinedTags = Array(Set(contextItems.flatMap { $0.tags }))
+        Button {
+            vm.toggleFilePin(item, side: side)
+        } label: {
+            Label(vm.isFilePinned(item, side: side) ? "Открепить" : "Закрепить сверху",
+                  systemImage: vm.isFilePinned(item, side: side) ? "pin.slash" : "pin")
+        }
+        Divider()
         
         let query = (side == .left ? vm.leftSearchQuery : vm.rightSearchQuery).trimmingCharacters(in: .whitespaces)
         if vm.isSearchActive(for: side) && !query.isEmpty {
@@ -3138,6 +3159,14 @@ public struct TableDoubleClickHandler: NSViewRepresentable {
             menu.addItem(NSMenuItem.separator())
             
             // 2. Стандартные действия контекстного меню
+            let pinItem = NSMenuItem(
+                title: vm.isFilePinned(item, side: side) ? "Открепить" : "Закрепить сверху",
+                action: #selector(menuActionToggleFilePin(_:)),
+                keyEquivalent: ""
+            )
+            pinItem.target = self
+            pinItem.representedObject = item
+            menu.addItem(pinItem)
             if item.isDirectory {
                 let openInNewTabItem = NSMenuItem(title: "Открыть в новой вкладке", action: #selector(menuActionOpenInNewTab(_:)), keyEquivalent: "")
                 openInNewTabItem.target = self
@@ -3311,6 +3340,11 @@ public struct TableDoubleClickHandler: NSViewRepresentable {
         @objc private func menuActionOpenInNewTab(_ sender: NSMenuItem) {
             guard let item = sender.representedObject as? FileItem, item.isDirectory else { return }
             self.vm?.openFolderInNewTab(path: item.path, source: item.source, side: self.side)
+        }
+
+        @objc private func menuActionToggleFilePin(_ sender: NSMenuItem) {
+            guard let item = sender.representedObject as? FileItem else { return }
+            vm?.toggleFilePin(item, side: side)
         }
         
         @objc private func menuActionNewFolder(_ sender: NSMenuItem) {
@@ -4222,6 +4256,31 @@ private struct PaneMirrorButton: View {
             }
         }
         .help(tooltip)
+    }
+}
+
+struct FileReorderDropDelegate: DropDelegate {
+    let item: FileItem
+    let side: PaneSide
+    let vm: DualPaneViewModel
+
+    func dropUpdated(info: DropInfo) -> DropProposal? {
+        DropProposal(operation: .move)
+    }
+
+    func performDrop(info: DropInfo) -> Bool {
+        guard vm.canReorderFiles(in: side) else { return false }
+        let providers = info.itemProviders(for: [UTType(exportedAs: DualPaneViewModel.reorderUTType).identifier])
+        guard let provider = providers.first else { return false }
+        provider.loadDataRepresentation(forTypeIdentifier: DualPaneViewModel.reorderUTType) { data, _ in
+            guard let data,
+                  let payload = try? JSONDecoder().decode(DualPaneViewModel.FileOrderDragPayload.self, from: data) else { return }
+            DispatchQueue.main.async {
+                vm.reorderFile(payload.path, fromDirectoryKey: payload.directoryKey, relativeTo: item.path,
+                               after: info.location.y > 14, side: side)
+            }
+        }
+        return true
     }
 }
 
