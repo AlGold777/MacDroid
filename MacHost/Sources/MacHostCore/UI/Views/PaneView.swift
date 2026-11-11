@@ -1004,6 +1004,15 @@ public struct PaneView: View {
                     }
                 }
                 .onDrag { vm.createDragItemProvider(for: item, side: side) }
+                .onLongPressGesture(minimumDuration: 0.55) {
+                    if vm.activePane != side { vm.activePane = side }
+                    if side == .left {
+                        vm.leftSelection = [item.id]
+                    } else {
+                        vm.rightSelection = [item.id]
+                    }
+                    vm.triggerRename(item: item, side: side)
+                }
             }
 
             if vm.isComparing {
@@ -2454,6 +2463,7 @@ public struct TableDoubleClickHandler: NSViewRepresentable {
         var onDoubleClick: ((Int) -> Void)?
         weak var hookedTableView: NSTableView?
         private var eventMonitor: Any?
+        private var longPressWorkItem: DispatchWorkItem?
         private var mouseDownLocation: NSPoint = .zero
         private var reorderMouseDownItem: FileItem?
         private var reorderSourceDirectoryKey: String?
@@ -2464,6 +2474,7 @@ public struct TableDoubleClickHandler: NSViewRepresentable {
         private weak var columnResizeView: ColumnResizeView?
         
         deinit {
+            cancelLongPressWorkItem()
             if let monitor = eventMonitor {
                 NSEvent.removeMonitor(monitor)
             }
@@ -2640,8 +2651,25 @@ public struct TableDoubleClickHandler: NSViewRepresentable {
                 )
             }
             
+            NotificationCenter.default.removeObserver(self, name: DualPaneViewModel.cancelLongPressNotification, object: nil)
+            NotificationCenter.default.addObserver(
+                self,
+                selector: #selector(onCancelLongPressNotification(_:)),
+                name: DualPaneViewModel.cancelLongPressNotification,
+                object: nil
+            )
+
             adjustTableColumns()
             setupEventMonitor()
+        }
+
+        @objc private func onCancelLongPressNotification(_ note: Notification) {
+            cancelLongPressWorkItem()
+        }
+
+        private func cancelLongPressWorkItem() {
+            longPressWorkItem?.cancel()
+            longPressWorkItem = nil
         }
         
         fileprivate func installColumnHeader(on table: NSTableView) {
@@ -2768,6 +2796,7 @@ public struct TableDoubleClickHandler: NSViewRepresentable {
                 
                 // KeyDown handling
                 if event.type == .keyDown {
+                    self.cancelLongPressWorkItem()
                     if event.keyCode == 53 && self.reorderMouseDownItem != nil {
                         self.isManualReorderCancelled = true
                         self.pendingSingleClickSelection = nil
@@ -2898,6 +2927,7 @@ public struct TableDoubleClickHandler: NSViewRepresentable {
                 }
                 
                 if event.type == .leftMouseUp {
+                    self.cancelLongPressWorkItem()
                     if let sourceItem = self.reorderMouseDownItem {
                         let wasReordering = self.isManualReorderDragging
                         defer {
@@ -2949,12 +2979,15 @@ public struct TableDoubleClickHandler: NSViewRepresentable {
                 }
                 
                 if event.type == .leftMouseDragged {
+                    let currLoc = event.locationInWindow
+                    let dist = hypot(currLoc.x - self.mouseDownLocation.x, currLoc.y - self.mouseDownLocation.y)
+                    if dist > 3 {
+                        self.cancelLongPressWorkItem()
+                    }
                     if self.reorderMouseDownItem != nil {
                         if self.isManualReorderCancelled {
                             return nil
                         }
-                        let currLoc = event.locationInWindow
-                        let dist = hypot(currLoc.x - self.mouseDownLocation.x, currLoc.y - self.mouseDownLocation.y)
                         if dist > 5 {
                             self.isManualReorderDragging = true
                         }
@@ -2966,8 +2999,6 @@ public struct TableDoubleClickHandler: NSViewRepresentable {
                     }
 
                     self.pendingSingleClickSelection = nil
-                    let currLoc = event.locationInWindow
-                    let dist = hypot(currLoc.x - self.mouseDownLocation.x, currLoc.y - self.mouseDownLocation.y)
                     if dist > 4 {
                         
                         // Если начался Drag & Drop выделенных файлов — гарантируем, что в NSPasteboard drag
@@ -2995,6 +3026,19 @@ public struct TableDoubleClickHandler: NSViewRepresentable {
                     }
                 }
                 
+                // Проверяем, что клик находится именно в видимой области таблицы текущей панели
+                guard isClickInPaneArea else {
+                    return event
+                }
+                
+                // Проверяем, что клик не перекрыт другим представлением поверх таблицы (зона сравнения файлов, модальное окно, тулбар и т.д.)
+                if let hitView = tv.window?.contentView?.hitTest(event.locationInWindow) {
+                    let isTableHit = (hitView === tv || hitView.isDescendant(of: tv) || (tv.enclosingScrollView != nil && (hitView === tv.enclosingScrollView || hitView.isDescendant(of: tv.enclosingScrollView!))))
+                    guard isTableHit else {
+                        return event
+                    }
+                }
+                
                 guard tv.bounds.contains(locationInTable) else {
                     return event
                 }
@@ -3002,6 +3046,7 @@ public struct TableDoubleClickHandler: NSViewRepresentable {
                 let clickedRow = tv.row(at: locationInTable)
                 
                 if event.type == .leftMouseDown {
+                    self.cancelLongPressWorkItem()
                     self.mouseDownLocation = event.locationInWindow
                     self.reorderMouseDownItem = nil
                     self.reorderSourceDirectoryKey = nil
@@ -3047,6 +3092,7 @@ public struct TableDoubleClickHandler: NSViewRepresentable {
                         
                         // Check for Double Click
                         if event.clickCount == 2 {
+                            self.cancelLongPressWorkItem()
                             print("DUAL_PANE: LeftMouseDown clickCount == 2 on row \(clickedRow), item: \(item.name)")
                             if self.side == .left {
                                 self.vm?.leftSelection = [item.id]
@@ -3055,6 +3101,29 @@ public struct TableDoubleClickHandler: NSViewRepresentable {
                             }
                             self.vm?.openItem(item: item, side: self.side)
                             return nil
+                        } else if event.clickCount == 1 {
+                            // Проверяем клик на колонку с именем файла (колонка 0)
+                            let clickedCol = tv.column(at: locationInTable)
+                            if clickedCol <= 0 && self.reorderMouseDownItem == nil && self.vm?.editingItemId == nil {
+                                let itemToRename = item
+                                let currentPaneSide = self.side
+                                let work = DispatchWorkItem { [weak self] in
+                                    guard let self = self, let vm = self.vm else { return }
+                                    guard !self.isManualReorderDragging else { return }
+                                    guard self.reorderMouseDownItem == nil else { return }
+                                    print("DUAL_PANE: Long press detected on file name '\(itemToRename.name)' -> triggering rename")
+                                    DispatchQueue.main.async {
+                                        if currentPaneSide == .left {
+                                            vm.leftSelection = [itemToRename.id]
+                                        } else {
+                                            vm.rightSelection = [itemToRename.id]
+                                        }
+                                        vm.triggerRename(item: itemToRename, side: currentPaneSide)
+                                    }
+                                }
+                                self.longPressWorkItem = work
+                                DispatchQueue.main.asyncAfter(deadline: .now() + 0.55, execute: work)
+                            }
                         }
                         
                         if let vm = self.vm {
@@ -3114,6 +3183,7 @@ public struct TableDoubleClickHandler: NSViewRepresentable {
                         }
                     }
                 } else if event.type == .rightMouseDown {
+                    self.cancelLongPressWorkItem()
                     
                     if tv.window?.firstResponder != tv {
                         tv.window?.makeFirstResponder(tv)

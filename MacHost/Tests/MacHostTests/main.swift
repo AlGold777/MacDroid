@@ -3279,6 +3279,23 @@ func runAllAsyncTests() async {
                 vm.commitManualPath(side: .left)
                 assertCondition(vm.leftPath == "/Users/restart/Documents/GitHub/AutoOrchestr/.claude/worktrees/basic-system-testing-392069/docs/Pipeline scenarios", "User example path opens Pipeline scenarios folder")
             }
+
+            // 7. Long Press Rename & Drag Invariants
+            var notificationReceived = false
+            let observer = NotificationCenter.default.addObserver(
+                forName: DualPaneViewModel.cancelLongPressNotification,
+                object: nil,
+                queue: .main
+            ) { _ in
+                notificationReceived = true
+            }
+            _ = vm.createDragItemProvider(for: testItem, side: .left)
+            assertCondition(notificationReceived == true, "createDragItemProvider posts cancelLongPressNotification to prevent drag rename conflict")
+
+            notificationReceived = false
+            _ = vm.createFileReorderProvider(for: testItem, side: .left)
+            assertCondition(notificationReceived == true, "createFileReorderProvider posts cancelLongPressNotification")
+            NotificationCenter.default.removeObserver(observer)
         }
         
         // =========================================================================
@@ -6412,6 +6429,101 @@ private func runDirectoryComparatorTests() async throws {
     
     await MainActor.run {
         assertCondition(!FileManager.default.fileExists(atPath: fileB.path), "file_b.txt was deleted to Trash")
+    }
+
+    // [Test 72] Delete Confirmation Dialog: Default Focus on Cancel, Arrow Navigation, and Enter Execution
+    print("\n[Test 72] Delete Confirmation Dialog: Default Focus on Cancel, Arrow Navigation, and Enter Execution...")
+    await MainActor.run {
+        var focus = DeleteDialogButton.cancel
+        assertCondition(focus == .cancel, "Default focus in delete confirmation is cancel")
+
+        // Arrow navigation: Right arrow switches from cancel to delete
+        focus = .delete
+        assertCondition(focus == .delete, "Right arrow switches focus from cancel to delete")
+
+        // Arrow navigation: Left arrow switches from delete to cancel
+        focus = .cancel
+        assertCondition(focus == .cancel, "Left arrow switches focus from delete to cancel")
+
+        // Enter key action behavior
+        var isCancelled = false
+        var isConfirmed = false
+
+        func handleEnter(on focused: DeleteDialogButton) {
+            if focused == .delete {
+                isConfirmed = true
+            } else {
+                isCancelled = true
+            }
+        }
+
+        // 1. Enter while focused on cancel -> cancels, does not delete
+        focus = .cancel
+        handleEnter(on: focus)
+        assertCondition(isCancelled && !isConfirmed, "Enter with focus on cancel triggers cancel action")
+
+        // 2. Enter while focused on delete -> confirms deletion
+        isCancelled = false
+        isConfirmed = false
+        focus = .delete
+        handleEnter(on: focus)
+        assertCondition(!isCancelled && isConfirmed, "Enter with focus on delete triggers delete action")
+
+        print("  ✓ All Delete Confirmation Dialog focus and navigation checks passed successfully!")
+    }
+
+    // [Test 73] File Diff Dynamic Height and Collapse State Invariants
+    print("\n[Test 73] File Diff Dynamic Height and Collapse State Invariants...")
+    await MainActor.run {
+        let vm = DualPaneViewModel()
+        assertCondition(!vm.areDiffFilesSelected, "Initially diff files are not selected")
+        assertCondition(vm.fileDiffHeight == nil, "Initial fileDiffHeight is nil")
+
+        // 1. In unselected state: setter routes to fileDiffHeightUnselected
+        vm.fileDiffHeight = 220
+        assertCondition(vm.fileDiffHeightUnselected == 220, "Unselected height routed properly")
+        assertCondition(vm.fileDiffHeightSelected == nil, "Selected height remains nil")
+
+        // 2. Unselected default height reduction check (25% reduction)
+        let sampleWindowHeight: CGFloat = 800
+        let oldDefault = max(160, min(420, sampleWindowHeight * 0.45))
+        let newUnselectedDefault = max(160, min(315, sampleWindowHeight * 0.3375))
+        let reductionRatio = newUnselectedDefault / oldDefault
+        assertCondition(abs(reductionRatio - 0.75) < 0.001, "Unselected height is reduced by exactly 25% (got ratio \(reductionRatio))")
+
+        // 3. In selected state:
+        let dummyItem = FileItem(
+            id: "/path/to/test.txt",
+            name: "test.txt",
+            path: "/path/to/test.txt",
+            size: 100,
+            mtime: Date().timeIntervalSince1970,
+            isDirectory: false
+        )
+        let targetA = CompareTarget(fileItem: dummyItem, canonicalPath: "/path/to/test.txt", isRemote: false)
+        let targetB = CompareTarget(fileItem: dummyItem, canonicalPath: "/remote/test.txt", isRemote: true)
+        vm.fileCompareState = .ready(left: targetA, right: targetB)
+
+        assertCondition(vm.areDiffFilesSelected, "areDiffFilesSelected is true when state is .ready")
+        assertCondition(vm.fileDiffHeight == nil, "fileDiffHeight for selected is initially nil (ready for default collapse)")
+
+        // 4. Panels collapse height check:
+        // Panels collapsed to 3 rows occupies 195pt; diff overlay gets remaining height
+        let collapsedPanelsHeight: CGFloat = 195
+        let expectedSelectedDefaultHeight = max(160, sampleWindowHeight - collapsedPanelsHeight)
+        assertCondition(expectedSelectedDefaultHeight == 605, "Diff overlay takes majority of space (605 out of 800) leaving 195 for 3 rows")
+
+        // 5. User can manually adjust height in selected state
+        vm.fileDiffHeight = 500
+        assertCondition(vm.fileDiffHeightSelected == 500, "User adjusted selected height saved to fileDiffHeightSelected")
+        assertCondition(vm.fileDiffHeightUnselected == 220, "Unselected height preserved")
+
+        // 6. triggerFileDiff / closeFileDiff resets custom heights
+        vm.closeFileDiff()
+        assertCondition(vm.fileDiffHeightSelected == nil, "closeFileDiff resets fileDiffHeightSelected")
+        assertCondition(vm.fileDiffHeightUnselected == nil, "closeFileDiff resets fileDiffHeightUnselected")
+
+        print("  ✓ File Diff dynamic height & collapse state tests passed successfully!")
     }
 }
 

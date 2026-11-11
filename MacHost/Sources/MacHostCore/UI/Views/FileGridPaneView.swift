@@ -1012,7 +1012,20 @@ public struct GridKeyHandler: NSViewRepresentable {
                 guard vm.failedConnectionSide == nil else { return event }
                 
                 let locInSelf = self.convert(event.locationInWindow, from: nil)
-                let isInside = self.bounds.contains(locInSelf)
+                let isInside: Bool
+                if let scroll = self.enclosingScrollView {
+                    let locInScroll = scroll.convert(event.locationInWindow, from: nil)
+                    isInside = scroll.bounds.contains(locInScroll)
+                } else {
+                    isInside = self.bounds.contains(locInSelf)
+                }
+                
+                if isInside, let hit = win.contentView?.hitTest(event.locationInWindow) {
+                    let isGridHit = (hit === self || hit.isDescendant(of: self) || (self.enclosingScrollView != nil && (hit === self.enclosingScrollView || hit.isDescendant(of: self.enclosingScrollView!))))
+                    if !isGridHit {
+                        return event
+                    }
+                }
                 
                 switch event.type {
                 case .leftMouseDown:
@@ -1310,15 +1323,17 @@ public struct FileGridCell: View {
                         .multilineTextAlignment(.center)
                         .truncationMode(.middle)
                         .frame(width: size)
-                        .onLongPressGesture(minimumDuration: 0.69) {
-                            if vm.activePane != side { vm.activePane = side }
-                            if side == .left {
-                                vm.leftSelection = [item.id]
-                            } else {
-                                vm.rightSelection = [item.id]
+                        .highPriorityGesture(
+                            LongPressGesture(minimumDuration: 0.55).onEnded { _ in
+                                if vm.activePane != side { vm.activePane = side }
+                                if side == .left {
+                                    vm.leftSelection = [item.id]
+                                } else {
+                                    vm.rightSelection = [item.id]
+                                }
+                                vm.triggerRename(item: item, side: side)
                             }
-                            vm.triggerRename(item: item, side: side)
-                        }
+                        )
                 }
                 
                 Group {

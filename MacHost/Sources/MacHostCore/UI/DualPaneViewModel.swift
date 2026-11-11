@@ -612,7 +612,32 @@ public final class DualPaneViewModel: ObservableObject {
     // File Diff overlay state
     @Published public var isFileDiffActive: Bool = false
     @Published public var fileDiffDockPosition: FileDiffDockPosition = .top
-    @Published public var fileDiffHeight: CGFloat? = nil
+    @Published public var fileDiffHeightSelected: CGFloat? = nil
+    @Published public var fileDiffHeightUnselected: CGFloat? = nil
+
+    public var areDiffFilesSelected: Bool {
+        if case .ready = fileCompareState {
+            return true
+        }
+        if case .sameFile = fileCompareState {
+            return true
+        }
+        return activeDiffLeftTarget != nil && activeDiffRightTarget != nil
+    }
+
+    public var fileDiffHeight: CGFloat? {
+        get {
+            areDiffFilesSelected ? fileDiffHeightSelected : fileDiffHeightUnselected
+        }
+        set {
+            objectWillChange.send()
+            if areDiffFilesSelected {
+                fileDiffHeightSelected = newValue
+            } else {
+                fileDiffHeightUnselected = newValue
+            }
+        }
+    }
     @Published public var fileCompareState: CompareState = .noLeftFile(reason: "Выберите файл в левой панели")
     @Published public var leftCursorItemId: String? = nil {
         didSet { scheduleCompareStateRecompute() }
@@ -4490,6 +4515,8 @@ public final class DualPaneViewModel: ObservableObject {
             return
         }
         
+        fileDiffHeightSelected = nil
+        fileDiffHeightUnselected = nil
         withAnimation(.easeInOut(duration: 0.18)) {
             isFileDiffActive = true
         }
@@ -4500,6 +4527,8 @@ public final class DualPaneViewModel: ObservableObject {
         withAnimation(.easeInOut(duration: 0.18)) {
             isFileDiffActive = false
         }
+        fileDiffHeightSelected = nil
+        fileDiffHeightUnselected = nil
         activeFileDiffResult = nil
         activeDiffLeftTarget = nil
         activeDiffRightTarget = nil
@@ -7113,6 +7142,7 @@ public final class DualPaneViewModel: ObservableObject {
     
     public static let dragUTType = "com.macdroid.dragitem"
     public static let reorderUTType = "com.macdroid.file-reorder"
+    public static let cancelLongPressNotification = Notification.Name("CancelLongPressRename")
 
     public struct FileOrderDragPayload: Codable {
         public let directoryKey: String
@@ -7125,6 +7155,7 @@ public final class DualPaneViewModel: ObservableObject {
     }
 
     public func createFileReorderProvider(for item: FileItem, side: PaneSide) -> NSItemProvider {
+        NotificationCenter.default.post(name: Self.cancelLongPressNotification, object: nil)
         let payload = FileOrderDragPayload(directoryKey: fileOrderDirectoryKey(for: side), path: item.path)
         let data = (try? JSONEncoder().encode(payload)) ?? Data()
         let provider = NSItemProvider()
@@ -7150,6 +7181,7 @@ public final class DualPaneViewModel: ObservableObject {
     }
     
     public func createDragItemProvider(for item: FileItem, side: PaneSide) -> NSItemProvider {
+        NotificationCenter.default.post(name: Self.cancelLongPressNotification, object: nil)
         let currentSelection = (side == .left) ? leftSelection : rightSelection
         let currentSource = (side == .left) ? leftSource : rightSource
         let currentDir = (side == .left) ? leftPath : rightPath
