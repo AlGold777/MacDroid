@@ -15,11 +15,11 @@
 	<key>CFBundleInfoDictionaryVersion</key>
 	<string>6.0</string>
 	<key>CFBundleName</key>
-	<string>MacDroid Commander 2.1.327</string>
+	<string>MacDroid Commander 2.1.328</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
-	<string>2.1.327</string>
+	<string>2.1.328</string>
 	<key>CFBundleVersion</key>
 	<string>39</string>
 	<key>LSMinimumSystemVersion</key>
@@ -34,5 +34,18 @@
 	<string>MacDroid Commander требует доступ к локальной сети для обнаружения смартфона Xiaomi по Bonjour и безопасного обмена файлами по SFTP.</string>
 	<key>NSSupportsAutomaticGraphicsSwitching</key>
 	<true/>
+	<key>UTExportedTypeDeclarations</key>
+	<array>
+		<dict>
+			<key>UTTypeConformsTo</key>
+			<array>
+				<string>public.data</string>
+			</array>
+			<key>UTTypeDescription</key>
+			<string>MacDroid Commander Drag Item</string>
+			<key>UTTypeIdentifier</key>
+			<string>com.macdroid.dragitem</string>
+		</dict>
+	</array>
 </dict>
 </plist>

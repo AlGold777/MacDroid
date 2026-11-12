@@ -3003,7 +3003,7 @@ public struct TableDoubleClickHandler: NSViewRepresentable {
                         
                         // Если начался Drag & Drop выделенных файлов — гарантируем, что в NSPasteboard drag
                         // записан полный список системных путей/URL для внешних приложений (Finder, Desktop, Telegram и т.д.)
-                        if let vm = self.vm, let payload = vm.currentDragPayload, payload.paths.count > 1 {
+                        if let vm = self.vm, let payload = vm.currentDragPayload, payload.paths.count > 1, payload.sourceKind == "localMac" {
                             vm.populateDragPasteboard(paths: payload.paths, payload: payload)
                         }
                     }
@@ -3754,9 +3754,59 @@ public struct PaneTableDropDelegate: DropDelegate {
         let isMove = NSEvent.modifierFlags.contains(.command)
         SSHTransportLog.write("DND_PERFORM_DROP side=\(side) hasPayload=\(vm.currentDragPayload != nil) targetDir=\(targetDirPath ?? "nil")")
         
+        // 1. Приоритетная проверка внутреннего Drag & Drop (межпанельный или внутри панели)
+        // ВАЖНО: Ни в коем случае НЕ запрашивать info.itemProviders(for: [.fileURL]) ДО этой проверки,
+        // так как AppKit синхронно блокирует главный поток в ожидании загрузки удаленного файла с телефона,
+        // что приводит к полному зависанию (дедлоку) приложения!
         let customUTType = UTType(exportedAs: DualPaneViewModel.dragUTType, conformingTo: .data)
+        let isInternalDrop = info.hasItemsConforming(to: [customUTType])
+            || info.hasItemsConforming(to: [DualPaneViewModel.dragUTType])
+            || (NSPasteboard(name: .drag).types?.contains(NSPasteboard.PasteboardType(DualPaneViewModel.dragUTType)) ?? false)
+        let hasInternalPayload = vm.consumeInternalDragPayload(isInternalDrop: isInternalDrop)
+        
+        if hasInternalPayload {
+            if isBlockedReorderDrop {
+                vm.currentDragPayload = nil
+                return true
+            }
+
+            // Dropping a file onto another row in the same pane means manual reorder.
+            // Folder targets continue through the normal transfer path below.
+            if vm.canReorderFiles(in: side),
+               let payload = vm.currentDragPayload,
+               payload.paths.count == 1,
+               items.contains(where: { $0.path == payload.paths[0] }),
+               payload.sourceSide == (side == .left ? "left" : "right"),
+               payload.sourceKind == (((side == .left ? vm.leftSource : vm.rightSource) == .localMac) ? "localMac" : "remotePhone"),
+               (payload.sourceDirPath as NSString).standardizingPath == ((side == .left ? vm.leftPath : vm.rightPath) as NSString).standardizingPath,
+               targetFolderId == nil,
+               let insertionIndex = targetInsertionIndex,
+               !items.isEmpty {
+                let boundedIndex = min(max(0, insertionIndex), items.count)
+                let target: (path: String, after: Bool)
+                if boundedIndex < items.count {
+                    target = (items[boundedIndex].path, false)
+                } else if let lastItem = items.last {
+                    target = (lastItem.path, true)
+                } else {
+                    target = (payload.paths[0], false)
+                }
+                vm.currentDragPayload = nil
+                vm.reorderFile(
+                    payload.paths[0],
+                    fromDirectoryKey: vm.fileOrderDirectoryKey(for: side),
+                    relativeTo: target.path,
+                    after: target.after,
+                    side: side
+                )
+                return true
+            }
+
+            return vm.handleDroppedProviders([], toSide: side, targetDirPath: targetDirPath, isMove: isMove)
+        }
+
+        // 2. Внешний Drag (Finder, Desktop и др.) - запрашиваем провайдеры только когда внутреннего payload нет
         let utTypes: [UTType] = [
-            customUTType,
             .fileURL,
             .utf8PlainText,
             .plainText,
@@ -3764,58 +3814,6 @@ public struct PaneTableDropDelegate: DropDelegate {
             .item
         ]
         let providers = info.itemProviders(for: utTypes)
-        let isInternalDrop = DualPaneViewModel.providersCarryInternalPayload(providers)
-            || info.hasItemsConforming(to: [DualPaneViewModel.dragUTType])
-        let hasInternalPayload = vm.consumeInternalDragPayload(isInternalDrop: isInternalDrop)
-        if hasInternalPayload && isInternalDrop && isBlockedReorderDrop {
-            vm.currentDragPayload = nil
-            return true
-        }
-
-        // Dropping a file onto another row in the same pane means manual reorder.
-        // Folder targets continue through the normal transfer path below.
-        if hasInternalPayload,
-           isInternalDrop,
-           vm.canReorderFiles(in: side),
-           let payload = vm.currentDragPayload,
-           payload.paths.count == 1,
-           items.contains(where: { $0.path == payload.paths[0] }),
-           payload.sourceSide == (side == .left ? "left" : "right"),
-           payload.sourceKind == (((side == .left ? vm.leftSource : vm.rightSource) == .localMac) ? "localMac" : "remotePhone"),
-           (payload.sourceDirPath as NSString).standardizingPath == ((side == .left ? vm.leftPath : vm.rightPath) as NSString).standardizingPath,
-           targetFolderId == nil,
-           let insertionIndex = targetInsertionIndex,
-           !items.isEmpty {
-            let boundedIndex = min(max(0, insertionIndex), items.count)
-            let target: (path: String, after: Bool)
-            if boundedIndex < items.count {
-                target = (items[boundedIndex].path, false)
-            } else if let lastItem = items.last {
-                target = (lastItem.path, true)
-            } else {
-                target = (payload.paths[0], false)
-            }
-            vm.currentDragPayload = nil
-            vm.reorderFile(
-                payload.paths[0],
-                fromDirectoryKey: vm.fileOrderDirectoryKey(for: side),
-                relativeTo: target.path,
-                after: target.after,
-                side: side
-            )
-            return true
-        }
-
-        // 1. Приоритетный путь для внутреннего Drag & Drop между панелями
-        // Если payload активен, обрабатываем напрямую без запроса провайдеров из AppKit/NSPasteboard,
-        // предотвращая синхронную блокировку главного потока и дедлок.
-        // Внутренний drag опознаём по провайдерам: hasItemsConforming(to:) для нашего нестандартного UTI
-        // возвращает false, и payload сбрасывался до того, как перенос успевал выполниться.
-        // Внешний drop (Finder) сбрасывает устаревший payload и идёт обычным путём (D11).
-        if hasInternalPayload {
-            return vm.handleDroppedProviders([], toSide: side, targetDirPath: targetDirPath, isMove: isMove)
-        }
-
         return vm.handleDroppedProviders(providers, toSide: side, targetDirPath: targetDirPath, isMove: isMove)
     }
     

@@ -7231,14 +7231,12 @@ public final class DualPaneViewModel: ObservableObject {
                     return nil
                 }
             }
-            
-            // Также наполняем системный NSPasteboard drag несколькими файловыми URL для мгновенной совместимости
-            DispatchQueue.main.async { [weak self] in
-                self?.populateDragPasteboard(paths: dragPaths, payload: payload)
-            }
         } else {
             // Для удаленного файла на Android: предзагружаем в локальный кэш DragOut (только для внешних приложений)
-            provider.registerItem(forTypeIdentifier: UTType.fileURL.identifier) { [weak self, orchestrator = self.orchestrator] completionHandler, _, _ in
+            let driver = self.remoteDriver
+            let trans = self.transport
+            let known = (side == .left ? self.leftItems : self.rightItems)
+            provider.registerItem(forTypeIdentifier: UTType.fileURL.identifier) { [orchestrator = self.orchestrator] completionHandler, _, _ in
                 let tempDir = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("MacDroidCommander/DragOut", isDirectory: true)
                 try? FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
                 let localTargetURL = tempDir.appendingPathComponent(item.name)
@@ -7248,25 +7246,25 @@ public final class DualPaneViewModel: ObservableObject {
                         if item.isDirectory {
                             // Рекурсивная выгрузка директории со всем содержимым для внешнего приложения (Finder, Desktop)
                             try FileManager.default.createDirectory(at: localTargetURL, withIntermediateDirectories: true)
-                            let plan = await self?.resolveTransferPlan(
+                            let plan = await DualPaneViewModel.scanRemoteTransferPlan(
                                 paths: [item.path],
-                                fromSource: .remotePhone,
-                                targetBaseDirPath: tempDir.path
+                                targetBaseDirPath: tempDir.path,
+                                remoteDriver: driver,
+                                transport: trans,
+                                knownItems: known
                             )
-                            if let plan = plan {
-                                for dir in plan.directoriesToCreate {
-                                    try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
-                                }
-                                for file in plan.filesToTransfer {
-                                    let subDirURL = URL(fileURLWithPath: file.targetDirPath)
-                                    _ = try? await orchestrator.executeCopyPhoneToMac(
-                                        jobId: UUID().uuidString,
-                                        itemId: UUID().uuidString,
-                                        remotePath: file.sourcePath,
-                                        localTargetDir: subDirURL,
-                                        strategy: .overwrite
-                                    ) { _ in }
-                                }
+                            for dir in plan.directoriesToCreate {
+                                try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+                            }
+                            for file in plan.filesToTransfer {
+                                let subDirURL = URL(fileURLWithPath: file.targetDirPath)
+                                _ = try? await orchestrator.executeCopyPhoneToMac(
+                                    jobId: UUID().uuidString,
+                                    itemId: UUID().uuidString,
+                                    remotePath: file.sourcePath,
+                                    localTargetDir: subDirURL,
+                                    strategy: .overwrite
+                                ) { _ in }
                             }
                         } else {
                             try await orchestrator.executeCopyPhoneToMac(
@@ -7292,18 +7290,27 @@ public final class DualPaneViewModel: ObservableObject {
             completionHandler?(text as NSString, nil)
         }
         
+        // Наполняем системный NSPasteboard drag
+        DispatchQueue.main.async { [weak self] in
+            self?.populateDragPasteboard(paths: dragPaths, payload: payload)
+        }
+        
         return provider
     }
     
     /// Заполняет drag pasteboard системными URL всех перетаскиваемых файлов, сохраняя внутренний payload
     public func populateDragPasteboard(paths: [String], payload: DragPayload? = nil) {
         guard !paths.isEmpty else { return }
+        let payload = payload ?? self.currentDragPayload
         let dragPB = NSPasteboard(name: .drag)
-        let urls = paths.map { NSURL(fileURLWithPath: $0) }
-        dragPB.clearContents()
-        dragPB.writeObjects(urls)
         
-        if let payload = payload ?? self.currentDragPayload,
+        if payload?.sourceKind == "localMac" {
+            let urls = paths.map { NSURL(fileURLWithPath: $0) }
+            dragPB.clearContents()
+            dragPB.writeObjects(urls)
+        }
+        
+        if let payload = payload,
            let data = try? JSONEncoder().encode(payload) {
             let customType = NSPasteboard.PasteboardType(DualPaneViewModel.dragUTType)
             dragPB.addTypes([customType], owner: nil)
@@ -8295,6 +8302,29 @@ public final class DualPaneViewModel: ObservableObject {
             }.value
         }
         
+        let driver = self.remoteDriver
+        let transport = self.transport
+        let known = self.leftItems + self.rightItems
+        return await Task.detached(priority: .userInitiated) {
+            await DualPaneViewModel.scanRemoteTransferPlan(
+                paths: paths,
+                targetBaseDirPath: targetBaseDirPath,
+                remoteDriver: driver,
+                transport: transport,
+                knownItems: known
+            )
+        }.value
+    }
+    
+    /// План передачи для удаленных источников (Android/SFTP). Выполняется вне MainActor,
+    /// исключая блокировку главного потока при Drag & Drop и сканировании папок.
+    nonisolated public static func scanRemoteTransferPlan(
+        paths: [String],
+        targetBaseDirPath: String,
+        remoteDriver: RemoteSFTPDriver,
+        transport: TransportMultiplexer,
+        knownItems: [FileItem] = []
+    ) async -> (directoriesToCreate: [String], filesToTransfer: [TransferPlanItem], sourceFoldersToDeleteOnMove: [String], skippedFolders: [(path: String, reason: String)]) {
         var directoriesToCreate: [String] = []
         var filesToTransfer: [TransferPlanItem] = []
         var sourceFoldersToDeleteOnMove: [String] = []
@@ -8307,18 +8337,17 @@ public final class DualPaneViewModel: ObservableObject {
             let normPath = path.precomposedStringWithCanonicalMapping
             
             var remoteStatSize: UInt64? = nil
-            let allSourceItems = leftItems + rightItems
-            if let item = allSourceItems.first(where: {
+            if let item = knownItems.first(where: {
                 $0.id == path || $0.path == path ||
                 $0.path.precomposedStringWithCanonicalMapping == normPath ||
                 $0.path.trimmingCharacters(in: CharacterSet(charactersIn: "/")) == cleanPath
             }) {
                 isDir = item.isDirectory
                 remoteStatSize = item.size
-            } else if let stat = try? await self.transport.prepareRead(actionId: UUID().uuidString, path: path) {
+            } else if let stat = try? await transport.prepareRead(actionId: UUID().uuidString, path: path) {
                 isDir = stat.isDirectory
                 remoteStatSize = stat.size
-            } else if let _ = try? await self.remoteDriver.listDirectory(at: path) {
+            } else if let _ = try? await remoteDriver.listDirectory(at: path) {
                 isDir = true
             }
             

@@ -56,15 +56,18 @@ public final class DeviceRegistry: @unchecked Sendable {
     private let lock = NSLock()
     private var devices: [String: TrustedDevice] = [:]
     private let storageURL: URL
+    private let isCustomStorage: Bool
     
     public init(storageURL: URL? = nil) {
         if let customURL = storageURL {
             self.storageURL = customURL
+            self.isCustomStorage = true
         } else {
             let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
             let dir = appSupport.appendingPathComponent("MacDroidCommander", isDirectory: true)
             try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
             self.storageURL = dir.appendingPathComponent("trusted_devices.json")
+            self.isCustomStorage = false
         }
         load()
         migrateLegacyDataIfNeeded()
@@ -285,6 +288,7 @@ public final class DeviceRegistry: @unchecked Sendable {
     private func migrateLegacyDataIfNeeded() {
         lock.lock()
         defer { lock.unlock() }
+        guard !isCustomStorage else { return }
         if !devices.isEmpty { return }
         
         // Миграция из UserDefaults phoneConnectionHistory

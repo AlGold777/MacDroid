@@ -1488,7 +1488,9 @@ public struct FileGridCell: View {
         let isMove = NSEvent.modifierFlags.contains(.command)
         let targetDir = item.isDirectory ? item.path : nil
         SSHTransportLog.write("DND_GRID_FOLDER_DROP side=\(side) folder=\(item.name) hasPayload=\(vm.currentDragPayload != nil)")
-        if vm.consumeInternalDragPayload(isInternalDrop: DualPaneViewModel.providersCarryInternalPayload(providers)) {
+        let isInternalDrop = DualPaneViewModel.providersCarryInternalPayload(providers)
+            || (NSPasteboard(name: .drag).types?.contains(NSPasteboard.PasteboardType(DualPaneViewModel.dragUTType)) ?? false)
+        if vm.consumeInternalDragPayload(isInternalDrop: isInternalDrop) {
             return vm.handleDroppedProviders([], toSide: side, targetDirPath: targetDir, isMove: isMove)
         }
         return vm.handleDroppedProviders(providers, toSide: side, targetDirPath: targetDir, isMove: isMove)
@@ -1703,9 +1705,18 @@ public struct FileGridDropDelegate: DropDelegate {
         let isMove = NSEvent.modifierFlags.contains(.command)
         SSHTransportLog.write("DND_GRID_PERFORM_DROP side=\(side) hasPayload=\(vm.currentDragPayload != nil) targetDir=\(targetDirPath ?? "nil")")
         
+        // 1. Приоритетная проверка внутреннего Drag & Drop (межпанельный или внутри панели)
         let customUTType = UTType(exportedAs: DualPaneViewModel.dragUTType, conformingTo: .data)
+        let isInternalDrop = info.hasItemsConforming(to: [customUTType])
+            || info.hasItemsConforming(to: [DualPaneViewModel.dragUTType])
+            || (NSPasteboard(name: .drag).types?.contains(NSPasteboard.PasteboardType(DualPaneViewModel.dragUTType)) ?? false)
+
+        if vm.consumeInternalDragPayload(isInternalDrop: isInternalDrop) {
+            return vm.handleDroppedProviders([], toSide: side, targetDirPath: targetDirPath, isMove: isMove)
+        }
+
+        // 2. Внешний Drag (Finder, Desktop и др.)
         let utTypes: [UTType] = [
-            customUTType,
             .fileURL,
             .utf8PlainText,
             .plainText,
@@ -1713,19 +1724,6 @@ public struct FileGridDropDelegate: DropDelegate {
             .item
         ]
         let providers = info.itemProviders(for: utTypes)
-
-        // 1. Приоритетный путь для внутреннего Drag & Drop между панелями
-        // Если payload активен, обрабатываем напрямую без запроса провайдеров из AppKit/NSPasteboard,
-        // предотвращая синхронную блокировку главного потока и дедлок.
-        // Внутренний drag опознаём по провайдерам: hasItemsConforming(to:) для нашего нестандартного UTI
-        // возвращает false, и payload сбрасывался до того, как перенос успевал выполниться.
-        // Внешний drop (Finder) сбрасывает устаревший payload и идёт обычным путём (D11).
-        let isInternalDrop = DualPaneViewModel.providersCarryInternalPayload(providers)
-            || info.hasItemsConforming(to: [DualPaneViewModel.dragUTType])
-        if vm.consumeInternalDragPayload(isInternalDrop: isInternalDrop) {
-            return vm.handleDroppedProviders([], toSide: side, targetDirPath: targetDirPath, isMove: isMove)
-        }
-
         return vm.handleDroppedProviders(providers, toSide: side, targetDirPath: targetDirPath, isMove: isMove)
     }
 }

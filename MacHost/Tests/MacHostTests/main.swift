@@ -504,6 +504,8 @@ func runTest52() async {
     assertCondition(provider.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier), "Provider conforms to UTType.fileURL for external apps")
     
     // 2. Perform drop onto Mac side via fast path without deadlock
+    let isInternal = (NSPasteboard(name: .drag).types?.contains(NSPasteboard.PasteboardType(DualPaneViewModel.dragUTType)) ?? false) || provider.hasItemConformingToTypeIdentifier(DualPaneViewModel.dragUTType)
+    assertCondition(vm.consumeInternalDragPayload(isInternalDrop: isInternal) == true, "consumeInternalDragPayload recognizes internal drop from phone")
     let handled = vm.handleDroppedProviders([], toSide: .left, targetDirPath: destDir.path, isMove: false)
     assertCondition(handled == true, "handleDroppedProviders successfully accepts drop")
     assertCondition(vm.currentDragPayload == nil, "currentDragPayload is consumed and reset after drop")
@@ -3285,7 +3287,7 @@ func runAllAsyncTests() async {
             let observer = NotificationCenter.default.addObserver(
                 forName: DualPaneViewModel.cancelLongPressNotification,
                 object: nil,
-                queue: .main
+                queue: nil
             ) { _ in
                 notificationReceived = true
             }
