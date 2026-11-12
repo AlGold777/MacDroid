@@ -356,8 +356,10 @@ public final class SessionCoordinator: @unchecked Sendable {
             "-o", "IdentitiesOnly=yes",
             "-o", "BatchMode=yes",
             "-o", "ConnectTimeout=5",
-            "-o", "ServerAliveInterval=10",
-            "-o", "ServerAliveCountMax=2",
+            // Телефон со спящим Wi-Fi молчит дольше 20–30 с и возвращается сам:
+            // разрыв только после минуты тишины (4 пропущенных ответа по 15 с).
+            "-o", "ServerAliveInterval=15",
+            "-o", "ServerAliveCountMax=4",
             "-o", "LogLevel=VERBOSE",
             "-o", "Compression=no",
             "-o", "IPQoS=throughput",

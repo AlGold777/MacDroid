@@ -956,11 +956,14 @@ public final class PhoneConnectionManager: @unchecked Sendable {
     public func fetchHostKeyObservation(host: String, port: UInt16) -> SSHHostKeyObservation? {
         let probe = NetworkPortReachability.probePort(host: host, port: port, timeoutMs: 1000)
         if !probe.isOpen {
-            // Измерение: при отказе для адреса своей подсети та же проба дочерним процессом.
-            if LocalNetworkStatus.isOnMacSubnet(host), !host.hasPrefix("127.") {
-                _ = LocalNetworkStatus.childProbe(host: host, port: port)
+            // Отказ собственной пробы для адреса своей подсети перепроверяется дочерним nc:
+            // macOS может отклонять сокеты приложения, а ssh-keyscan и ssh при этом проходят.
+            let norm = ConnectionHostAddress.normalized(host)
+            guard NetworkPortReachability.needsChildCrossCheck(probe, host: norm),
+                  LocalNetworkStatus.childProbe(host: norm, port: port) == true else {
+                return nil
             }
-            return nil
+            NetworkPortReachability.logAppSocketDenied(host: norm, port: port, probe: probe)
         }
         
         let keyscanProc = Process()
@@ -1030,6 +1033,6 @@ public final class PhoneConnectionManager: @unchecked Sendable {
     
     /// Быстрая неблокирующая проверка доступности сетевого порта хоста (для проверки Wi-Fi связи)
     public func isHostPortReachable(host: String, port: UInt16, timeoutSeconds: Int = 1) -> Bool {
-        return NetworkPortReachability.isPortOpen(host: host, port: port, timeoutMs: timeoutSeconds * 1000)
+        return NetworkPortReachability.isPortReachable(host: host, port: port, timeoutMs: timeoutSeconds * 1000)
     }
 }

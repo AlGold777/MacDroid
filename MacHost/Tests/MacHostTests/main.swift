@@ -5958,6 +5958,24 @@ func runTest63() async {
         let subnetHosts = NetworkPortReachability.localSubnetHosts()
         assertCondition(subnetHosts.count <= 254 * 4, "Subnet enumeration is capped to /24 per interface (got \(subnetHosts.count))")
         assertCondition(subnetHosts.allSatisfy { ConnectionHostAddress.isIPv4($0) && !$0.hasPrefix("127.") }, "Subnet enumeration yields only non-loopback IPv4 hosts")
+
+        // Отказ собственной пробы перепроверяется дочерним процессом только для адресов своей подсети
+        let denied = NetworkPortReachability.ProbeResult(isOpen: false, stage: "connect", errno: EHOSTUNREACH, durationMs: 0)
+        let refused = NetworkPortReachability.ProbeResult(isOpen: false, stage: "so_error", errno: ECONNREFUSED, durationMs: 3)
+        let timedOut = NetworkPortReachability.ProbeResult(isOpen: false, stage: "timeout", errno: ETIMEDOUT, durationMs: 1000)
+        let opened = NetworkPortReachability.ProbeResult(isOpen: true, stage: "ok", errno: 0, durationMs: 1)
+        assertCondition(!NetworkPortReachability.needsChildCrossCheck(denied, host: "127.0.0.1"), "Loopback denial is not cross-checked")
+        assertCondition(!NetworkPortReachability.needsChildCrossCheck(denied, host: "203.0.113.7"), "Foreign-subnet denial is not cross-checked")
+        assertCondition(!NetworkPortReachability.needsChildCrossCheck(denied, host: "-oProxyCommand=x"), "Non-IPv4 host never reaches nc")
+        if let ownHost = subnetHosts.first {
+            assertCondition(NetworkPortReachability.needsChildCrossCheck(denied, host: ownHost), "Immediate denial on own subnet is cross-checked")
+            assertCondition(NetworkPortReachability.needsChildCrossCheck(timedOut, host: ownHost), "Timeout on own subnet is cross-checked")
+            assertCondition(!NetworkPortReachability.needsChildCrossCheck(refused, host: ownHost), "ECONNREFUSED is the host's own answer")
+            assertCondition(!NetworkPortReachability.needsChildCrossCheck(opened, host: ownHost), "Open port needs no cross-check")
+        }
+        assertCondition(NetworkPortReachability.shouldRescanWithChild(total: 254, deniedImmediately: 254), "All-denied scan is repeated with nc")
+        assertCondition(!NetworkPortReachability.shouldRescanWithChild(total: 254, deniedImmediately: 3), "Ordinary empty scan is not repeated")
+        assertCondition(!NetworkPortReachability.shouldRescanWithChild(total: 0, deniedImmediately: 0), "Empty host list is not rescanned")
     }
 
         // 67. Deterministic Wi-Fi PHONE search races, identity, ports and cancellation

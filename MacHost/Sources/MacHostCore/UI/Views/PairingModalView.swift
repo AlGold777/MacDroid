@@ -595,7 +595,7 @@ public struct PairingModalView: View {
         let norm = ConnectionHostAddress.normalized(host)
         guard !norm.isEmpty else { return }
         Task.detached(priority: .userInitiated) {
-            let ok = NetworkPortReachability.isPortOpen(host: norm, port: 2222, timeoutMs: 250)
+            let ok = NetworkPortReachability.isPortReachable(host: norm, port: 2222, timeoutMs: 250)
             await MainActor.run {
                 if ok {
                     self.reachableHosts.insert(norm)

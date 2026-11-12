@@ -103,6 +103,38 @@ public enum NetworkPortReachability {
         probePort(host: host, port: port, timeoutMs: timeoutMs).isOpen
     }
 
+    /// Нужна ли перепроверка дочерним процессом: отказ собственной пробы для адреса своей подсети
+    /// не доказывает, что телефон молчит, — macOS может отклонять сокеты самого приложения
+    /// («Локальная сеть»), а /usr/bin/nc и /usr/bin/ssh при этом проходят.
+    /// ECONNREFUSED — ответ самого узла, ему верим.
+    static func needsChildCrossCheck(_ probe: ProbeResult, host: String) -> Bool {
+        let norm = ConnectionHostAddress.normalized(host)
+        guard !probe.isOpen, probe.errno != ECONNREFUSED,
+              ConnectionHostAddress.isIPv4(norm), !norm.hasPrefix("127.") else { return false }
+        return LocalNetworkStatus.isOnMacSubnet(norm)
+    }
+
+    /// Проверка порта для решения «подключаться или нет»: собственная проба, а при её отказе
+    /// для адреса своей подсети — та же проба через /usr/bin/nc. Подключение идёт через ssh,
+    /// тоже дочерний процесс, поэтому запрет сокетов приложения его не касается.
+    public static func isPortReachable(host: String, port: UInt16 = 2222, timeoutMs: Int = 1000) -> Bool {
+        let probe = probePort(host: host, port: port, timeoutMs: timeoutMs)
+        if probe.isOpen { return true }
+        guard needsChildCrossCheck(probe, host: host) else { return false }
+        let norm = ConnectionHostAddress.normalized(host)
+        guard LocalNetworkStatus.childProbe(host: norm, port: port) == true else { return false }
+        logAppSocketDenied(host: norm, port: port, probe: probe)
+        return true
+    }
+
+    static func logAppSocketDenied(host: String, port: UInt16, probe: ProbeResult) {
+        SSHTransportLog.event(
+            key: "appdenied \(host):\(port)",
+            signature: "\(probe.stage)/\(probe.errno)",
+            "APP_SOCKET_DENIED \(host):\(port) проба приложения: этап=\(probe.stage) errno=\(probe.errnoName), nc: открыт — подключение через ssh"
+        )
+    }
+
     /// Параллельная неблокирующая проверка доступности порта для группы хостов
     public static func checkReachableHosts(hosts: [String], port: UInt16 = 2222, timeoutMs: Int = 250) async -> Set<String> {
         let uniqueHosts = Array(Set(hosts.compactMap { host -> String? in
@@ -154,6 +186,47 @@ public enum NetworkPortReachability {
             key: "scan \(port)",
             signature: "\(unique.count)/\(open.sorted())/\(errors)",
             "SCAN порт=\(port) адресов=\(unique.count) открыто=\(open.sorted()) отказ_сразу_errno=[\(errors)] \(ms)мс"
+        )
+        // Большинство адресов отклонено сразу и ничего не открыто: сокеты приложения запрещены.
+        // Повторяем скан дочерними процессами nc.
+        let denied = immediateErrors.values.reduce(0, +)
+        if open.isEmpty, shouldRescanWithChild(total: unique.count, deniedImmediately: denied), !Task.isCancelled {
+            open = childScanOpenPort(hosts: unique, port: port)
+        }
+        return open
+    }
+
+    static func shouldRescanWithChild(total: Int, deniedImmediately: Int) -> Bool {
+        total > 0 && deniedImmediately * 2 >= total
+    }
+
+    /// Скан порта дочерними процессами /usr/bin/nc (до 48 одновременно, 1 с на адрес).
+    static func childScanOpenPort(hosts: [String], port: UInt16) -> Set<String> {
+        let targets = hosts.filter { !$0.hasPrefix("127.") && ConnectionHostAddress.isIPv4($0) }
+        guard !targets.isEmpty else { return [] }
+        let started = DispatchTime.now().uptimeNanoseconds
+        let lock = NSLock()
+        var open = Set<String>()
+        let queue = OperationQueue()
+        queue.maxConcurrentOperationCount = 48
+        for host in targets {
+            queue.addOperation {
+                let (status, _) = PhoneConnectionManager.shared.runCommand(
+                    executable: "/usr/bin/nc",
+                    arguments: ["-z", "-G", "1", "-w", "1", host, String(port)],
+                    timeoutSeconds: 3
+                )
+                if status == 0 {
+                    lock.lock(); open.insert(host); lock.unlock()
+                }
+            }
+        }
+        queue.waitUntilAllOperationsAreFinished()
+        let ms = Int((DispatchTime.now().uptimeNanoseconds - started) / 1_000_000)
+        SSHTransportLog.event(
+            key: "childscan \(port)",
+            signature: "\(targets.count)/\(open.sorted())",
+            "CHILD_SCAN nc порт=\(port) адресов=\(targets.count) открыто=\(open.sorted()) \(ms)мс"
         )
         return open
     }
