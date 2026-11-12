@@ -335,6 +335,8 @@ class FileDaemonService : Service() {
         server = null
         boundHost = null
         isServerListening = false
+        // Остановка сервера закрывает все сессии: блокировки сна больше не нужны
+        releaseTransferLocks()
     }
 
     private fun registerDiscoveryLocked() {
@@ -371,14 +373,21 @@ class FileDaemonService : Service() {
         }
     }
 
-    /** Wi-Fi lock и WakeLock берутся на первую активную сессию и отпускаются на последней. */
+    /**
+     * Wi-Fi lock и WakeLock берутся на первую активную сессию и отпускаются на последней
+     * (а также при остановке сервера и службы). Срока у WakeLock нет: с 30-минутным сроком
+     * простаивающая сессия теряла его и рвалась по молчанию, когда телефон засыпал.
+     * Зависшую сессию sshd закрывает сам по idle-timeout, после чего блокировки отпускаются.
+     */
     private fun acquireTransferLocks() {
         val pm = getSystemService(POWER_SERVICE) as PowerManager
         if (wakeLock == null) {
             wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "MacDroid::TransferLock")
         }
-        if (wakeLock?.isHeld == false) {
-            wakeLock?.acquire(30 * 60 * 1000L) // до 30 мин на сессию активной передачи
+        val wasHeld = wakeLock?.isHeld == true
+        if (!wasHeld) {
+            @Suppress("WakelockTimeout")
+            wakeLock?.acquire()
         }
         if (wifiLock == null) {
             wifiLock = (applicationContext.getSystemService(WIFI_SERVICE) as? WifiManager)
@@ -388,9 +397,11 @@ class FileDaemonService : Service() {
         if (wifiLock?.isHeld == false) {
             wifiLock?.acquire()
         }
+        if (!wasHeld) DaemonLog.write(this, "Блокировки сна взяты: открыта сессия")
     }
 
     private fun releaseTransferLocks() {
+        if (wakeLock?.isHeld == true) DaemonLog.write(this, "Блокировки сна отпущены")
         wakeLock?.let {
             if (it.isHeld) it.release()
         }
