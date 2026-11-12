@@ -872,11 +872,11 @@ public final class PhoneConnectionManager: @unchecked Sendable {
             ?? defaults.string(forKey: "lastSuccessfulPhoneHost").flatMap {
                 DeviceRegistry.shared.device(matchingHost: $0)?.id
             }
-        return await WiFiPhoneSearch.search(
+        let result = await WiFiPhoneSearch.search(
             deep: deep,
             preferredDeviceId: preferred,
             candidates: {
-                self.knownWifiCandidates(defaultPort: port).filter { !excludedHosts.contains($0.endpoint.host) }
+                self.searchCandidates(deep: deep, port: port, excludedHosts: excludedHosts)
             },
             fallbackCandidates: {
                 guard !Task.isCancelled else { return [] }
@@ -904,11 +904,64 @@ public final class PhoneConnectionManager: @unchecked Sendable {
                 return .paired(pinKey: pinKey, name: name)
             }
         )
+        let outcome: String
+        switch result {
+        case .paired(let host, let foundPort, _, let name): outcome = "найден \(name) \(host):\(foundPort)"
+        case .unpaired(let hosts): outcome = "не сопряжён \(hosts)"
+        case .notFound: outcome = "не найден"
+        }
+        SSHTransportLog.event(key: "search \(deep)", signature: outcome,
+                              "SEARCH \(deep ? "по кнопке" : "фон") результат=\(outcome) сети_Mac=\(LocalNetworkStatus.macSubnetsDescription())")
+        return result
+    }
+
+    /// Кандидаты поиска. Адрес вне подсетей Mac — старый маршрут из истории: пакет уйдёт через шлюз
+    /// в чужую сеть и повиснет до таймаута. Такие адреса не опрашиваются; адрес из Bonjour проверяется всегда.
+    private func searchCandidates(deep: Bool, port: UInt16, excludedHosts: Set<String>) -> [WiFiSearchCandidate] {
+        let all = knownWifiCandidates(defaultPort: port)
+        var kept: [WiFiSearchCandidate] = []
+        var foreign: [String] = []
+        var paused: [String] = []
+        for candidate in all {
+            let host = candidate.endpoint.host
+            if excludedHosts.contains(host) {
+                paused.append(host)
+            } else if !candidate.isBonjour && !LocalNetworkStatus.isOnMacSubnet(host) {
+                foreign.append(host)
+            } else {
+                kept.append(candidate)
+            }
+        }
+        let keptHosts = kept.map { $0.endpoint.host }
+        SSHTransportLog.event(
+            key: "candidates \(deep)",
+            signature: "\(keptHosts)|\(foreign)|\(paused)",
+            "CANDIDATES \(deep ? "по кнопке" : "фон") опрос=\(keptHosts) пропуск_чужая_сеть=\(foreign) пропуск_пауза=\(paused) сети_Mac=\(LocalNetworkStatus.macSubnetsDescription())"
+        )
+        return kept
+    }
+
+    /// Известные адреса телефонов, которые сейчас вне подсетей Mac (для сообщения «телефон в другой сети Wi-Fi»).
+    public func knownHostsOutsideMacSubnets() -> [String] {
+        knownWifiCandidates().filter { !$0.isBonjour && !LocalNetworkStatus.isOnMacSubnet($0.endpoint.host) }
+            .map { $0.endpoint.host }
+    }
+
+    /// Известные адреса телефонов в подсетях Mac.
+    public func knownHostsOnMacSubnets() -> [String] {
+        knownWifiCandidates().filter { LocalNetworkStatus.isOnMacSubnet($0.endpoint.host) }.map { $0.endpoint.host }
     }
 
     /// Получает ключ через ssh-keyscan и возвращает строку known_hosts для строгой проверки самой SSH-сессии.
     public func fetchHostKeyObservation(host: String, port: UInt16) -> SSHHostKeyObservation? {
-        guard isHostPortReachable(host: host, port: port, timeoutSeconds: 1) else { return nil }
+        let probe = NetworkPortReachability.probePort(host: host, port: port, timeoutMs: 1000)
+        if !probe.isOpen {
+            // Измерение: при отказе для адреса своей подсети та же проба дочерним процессом.
+            if LocalNetworkStatus.isOnMacSubnet(host), !host.hasPrefix("127.") {
+                _ = LocalNetworkStatus.childProbe(host: host, port: port)
+            }
+            return nil
+        }
         
         let keyscanProc = Process()
         keyscanProc.executableURL = URL(fileURLWithPath: "/usr/bin/ssh-keyscan")

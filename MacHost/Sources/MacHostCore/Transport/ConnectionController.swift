@@ -82,10 +82,41 @@ public final class ConnectionController: ObservableObject {
         isExplicitUserAction: Bool = false,
         viewModel: DualPaneViewModel
     ) async -> Bool {
+        let started = Date()
+        let success = await performConnect(
+            targetCandidate: targetCandidate,
+            customHost: customHost,
+            customPort: customPort,
+            preferredDeviceId: preferredDeviceId,
+            isExplicitUserAction: isExplicitUserAction,
+            viewModel: viewModel
+        )
+        let outcome: String
+        switch phase {
+        case .connected(let path, let name): outcome = "подключено \(name) \(path.displayString)"
+        case .authFailed(let reason): outcome = "отказ доверия: \(reason)"
+        case .disconnected(let reason): outcome = "отказ: \(reason ?? "без причины")"
+        case .connecting, .discovering: outcome = success ? "подключено" : "попытка заменена новой"
+        }
+        let diagnostics = success || lastConnectionDiagnostics.isEmpty ? "" : " подробности=\(lastConnectionDiagnostics.suffix(300))"
+        SSHTransportLog.write("CONNECT итог=\(outcome) \(String(format: "%.1f", Date().timeIntervalSince(started)))с\(diagnostics)")
+        return success
+    }
+
+    private func performConnect(
+        targetCandidate: CandidatePath?,
+        customHost: String?,
+        customPort: UInt16?,
+        preferredDeviceId: String?,
+        isExplicitUserAction: Bool,
+        viewModel: DualPaneViewModel
+    ) async -> Bool {
         if isExplicitUserAction {
             isManualDisconnectSuppressed = false
         } else if isManualDisconnectSuppressed {
             // Фоновое автоподключение блокируется подавлением ручного отключения
+            SSHTransportLog.event(key: "connect-skip", signature: "manual",
+                                  "CONNECT пропуск: телефон отключён вручную, автоподключение ждёт кнопку PHONE")
             return false
         }
         
@@ -98,6 +129,7 @@ public final class ConnectionController: ObservableObject {
         
         let targetDesc = targetCandidate?.displayString ?? customHost ?? "авто"
         phase = .connecting(attemptId: attemptId, target: targetDesc)
+        SSHTransportLog.write("CONNECT начало цель=\(targetDesc) \(isExplicitUserAction ? "по кнопке" : "авто")")
         if isExplicitUserAction {
             viewModel.statusMessage = "Поиск и проверка доступности устройства (\(targetDesc))..."
         }

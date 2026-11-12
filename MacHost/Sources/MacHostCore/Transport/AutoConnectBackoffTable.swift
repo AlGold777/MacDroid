@@ -63,12 +63,16 @@ public struct AutoConnectBackoffTable: Sendable {
         entry.failures += 1
         entry.nextAttemptAt = now.addingTimeInterval(Self.pause(afterFailures: entry.failures))
         entries[key] = entry
+        SSHTransportLog.event(key: "autoconnect-pause \(key)", signature: "\(Int(Self.pause(afterFailures: entry.failures)))",
+                              "AUTOCONNECT пауза ключ=\(key) неудач=\(entry.failures) пауза=\(Int(Self.pause(afterFailures: entry.failures)))с")
     }
 
     public mutating func suppress(_ key: String) {
         var entry = entries[key] ?? Entry()
         entry.suppressed = true
         entries[key] = entry
+        SSHTransportLog.event(key: "autoconnect-pause \(key)", signature: "suppressed",
+                              "AUTOCONNECT пропуск ключ=\(key): ошибка доверия, до ручного подключения")
     }
 
     /// Успешное подключение по ключу: запись полностью убирается.

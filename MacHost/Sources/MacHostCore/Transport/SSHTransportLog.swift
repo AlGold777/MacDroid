@@ -27,6 +27,28 @@ enum SSHTransportLog {
         write(message())
     }
 
+    private static let throttleLock = NSLock()
+    private static var throttled: [String: (signature: String, at: Date, skipped: Int)] = [:]
+
+    /// Событие диагностики связи: одна строка на событие, одинаковый результат по одному ключу —
+    /// не чаще раза в `interval` секунд. Смена результата пишется сразу; пропущенные повторы считаются.
+    static func event(key: String, signature: String, interval: TimeInterval = 60, _ message: @autoclosure () -> String) {
+        let now = Date()
+        throttleLock.lock()
+        var repeats = 0
+        if let last = throttled[key], last.signature == signature, now.timeIntervalSince(last.at) < interval {
+            throttled[key] = (signature, last.at, last.skipped + 1)
+            throttleLock.unlock()
+            return
+        } else if let last = throttled[key], last.signature == signature {
+            repeats = last.skipped
+        }
+        if throttled.count > 2000 { throttled.removeAll() }
+        throttled[key] = (signature, now, 0)
+        throttleLock.unlock()
+        write(repeats > 0 ? "\(message()) повторов=\(repeats)" : message())
+    }
+
     static func write(_ message: String) {
         lock.lock()
         defer { lock.unlock() }

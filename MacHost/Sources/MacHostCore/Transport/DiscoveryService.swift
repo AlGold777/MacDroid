@@ -105,6 +105,7 @@ public final class DiscoveryService: ObservableObject {
         newBrowser.stateUpdateHandler = { [weak self] state in
             Task { @MainActor [weak self] in
                 guard let self, self.discoveryGeneration == generation else { return }
+                Self.logBrowserState(state)
                 switch state {
                 case .failed, .cancelled:
                     self.stopDiscovery()
@@ -124,6 +125,22 @@ public final class DiscoveryService: ObservableObject {
         newBrowser.start(queue: .main)
     }
     
+    /// Последнее состояние NWBrowser: `.waiting` с PolicyDenied означает запрет «Локальная сеть».
+    nonisolated(unsafe) public private(set) static var lastBrowserError: String?
+
+    nonisolated private static func logBrowserState(_ state: NWBrowser.State) {
+        let text: String
+        switch state {
+        case .setup: text = "setup"
+        case .ready: text = "ready"; lastBrowserError = nil
+        case .cancelled: text = "cancelled"
+        case .waiting(let error): text = "waiting ошибка=\(error)"; lastBrowserError = "\(error)"
+        case .failed(let error): text = "failed ошибка=\(error)"; lastBrowserError = "\(error)"
+        @unknown default: text = "unknown"
+        }
+        SSHTransportLog.event(key: "nwbrowser", signature: text, "NWBROWSER состояние=\(text)")
+    }
+
     private func scheduleSearchTimeout(generation: UInt64) {
         searchTimer?.cancel()
         searchTimer = Task { @MainActor [weak self] in
@@ -142,6 +159,11 @@ public final class DiscoveryService: ObservableObject {
             return (result.endpoint, name, serviceId)
         }
         let currentIds = Set(services.map { $0.2 })
+        SSHTransportLog.event(
+            key: "bonjour-results",
+            signature: currentIds.sorted().joined(separator: "|"),
+            "BONJOUR сервисов=\(currentIds.count) \(services.map { $0.1 }.sorted())"
+        )
         activeServiceIds = currentIds
         let removed = pendingServiceResolutions.filter { !currentIds.contains($0.key) }
         for (serviceId, resolutionId) in removed {
@@ -240,7 +262,14 @@ public final class DiscoveryService: ObservableObject {
                     }
                 }
                 
+            case .waiting(let error):
+                SSHTransportLog.event(key: "bonjour-resolve \(serviceId)", signature: "waiting \(error)",
+                                      "BONJOUR_RESOLVE \(name) ожидание ошибка=\(error)")
             case .failed, .cancelled:
+                if case .failed(let error) = state {
+                    SSHTransportLog.event(key: "bonjour-resolve \(serviceId)", signature: "failed \(error)",
+                                          "BONJOUR_RESOLVE \(name) отказ ошибка=\(error)")
+                }
                 conn.stateUpdateHandler = nil
                 conn.cancel()
                 Task { @MainActor [weak self] in
@@ -275,6 +304,8 @@ public final class DiscoveryService: ObservableObject {
               ConnectionHostAddress.isIPv4(host) else { return }
 
         let device = DiscoveredDevice(id: serviceId, name: name, host: host, port: port)
+        SSHTransportLog.event(key: "bonjour-resolve \(serviceId)", signature: "\(host):\(port)",
+                              "BONJOUR_RESOLVE \(name) адрес=\(host):\(port)")
         let previous = discoveredDevices.first(where: { $0.id == device.id })
         if let index = discoveredDevices.firstIndex(where: { $0.id == device.id }) {
             discoveredDevices[index] = device
