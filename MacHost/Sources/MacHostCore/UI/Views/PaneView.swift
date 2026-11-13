@@ -940,7 +940,13 @@ public struct PaneView: View {
         let isHoverFolder = (item.isDirectory && vm.dragHoverSide == side && vm.dragHoverFolderId == item.id)
 
         HStack(spacing: 6) {
-            if vm.canReorderFiles(in: side) {
+            if vm.isFilePinned(item, side: side) {
+                Image(systemName: "lock.fill")
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundColor(.secondary.opacity(0.7))
+                    .frame(width: 12)
+                    .help("Закреплённый файл")
+            } else if vm.canReorderFiles(in: side) {
                 Image(systemName: "line.3.horizontal")
                     .font(.system(size: 10, weight: .medium))
                     .foregroundColor(.secondary.opacity(0.7))
@@ -1019,12 +1025,6 @@ public struct PaneView: View {
                 comparisonBadge(for: item.name)
             }
             Spacer(minLength: 0)
-            Image(systemName: "lock.fill")
-                .font(.system(size: 10))
-                .foregroundColor(.secondary.opacity(0.55))
-                .opacity(vm.isFilePinned(item, side: side) ? 1 : 0)
-                .frame(width: 16)
-                .help(vm.isFilePinned(item, side: side) ? "Закреплённый файл" : "")
         }
         .padding(.vertical, 2)
         .padding(.leading, 6)
@@ -1034,6 +1034,7 @@ public struct PaneView: View {
             UnevenRoundedRectangle(topLeadingRadius: 4, bottomLeadingRadius: 4, bottomTrailingRadius: 0, topTrailingRadius: 0)
                 .fill(isHoverFolder ? Color.accentColor.opacity(0.35) : Color.clear)
         )
+        .offset(x: -16)
         .contentShape(Rectangle())
         .simultaneousGesture(TapGesture(count: 2).onEnded {
             print("DUAL_PANE: Cell double tap on \(item.name)")
