@@ -2413,12 +2413,33 @@ public struct TableDoubleClickHandler: NSViewRepresentable {
             }
         }
         
+        public static func reloadTable(for side: PaneSide) {
+            ensureTableViewsDiscovered()
+            guard let tv = (side == .left) ? leftTableView : rightTableView else { return }
+            let vm = activeVM(for: side)
+            let selection = (side == .left) ? vm?.leftSelection : vm?.rightSelection
+            tv.reloadData()
+            if let selection = selection, !selection.isEmpty {
+                let items = vm?.displayItems(for: side) ?? []
+                var selectedIndexes = IndexSet()
+                for (idx, item) in items.enumerated() {
+                    if selection.contains(item.id) || selection.contains(item.path) {
+                        selectedIndexes.insert(idx)
+                    }
+                }
+                if !selectedIndexes.isEmpty {
+                    tv.selectRowIndexes(selectedIndexes, byExtendingSelection: false)
+                }
+            }
+        }
+        
         public static func focusAndScrollToItem(id: String, side: PaneSide) {
             ensureTableViewsDiscovered()
             setActiveSide(side)
             let performSelect = {
                 ensureTableViewsDiscovered()
                 let tv = (side == .left) ? leftTableView : rightTableView
+                tv?.reloadData()
                 let items = activeVM(for: side)?.displayItems(for: side) ?? []
                 let normId = id.precomposedStringWithCanonicalMapping
                 guard let index = items.firstIndex(where: {
@@ -2450,7 +2471,9 @@ public struct TableDoubleClickHandler: NSViewRepresentable {
         /// Прокрутка к элементу без перехвата фокуса (окно Quick Look остаётся ключевым)
         public static func scrollToItem(id: String, side: PaneSide) {
             DispatchQueue.main.async {
+                ensureTableViewsDiscovered()
                 let tv = (side == .left) ? leftTableView : rightTableView
+                tv?.reloadData()
                 let items = activeVM(for: side)?.displayItems(for: side) ?? []
                 guard let index = items.firstIndex(where: { $0.id == id || $0.path == id }) else { return }
                 tv?.scrollRowToVisible(index)

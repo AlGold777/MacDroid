@@ -88,9 +88,14 @@ public struct FileDiffOverlayView: View {
                     Color(nsColor: .textBackgroundColor)
                     
                     if let result = vm.activeFileDiffResult {
-                        // Обе стороны готовы: двухколоночный синхронный список различий
-                        ScrollViewReader { scrollProxy in
-                            diffContentTable(result: result, proxy: scrollProxy, totalWidth: totalWidth, columnWidth: columnWidth)
+                        if vm.isDiffSyncScrollEnabled {
+                            // Синхронный режим: единый двухколоночный список различий
+                            ScrollViewReader { scrollProxy in
+                                diffContentTable(result: result, proxy: scrollProxy, totalWidth: totalWidth, columnWidth: columnWidth)
+                            }
+                        } else {
+                            // Раздельный режим: независимая прокрутка левой и правой колонок
+                            independentDiffTable(result: result, totalWidth: totalWidth, columnWidth: columnWidth)
                         }
                         
                         if result.isIdentical {
@@ -110,6 +115,7 @@ public struct FileDiffOverlayView: View {
                                 
                                 Spacer()
                             }
+                            .allowsHitTesting(false)
                         }
                     } else {
                         // Режим ожидания выбора файлов / предпросмотра: две независимые панели рядом
@@ -170,7 +176,7 @@ public struct FileDiffOverlayView: View {
             .frame(width: totalWidth, height: effectiveHeight)
         }
         .frame(height: effectiveHeight)
-        .animation(nil, value: effectiveHeight)
+        .animation(isDragging ? nil : .easeInOut(duration: 0.22), value: effectiveHeight)
         .background(Color(nsColor: .windowBackgroundColor))
     }
     
@@ -423,7 +429,7 @@ public struct FileDiffOverlayView: View {
         .background(Color.orange.opacity(0.15))
     }
     
-    // MARK: - Таблица содержимого diff
+    // MARK: - Таблица содержимого diff (Синхронный режим)
     private func diffContentTable(
         result: DiffResult,
         proxy: ScrollViewProxy,
@@ -438,9 +444,11 @@ public struct FileDiffOverlayView: View {
                 }
             }
             .frame(width: totalWidth, alignment: .leading)
+            .contentShape(Rectangle())
         }
         .frame(width: totalWidth)
         .frame(maxHeight: .infinity)
+        .contentShape(Rectangle())
         .onChange(of: vm.diffCurrentHunkIndex) { _, newIndex in
             if newIndex >= 0 && newIndex < result.hunks.count {
                 let targetRow = result.hunks[newIndex].startRowIndex
@@ -449,6 +457,103 @@ public struct FileDiffOverlayView: View {
                 }
             }
         }
+    }
+    
+    // MARK: - Таблица содержимого diff (Раздельный / независимый режим)
+    private func independentDiffTable(
+        result: DiffResult,
+        totalWidth: CGFloat,
+        columnWidth: CGFloat
+    ) -> some View {
+        HStack(spacing: 0) {
+            // Левая колонка с независимым скроллом
+            ScrollView(.vertical) {
+                LazyVStack(alignment: .leading, spacing: 0) {
+                    ForEach(result.alignedLines.filter { $0.leftContent != nil }) { line in
+                        singleSideRow(
+                            lineNumber: line.leftLineNumber,
+                            content: line.leftContent,
+                            highlights: line.leftIntraHighlights,
+                            kind: line.kind == .deleted || line.kind == .modified ? line.kind : .equal,
+                            highlightColor: Color.red.opacity(0.35),
+                            width: columnWidth
+                        )
+                        .id(line.id)
+                    }
+                }
+                .frame(width: columnWidth, alignment: .leading)
+                .contentShape(Rectangle())
+            }
+            .frame(width: columnWidth)
+            .frame(maxHeight: .infinity)
+            .contentShape(Rectangle())
+            
+            Rectangle()
+                .fill(Color(nsColor: .separatorColor))
+                .frame(width: 1)
+            
+            // Правая колонка с независимым скроллом
+            ScrollView(.vertical) {
+                LazyVStack(alignment: .leading, spacing: 0) {
+                    ForEach(result.alignedLines.filter { $0.rightContent != nil }) { line in
+                        singleSideRow(
+                            lineNumber: line.rightLineNumber,
+                            content: line.rightContent,
+                            highlights: line.rightIntraHighlights,
+                            kind: line.kind == .added || line.kind == .modified ? line.kind : .equal,
+                            highlightColor: Color.green.opacity(0.35),
+                            width: columnWidth
+                        )
+                        .id(line.id)
+                    }
+                }
+                .frame(width: columnWidth, alignment: .leading)
+                .contentShape(Rectangle())
+            }
+            .frame(width: columnWidth)
+            .frame(maxHeight: .infinity)
+            .contentShape(Rectangle())
+        }
+        .frame(width: totalWidth)
+        .frame(maxHeight: .infinity)
+    }
+
+    // Строка отдельной колонки для независимого режима
+    private func singleSideRow(
+        lineNumber: Int?,
+        content: String?,
+        highlights: [DiffHighlightRange],
+        kind: DiffLineKind,
+        highlightColor: Color,
+        width: CGFloat
+    ) -> some View {
+        let (bgColor, gutterSign) = styleForKind(kind)
+        return HStack(spacing: 0) {
+            Text(lineNumber.map { "\($0)" } ?? "")
+                .font(.system(size: 11, design: .monospaced))
+                .foregroundColor(.secondary.opacity(0.6))
+                .frame(width: 44, alignment: .trailing)
+                .padding(.trailing, 4)
+            
+            Text(kind != .equal ? gutterSign : " ")
+                .font(.system(size: 11, weight: .bold, design: .monospaced))
+                .foregroundColor(colorForKind(kind))
+                .frame(width: 14, alignment: .center)
+            
+            if let content = content {
+                renderedLineText(
+                    content: content,
+                    highlights: highlights,
+                    highlightColor: highlightColor
+                )
+            }
+            Spacer(minLength: 0)
+        }
+        .frame(width: width, alignment: .leading)
+        .frame(height: 20)
+        .background(kind != .equal ? bgColor : Color.clear)
+        .contentShape(Rectangle())
+        .clipped()
     }
     
     // Строка пары строк
@@ -535,6 +640,7 @@ public struct FileDiffOverlayView: View {
         }
         .frame(width: totalWidth, alignment: .leading)
         .frame(height: 20)
+        .contentShape(Rectangle())
         .overlay(
             line.isHunkStart ?
                 Rectangle()

@@ -2814,24 +2814,43 @@ func runAllAsyncTests() async {
             source: .localMac
         )
         
-        await MainActor.run {
-            let vm38 = DualPaneViewModel()
-            vm38.leftPath = testDir38.path
-            vm38.leftItems = [item38]
+        let vm38 = await MainActor.run {
+            let vm = DualPaneViewModel()
+            vm.leftPath = testDir38.path
+            vm.leftItems = [item38]
             
             // A. Start inline rename
-            vm38.startInlineRename(item: item38, side: .left)
-            assertCondition(vm38.editingItemId == item38.id, "startInlineRename set editingItemId")
-            assertCondition(vm38.editingItemSide == .left, "editingItemSide is left")
-            assertCondition(vm38.editingItemName == "document_v1.txt", "editingItemName set to document_v1.txt")
-            assertCondition(!vm38.showRenameDialog, "showRenameDialog is false (in-place rename without modal window)")
+            vm.startInlineRename(item: item38, side: .left)
+            assertCondition(vm.editingItemId == item38.id, "startInlineRename set editingItemId")
+            assertCondition(vm.editingItemSide == .left, "editingItemSide is left")
+            assertCondition(vm.editingItemName == "document_v1.txt", "editingItemName set to document_v1.txt")
+            assertCondition(!vm.showRenameDialog, "showRenameDialog is false (in-place rename without modal window)")
             
             // B. Commit inline rename
-            vm38.editingItemName = "document_v2.txt"
-            vm38.commitInlineRename(item: item38, side: .left)
-            assertCondition(vm38.editingItemId == nil, "commitInlineRename reset editingItemId to nil")
-            assertCondition(vm38.editingItemSide == nil, "commitInlineRename reset editingItemSide to nil")
-            assertCondition(vm38.editingItemName == "", "commitInlineRename reset editingItemName")
+            vm.editingItemName = "document_v2.txt"
+            vm.commitInlineRename(item: item38, side: .left)
+            assertCondition(vm.editingItemId == nil, "commitInlineRename reset editingItemId to nil")
+            assertCondition(vm.editingItemSide == nil, "commitInlineRename reset editingItemSide to nil")
+            assertCondition(vm.editingItemName == "", "commitInlineRename reset editingItemName")
+            return vm
+        }
+        
+        // Wait for async rename & refreshPane to complete
+        for _ in 0..<40 {
+            let done = await MainActor.run {
+                FileManager.default.fileExists(atPath: testDir38.appendingPathComponent("document_v2.txt").path) &&
+                vm38.leftItems.contains(where: { $0.name == "document_v2.txt" })
+            }
+            if done { break }
+            try? await Task.sleep(nanoseconds: 50_000_000)
+        }
+        
+        await MainActor.run {
+            let renamedItem = vm38.leftItems.first(where: { $0.name == "document_v2.txt" })
+            assertCondition(renamedItem != nil, "commitInlineRename refreshed pane with document_v2.txt visible in leftItems")
+            let oldGone = !vm38.leftItems.contains(where: { $0.name == "document_v1.txt" })
+            assertCondition(oldGone, "commitInlineRename removed old document_v1.txt from leftItems")
+            assertCondition(renamedItem != nil && vm38.leftSelection.contains(renamedItem!.id), "commitInlineRename selected newly renamed file path")
             
             // C. Cancel inline rename
             vm38.startInlineRename(item: item38, side: .left)

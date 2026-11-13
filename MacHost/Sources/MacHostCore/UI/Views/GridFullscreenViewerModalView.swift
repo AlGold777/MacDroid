@@ -502,10 +502,7 @@ public struct GridFullscreenHostView: View {
     // MARK: - Модальное окно подтверждения удаления (поверх сетки и всех окон)
     
     private var deleteConfirmationOverlay: some View {
-        let activeSource = (side == .left ? vm.leftSource : vm.rightSource)
-        let selectedCount = (side == .left ? vm.leftSelection : vm.rightSelection).count
-        
-        return ZStack {
+        ZStack {
             Color.black.opacity(0.4)
                 .edgesIgnoringSafeArea(.all)
                 .contentShape(Rectangle())
@@ -513,61 +510,10 @@ public struct GridFullscreenHostView: View {
                     vm.showDeleteConfirmDialog = false
                 }
             
-            VStack(spacing: 16) {
-                HStack(alignment: .top, spacing: 14) {
-                    Image(systemName: "trash.fill")
-                        .font(.system(size: 32))
-                        .foregroundColor(.accentColor)
-                    
-                    VStack(alignment: .leading, spacing: 6) {
-                        Text("Подтверждение удаления")
-                            .font(.system(size: 14, weight: .bold))
-                            .foregroundColor(.primary)
-                        
-                        if activeSource == .localMac {
-                            Text("Вы действительно хотите переместить в Корзину \(selectedCount) выбранных объектов?")
-                                .font(.system(size: 12))
-                                .foregroundColor(.secondary)
-                                .fixedSize(horizontal: false, vertical: true)
-                        } else {
-                            Text("Переместить \(selectedCount) выбранных объектов в Корзину телефона? Их можно восстановить через меню «Корзина телефона…».")
-                                .font(.system(size: 12, weight: .medium))
-                                .foregroundColor(.secondary)
-                                .fixedSize(horizontal: false, vertical: true)
-                        }
-                    }
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
-                
-                HStack(spacing: 12) {
-                    Spacer()
-                    
-                    Button("Отмена") {
-                        vm.showDeleteConfirmDialog = false
-                    }
-                    .keyboardShortcut(.escape, modifiers: [])
-                    
-                    Button(role: .destructive) {
-                        vm.showDeleteConfirmDialog = false
-                        vm.confirmDelete()
-                    } label: {
-                        Text("Удалить")
-                            .foregroundColor(.white)
-                            .padding(.horizontal, 10)
-                            .padding(.vertical, 4)
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .tint(.red)
-                    .keyboardShortcut(.return, modifiers: [])
-                }
-            }
-            .padding(22)
-            .frame(width: 440)
-            .background(Color(nsColor: .windowBackgroundColor))
-            .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-            .overlay(
-                RoundedRectangle(cornerRadius: 12, style: .continuous)
-                    .strokeBorder(Color.primary.opacity(0.18), lineWidth: 1)
+            DeleteConfirmationModalView(
+                isPresented: $vm.showDeleteConfirmDialog,
+                vm: vm,
+                targetSide: side
             )
             .shadow(color: Color.black.opacity(0.4), radius: 24, x: 0, y: 10)
         }

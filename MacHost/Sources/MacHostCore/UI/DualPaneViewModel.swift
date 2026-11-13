@@ -354,6 +354,7 @@ public final class DualPaneViewModel: ObservableObject {
     @Published public var editingItemId: String? = nil
     @Published public var editingItemSide: PaneSide? = nil
     @Published public var editingItemName: String = ""
+    private var isRenameInFlight: Bool = false
     @Published public var showPropertiesDialog: Bool = false
     @Published public var propertiesItem: FileItem? = nil
     @Published public var showDeleteConfirmDialog: Bool = false
@@ -4010,6 +4011,8 @@ public final class DualPaneViewModel: ObservableObject {
                                 QuickLookBridge.shared.close()
                             }
                         }
+                    } else {
+                        TableDoubleClickHandler.HandlerView.reloadTable(for: .left)
                     }
                 } else {
                     self.rightItems = items
@@ -4044,6 +4047,8 @@ public final class DualPaneViewModel: ObservableObject {
                                 QuickLookBridge.shared.close()
                             }
                         }
+                    } else {
+                        TableDoubleClickHandler.HandlerView.reloadTable(for: .right)
                     }
                 }
                 if isRemoteOffline {
@@ -4379,6 +4384,7 @@ public final class DualPaneViewModel: ObservableObject {
     }
     
     public func commitInlineRename(item: FileItem? = nil, side: PaneSide? = nil) {
+        guard !isRenameInFlight else { return }
         guard let targetItem = item ?? itemToRename ?? (editingItemId != nil ? (editingItemSide == .left ? leftItems : rightItems).first(where: { $0.id == editingItemId }) : nil) else {
             cancelInlineRename()
             return
@@ -4400,12 +4406,21 @@ public final class DualPaneViewModel: ObservableObject {
         }
         guard trimmed != targetItem.name else { return }
         
+        isRenameInFlight = true
+        let dir = (targetItem.path as NSString).deletingLastPathComponent
+        let newPath = (dir as NSString).appendingPathComponent(trimmed).precomposedStringWithCanonicalMapping
+        
         Task {
+            defer {
+                Task { @MainActor in
+                    self.isRenameInFlight = false
+                }
+            }
             do {
                 try await self.renameChecked(from: targetItem.path, toName: trimmed, source: targetItem.source)
                 await MainActor.run {
                     self.statusMessage = "Переименовано: '\(targetItem.name)' → '\(trimmed)'"
-                    self.refreshPane(side: targetSide)
+                    self.refreshPane(side: targetSide, selectPath: newPath)
                 }
             } catch {
                 await MainActor.run {
@@ -4474,13 +4489,15 @@ public final class DualPaneViewModel: ObservableObject {
         guard trimmed != item.name else { return }
         
         let side: PaneSide = (item.source == leftSource && leftItems.contains(where: { $0.id == item.id })) ? .left : .right
+        let dir = (item.path as NSString).deletingLastPathComponent
+        let newPath = (dir as NSString).appendingPathComponent(trimmed).precomposedStringWithCanonicalMapping
 
         Task {
             do {
                 try await self.renameChecked(from: item.path, toName: trimmed, source: item.source)
                 await MainActor.run {
                     self.statusMessage = "Переименовано: '\(item.name)' → '\(trimmed)'"
-                    self.refreshPane(side: side)
+                    self.refreshPane(side: side, selectPath: newPath)
                 }
             } catch {
                 await MainActor.run {
@@ -6350,7 +6367,8 @@ public final class DualPaneViewModel: ObservableObject {
                 self.lastBatchRenameSide = targetSide
                 self.canUndoBatchRename = true
             }
-            self.refreshPane(side: targetSide)
+            let firstNewPath = steps.first?.finalPath
+            self.refreshPane(side: targetSide, selectPath: firstNewPath)
             if failures.isEmpty {
                 self.statusMessage = "Успешно переименовано объектов: \(renamedCount)"
             } else {
@@ -6378,9 +6396,10 @@ public final class DualPaneViewModel: ObservableObject {
                     print("Undo rename error: \(error)")
                 }
             }
+            let firstOldPath = history.first?.oldPath
             self.lastBatchRenameHistory.removeAll()
             self.canUndoBatchRename = false
-            self.refreshPane(side: side)
+            self.refreshPane(side: side, selectPath: firstOldPath)
             self.statusMessage = "Откат переименования завершен: восстановлено \(restoredCount) файлов"
         }
     }

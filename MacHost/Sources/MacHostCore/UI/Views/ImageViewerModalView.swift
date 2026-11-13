@@ -151,26 +151,32 @@ public struct ImageViewerModalView: View {
                 .padding()
                 Spacer()
             }
+            
+            if showDeleteConfirm {
+                ZStack {
+                    Color.black.opacity(0.4)
+                        .edgesIgnoringSafeArea(.all)
+                        .contentShape(Rectangle())
+                        .onTapGesture {
+                            showDeleteConfirm = false
+                        }
+                    
+                    DeleteConfirmationModalView(
+                        isPresented: $showDeleteConfirm,
+                        customMessage: currentDeletePromptMessage,
+                        onConfirm: {
+                            deleteCurrentItem()
+                        }
+                    )
+                    .shadow(color: Color.black.opacity(0.4), radius: 24, x: 0, y: 10)
+                }
+                .transition(.opacity.combined(with: .scale(scale: 0.95)))
+            }
         }
         .frame(minWidth: 800, minHeight: 600)
         .onAppear {
             loadCurrentImage()
             prefetchNeighbors()
-        }
-        .alert("Подтверждение удаления", isPresented: $showDeleteConfirm) {
-            Button("Удалить", role: .destructive) {
-                deleteCurrentItem()
-            }
-            Button("Отмена", role: .cancel) {}
-        } message: {
-            if currentIndex < currentImages.count {
-                let item = currentImages[currentIndex]
-                if item.source == .localMac {
-                    Text("Вы действительно хотите переместить «\(item.name)» в Корзину?")
-                } else {
-                    Text("Переместить «\(item.name)» в Корзину телефона? Файл можно восстановить через меню «Корзина телефона…».")
-                }
-            }
         }
         .alert("Удаление невозможно", isPresented: $showTaggedError) {
             Button("OK", role: .cancel) {}
@@ -193,6 +199,16 @@ public struct ImageViewerModalView: View {
             return
         }
         showDeleteConfirm = true
+    }
+    
+    private var currentDeletePromptMessage: String {
+        guard currentIndex < currentImages.count else { return "" }
+        let item = currentImages[currentIndex]
+        if item.source == .localMac {
+            return "Вы действительно хотите переместить «\(item.name)» в Корзину?"
+        } else {
+            return "Переместить «\(item.name)» в Корзину телефона? Файл можно восстановить через меню «Корзина телефона…»."
+        }
     }
     
     private func deleteCurrentItem() {

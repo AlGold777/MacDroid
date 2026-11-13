@@ -61,8 +61,24 @@ public struct MainContentView: View {
     @ViewBuilder
     private func mainLayout(fullGeo: GeometryProxy) -> some View {
         let minHeight: CGFloat = 160
-        let maxHeight = max(minHeight, fullGeo.size.height - 120)
-        let defaultHeight = max(minHeight, min(420, fullGeo.size.height * 0.45))
+        let collapsedPanelsHeight: CGFloat = 195
+        let extraBannersHeight: CGFloat = vm.showCopyDoneOffer ? 40 : 0
+        let maxHeight = max(minHeight, fullGeo.size.height - collapsedPanelsHeight - extraBannersHeight)
+        
+        let defaultHeight: CGFloat = {
+            if vm.areDiffFilesSelected {
+                // Режим активного сравнения: область содержимого занимает большую часть пространства,
+                // а панели сворачиваются до минимума (видно 3 строки с файлами/папками).
+                return maxHeight
+            } else {
+                // До того как файлы выбраны: область отображения содержимого уменьшена на 25%
+                // относительно прежнего значения (min(420, height * 0.45) -> min(315, height * 0.3375)),
+                // освобождая больше пространства для поиска файлов в панелях.
+                let unselectedHeight = min(315, fullGeo.size.height * 0.3375)
+                return max(minHeight, min(maxHeight, unselectedHeight))
+            }
+        }()
+        
         let baseHeight = min(maxHeight, max(minHeight, vm.fileDiffHeight ?? defaultHeight))
         
         VStack(spacing: 0) {
@@ -116,6 +132,7 @@ public struct MainContentView: View {
                 )
             )
             .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .animation(.easeInOut(duration: 0.22), value: vm.areDiffFilesSelected)
             
             if vm.isFileDiffActive && vm.fileDiffDockPosition == .bottom {
                 Divider()
@@ -323,22 +340,17 @@ private struct MainContentSheetsModifier: ViewModifier {
             } message: {
                 Text(vm.errorMessage)
             }
-            .alert("Подтверждение удаления", isPresented: Binding(
+            .sheet(isPresented: Binding(
                 get: { vm.showDeleteConfirmDialog && vm.fullscreenGridPaneSide == nil },
                 set: { vm.showDeleteConfirmDialog = $0 }
             )) {
-                Button("Удалить", role: .destructive) {
-                    vm.confirmDelete()
-                }
-                Button("Отмена", role: .cancel) {}
-            } message: {
-                let activeSource = (vm.activePane == .left) ? vm.leftSource : vm.rightSource
-                let count = (vm.activePane == .left) ? vm.leftSelection.count : vm.rightSelection.count
-                if activeSource == .localMac {
-                    Text("Вы действительно хотите переместить в Корзину \(count) выбранных объектов?")
-                } else {
-                    Text("Переместить \(count) выбранных объектов в Корзину телефона? Их можно восстановить через меню «Корзина телефона…».")
-                }
+                DeleteConfirmationModalView(
+                    isPresented: Binding(
+                        get: { vm.showDeleteConfirmDialog && vm.fullscreenGridPaneSide == nil },
+                        set: { vm.showDeleteConfirmDialog = $0 }
+                    ),
+                    vm: vm
+                )
             }
     }
 }
