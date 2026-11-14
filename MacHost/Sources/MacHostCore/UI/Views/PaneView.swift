@@ -2113,6 +2113,7 @@ public struct TableDoubleClickHandler: NSViewRepresentable {
     }
     
     public func updateNSView(_ nsView: HandlerView, context: Context) {
+        let itemsChanged = (nsView.items != items)
         nsView.side = side
         nsView.vm = vm
         nsView.items = items
@@ -2133,6 +2134,12 @@ public struct TableDoubleClickHandler: NSViewRepresentable {
             } else {
                 HandlerView.rightTableView = tv
                 HandlerView.rightVM = vm
+            }
+            if itemsChanged {
+                let targetSide = side
+                DispatchQueue.main.async {
+                    HandlerView.reloadTable(for: targetSide)
+                }
             }
         }
         if vm.activePane == side {

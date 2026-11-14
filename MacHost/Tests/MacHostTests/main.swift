@@ -2852,6 +2852,27 @@ func runAllAsyncTests() async {
             assertCondition(oldGone, "commitInlineRename removed old document_v1.txt from leftItems")
             assertCondition(renamedItem != nil && vm38.leftSelection.contains(renamedItem!.id), "commitInlineRename selected newly renamed file path")
             
+            // Verify date sort order invariant (newest/today's file stays at top when sorted by date descending)
+            vm38.leftSortField = .date
+            vm38.leftSortAscending = false
+            let olderSample = FileItem(
+                id: testDir38.appendingPathComponent("older_document.txt").path,
+                name: "older_document.txt",
+                path: testDir38.appendingPathComponent("older_document.txt").path,
+                size: 10,
+                mtime: Date().timeIntervalSince1970 - 100000,
+                isDirectory: false,
+                source: .localMac
+            )
+            vm38.leftItems.append(olderSample)
+            let displayList = vm38.displayItems(for: .left)
+            assertCondition(displayList.first?.name == "document_v2.txt", "Date descending sort places renamed today file at the top, not at the bottom")
+            assertCondition(displayList.last?.name == "older_document.txt", "Older file remains below today's renamed file")
+            
+            // Restore default sort
+            vm38.leftSortField = .name
+            vm38.leftSortAscending = true
+            
             // C. Cancel inline rename
             vm38.startInlineRename(item: item38, side: .left)
             vm38.cancelInlineRename()
@@ -4431,6 +4452,8 @@ func runAllAsyncTests() async {
             let item2 = FileItem(id: "2", name: "file2.txt", path: "/tmp/file2.txt", size: 200, mtime: 0, isDirectory: false)
             let item3 = FileItem(id: "3", name: "file3.txt", path: "/tmp/file3.txt", size: 300, mtime: 0, isDirectory: false)
             vm49.leftItems = [item1, item2, item3]
+            vm49.leftSortField = .name
+            vm49.leftSortAscending = true
             vm49.leftSelection = [item1.id]
             vm49.activePane = .left
             
