@@ -1050,7 +1050,7 @@ public struct PaneView: View {
         HStack(spacing: 3) {
             Spacer(minLength: 0)
             if !item.tags.isEmpty {
-                ForEach(item.tags.prefix(3), id: \.self) { tagName in
+                ForEach(item.tags.prefix(1), id: \.self) { tagName in
                     if let tag = FileTag.tag(for: tagName) {
                         Circle()
                             .fill(tag.color)
@@ -1319,7 +1319,7 @@ public struct PaneView: View {
     @ViewBuilder
     private func rowContextMenu(for item: FileItem) -> some View {
         let contextItems = vm.contextMenuItems(for: item, side: side)
-        let combinedTags = Array(Set(contextItems.flatMap { $0.tags }))
+        let activeTags = TagsManager.shared.activeTags(for: contextItems.isEmpty ? [item] : contextItems)
         Button {
             vm.toggleFilePin(item, side: side)
         } label: {
@@ -1340,7 +1340,7 @@ public struct PaneView: View {
         
         ControlGroup {
             ForEach(FileTag.allTags) { tag in
-                let isSelected = combinedTags.contains { FileTag.isTagMatching($0, tagIdOrName: tag.id) }
+                let isSelected = activeTags.contains { FileTag.isTagMatching($0, tagIdOrName: tag.id) }
                 Button(action: {
                     vm.toggleTag(tag.id, for: contextItems, side: side)
                 }) {
@@ -3330,7 +3330,7 @@ public struct TableDoubleClickHandler: NSViewRepresentable {
             let menu = NSMenu(title: "Context Menu")
             
             // 1. Верхний пункт меню: строка цветных кнопок тегов (Red, Orange, Yellow, Green, Blue, Grey)
-            let itemTags = item.tags.isEmpty ? TagsManager.shared.getTags(for: item) : item.tags
+            let itemTags = TagsManager.shared.activeTags(for: contextItems.isEmpty ? [item] : contextItems)
             let tagMenuView = TagRowMenuView(currentTags: itemTags) { tagId in
                 vm.toggleTag(tagId, for: contextItems, side: side)
             }

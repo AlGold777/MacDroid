@@ -4579,6 +4579,9 @@ func runAllAsyncTests() async {
         // 63. Tab Titles: 'Mac' and Phone Name instead of '/restart' and '0'
         await runTest63()
         
+        // 64. Single Tag Enforcement (Old Tag Disappears on New Selection)
+        await runTest64()
+        
         print("\n🎉 ==================================================")
         print("🎉   ALL PRODUCTION TEST SUITES PASSED!             ")
         print("🎉 ==================================================")
@@ -6619,6 +6622,50 @@ private func runDirectoryComparatorTests() async throws {
 
         print("  ✓ File Diff dynamic height & collapse state tests passed successfully!")
     }
+}
+
+func runTest64() async {
+    print("\n--- [TEST 64] Single Tag Enforcement (Old Tag Disappears on New Selection) ---")
+    
+    // 1. Single item tag toggle on remote phone item
+    let item1 = FileItem(id: "item1", name: "test1.txt", path: "/storage/emulated/0/test1.txt", size: 100, mtime: 1000, isDirectory: false, source: .remotePhone)
+    
+    // Set first tag
+    let tags1 = TagsManager.shared.toggleTag("Red", for: item1)
+    assertCondition(tags1 == ["Red"], "Setting initial tag results in ['Red']: got \(tags1)")
+    
+    // Select new tag "Blue" -> old tag "Red" disappears!
+    let tags2 = TagsManager.shared.toggleTag("Blue", for: item1)
+    assertCondition(tags2 == ["Blue"], "Selecting new tag 'Blue' replaces 'Red' with ['Blue']: got \(tags2)")
+    
+    // Select "Blue" again -> tag is toggled off (becomes [])
+    let tags3 = TagsManager.shared.toggleTag("Blue", for: item1)
+    assertCondition(tags3.isEmpty, "Selecting same tag 'Blue' again toggles it off: got \(tags3)")
+    
+    // 2. Multiple items applyTagToggle
+    let itemA = FileItem(id: "itemA", name: "docA.pdf", path: "/storage/emulated/0/docA.pdf", size: 200, mtime: 1000, isDirectory: false, source: .remotePhone)
+    let itemB = FileItem(id: "itemB", name: "docB.pdf", path: "/storage/emulated/0/docB.pdf", size: 300, mtime: 1000, isDirectory: false, source: .remotePhone)
+    
+    // Give itemA tag "Orange", itemB tag "Green"
+    TagsManager.shared.setTags(["Orange"], for: itemA)
+    TagsManager.shared.setTags(["Green"], for: itemB)
+    
+    // Now apply "Yellow" to both items -> both have old tags replaced by "Yellow"
+    let updatedBatch1 = TagsManager.shared.applyTagToggle("Yellow", to: [itemA, itemB])
+    assertCondition(updatedBatch1[itemA.id] == ["Yellow"], "itemA old tag 'Orange' replaced by 'Yellow': got \(String(describing: updatedBatch1[itemA.id]))")
+    assertCondition(updatedBatch1[itemB.id] == ["Yellow"], "itemB old tag 'Green' replaced by 'Yellow': got \(String(describing: updatedBatch1[itemB.id]))")
+    
+    // Both items now have "Yellow". Clicking "Yellow" again toggles it off for all items
+    let updatedBatch2 = TagsManager.shared.applyTagToggle("Yellow", to: [itemA, itemB])
+    assertCondition(updatedBatch2[itemA.id]?.isEmpty == true, "itemA tag toggled off: got \(String(describing: updatedBatch2[itemA.id]))")
+    assertCondition(updatedBatch2[itemB.id]?.isEmpty == true, "itemB tag toggled off: got \(String(describing: updatedBatch2[itemB.id]))")
+    
+    // Clean up
+    TagsManager.shared.clearTags(at: item1.path, source: .remotePhone)
+    TagsManager.shared.clearTags(at: itemA.path, source: .remotePhone)
+    TagsManager.shared.clearTags(at: itemB.path, source: .remotePhone)
+    
+    print("  ✓ Single tag enforcement tests passed successfully!")
 }
 
 dispatchMain()

@@ -63,8 +63,10 @@ public struct FileTag: Identifiable, Hashable, Sendable, Codable {
     }
 
     public static func isTagMatching(_ a: String, tagIdOrName b: String) -> Bool {
-        let aLower = a.lowercased()
-        let bLower = b.lowercased()
+        let aClean = (a.components(separatedBy: "\n").first ?? a).trimmingCharacters(in: .whitespaces)
+        let bClean = (b.components(separatedBy: "\n").first ?? b).trimmingCharacters(in: .whitespaces)
+        let aLower = aClean.lowercased()
+        let bLower = bClean.lowercased()
         if aLower == bLower { return true }
         
         let redSynonyms = ["red", "красный", "червоний"]
@@ -127,6 +129,21 @@ public final class TagsManager: @unchecked Sendable {
             lock.lock()
             defer { lock.unlock() }
             return remoteItemTags[item.path] ?? []
+        }
+    }
+    
+    /// Получить активные общие теги для набора объектов (если объектов несколько — только тег, общий для всех)
+    public func activeTags(for items: [FileItem]) -> [String] {
+        guard let first = items.first else { return [] }
+        if items.count == 1 {
+            return getTags(for: first)
+        }
+        let firstTags = getTags(for: first)
+        return firstTags.filter { tag in
+            items.allSatisfy { item in
+                let itTags = getTags(for: item)
+                return itTags.contains(where: { FileTag.isTagMatching($0, tagIdOrName: tag) })
+            }
         }
     }
     
@@ -199,7 +216,13 @@ public final class TagsManager: @unchecked Sendable {
     public func setTags(_ tags: [String], for item: FileItem) {
         if item.source == .localMac {
             let url = URL(fileURLWithPath: item.path)
-            try? (url as NSURL).setResourceValue(tags as NSArray, forKey: .tagNamesKey)
+            if tags.isEmpty {
+                try? (url as NSURL).setResourceValue(nil, forKey: .tagNamesKey)
+                try? (url as NSURL).setResourceValue([] as NSArray, forKey: .tagNamesKey)
+                removexattr(item.path, "com.apple.metadata:_kMDItemUserTags", 0)
+            } else {
+                try? (url as NSURL).setResourceValue(tags as NSArray, forKey: .tagNamesKey)
+            }
         } else {
             lock.lock()
             if tags.isEmpty {
@@ -246,23 +269,23 @@ public final class TagsManager: @unchecked Sendable {
         }
     }
     
-    /// Переключить тег для объекта (добавить, если нет; удалить, если уже есть)
+    /// Переключить тег для объекта (добавить, если нет; удалить, если уже есть).
+    /// У объекта может быть только один тег: если выбран новый тег, старый исчезает.
     @discardableResult
     public func toggleTag(_ tag: String, for item: FileItem) -> [String] {
-        var current = getTags(for: item)
-        if let idx = current.firstIndex(where: { FileTag.isTagMatching($0, tagIdOrName: tag) }) {
-            current.remove(at: idx)
-        } else {
-            current.append(tag)
-        }
-        setTags(current, for: item)
-        return current
+        let current = getTags(for: item)
+        let hasTag = current.contains(where: { FileTag.isTagMatching($0, tagIdOrName: tag) })
+        let newTags: [String] = hasTag ? [] : [tag]
+        setTags(newTags, for: item)
+        return newTags
     }
     
     /// Применить тег к массиву объектов:
+    /// У каждого объекта может быть только один тег.
     /// Если ВСЕ объекты уже имеют этот тег — снимаем его.
-    /// Иначе — добавляем этот тег ко всем выбранным объектам.
+    /// Иначе — устанавливаем этот единственный тег ко всем выбранным объектам (старый тег заменяется новым).
     public func applyTagToggle(_ tag: String, to items: [FileItem]) -> [String: [String]] {
+        guard !items.isEmpty else { return [:] }
         let allHaveTag = items.allSatisfy { item in
             let tags = getTags(for: item)
             return tags.contains(where: { FileTag.isTagMatching($0, tagIdOrName: tag) })
@@ -270,20 +293,9 @@ public final class TagsManager: @unchecked Sendable {
         
         var result: [String: [String]] = [:]
         for item in items {
-            var tags = getTags(for: item)
-            let existingIdx = tags.firstIndex(where: { FileTag.isTagMatching($0, tagIdOrName: tag) })
-            
-            if allHaveTag {
-                if let idx = existingIdx {
-                    tags.remove(at: idx)
-                }
-            } else {
-                if existingIdx == nil {
-                    tags.append(tag)
-                }
-            }
-            setTags(tags, for: item)
-            result[item.id] = tags
+            let newTags: [String] = allHaveTag ? [] : [tag]
+            setTags(newTags, for: item)
+            result[item.id] = newTags
         }
         return result
     }

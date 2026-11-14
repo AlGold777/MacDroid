@@ -1545,7 +1545,7 @@ public struct FileGridCell: View {
     @ViewBuilder
     private func gridContextMenu(for item: FileItem) -> some View {
         let contextItems = vm.contextMenuItems(for: item, side: side)
-        let combinedTags = Array(Set(contextItems.flatMap { $0.tags }))
+        let activeTags = TagsManager.shared.activeTags(for: contextItems.isEmpty ? [item] : contextItems)
         Button {
             vm.toggleFilePin(item, side: side)
         } label: {
@@ -1555,7 +1555,7 @@ public struct FileGridCell: View {
         Divider()
         ControlGroup {
             ForEach(FileTag.allTags) { tag in
-                let isSelected = combinedTags.contains { FileTag.isTagMatching($0, tagIdOrName: tag.id) }
+                let isSelected = activeTags.contains { FileTag.isTagMatching($0, tagIdOrName: tag.id) }
                 Button(action: {
                     vm.toggleTag(tag.id, for: contextItems, side: side)
                 }) {
