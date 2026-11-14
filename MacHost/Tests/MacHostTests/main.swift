@@ -2872,6 +2872,38 @@ func runAllAsyncTests() async {
             // Restore default sort
             vm38.leftSortField = .name
             vm38.leftSortAscending = true
+
+            // Manual sort mode invariants (new/renamed files never drop to the bottom)
+            let dirKey = vm38.fileOrderDirectoryKey(for: .left)
+            let pathV2 = testDir38.appendingPathComponent("document_v2.txt").path
+            let olderPath = olderSample.path
+            vm38.manualFileOrderByDirectory[dirKey] = [pathV2, olderPath]
+            vm38.leftSortField = .manual
+            
+            // Renaming v2 to v3 preserves manual rank
+            let pathV3 = testDir38.appendingPathComponent("document_v3.txt").path
+            vm38.updatePathReferencesAfterRename(from: pathV2, to: pathV3, source: .localMac)
+            assertCondition(vm38.manualFileOrderByDirectory[dirKey]?.first == pathV3, "updatePathReferencesAfterRename kept renamed file at index 0 of manual order")
+            
+            // Newly added unranked file appears at the TOP in manual mode, never at the bottom
+            let brandNewItem = FileItem(
+                id: testDir38.appendingPathComponent("brand_new.txt").path,
+                name: "brand_new.txt",
+                path: testDir38.appendingPathComponent("brand_new.txt").path,
+                size: 5,
+                mtime: Date().timeIntervalSince1970 + 10,
+                isDirectory: false,
+                source: .localMac
+            )
+            vm38.leftItems = [olderSample, brandNewItem]
+            let manualList = vm38.displayItems(for: .left)
+            assertCondition(manualList.first?.name == "brand_new.txt", "Unranked new file appears at the top in manual mode")
+            assertCondition(manualList.last?.name == "older_document.txt", "Ranked existing file stays below top new file")
+            
+            // Restore default sort and clean up
+            vm38.manualFileOrderByDirectory.removeValue(forKey: dirKey)
+            vm38.leftSortField = .name
+            vm38.leftSortAscending = true
             
             // C. Cancel inline rename
             vm38.startInlineRename(item: item38, side: .left)

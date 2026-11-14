@@ -2235,7 +2235,10 @@ public final class DualPaneViewModel: ObservableObject {
             order = visibleOrder + completeOrder.filter { !visiblePaths.contains($0) }
         }
         var orderPaths = order ?? []
-        for path in rawItems.map(\.path) where !orderPaths.contains(path) { orderPaths.append(path) }
+        let unranked = rawItems.filter { !orderPaths.contains($0.path) }
+            .sorted { $0.mtime > $1.mtime }
+            .map(\.path)
+        orderPaths = unranked + orderPaths
         orderPaths.removeAll { $0 == sourcePath }
         if let index = orderPaths.firstIndex(of: targetPath) {
             orderPaths.insert(sourcePath, at: index + (after ? 1 : 0))
@@ -2270,8 +2273,21 @@ public final class DualPaneViewModel: ObservableObject {
                 let rankA = order.firstIndex(of: a.path)
                 let rankB = order.firstIndex(of: b.path)
                 if rankA != rankB {
-                    if let rankA { return rankB == nil || rankA < rankB! }
-                    return false
+                    if let rankA, let rankB {
+                        return rankA < rankB
+                    }
+                    // Новые / не ранжированные вручную файлы помещаются сверху списка (не падают вниз),
+                    // чтобы пользователь сразу видел добавленные и сегодняшние файлы.
+                    if rankA == nil && rankB != nil {
+                        return true
+                    }
+                    if rankA != nil && rankB == nil {
+                        return false
+                    }
+                }
+                // Для файлов без ручного ранга приоритет отдается более свежей дате изменения
+                if a.mtime != b.mtime {
+                    return a.mtime > b.mtime
                 }
                 let cmp = a.name.localizedStandardCompare(b.name)
                 if cmp != .orderedSame { return cmp == .orderedAscending }
@@ -4449,6 +4465,34 @@ public final class DualPaneViewModel: ObservableObject {
         return items.contains { $0.name.lowercased() == name.lowercased() && $0.name != originalName }
     }
 
+    /// Сохраняет позицию файла в ручной сортировке и статус закрепления при переименовании
+    public func updatePathReferencesAfterRename(from oldPath: String, to newPath: String, source: FileSource) {
+        let normOldPath = oldPath.precomposedStringWithCanonicalMapping
+        let normNewPath = newPath.precomposedStringWithCanonicalMapping
+        let oldPrefKey = "\(source.rawValue)|\(normOldPath)"
+        let newPrefKey = "\(source.rawValue)|\(normNewPath)"
+        if pinnedFileKeys.contains(oldPrefKey) || pinnedFileKeys.contains("\(source.rawValue)|\(oldPath)") {
+            pinnedFileKeys.remove(oldPrefKey)
+            pinnedFileKeys.remove("\(source.rawValue)|\(oldPath)")
+            pinnedFileKeys.insert(newPrefKey)
+            UserDefaults.standard.set(Array(pinnedFileKeys), forKey: "files.pinnedKeys")
+        }
+        var manualModified = false
+        for (dirKey, order) in manualFileOrderByDirectory {
+            if let idx = order.firstIndex(where: { $0 == oldPath || $0 == normOldPath || $0.precomposedStringWithCanonicalMapping == normOldPath }) {
+                var updated = order
+                updated[idx] = normNewPath
+                manualFileOrderByDirectory[dirKey] = updated
+                manualModified = true
+            }
+        }
+        if manualModified {
+            if let data = try? JSONEncoder().encode(manualFileOrderByDirectory) {
+                UserDefaults.standard.set(data, forKey: "files.manualOrder")
+            }
+        }
+    }
+
     /// Переименование с проверкой занятого имени: rename поверх существующего объекта уничтожил бы его (D7)
     private func renameChecked(from oldPath: String, toName newName: String, source: FileSource) async throws {
         let dir = (oldPath as NSString).deletingLastPathComponent
@@ -4458,6 +4502,9 @@ public final class DualPaneViewModel: ObservableObject {
         let newPath = (dir as NSString).appendingPathComponent(newName).precomposedStringWithCanonicalMapping
         let driver: FileSystemDriver = (source == .localMac) ? localDriver : remoteDriver
         try await driver.renameItem(from: oldPath, to: newPath)
+        await MainActor.run {
+            self.updatePathReferencesAfterRename(from: oldPath, to: newPath, source: source)
+        }
     }
 
     public func cancelInlineRename() {
