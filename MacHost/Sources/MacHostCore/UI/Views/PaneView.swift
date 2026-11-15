@@ -251,11 +251,9 @@ public struct PaneView: View {
                                         )
                                     }
                                 }) {
-                                    Label {
-                                        Text(phone.name)
-                                    } icon: {
-                                        Image(nsImage: .greenDot)
-                                    }
+                                    Text("● ")
+                                        .foregroundColor(Color(red: 0.35, green: 0.88, blue: 0.35))
+                                        + Text(phone.name)
                                 }
                             }
                             
