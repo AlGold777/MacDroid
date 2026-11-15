@@ -768,9 +768,22 @@ public final class TransportMultiplexer: @unchecked Sendable {
             // Fsync расширение при поддержке сервером. Только когда нужна гарантия на диске (перенос удаляет оригинал):
             // для копии оригинал остаётся, а fsync каждого мелкого файла на FUSE-разделе телефона дорог.
             if syncToDisk && coordinator.hasServerExtension("fsync@openssh.com") {
+                // M6 (Z.ai): durable-семантика (перенос удаляет оригинал) обязана опираться на реальный
+                // ответ fsync: таймаут/ошибка/не-OK = данные не доказаны на диске, коммитить нельзя.
                 let fsyncReqId = channel.allocateRequestId()
                 let fsyncPacket = packetEngine.createFsyncPacket(requestId: fsyncReqId, handle: remoteHandle)
-                _ = try? await channel.sendRequest(packet: fsyncPacket, requestId: fsyncReqId)
+                do {
+                    let (fsyncType, fsyncPayload) = try await channel.sendRequest(packet: fsyncPacket, requestId: fsyncReqId)
+                    let fsyncStatus = (fsyncType == .status) ? (try? packetEngine.parseStatusResponse(data: fsyncPayload)) : nil
+                    guard fsyncStatus?.code == .ok else {
+                        SSHTransportLog.write("UL_FSYNC_REJECTED channel=\(channel.channelId)")
+                        throw NSError(domain: "TransportMultiplexer", code: 61, userInfo: [NSLocalizedDescriptionKey: "Сервер не подтвердил fsync временного файла"])
+                    }
+                } catch {
+                    SSHTransportLog.write("UL_FSYNC_FAILED err=\(error.localizedDescription) channel=\(channel.channelId)")
+                    await sendCloseUncancellable(handle: remoteHandle, channel: channel)
+                    throw error
+                }
             }
             
             let closeReqId = channel.allocateRequestId()
@@ -907,8 +920,12 @@ public final class TransportMultiplexer: @unchecked Sendable {
             return nil
         }
         
-        let free = vfs.bavail * vfs.frsize
-        let total = vfs.blocks * vfs.frsize
+        let (free, freeOverflow) = vfs.bavail.multipliedReportingOverflow(by: vfs.frsize)
+        let (total, totalOverflow) = vfs.blocks.multipliedReportingOverflow(by: vfs.frsize)
+        guard !freeOverflow, !totalOverflow else {
+            SSHTransportLog.write("STATVFS_UNTRUSTED bavail=\(vfs.bavail) blocks=\(vfs.blocks) frsize=\(vfs.frsize)")
+            return (free: 0, total: 0)
+        }
         return (free: free, total: total)
     }
     

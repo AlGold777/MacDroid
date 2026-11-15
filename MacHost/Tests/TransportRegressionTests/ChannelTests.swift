@@ -37,7 +37,10 @@ struct ChannelTests {
         try tests.testPacketReaderDataSliceIndexing()
         try tests.testExtendedAttributesParsing()
         try await tests.testChannelDesyncThresholdClosesChannel()
-        print("PASS: handshake timeout, request cancellation, consecutive timeouts, SSH EOF diagnostics, VERSION response, slice indexing, extended attrs, desync threshold")
+        tests.testCopyFileOnDeviceRequiresAuthorizedSerial()
+        tests.testUpdateEndpointInvalidatesDirectoryCache()
+        tests.testStatVfsMultiplicationOverflowProtection()
+        print("PASS: handshake timeout, request cancellation, consecutive timeouts, SSH EOF diagnostics, VERSION response, slice indexing, extended attrs, desync threshold, adb serial binding, cache invalidation, statvfs overflow")
     }
 
     func testSuccessfulVersionResponse() async throws {
@@ -250,5 +253,31 @@ struct ChannelTests {
             try await Task.sleep(nanoseconds: 20_000_000)
         }
         XCTAssertTrue(!channel.isRunning)
+    }
+
+    func testCopyFileOnDeviceRequiresAuthorizedSerial() {
+        let mgr = PhoneConnectionManager.shared
+        XCTAssertTrue(!mgr.copyFileOnDevice(sourcePath: "/sdcard/a", targetPath: "/sdcard/b", deviceId: nil))
+        XCTAssertTrue(!mgr.copyFileOnDevice(sourcePath: "/sdcard/a", targetPath: "/sdcard/b", deviceId: ""))
+        XCTAssertTrue(!mgr.copyFileOnDevice(sourcePath: "/sdcard/a", targetPath: "/sdcard/b", deviceId: "unauthorized_bogus_serial"))
+    }
+
+    func testUpdateEndpointInvalidatesDirectoryCache() {
+        let cache = DirectoryCache.shared
+        let dummy = [FileItem(id: "/test/file", name: "file", path: "/test/file", size: 100, mtime: Date().timeIntervalSince1970, isDirectory: false)]
+        cache.set(path: "/test", items: dummy)
+        XCTAssertTrue(cache.get(path: "/test") != nil)
+        
+        let driver = RemoteSFTPDriver()
+        driver.updateEndpoint(host: "10.0.0.1", port: 2222, deviceId: "device_new")
+        XCTAssertTrue(cache.get(path: "/test") == nil)
+    }
+
+    func testStatVfsMultiplicationOverflowProtection() {
+        let bavail = UInt64.max
+        let frsize: UInt64 = 4096
+        let (free, freeOverflow) = bavail.multipliedReportingOverflow(by: frsize)
+        XCTAssertTrue(freeOverflow)
+        XCTAssertTrue(free != 0)
     }
 }

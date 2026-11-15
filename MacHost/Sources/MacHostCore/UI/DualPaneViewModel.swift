@@ -5934,8 +5934,9 @@ public final class DualPaneViewModel: ObservableObject {
                     guard let existing = siblings, !existing.contains(where: { $0.name == newName }) else {
                         throw NSError(domain: "Duplicate", code: 2, userInfo: [NSLocalizedDescriptionKey: "Не удалось дублировать: объект с именем «\(newName)» уже существует или папка недоступна"])
                     }
+                    let deviceId = self.remoteDriver.coordinator.deviceId
                     let copied = await Task.detached(priority: .userInitiated) {
-                        PhoneConnectionManager.shared.copyFileOnDevice(sourcePath: target.path, targetPath: newPath)
+                        PhoneConnectionManager.shared.copyFileOnDevice(sourcePath: target.path, targetPath: newPath, deviceId: deviceId)
                     }.value
                     guard copied else {
                         throw NSError(domain: "Duplicate", code: 3, userInfo: [NSLocalizedDescriptionKey: "Не удалось дублировать на телефоне: \(target.name)"])
@@ -8284,10 +8285,16 @@ public final class DualPaneViewModel: ObservableObject {
                 return .skipped(reason: reason)
             case .place(let targetPath):
                 if isMove {
-                    let ok = try await orchestrator.transport.executeRename(oldPath: job.path, newPath: targetPath)
-                    if ok {
+                    // H2 (Z.ai): типизированный исход вместо Bool — транспортная ошибка больше не
+                    // маскируется под «отказ переименования». SSH_FXP_RENAME без замены не затирает
+                    // цель, появившуюся между resolvePhonePlacement и коммитом (MINA отказывает).
+                    let renameCode = try await orchestrator.transport.commitRename(oldPath: job.path, newPath: targetPath, replaceExisting: false)
+                    if renameCode == .ok {
                         return .transferred
-                    } else if PhoneConnectionManager.shared.copyFileOnDevice(sourcePath: job.path, targetPath: targetPath) {
+                    }
+                    SSHTransportLog.write("PHONE_MOVE_RENAME_REJECTED src=\(job.path) dst=\(targetPath) code=\(renameCode.rawValue)")
+                    // H1 (Z.ai): серверная копия строго на устройстве текущей SFTP-сессии
+                    if PhoneConnectionManager.shared.copyFileOnDevice(sourcePath: job.path, targetPath: targetPath, deviceId: orchestrator.transport.coordinator.deviceId) {
                         // Обработка EXDEV (Cross-device link): если перенос между разделами (SD-карта / память), копируем и удаляем оригинал.
                         // Результат удаления проверяем: иначе копия есть, а исходник тихо остался.
                         let deleted = (try? await orchestrator.transport.executeDelete(actionId: itemId, path: job.path)) ?? false
@@ -8299,7 +8306,8 @@ public final class DualPaneViewModel: ObservableObject {
                     return .skipped(reason: "Не удалось переименовать или переместить на телефоне (защита Scoped Storage или разные разделы)")
                 }
                 // Оптимизация P1: Прямое серверное копирование файла внутри телефона без прокачки 20 ГБ трафика через Mac
-                if PhoneConnectionManager.shared.copyFileOnDevice(sourcePath: job.path, targetPath: targetPath) {
+                // H1 (Z.ai): строго на устройстве текущей SFTP-сессии
+                if PhoneConnectionManager.shared.copyFileOnDevice(sourcePath: job.path, targetPath: targetPath, deviceId: orchestrator.transport.coordinator.deviceId) {
                     onProgress(1.0)
                     return .transferred
                 }

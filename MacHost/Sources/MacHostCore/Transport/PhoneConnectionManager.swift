@@ -377,7 +377,20 @@ public final class PhoneConnectionManager: @unchecked Sendable {
     /// Серверное копирование файла внутри Android устройства без передачи данных на Mac.
     /// Не перезаписывает существующий объект: проверка и cp выполняются одной командой на устройстве.
     /// Возвращает false, если цель уже существует (код выхода 17) или копирование не удалось.
-    public func copyFileOnDevice(sourcePath: String, targetPath: String, deviceId: String? = nil) -> Bool {
+    /// H1 (Z.ai): serial ОБЯЗАТЕЛЕН и проверяется fail-closed. Без него adb без -s выполняет cp
+    /// на «каком-то» подключённом по USB телефоне, а SFTP-сессия может быть с ДРУГИМ (Wi-Fi):
+    /// копия создаётся не там, и при MOVE оригинал затем удаляется на телефоне сессии.
+    public func copyFileOnDevice(sourcePath: String, targetPath: String, deviceId: String?) -> Bool {
+        guard let deviceId, !deviceId.isEmpty else {
+            SSHTransportLog.write("ADB_COPY_REFUSED reason=no_device_id src=\(sourcePath)")
+            return false
+        }
+        // Серийник обязан присутствовать среди авторизованных ADB-устройств: deviceId Wi-Fi-сессии
+        // (ключ устройства, не adb-serial) → отказ; дальше безопасный фолбэк через Mac.
+        guard let authorized = authorizedAdbDeviceIdsIfAvailable(), authorized.contains(deviceId) else {
+            SSHTransportLog.write("ADB_COPY_REFUSED reason=serial_not_authorized serial=\(deviceId)")
+            return false
+        }
         let srcEsc = Self.shellEscape(sourcePath)
         let dstEsc = Self.shellEscape(targetPath)
         let command = "if [ -e \(dstEsc) ] || [ -L \(dstEsc) ]; then exit 17; fi; cp -p -- \(srcEsc) \(dstEsc)"

@@ -25,6 +25,9 @@ public final class RemoteSFTPDriver: FileSystemDriver, @unchecked Sendable {
     
     public func updateEndpoint(host: String, port: UInt16, deviceId: String? = nil) {
         coordinator.updateEndpoint(host: host, port: port, deviceId: deviceId)
+        // M4 (Z.ai): кэш листинга ключуется только путём — при смене устройства
+        // он обязан сбрасываться, иначе TTL 5 с показывает папки предыдущего телефона
+        DirectoryCache.shared.invalidateAll()
     }
     
     public func ensureConnected(allowLegacyFallback: Bool? = nil) async throws {
@@ -350,8 +353,14 @@ public final class RemoteSFTPDriver: FileSystemDriver, @unchecked Sendable {
             if let (respType, payload) = try? await channel.sendRequest(packet: statvfsPacket, requestId: reqId),
                respType == .extendedReply,
                let (_, vfs) = try? packetEngine.parseStatVfsResponse(data: payload) {
-                let free = vfs.bavail * vfs.frsize
-                let total = vfs.blocks * vfs.frsize
+                // M9 (Z.ai): умножение UInt64 без защиты от переполнения — аномальные
+                // значения сервера роняют приложение trap'ом. Ненадёжный ответ = «неизвестно».
+                let (free, freeOverflow) = vfs.bavail.multipliedReportingOverflow(by: vfs.frsize)
+                let (total, totalOverflow) = vfs.blocks.multipliedReportingOverflow(by: vfs.frsize)
+                guard !freeOverflow, !totalOverflow else {
+                    SSHTransportLog.write("STATVFS_UNTRUSTED bavail=\(vfs.bavail) blocks=\(vfs.blocks) frsize=\(vfs.frsize)")
+                    return (free: 0, total: 0)
+                }
                 return (free: free, total: total)
             }
         }
