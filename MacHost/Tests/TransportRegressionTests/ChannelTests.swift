@@ -34,7 +34,10 @@ struct ChannelTests {
         try await tests.testSecondConsecutiveTimeoutClosesChannel()
         try await tests.testPrematureEOFIncludesSSHStderrAndExitCode()
         try await tests.testSuccessfulVersionResponse()
-        print("PASS: handshake timeout, request cancellation, consecutive timeouts, SSH EOF diagnostics, VERSION response")
+        try tests.testPacketReaderDataSliceIndexing()
+        try tests.testExtendedAttributesParsing()
+        try await tests.testChannelDesyncThresholdClosesChannel()
+        print("PASS: handshake timeout, request cancellation, consecutive timeouts, SSH EOF diagnostics, VERSION response, slice indexing, extended attrs, desync threshold")
     }
 
     func testSuccessfulVersionResponse() async throws {
@@ -151,5 +154,101 @@ struct ChannelTests {
             let message = error.localizedDescription
             XCTAssertTrue(message.contains("255") && message.contains("Permission denied"))
         }
+    }
+
+    func testPacketReaderDataSliceIndexing() throws {
+        var full = Data([0xFF, 0xFE, 0xFD]) // 3 bytes prefix
+        full.append(contentsOf: [0x42]) // readUInt8 -> 0x42
+        // UInt32 = 4 (length of string "test")
+        full.append(contentsOf: [0, 0, 0, 4])
+        full.append(contentsOf: "test".utf8)
+        // UInt32 = 3 (length of data [1, 2, 3])
+        full.append(contentsOf: [0, 0, 0, 3])
+        full.append(contentsOf: [1, 2, 3])
+        
+        let slice = full.dropFirst(3)
+        precondition(slice.startIndex == 3)
+        
+        let reader = SFTPPacketReader(data: slice)
+        let byte = try reader.readUInt8()
+        XCTAssertEqual(Int(byte), 0x42)
+        
+        let (str, raw) = try reader.readStringWithRaw()
+        XCTAssertTrue(str == "test")
+        XCTAssertEqual(raw.count, 4)
+        
+        let data = try reader.readData()
+        XCTAssertEqual(data.count, 3)
+        XCTAssertEqual(Int(data[0]), 1)
+    }
+
+    func testExtendedAttributesParsing() throws {
+        let engine = SFTPPacketEngine()
+        let writer = SFTPPacketWriter()
+        writer.appendUInt32(42) // reqId
+        // flags: size (0x1) + mtime (0x8) + extended (0x80000000) = 0x80000009
+        writer.appendUInt32(0x80000009)
+        writer.appendUInt64(1024) // size
+        writer.appendUInt32(100) // atime
+        writer.appendUInt32(200) // mtime
+        writer.appendUInt32(1) // 1 extended pair
+        writer.appendString("vendor@attr")
+        writer.appendString("custom_value")
+        
+        let attrsPayload = Data(writer.buildPacket(type: .attrs).dropFirst(5))
+        let (reqId, size, mtime, isDir) = try engine.parseAttrsResponse(data: attrsPayload)
+        XCTAssertEqual(Int(reqId), 42)
+        XCTAssertEqual(Int(size), 1024)
+        XCTAssertEqual(Int(mtime), 200)
+        XCTAssertTrue(!isDir)
+        
+        // Name response with extended attribute
+        let nameWriter = SFTPPacketWriter()
+        nameWriter.appendUInt32(99) // reqId
+        nameWriter.appendUInt32(1) // 1 entry
+        nameWriter.appendString("file.txt")
+        nameWriter.appendString("-rw-r--r-- 1 root root 1024 Jan 1 00:00 file.txt")
+        nameWriter.appendUInt32(0x80000009) // flags: size + mtime + extended
+        nameWriter.appendUInt64(1024)
+        nameWriter.appendUInt32(100)
+        nameWriter.appendUInt32(200)
+        nameWriter.appendUInt32(1) // 1 extended pair
+        nameWriter.appendString("vendor@attr")
+        nameWriter.appendString("custom_val")
+        
+        let namePayload = Data(nameWriter.buildPacket(type: .name).dropFirst(5))
+        let entries = try engine.parseNameResponse(data: namePayload)
+        XCTAssertEqual(entries.count, 1)
+        XCTAssertTrue(entries[0].filename == "file.txt")
+        XCTAssertEqual(Int(entries[0].size), 1024)
+        XCTAssertTrue(entries[0].rawFilename == Data("file.txt".utf8))
+    }
+
+    func testChannelDesyncThresholdClosesChannel() async throws {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/cat")
+        let input = Pipe(), output = Pipe()
+        process.standardInput = input
+        process.standardOutput = output
+        try process.run()
+        let channel = SFTPChannel(channelId: "desync", isInteractive: true, process: process,
+                                  inHandle: input.fileHandleForWriting, outHandle: output.fileHandleForReading)
+        defer { channel.close() }
+        
+        var statusPacket = Data([0, 0, 0, 9, 101])
+        var reqId: UInt32 = UInt32(999_999).bigEndian
+        var statusCode: UInt32 = UInt32(0).bigEndian
+        withUnsafeBytes(of: &reqId) { statusPacket.append(contentsOf: $0) }
+        withUnsafeBytes(of: &statusCode) { statusPacket.append(contentsOf: $0) }
+        
+        for _ in 0..<SFTPChannel.maxUnknownResponses {
+            try input.fileHandleForWriting.write(contentsOf: statusPacket)
+        }
+        
+        let start = ProcessInfo.processInfo.systemUptime
+        while channel.isRunning && ProcessInfo.processInfo.systemUptime - start < 1.0 {
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+        XCTAssertTrue(!channel.isRunning)
     }
 }

@@ -106,10 +106,23 @@ public final class RemoteSFTPDriver: FileSystemDriver, @unchecked Sendable {
                 )
             }
             let (_, dirHandle) = try packetEngine.parseHandleResponse(data: openPayload)
-            defer {
+            // L6: opendir-хендл занимает серверный лимит (max-open-handles-per-session = 32) —
+            // учитываем его в SessionBudget, чтобы пик параллельных листингов + передачи
+            // ждали слота, а не получали отказ сервера.
+            let handleAcquired = await coordinator.budget.acquireHandle(waitingUpTo: 10)
+            if !handleAcquired {
                 let closeReqId = channel.allocateRequestId()
                 let closePacket = packetEngine.createClosePacket(requestId: closeReqId, handle: dirHandle)
                 channel.writeStreamingPacket(packet: closePacket, requestId: closeReqId) { _ in }
+                throw NSError(domain: "RemoteSFTPDriver", code: 40, userInfo: [NSLocalizedDescriptionKey: "Исчерпан бюджет открытых хендлов SFTP (каталог \(nfcPath))"])
+            }
+            defer {
+                let closeReqId = channel.allocateRequestId()
+                let closePacket = packetEngine.createClosePacket(requestId: closeReqId, handle: dirHandle)
+                // Слот освобождаем по ответу сервера (или по ошибке канала), а не по отправке CLOSE.
+                channel.writeStreamingPacket(packet: closePacket, requestId: closeReqId) { _ in
+                    self.coordinator.budget.releaseHandle()
+                }
             }
             
             var allEntries: [FileItem] = []

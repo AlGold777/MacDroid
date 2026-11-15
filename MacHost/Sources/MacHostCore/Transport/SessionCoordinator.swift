@@ -328,8 +328,12 @@ public final class SessionCoordinator: @unchecked Sendable {
             let keygen = Process()
             keygen.executableURL = URL(fileURLWithPath: "/usr/bin/ssh-keygen")
             keygen.arguments = ["-t", "ed25519", "-N", "", "-C", "macdroid@commander", "-f", keyURL.path]
-            try? keygen.run()
+            try keygen.run()
             keygen.waitUntilExit()
+            // L7: при сбое генерации ключа ошибка должна всплыть здесь, а не позже в обмене.
+            guard keygen.terminationStatus == 0 else {
+                throw NSError(domain: "SessionCoordinator", code: 1006, userInfo: [NSLocalizedDescriptionKey: "ssh-keygen завершился с кодом \(keygen.terminationStatus)"])
+            }
             try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: keyURL.path)
         }
         
@@ -386,6 +390,10 @@ public final class SessionCoordinator: @unchecked Sendable {
         let socketDirectory = home.appendingPathComponent("Library/Caches/MCD", isDirectory: true)
         try FileManager.default.createDirectory(at: socketDirectory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
         try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: socketDirectory.path)
+        // M2: уборка осиротевших ControlMaster прошлых запусков (приложение могло упасть,
+        // disconnect() не вызван — мастер с -N и stdin=nullDevice живёт вечно на keepalive).
+        // Живым мастерам шлём `-O exit`, мёртвые файлы сокетов удаляем.
+        sweepStaleControlMasters(in: socketDirectory, port: targetPort)
         let sockPath = Self.controlSocketPath(home: home)
         
         var interactiveChan: SFTPChannel?
@@ -488,7 +496,10 @@ public final class SessionCoordinator: @unchecked Sendable {
             }
         } catch {
             try Task.checkCancellation()
-            // Фолбэк на единый безопасный канал при невозможности мультиплексирования
+            // Фолбэк на единый безопасный канал при невозможности мультиплексирования.
+            // M4: причину отказа фиксируем — host-key mismatch / отказ авторизации / таймаут
+            // мастера иначе терялись за «попробуем один канал».
+            SSHTransportLog.write("ControlMaster/mux setup failed epoch=\(currentEpoch) error=\(error.localizedDescription)")
             isMultiplexed = false
         }
         
@@ -606,6 +617,34 @@ public final class SessionCoordinator: @unchecked Sendable {
         connectingChannels.append(channel)
     }
 
+    /// M2: просит завершиться осиротевших мастеров прошлых запусков (`ssh -O exit` по сокету)
+    /// и удаляет мёртвые файлы сокетов. Свежий сокет текущего подключения ещё не создан —
+    /// sweep затрагивает только устаревшие.
+    private func sweepStaleControlMasters(in directory: URL, port: UInt16) {
+        let fm = FileManager.default
+        guard let entries = try? fm.contentsOfDirectory(atPath: directory.path) else { return }
+        for entry in entries where entry.hasPrefix("c_") {
+            let sock = directory.appendingPathComponent(entry)
+            let quit = Process()
+            quit.executableURL = URL(fileURLWithPath: "/usr/bin/ssh")
+            quit.arguments = ["-F", "/dev/null", "-S", sock.path, "-p", String(port), "-O", "exit", "macdroid@sweep"]
+            quit.standardInput = FileHandle.nullDevice
+            quit.standardOutput = FileHandle.nullDevice
+            quit.standardError = FileHandle.nullDevice
+            let finished = DispatchSemaphore(value: 0)
+            quit.terminationHandler = { _ in finished.signal() }
+            guard (try? quit.run()) != nil else { continue }
+            if finished.wait(timeout: .now() + 2) == .timedOut {
+                quit.terminate()
+            }
+            SSHTransportLog.write("ControlMaster sweep socket=\(entry) status=\(quit.terminationStatus)")
+            // После -O exit живой мастер удаляет сокет сам; оставшийся файл — мёртвый, убираем.
+            if fm.fileExists(atPath: sock.path) {
+                try? fm.removeItem(at: sock)
+            }
+        }
+    }
+    
     private func checkControlMaster(sockPath: String, port: UInt16, destination: String) throws {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/ssh")

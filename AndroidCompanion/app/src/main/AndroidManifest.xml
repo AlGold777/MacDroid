@@ -50,5 +50,11 @@
                 <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
             </intent-filter>
         </receiver>
+
+        <!-- H2: кнопки подтверждения сопряжения из уведомления.
+             Не экспортируется: действия принимаются только от самого приложения. -->
+        <receiver
+            android:name=".runtime.PairingConfirmationReceiver"
+            android:exported="false" />
     </application>
 </manifest>

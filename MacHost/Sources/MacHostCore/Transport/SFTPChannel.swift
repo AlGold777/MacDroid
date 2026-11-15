@@ -19,6 +19,8 @@ public final class SFTPChannel: @unchecked Sendable {
     private var nextReqId: UInt32 = 1
     private var consecutiveRequestTimeouts = 0
     private var lastResponseUptime = ProcessInfo.processInfo.systemUptime
+    private var unknownResponses = 0
+    private var writeInFlightSince: TimeInterval?
     
     private enum PendingEntry {
         case active(continuation: CheckedContinuation<(type: SFTPMessageType, payload: Data), Error>)
@@ -31,6 +33,13 @@ public final class SFTPChannel: @unchecked Sendable {
     private var initTimeoutWorkItem: DispatchWorkItem?
     
     public static let maxPacketLength: Int = 4 * 1024 * 1024 // 4 MiB жесткий потолок
+    /// Абсолютный потолок ожидания одного запроса суммарно (со всеми idle-продлениями).
+    /// Без него потерянный ответ при живом конвейере ждёт бесконечно.
+    public static let absoluteRequestCeilingSeconds: TimeInterval = 120
+    /// Watchdog зависшей записи в pipe (SSH-процесс перестал читать stdin).
+    public static let writeWatchdogSeconds: TimeInterval = 15
+    /// Порог подряд идущих ответов с неизвестным requestId до разрыва рассинхронизированного канала.
+    public static let maxUnknownResponses = 10
     
     public init(
         channelId: String,
@@ -119,9 +128,13 @@ public final class SFTPChannel: @unchecked Sendable {
             
             writerQueue.async { [weak self] in
                 guard let self = self else { return }
+                self.markWriteStart()
+                self.armWriteWatchdog()
                 do {
                     try self.inHandle.write(contentsOf: packet)
+                    self.markWriteEnd()
                 } catch {
+                    self.markWriteEnd()
                     self.lock.lock()
                     let c = self.initContinuation
                     self.initContinuation = nil
@@ -160,6 +173,8 @@ public final class SFTPChannel: @unchecked Sendable {
                 // Регистрируем ДО отправки
                 pendingRequests[requestId] = .active(continuation: continuation)
                 
+                // M1: начало окна ожидания запроса — для абсолютного потолка в 120 с.
+                let requestStartUptime = ProcessInfo.processInfo.systemUptime
                 func scheduleTimeoutWorkItem() {
                     let timeout = DispatchWorkItem { [weak self] in
                         guard let self else { return }
@@ -172,8 +187,12 @@ public final class SFTPChannel: @unchecked Sendable {
                         }
                         
                         // Проверяем время последней активности канала (inactivity/idle timeout)
-                        let timeSinceLastActivity = ProcessInfo.processInfo.systemUptime - self.lastResponseUptime
-                        if timeSinceLastActivity < timeoutSeconds {
+                        let now = ProcessInfo.processInfo.systemUptime
+                        // M1: активность канала продлевает таймаут, но не бесконечно —
+                        // иначе потерянный ответ при живом конвейере ждёт вечно.
+                        let withinCeiling = now - requestStartUptime < Self.absoluteRequestCeilingSeconds
+                        let timeSinceLastActivity = now - self.lastResponseUptime
+                        if withinCeiling && timeSinceLastActivity < timeoutSeconds {
                             // Канал активно передает данные (другие запросы конвейера успешно завершаются).
                             // Продлеваем ожидание на оставшееся время до реального простоя.
                             let remainingIdle = max(1.0, timeoutSeconds - timeSinceLastActivity)
@@ -216,9 +235,13 @@ public final class SFTPChannel: @unchecked Sendable {
                 // Запись в pipe на выделенной очереди
                 writerQueue.async { [weak self] in
                     guard let self = self else { return }
+                    self.markWriteStart()
+                    self.armWriteWatchdog()
                     do {
                         try self.inHandle.write(contentsOf: packet)
+                        self.markWriteEnd()
                     } catch {
+                        self.markWriteEnd()
                         self.lock.lock()
                         let entry = self.pendingRequests.removeValue(forKey: requestId)
                         self.requestTimeoutWorkItems.removeValue(forKey: requestId)?.cancel()
@@ -245,7 +268,10 @@ public final class SFTPChannel: @unchecked Sendable {
         }
     }
     
-    /// Асинхронная запись сырого пакета (например, в streaming конвейере) с предварительной регистрацией
+    /// Асинхронная запись сырого пакета с предварительной регистрацией.
+    /// ВНИМАНИЕ: ответ приходит в callback из неструктурированного Task — без проброса отмены.
+    /// Контракт: только fire-and-forget операции уровня CLOSE в defer (ответ не нужен).
+    /// Для операций, где важен результат, использовать sendRequest (async/await).
     public func writeStreamingPacket(packet: Data, requestId: UInt32, onResponse: @escaping (Result<(type: SFTPMessageType, payload: Data), Error>) -> Void) {
         lock.lock()
         guard !isClosed else {
@@ -328,19 +354,35 @@ public final class SFTPChannel: @unchecked Sendable {
                 lock.lock()
                 let entry = pendingRequests.removeValue(forKey: reqId)
                 requestTimeoutWorkItems.removeValue(forKey: reqId)?.cancel()
-                consecutiveRequestTimeouts = 0
-                lastResponseUptime = ProcessInfo.processInfo.systemUptime
+                var closeOnDesync = false
+                switch entry {
+                case .active:
+                    // Полноценное доказательство живости канала
+                    consecutiveRequestTimeouts = 0
+                    unknownResponses = 0
+                    lastResponseUptime = ProcessInfo.processInfo.systemUptime
+                case .cancelled:
+                    // Поздний ответ на отменённый запрос: сервер жив (просто опоздал) —
+                    // живость обновляем, но запрос не воскрешаем
+                    consecutiveRequestTimeouts = 0
+                    lastResponseUptime = ProcessInfo.processInfo.systemUptime
+                case .none:
+                    // Ответ на несуществующий requestId — рассинхронизация с сервером,
+                    // а не признак здорового конвейера. Мусор не должен сбрасывать таймауты
+                    // и подавлять health-probe через idleDuration.
+                    unknownResponses += 1
+                    closeOnDesync = unknownResponses >= Self.maxUnknownResponses
+                    if closeOnDesync { unknownResponses = 0 }
+                }
                 lock.unlock()
                 
-                switch entry {
-                case .active(let continuation):
+                if closeOnDesync {
+                    SSHTransportLog.write("SFTP channel desync: \(Self.maxUnknownResponses) responses with unknown requestId channel=\(channelId)")
+                    close()
+                    return
+                }
+                if case .active(let continuation) = entry {
                     continuation.resume(returning: (msgType, payload))
-                case .cancelled:
-                    // Запрос был отменен клиентом — безопасно поглощаем ответ сервера
-                    break
-                case .none:
-                    // Неизвестный или дублированный ответ — не ломает другие операции
-                    break
                 }
             } catch {
                 // Ошибка I/O или закрытие соединения — разрываем канал и уведомляем всех ожидающих
@@ -378,6 +420,33 @@ public final class SFTPChannel: @unchecked Sendable {
         return accumulated
     }
     
+    /// Фиксация начала синхронной записи в stdin SSH-процесса (для watchdog).
+    private func markWriteStart() {
+        lock.lock()
+        writeInFlightSince = ProcessInfo.processInfo.systemUptime
+        lock.unlock()
+    }
+    
+    private func markWriteEnd() {
+        lock.lock()
+        writeInFlightSince = nil
+        lock.unlock()
+    }
+    
+    /// Watchdog зависшей записи: SSH-процесс перестал читать stdin, буфер pipe заполнен,
+    /// writerQueue заблокирован — канал закрываем, pending-запросы получают ошибку.
+    private func armWriteWatchdog() {
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + Self.writeWatchdogSeconds) { [weak self] in
+            guard let self else { return }
+            self.lock.lock()
+            let stuck = self.writeInFlightSince.map { ProcessInfo.processInfo.systemUptime - $0 >= Self.writeWatchdogSeconds } ?? false
+            self.lock.unlock()
+            guard stuck else { return }
+            SSHTransportLog.write("SFTP write watchdog fired channel=\(self.channelId): запись в pipe зависла >\(Int(Self.writeWatchdogSeconds)) сек.")
+            self.close()
+        }
+    }
+    
     public func close() {
         teardown(error: NSError(domain: "SFTPChannel", code: 0, userInfo: [NSLocalizedDescriptionKey: "Channel closed by client"]))
     }
@@ -413,10 +482,10 @@ public final class SFTPChannel: @unchecked Sendable {
         let diagnostics = diagnosticMessage()
         SSHTransportLog.write("SFTP channel teardown channel=\(channelId) exit=\(exitStatus) error=\(error.localizedDescription) stderr=\(diagnostics)")
         
+        // inHandle закрываем ДО terminate: это разблокирует запись, зависшую в заполненном pipe.
+        try? inHandle.close()
         if process.isRunning {
             process.terminate()
         }
-        // The child process closes its pipe on exit; only the reader owns stdout.
-        writerQueue.async { [inHandle] in try? inHandle.close() }
     }
 }

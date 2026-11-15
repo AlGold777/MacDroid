@@ -18,12 +18,14 @@ import java.nio.file.Paths
 import java.security.PublicKey
 import java.util.Base64
 import java.util.Collections
+import com.macandroid.filemanager.runtime.PairingConfirmationReceiver
 
 /**
- * SFTP/SSH-сервер телефона. Слушает только Wi-Fi-адрес (wlan*), если он определён;
- * иначе (Wi-Fi недоступен) — все интерфейсы (поведение по решению, см. документацию).
+ * SFTP/SSH-сервер телефона. Слушает Wi-Fi-адрес (wlan*) + loopback, если Wi-Fi определён;
+ * иначе (H3) — только loopback: SSH не выставляется на cellular/все интерфейсы,
+ * а USB-подключение через `adb forward` продолжает работать.
  *
- * @param bindHost адрес для прослушивания; null — все интерфейсы.
+ * @param bindHost адрес для прослушивания; null — все интерфейсы (вызывающий код не использует).
  */
 class EmbeddedServer(
     private val context: Context,
@@ -45,26 +47,51 @@ class EmbeddedServer(
             this.port = this@EmbeddedServer.port
             // Кроме Wi-Fi адреса слушаем loopback: через него идёт `adb forward` (подключение по кабелю).
             // MINA SSHD принимает список адресов через запятую.
-            bindHost?.let { this.host = "$it,127.0.0.1" }
+            bindHost?.let { this.host = listOf(it, "127.0.0.1").distinct().joinToString(",") }
 
             // Хост-ключи сервера
             val hostKeyFile = File(context.filesDir, "hostkey.ser")
-            keyPairProvider = SimpleGeneratorHostKeyProvider(hostKeyFile.toPath())
+            // M3: без setAlgorithm MINA 2.12 генерирует EC-ключ (nistp521), а README и pin-политика
+            // рассчитывают на Ed25519. EdDSA-провайдер уже в зависимостях (клиентские ключи Mac — Ed25519).
+            keyPairProvider = SimpleGeneratorHostKeyProvider(hostKeyFile.toPath()).apply {
+                setAlgorithm("Ed25519")
+            }
 
             // SEC-01 FIX: Отключаем парольный вход без авторизации.
             // Применяем строгую проверку открытого ключа (Public Key Auth)
             passwordAuthenticator = null
+            // M6: hardening дефолтов MINA 2.12:
+            // — keyboard-interactive не рекламируется (passwordAuthenticator отключён);
+            // — SSH-форвардинг запрещён (сервер — только SFTP/exec, не прокси);
+            // — единственный тип канала — session (DirectTcpipFactory убран).
+            keyboardInteractiveAuthenticator = null
+            forwardingFilter = org.apache.sshd.server.forward.RejectAllForwardingFilter.INSTANCE
+            channelFactories = listOf(org.apache.sshd.server.channel.ChannelSessionFactory.INSTANCE)
 
             publickeyAuthenticator = PublickeyAuthenticator { _, key: PublicKey, session ->
                 var accepted = false
                 synchronized(pairingLock) {
                     val encodedKey = Base64.getEncoder().encodeToString(key.encoded)
                     if (!authorizedKeysFile.exists() || authorizedKeysFile.length() == 0L) {
-                        // Первый ключ принимается только в окне сопряжения, окно закрывается сразу после записи.
                         if (isPairingModeActive) {
-                            authorizedKeysFile.writeText(encodedKey + "\n")
-                            closePairingWindow()
-                            accepted = true
+                            // H2: первый ключ НЕ записывается автоматически — иначе в 60-секундном
+                            // окне его регистрирует любой хост LAN / локальный процесс через adb forward.
+                            // Ключ запоминается как заявка; запись делает только явное подтверждение
+                            // пользователя на телефоне (уведомление PairingConfirmationReceiver).
+                            if (pendingPairingKeyBase64 == null) {
+                                pendingPairingKeyBase64 = encodedKey
+                                val fingerprint = try {
+                                    KeyUtils.getFingerPrint(key)
+                                } catch (e: Exception) {
+                                    "отпечаток недоступен"
+                                }
+                                PairingConfirmationReceiver.showConfirmationNotification(
+                                    context.applicationContext, fingerprint
+                                )
+                                Log.i(TAG, "Запрос сопряжения: ждёт подтверждения на телефоне ($fingerprint)")
+                            }
+                            // Отклоняем эту попытку: Mac переподключится после подтверждения на телефоне.
+                            accepted = false
                         }
                     } else {
                         // Последующие подключения должны совпадать с уже сохранёнными ключами.
@@ -189,9 +216,11 @@ class EmbeddedServer(
                                 exitCallback?.onExit(1)
                             }
                         } else {
-                            outStream?.write("OK\n".toByteArray(java.nio.charset.StandardCharsets.UTF_8))
+                            // M6: неизвестная команда — честный отказ, а не мнимый успех.
+                            // Проверить MacHost: служебные probe-команды добавлять в ветки выше.
+                            outStream?.write("ERROR_UNKNOWN_COMMAND\n".toByteArray(java.nio.charset.StandardCharsets.UTF_8))
                             outStream?.flush()
-                            exitCallback?.onExit(0)
+                            exitCallback?.onExit(127)
                         }
                     }
 
@@ -320,6 +349,42 @@ class EmbeddedServer(
 
         fun closePairingWindow() {
             pairingWindowEndsAt = 0L
+        }
+
+        // H2: заявка на сопряжение, ожидающая подтверждения пользователя на телефоне.
+        // Хранится только в памяти: перезапуск приложения сбрасывает неподтверждённую заявку.
+        @Volatile
+        var pendingPairingKeyBase64: String? = null
+            private set
+
+        /**
+         * Подтверждение сопряжения пользователем (кнопка «Разрешить» в уведомлении):
+         * записывает отложенный ключ в authorized_keys и закрывает окно.
+         * @return true, если ключ записан; false — заявки нет или окно уже закрыто.
+         */
+        fun confirmPendingPairing(filesDir: File): Boolean {
+            val key = pendingPairingKeyBase64 ?: return false
+            if (!isPairingModeActive) {
+                pendingPairingKeyBase64 = null
+                return false
+            }
+            return synchronized(pairingLock) {
+                try {
+                    File(filesDir, "authorized_keys").writeText(key + "\n")
+                    true
+                } catch (e: Exception) {
+                    Log.e(TAG, "Не удалось записать authorized_keys", e)
+                    false
+                } finally {
+                    pendingPairingKeyBase64 = null
+                    closePairingWindow()
+                }
+            }
+        }
+
+        /** Отклонение заявки (кнопка «Отклонить» или истечение окна). */
+        fun rejectPendingPairing() {
+            pendingPairingKeyBase64 = null
         }
 
         /**

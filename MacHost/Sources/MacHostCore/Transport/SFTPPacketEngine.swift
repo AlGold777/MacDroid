@@ -47,16 +47,21 @@ public enum SFTPStatusCode: UInt32, Sendable {
 public struct SFTPNameEntry: Sendable {
     public let filename: String
     public let longname: String
+    /// Исходные байты имени с сервера. Канон для обратных операций (open/remove/rename/stat):
+    /// декодированная `filename` может терять байты (не-UTF8, lossy-декод) или меняться
+    /// при NFC-нормализации — round-trip по ней такой файл не найдёт.
+    public let rawFilename: Data
     public let size: UInt64
     public let mtime: UInt32
     public let isDirectory: Bool
     public let isSymbolicLink: Bool
     
-    public init(filename: String, longname: String, size: UInt64, mtime: UInt32, isDirectory: Bool, isSymbolicLink: Bool = false) {
+    public init(filename: String, longname: String, size: UInt64, mtime: UInt32, isDirectory: Bool, isSymbolicLink: Bool = false, rawFilename: Data? = nil) {
         // Оптимизация: пропускаем NFC-нормализацию для чистых ASCII-имён
         self.filename = filename.utf8.allSatisfy({ $0 < 128 }) ? filename : filename.precomposedStringWithCanonicalMapping
         // longname не требует нормализации, так как используется лишь как служебная строка
         self.longname = longname
+        self.rawFilename = rawFilename ?? Data(self.filename.utf8)
         self.size = size
         self.mtime = mtime
         self.isDirectory = isDirectory
@@ -166,7 +171,7 @@ public final class SFTPPacketReader {
     
     public func readUInt8() throws -> UInt8 {
         guard offset < data.count else { throw NSError(domain: "SFTPPacketReader", code: 1, userInfo: [NSLocalizedDescriptionKey: "Unexpected EOF"]) }
-        let val = data[offset]
+        let val = data[data.startIndex + offset] // L3: индексация от startIndex (срезы Data)
         offset += 1
         return val
     }
@@ -207,10 +212,22 @@ public final class SFTPPacketReader {
         return str
     }
     
+    /// Строка + её исходные байты: для round-trip имён файлов без потерь (не-UTF8, NFD).
+    public func readStringWithRaw() throws -> (value: String, raw: Data) {
+        let len = Int(try readUInt32())
+        guard offset + len <= data.count else { throw NSError(domain: "SFTPPacketReader", code: 1, userInfo: [NSLocalizedDescriptionKey: "Unexpected EOF reading String"]) }
+        let start = data.startIndex + offset
+        let slice = data[start..<(start + len)]
+        let raw = len == 0 ? Data() : Data(slice)
+        let str = len == 0 ? "" : String(decoding: slice, as: UTF8.self)
+        offset += len
+        return (str, raw)
+    }
+    
     public func readData() throws -> Data {
         let len = Int(try readUInt32())
         guard offset + len <= data.count else { throw NSError(domain: "SFTPPacketReader", code: 1, userInfo: [NSLocalizedDescriptionKey: "Unexpected EOF reading Data"]) }
-        let sub = data.subdata(in: offset..<offset+len)
+        let sub = data.subdata(in: (data.startIndex + offset)..<(data.startIndex + offset + len)) // L3
         offset += len
         return sub
     }
@@ -362,6 +379,14 @@ public final class SFTPPacketEngine: @unchecked Sendable {
             _ = try reader.readUInt32()
             mtime = try reader.readUInt32()
         }
+        // T8: SSH_FILEXFER_ATTR_EXTENDED — count пар (extended_type, extended_data), пропускаем
+        if (flags & 0x80000000) != 0 {
+            let extCount = try reader.readUInt32()
+            for _ in 0..<extCount {
+                _ = try reader.readString()
+                _ = try reader.readString()
+            }
+        }
         let isDir = (permissions & 0o040000) != 0
         return (reqId, size, mtime, isDir)
     }
@@ -380,7 +405,7 @@ public final class SFTPPacketEngine: @unchecked Sendable {
         var entries: [SFTPNameEntry] = []
         
         for _ in 0..<count {
-            let filename = try reader.readString()
+            let (filename, filenameRaw) = try reader.readStringWithRaw()
             let longname = try reader.readString()
             let flags = try reader.readUInt32()
             
@@ -401,6 +426,14 @@ public final class SFTPPacketEngine: @unchecked Sendable {
                 _ = try reader.readUInt32() // atime
                 mtime = try reader.readUInt32()
             }
+            // T8: SSH_FILEXFER_ATTR_EXTENDED — пропускаем пары (extended_type, extended_data)
+            if (flags & 0x80000000) != 0 {
+                let extCount = try reader.readUInt32()
+                for _ in 0..<extCount {
+                    _ = try reader.readString()
+                    _ = try reader.readString()
+                }
+            }
             
             let isDir = (permissions & 0o040000) != 0 || longname.hasPrefix("d")
             entries.append(SFTPNameEntry(
@@ -409,7 +442,8 @@ public final class SFTPPacketEngine: @unchecked Sendable {
                 size: size,
                 mtime: mtime,
                 isDirectory: isDir,
-                isSymbolicLink: (permissions & 0o170000) == 0o120000 || (permissions == 0 && longname.hasPrefix("l"))
+                isSymbolicLink: (permissions & 0o170000) == 0o120000 || (permissions == 0 && longname.hasPrefix("l")),
+                rawFilename: filenameRaw
             ))
         }
         return entries

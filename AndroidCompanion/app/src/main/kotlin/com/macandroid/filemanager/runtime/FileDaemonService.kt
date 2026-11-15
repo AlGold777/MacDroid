@@ -247,12 +247,15 @@ class FileDaemonService : Service() {
 
         stopServerLocked()
         try {
-            val newServer = EmbeddedServer(this, port = SFTP_PORT, bindHost = wanted)
+            // H3: без Wi-Fi — только loopback: SSH не торчит на cellular/все интерфейсы,
+            // а USB-подключение через `adb forward` (127.0.0.1) продолжает работать.
+            val newServer = EmbeddedServer(this, port = SFTP_PORT, bindHost = wanted ?: "127.0.0.1")
             newServer.start()
             server = newServer
             boundHost = wanted
             isServerListening = true
-            DaemonLog.write(this, "SFTP-сервер запущен (адрес ${addressLabel(wanted)}, порт $SFTP_PORT)")
+            // M3: отпечаток в журнале делает видимой молчаливую перегенерацию hostkey.ser
+            DaemonLog.write(this, "SFTP-сервер запущен (адрес ${addressLabel(wanted)}, порт $SFTP_PORT, хост-ключ ${newServer.hostKeyFingerprint() ?: "неизвестен"})")
             // Сервер поднят: ожидающий повтор и счётчик неудач больше не нужны
             retryAttempt = 0
             cancelRetryLocked()
