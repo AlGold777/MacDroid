@@ -5736,25 +5736,18 @@ public final class DualPaneViewModel: ObservableObject {
         var totalObjectsCount = 0
         var totalBytesCount: UInt64 = 0
         
+        var targetBytes: [UInt64] = []
         for target in targets {
             if target.isDirectory && source == .localMac {
-                totalObjectsCount += 1
-                if let enumerator = FileManager.default.enumerator(
-                    at: URL(fileURLWithPath: target.path),
-                    includingPropertiesForKeys: [.fileSizeKey, .isDirectoryKey],
-                    options: []
-                ) {
-                    for case let fileURL as URL in enumerator {
-                        totalObjectsCount += 1
-                        let vals = try? fileURL.resourceValues(forKeys: [.fileSizeKey, .isDirectoryKey])
-                        if vals?.isDirectory != true {
-                            totalBytesCount += UInt64(vals?.fileSize ?? 0)
-                        }
-                    }
-                }
+                let path = target.path
+                let m = await Task.detached(priority: .userInitiated) { LocalCopyEngine.measure(path: path) }.value
+                totalObjectsCount += m.objects
+                totalBytesCount += m.bytes
+                targetBytes.append(m.bytes)
             } else {
                 totalObjectsCount += 1
                 totalBytesCount += target.size
+                targetBytes.append(target.size)
             }
         }
         
@@ -5780,10 +5773,9 @@ public final class DualPaneViewModel: ObservableObject {
         var currentItems = allItems
         var createdNames: [String] = []
         var transferredBytesTotal: UInt64 = 0
-        var lastProgressUpdate: CFAbsoluteTime = 0
         
         do {
-            for target in targets {
+            for (targetIndex, target) in targets.enumerated() {
                 if self.isDuplicateCancelled || Task.isCancelled {
                     throw CancellationError()
                 }
@@ -5796,148 +5788,44 @@ public final class DualPaneViewModel: ObservableObject {
                 }
                 
                 if source == .localMac {
-                    if target.isDirectory {
-                        try FileManager.default.createDirectory(atPath: newPath, withIntermediateDirectories: true)
-                        
-                        let sourceURL = URL(fileURLWithPath: target.path)
-                        guard let enumerator = FileManager.default.enumerator(
-                            at: sourceURL,
-                            includingPropertiesForKeys: [.fileSizeKey, .isDirectoryKey],
-                            options: []
-                        ) else {
-                            try FileManager.default.copyItem(atPath: target.path, toPath: newPath)
-                            continue
-                        }
-                        
-                        let targetResolvedPath = URL(fileURLWithPath: target.path).resolvingSymlinksInPath().path
-                        let targetResolvedPrefix = targetResolvedPath.hasSuffix("/") ? targetResolvedPath : (targetResolvedPath + "/")
-                        let targetPrefix = target.path.hasSuffix("/") ? target.path : (target.path + "/")
-                        
-                        for case let fileURL as URL in enumerator {
-                            if self.isDuplicateCancelled || Task.isCancelled {
-                                throw CancellationError()
-                            }
-                            
-                            let fileResolvedPath = fileURL.resolvingSymlinksInPath().path
-                            let relPath: String
-                            if fileResolvedPath.hasPrefix(targetResolvedPrefix) {
-                                relPath = String(fileResolvedPath.dropFirst(targetResolvedPrefix.count))
-                            } else if fileURL.path.hasPrefix(targetPrefix) {
-                                relPath = String(fileURL.path.dropFirst(targetPrefix.count))
-                            } else {
-                                relPath = fileURL.lastPathComponent
-                            }
-                            
-                            let destURL = URL(fileURLWithPath: newPath).appendingPathComponent(relPath)
-                            let destPath = destURL.path
-                            let vals = try? fileURL.resourceValues(forKeys: [.fileSizeKey, .isDirectoryKey])
-                            let isDir = vals?.isDirectory ?? false
-                            
-                            if isDir {
-                                try FileManager.default.createDirectory(atPath: destPath, withIntermediateDirectories: true)
-                            } else {
-                                let parentDir = destURL.deletingLastPathComponent().path
-                                if !FileManager.default.fileExists(atPath: parentDir) {
-                                    try FileManager.default.createDirectory(atPath: parentDir, withIntermediateDirectories: true)
-                                }
-                                let fSize = UInt64(vals?.fileSize ?? 0)
-                                if fSize > 2 * 1024 * 1024,
-                                   let readHandle = try? FileHandle(forReadingFrom: fileURL) {
-                                    FileManager.default.createFile(atPath: destPath, contents: nil)
-                                    if let writeHandle = try? FileHandle(forWritingTo: URL(fileURLWithPath: destPath)) {
-                                        let chunkSize = 1024 * 1024
-                                        while !self.isDuplicateCancelled && !Task.isCancelled {
-                                            let data = readHandle.readData(ofLength: chunkSize)
-                                            if data.isEmpty { break }
-                                            writeHandle.write(data)
-                                            transferredBytesTotal += UInt64(data.count)
-                                            speedTracker.update(bytesTransferred: transferredBytesTotal)
-                                            
-                                            let now = CFAbsoluteTimeGetCurrent()
-                                            if now - lastProgressUpdate >= 0.067 {
-                                                lastProgressUpdate = now
-                                                let rem = totalBytesCount > transferredBytesTotal ? (totalBytesCount - transferredBytesTotal) : 0
-                                                let eta = speedTracker.calculateETA(remainingBytes: rem)
-                                                self.duplicateTransferredBytes = transferredBytesTotal
-                                                self.duplicateProgress = totalBytesCount > 0 ? min(1.0, Double(transferredBytesTotal) / Double(totalBytesCount)) : 0.0
-                                                self.duplicateSubtitle = Self.formatDuplicateSizeAndETA(transferred: transferredBytesTotal, total: totalBytesCount, eta: eta)
-                                            }
-                                            await Task.yield()
-                                        }
-                                        try? writeHandle.close()
-                                        try? readHandle.close()
-                                        if self.isDuplicateCancelled || Task.isCancelled {
-                                            throw CancellationError()
-                                        }
-                                    } else {
-                                        try? readHandle.close()
-                                        try FileManager.default.copyItem(atPath: fileURL.path, toPath: destPath)
-                                        transferredBytesTotal += fSize
-                                    }
-                                } else {
-                                    try FileManager.default.copyItem(atPath: fileURL.path, toPath: destPath)
-                                    transferredBytesTotal += fSize
-                                    speedTracker.update(bytesTransferred: transferredBytesTotal)
-                                    
-                                    let now = CFAbsoluteTimeGetCurrent()
-                                    if now - lastProgressUpdate >= 0.067 {
-                                        lastProgressUpdate = now
-                                        let rem = totalBytesCount > transferredBytesTotal ? (totalBytesCount - transferredBytesTotal) : 0
-                                        let eta = speedTracker.calculateETA(remainingBytes: rem)
-                                        self.duplicateTransferredBytes = transferredBytesTotal
-                                        self.duplicateProgress = totalBytesCount > 0 ? min(1.0, Double(transferredBytesTotal) / Double(totalBytesCount)) : 0.0
-                                        self.duplicateSubtitle = Self.formatDuplicateSizeAndETA(transferred: transferredBytesTotal, total: totalBytesCount, eta: eta)
-                                    }
-                                }
-                            }
-                            TagsManager.shared.clearTags(at: destPath, source: .localMac)
-                            await Task.yield()
-                        }
-                        
-                        TagsManager.shared.clearTags(at: newPath, source: .localMac)
-                    } else {
-                        // Одиночный файл
-                        let fSize = target.size
-                        if fSize > 2 * 1024 * 1024,
-                           let readHandle = try? FileHandle(forReadingFrom: URL(fileURLWithPath: target.path)) {
-                            FileManager.default.createFile(atPath: newPath, contents: nil)
-                            if let writeHandle = try? FileHandle(forWritingTo: URL(fileURLWithPath: newPath)) {
-                                let chunkSize = 1024 * 1024
-                                while !self.isDuplicateCancelled && !Task.isCancelled {
-                                    let data = readHandle.readData(ofLength: chunkSize)
-                                    if data.isEmpty { break }
-                                    writeHandle.write(data)
-                                    transferredBytesTotal += UInt64(data.count)
-                                    speedTracker.update(bytesTransferred: transferredBytesTotal)
-                                    
-                                    let now = CFAbsoluteTimeGetCurrent()
-                                    if now - lastProgressUpdate >= 0.067 {
-                                        lastProgressUpdate = now
-                                        let rem = totalBytesCount > transferredBytesTotal ? (totalBytesCount - transferredBytesTotal) : 0
-                                        let eta = speedTracker.calculateETA(remainingBytes: rem)
-                                        self.duplicateTransferredBytes = transferredBytesTotal
-                                        self.duplicateProgress = totalBytesCount > 0 ? min(1.0, Double(transferredBytesTotal) / Double(totalBytesCount)) : 0.0
-                                        self.duplicateSubtitle = Self.formatDuplicateSizeAndETA(transferred: transferredBytesTotal, total: totalBytesCount, eta: eta)
-                                    }
-                                    await Task.yield()
-                                }
-                                try? writeHandle.close()
-                                try? readHandle.close()
-                                if self.isDuplicateCancelled || Task.isCancelled {
-                                    throw CancellationError()
-                                }
-                            } else {
-                                try? readHandle.close()
-                                try FileManager.default.copyItem(atPath: target.path, toPath: newPath)
-                                transferredBytesTotal += fSize
-                            }
-                        } else {
-                            try FileManager.default.copyItem(atPath: target.path, toPath: newPath)
-                            transferredBytesTotal += fSize
-                            speedTracker.update(bytesTransferred: transferredBytesTotal)
-                        }
-                        TagsManager.shared.clearTags(at: newPath, source: .localMac)
+                    // Копирование вне главного актора: clonefile/copyfile (как Finder), прогресс и отмена через callback.
+                    let cancelFlag = LocalCopyCancelFlag()
+                    let baseBytes = transferredBytesTotal
+                    let srcPath = target.path
+                    let applyProgress: @MainActor (UInt64) -> Void = { [weak self] copied in
+                        guard let self = self else { return }
+                        let total = baseBytes + copied
+                        speedTracker.update(bytesTransferred: total)
+                        let rem = totalBytesCount > total ? (totalBytesCount - total) : 0
+                        let eta = speedTracker.calculateETA(remainingBytes: rem)
+                        self.duplicateTransferredBytes = total
+                        self.duplicateProgress = totalBytesCount > 0 ? min(1.0, Double(total) / Double(totalBytesCount)) : 0.0
+                        self.duplicateSubtitle = Self.formatDuplicateSizeAndETA(transferred: total, total: totalBytesCount, eta: eta)
                     }
+                    try await withTaskCancellationHandler {
+                        try await Task.detached(priority: .userInitiated) {
+                            var last: CFAbsoluteTime = 0
+                            try LocalCopyEngine.copy(from: srcPath, to: newPath, cancel: cancelFlag) { copied in
+                                let now = CFAbsoluteTimeGetCurrent()
+                                guard now - last >= 0.067 else { return }
+                                last = now
+                                Task { @MainActor in applyProgress(copied) }
+                            }
+                        }.value
+                    } onCancel: {
+                        cancelFlag.cancel()
+                    }
+                    if self.isDuplicateCancelled || Task.isCancelled {
+                        throw CancellationError()
+                    }
+                    transferredBytesTotal = baseBytes + (targetBytes.indices.contains(targetIndex) ? targetBytes[targetIndex] : target.size)
+                    applyProgress(transferredBytesTotal - baseBytes)
+                    
+                    // Теги у копии не наследуются; для папки чистим и вложенные объекты
+                    if target.isDirectory {
+                        LocalCopyEngine.clearTagsRecursively(at: newPath)
+                    }
+                    TagsManager.shared.clearTags(at: newPath, source: .localMac)
                 } else {
                     // Телефон: прямое копирование внутри устройства (раньше задача лишь ставилась в очередь и не выполнялась).
                     guard !target.isDirectory else {
