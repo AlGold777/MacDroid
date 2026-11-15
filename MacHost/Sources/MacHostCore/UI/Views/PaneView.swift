@@ -4,6 +4,7 @@ import AppKit
 
 public struct PaneView: View {
     @EnvironmentObject var vm: DualPaneViewModel
+    @ObservedObject private var discoveryService = DiscoveryService.shared
     public let side: PaneSide
     
     @State private var isDropTarget: Bool = false
@@ -227,11 +228,40 @@ public struct PaneView: View {
                         isPhoneHovered = hovering
                         if hovering {
                             vm.hoveredPhoneButtonSide = side
+                            vm.discoveryService.startDiscovery()
                         } else if vm.hoveredPhoneButtonSide == side {
                             vm.hoveredPhoneButtonSide = nil
                         }
                     }
                     .contextMenu {
+                        if !vm.onlinePhones.isEmpty {
+                            ForEach(vm.onlinePhones) { phone in
+                                Button(action: {
+                                    if currentSrc != .remotePhone {
+                                        vm.changeSource(to: .remotePhone, side: side)
+                                    }
+                                    if phone.isConnected {
+                                        vm.navigateTo(path: "/storage/emulated/0", side: side)
+                                    } else {
+                                        vm.connectPhone(
+                                            customHost: phone.host,
+                                            customPort: UInt16(phone.port),
+                                            forceActivate: true,
+                                            isExplicit: true
+                                        )
+                                    }
+                                }) {
+                                    Label {
+                                        Text(phone.name)
+                                    } icon: {
+                                        Image(nsImage: .greenDot)
+                                    }
+                                }
+                            }
+                            
+                            Divider()
+                        }
+                        
                         if vm.isPhoneConnected && vm.remoteDriver.isConnected {
                             Button(action: {
                                 vm.disconnectPhone()
@@ -4536,4 +4566,21 @@ struct FileReorderDropDelegate: DropDelegate {
         return true
     }
 }
+
+extension NSImage {
+    /// Точный зеленый индикатор размера 7×7 pt для элементов NSMenu (в выпадающих списках и контекстных меню)
+    @MainActor public static let greenDot: NSImage = {
+        let size: CGFloat = 14
+        let img = NSImage(size: NSSize(width: size, height: size), flipped: false) { rect in
+            NSColor(calibratedRed: 0.35, green: 0.88, blue: 0.35, alpha: 1.0).setFill()
+            let circleRect = NSRect(x: 3.5, y: 3.5, width: 7, height: 7)
+            let path = NSBezierPath(ovalIn: circleRect)
+            path.fill()
+            return true
+        }
+        img.isTemplate = false
+        return img
+    }()
+}
+
 

@@ -505,16 +505,7 @@ public struct PairingModalView: View {
     
     /// Точный зеленый индикатор размера 7×7 pt для выпадающего NSMenu
     private var greenDotImage: NSImage {
-        let size: CGFloat = 14
-        let img = NSImage(size: NSSize(width: size, height: size), flipped: false) { rect in
-            NSColor(calibratedRed: 0.35, green: 0.88, blue: 0.35, alpha: 1.0).setFill()
-            let circleRect = NSRect(x: 3.5, y: 3.5, width: 7, height: 7)
-            let path = NSBezierPath(ovalIn: circleRect)
-            path.fill()
-            return true
-        }
-        img.isTemplate = false
-        return img
+        NSImage.greenDot
     }
     
     private func isConnectionSelected(_ item: SavedConnection) -> Bool {

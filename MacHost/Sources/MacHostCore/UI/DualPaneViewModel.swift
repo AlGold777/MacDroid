@@ -212,6 +212,104 @@ public final class DualPaneViewModel: ObservableObject {
     @Published public var leftHistoryIndex: Int = -1
     @Published public var isEditingLeftPath: Bool = false
     
+    public struct OnlinePhoneItem: Identifiable, Hashable, Sendable {
+        public var id: String { "\(host):\(port)" }
+        public let name: String
+        public let fullName: String
+        public let host: String
+        public let port: Int
+        public let isConnected: Bool
+        
+        public init(name: String, fullName: String, host: String, port: Int, isConnected: Bool) {
+            self.name = name
+            self.fullName = fullName
+            self.host = host
+            self.port = port
+            self.isConnected = isConnected
+        }
+    }
+    
+    nonisolated public static func formatShortPhoneName(_ rawName: String) -> String {
+        var clean = rawName.replacingOccurrences(of: "(MacDroid Companion)", with: "")
+            .replacingOccurrences(of: "(MacDroid)", with: "")
+            .trimmingCharacters(in: .whitespaces)
+        if clean.hasPrefix("Телефон ") {
+            let remainder = String(clean.dropFirst(8)).trimmingCharacters(in: .whitespaces)
+            if !remainder.isEmpty && remainder != "Android" {
+                clean = remainder
+            }
+        }
+        if clean.contains("2409BRN2CY") || clean.contains("RN") || clean.lowercased().contains("redmi") {
+            clean = clean.replacingOccurrences(of: "Xiaomi", with: "Redmi")
+        }
+        
+        let words = clean.split(separator: " ").map(String.init)
+        let nonModelWords = words.filter { word in
+            let hasDigits = word.contains { $0.isNumber }
+            let hasLetters = word.contains { $0.isLetter }
+            if hasDigits && hasLetters { return false }
+            return true
+        }
+        if !nonModelWords.isEmpty {
+            return nonModelWords.joined(separator: " ")
+        }
+        return words.first ?? (clean.isEmpty ? "Phone" : clean)
+    }
+    
+    private func resolveDeviceFullName(host: String, initialName: String) -> String {
+        let normHost = ConnectionHostAddress.normalized(host)
+        if !initialName.isEmpty && initialName != "Телефон Android" && initialName != "Android" && initialName != "Phone" {
+            return initialName
+        }
+        if let found = discoveryService.discoveredDevices.first(where: { ConnectionHostAddress.normalized($0.host) == normHost }), !found.name.isEmpty, found.name != "Телефон Android", found.name != "Android" {
+            return found.name
+        }
+        if let devName = PhoneConnectionManager.shared.deviceNameForHost(normHost), devName != "Телефон Android", devName != "Android", !devName.isEmpty {
+            return devName
+        }
+        if let dev = DeviceRegistry.shared.device(matchingHost: normHost), dev.name != "Телефон Android", dev.name != "Android", !dev.name.isEmpty {
+            return dev.name
+        }
+        if let saved = PairingModalView.loadInitialHistory().first(where: { ConnectionHostAddress.normalized($0.host) == normHost }), saved.name != "Телефон Android", saved.name != "Android", !saved.name.isEmpty {
+            return saved.name
+        }
+        return initialName.isEmpty ? "Телефон Android" : initialName
+    }
+    
+    public var onlinePhones: [OnlinePhoneItem] {
+        var items: [OnlinePhoneItem] = []
+        var seen = Set<String>()
+        
+        let connectedHost = (isPhoneConnected && remoteDriver.isConnected) 
+            ? ConnectionHostAddress.normalized(SessionCoordinator.shared.host) 
+            : nil
+        
+        for dev in discoveryService.discoveredDevices {
+            guard ConnectionHostAddress.isIPv4(dev.host) else { continue }
+            let normHost = ConnectionHostAddress.normalized(dev.host)
+            let port = dev.port > 0 ? dev.port : 2222
+            let key = "\(normHost):\(port)"
+            guard seen.insert(key).inserted else { continue }
+            
+            let resolvedFullName = resolveDeviceFullName(host: normHost, initialName: dev.name)
+            let shortName = Self.formatShortPhoneName(resolvedFullName)
+            let isConnected = (connectedHost == normHost)
+            items.append(OnlinePhoneItem(name: shortName, fullName: resolvedFullName, host: normHost, port: port, isConnected: isConnected))
+        }
+        
+        if let connHost = connectedHost, !connHost.isEmpty {
+            let port = Int(SessionCoordinator.shared.port != 0 ? SessionCoordinator.shared.port : 2222)
+            let key = "\(connHost):\(port)"
+            if seen.insert(key).inserted {
+                let resolvedFullName = resolveDeviceFullName(host: connHost, initialName: getConnectedPhoneName())
+                let shortName = Self.formatShortPhoneName(resolvedFullName)
+                items.append(OnlinePhoneItem(name: shortName, fullName: resolvedFullName, host: connHost, port: port, isConnected: true))
+            }
+        }
+        
+        return items
+    }
+    
     private func cleanDeviceName(_ name: String) -> String {
         var clean = name.replacingOccurrences(of: "(MacDroid)", with: "")
             .trimmingCharacters(in: .whitespaces)

@@ -4582,6 +4582,9 @@ func runAllAsyncTests() async {
         // 64. Single Tag Enforcement (Old Tag Disappears on New Selection)
         await runTest64()
         
+        // 65. Phone Context Menu Online Devices & Short Name Formatting
+        await runTest65()
+        
         print("\n🎉 ==================================================")
         print("🎉   ALL PRODUCTION TEST SUITES PASSED!             ")
         print("🎉 ==================================================")
@@ -6666,6 +6669,51 @@ func runTest64() async {
     TagsManager.shared.clearTags(at: itemB.path, source: .remotePhone)
     
     print("  ✓ Single tag enforcement tests passed successfully!")
+}
+
+func runTest65() async {
+    print("\n--- [TEST 65] Phone Context Menu Online Devices & Short Name Formatting ---")
+    
+    // 1. formatShortPhoneName tests
+    let xiaomiShort = DualPaneViewModel.formatShortPhoneName("Xiaomi 24030PN60G (MacDroid)")
+    assertCondition(xiaomiShort == "Xiaomi", "Xiaomi 24030PN60G (MacDroid) formats to 'Xiaomi', got: '\(xiaomiShort)'")
+    
+    let redmiShort = DualPaneViewModel.formatShortPhoneName("Redmi 2409BRN2CY (MacDroid)")
+    assertCondition(redmiShort == "Redmi", "Redmi 2409BRN2CY (MacDroid) formats to 'Redmi', got: '\(redmiShort)'")
+    
+    let xiaomiRedmiShort = DualPaneViewModel.formatShortPhoneName("Xiaomi 2409BRN2CY (MacDroid)")
+    assertCondition(xiaomiRedmiShort == "Redmi", "Xiaomi 2409BRN2CY (MacDroid) formats to 'Redmi', got: '\(xiaomiRedmiShort)'")
+    
+    let samsungShort = DualPaneViewModel.formatShortPhoneName("Samsung SM-S918B (MacDroid)")
+    assertCondition(samsungShort == "Samsung", "Samsung SM-S918B (MacDroid) formats to 'Samsung', got: '\(samsungShort)'")
+    
+    let pixelShort = DualPaneViewModel.formatShortPhoneName("Google Pixel 8 (MacDroid)")
+    assertCondition(pixelShort == "Google Pixel 8", "Google Pixel 8 (MacDroid) formats to 'Google Pixel 8', got: '\(pixelShort)'")
+    
+    // 2. NSImage.greenDot verification
+    await MainActor.run {
+        let dot = NSImage.greenDot
+        assertCondition(dot.size.width == 14 && dot.size.height == 14, "NSImage.greenDot size is 14x14")
+        assertCondition(!dot.isTemplate, "NSImage.greenDot is not a template (preserves green color in NSMenu)")
+    }
+    
+    // 3. DualPaneViewModel.onlinePhones discovery test
+    await MainActor.run {
+        let vm = DualPaneViewModel()
+        vm.discoveryService.discoveredDevices = [
+            DiscoveredDevice(id: "dev1", name: "Xiaomi 24030PN60G (MacDroid)", host: "192.168.1.16", port: 2222),
+            DiscoveredDevice(id: "dev2", name: "Redmi 2409BRN2CY (MacDroid)", host: "192.168.1.11", port: 2222)
+        ]
+        
+        let phones = vm.onlinePhones
+        assertCondition(phones.count == 2, "DualPaneViewModel.onlinePhones has 2 devices: got \(phones.count)")
+        assertCondition(phones[0].name == "Xiaomi", "First phone name is 'Xiaomi': got '\(phones[0].name)'")
+        assertCondition(phones[0].host == "192.168.1.16", "First phone host is 192.168.1.16")
+        assertCondition(phones[1].name == "Redmi", "Second phone name is 'Redmi': got '\(phones[1].name)'")
+        assertCondition(phones[1].host == "192.168.1.11", "Second phone host is 192.168.1.11")
+    }
+    
+    print("  ✓ Phone Context Menu Online Devices & Short Name Formatting tests passed successfully!")
 }
 
 dispatchMain()
