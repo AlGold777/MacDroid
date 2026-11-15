@@ -6231,6 +6231,7 @@ func runTest63() async {
         try? FileManager.default.removeItem(atPath: apkDir)
 
         runColumnBoundaryResizeTests()
+        runTest66()
 
         print("\n🎉 ALL 69 PRODUCTION TEST SUITES PASSED!")
         exit(0)
@@ -6716,6 +6717,35 @@ func runTest65() async {
     print("  ✓ Phone Context Menu Online Devices & Short Name Formatting tests passed successfully!")
 }
 
+func runTest66() {
+    print("\n--- [TEST 66] ProgressThrottle: ограничение отправок прогресса ---")
+    final class Clock: @unchecked Sendable { var now: CFAbsoluteTime = 1000 }
+    let clock = Clock()
+    let throttle = ProgressThrottle(minInterval: 1.0 / 15.0, clock: { clock.now })
+
+    // 4096 чанков по 256 КиБ (1 ГиБ), чанк каждые 1 мс: ~4 с
+    let chunks = 4096
+    var emitted: [Double] = []
+    for i in 1...chunks {
+        clock.now += 0.001
+        if let v = throttle.submit(Double(i) / Double(chunks)) { emitted.append(v) }
+    }
+    assertCondition(emitted.count <= 70, "За ~4 с отправлено не более ~15/с: \(emitted.count)")
+    assertCondition(emitted.count >= 2, "Отправки не потеряны полностью: \(emitted.count)")
+    assertCondition(emitted.last == 1.0, "Финальное значение (100%) отправлено всегда")
+    assertCondition(zip(emitted, emitted.dropFirst()).allSatisfy { $0 <= $1 }, "Значения монотонны")
+    assertCondition(throttle.submit(1.0) == nil, "Повторное финальное значение не дублируется")
+
+    // Потокобезопасность: параллельные вызовы не теряют финал и не превышают лимит
+    let real = ProgressThrottle(minInterval: 0.05)
+    let counter = NSLock()
+    nonisolated(unsafe) var count = 0
+    DispatchQueue.concurrentPerform(iterations: 2000) { i in
+        if real.submit(min(1.0, Double(i) / 1999.0)) != nil { counter.lock(); count += 1; counter.unlock() }
+    }
+    assertCondition(count >= 1 && count < 2000, "Параллельные вызовы троттлятся: \(count)")
+    assertCondition(real.latest >= 0, "latest доступен")
+    print("  ✓ ProgressThrottle tests passed successfully!")
+}
+
 dispatchMain()
-
-

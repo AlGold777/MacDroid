@@ -7308,16 +7308,23 @@ public final class DualPaneViewModel: ObservableObject {
                             for dir in plan.directoriesToCreate {
                                 try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
                             }
+                            var firstDownloadError: Error?
                             for file in plan.filesToTransfer {
                                 let subDirURL = URL(fileURLWithPath: file.targetDirPath)
-                                _ = try? await orchestrator.executeCopyPhoneToMac(
-                                    jobId: UUID().uuidString,
-                                    itemId: UUID().uuidString,
-                                    remotePath: file.sourcePath,
-                                    localTargetDir: subDirURL,
-                                    strategy: .overwrite
-                                ) { _ in }
+                                do {
+                                    _ = try await orchestrator.executeCopyPhoneToMac(
+                                        jobId: UUID().uuidString,
+                                        itemId: UUID().uuidString,
+                                        remotePath: file.sourcePath,
+                                        localTargetDir: subDirURL,
+                                        strategy: .overwrite
+                                    ) { _ in }
+                                } catch {
+                                    SSHTransportLog.write("DND_DRAGOUT_FILE_FAILED path=\(file.sourcePath) error=\(error.localizedDescription)")
+                                    if firstDownloadError == nil { firstDownloadError = error }
+                                }
                             }
+                            if let firstDownloadError { throw firstDownloadError }
                         } else {
                             try await orchestrator.executeCopyPhoneToMac(
                                 jobId: UUID().uuidString,
@@ -7731,9 +7738,12 @@ public final class DualPaneViewModel: ObservableObject {
             // Папка, созданная сейчас, заведомо пуста: листинг для проверки конфликтов в ней не нужен.
             var targetListingCache: [String: [String: FileItem]] = [:]
             if targetSource == .localMac {
-                for dir in plan.directoriesToCreate {
-                    try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true, attributes: nil)
-                }
+                let dirsToCreate = plan.directoriesToCreate
+                await Task.detached(priority: .userInitiated) {
+                    for dir in dirsToCreate {
+                        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true, attributes: nil)
+                    }
+                }.value
             } else {
                 let created = await Self.createRemoteDirectories(plan.directoriesToCreate, driver: self.remoteDriver)
                 for dir in created {
@@ -7744,6 +7754,8 @@ public final class DualPaneViewModel: ObservableObject {
             // 2. Расчёт общего объёма и регистрация файлов в очереди
             var totalQueueBytes: UInt64 = 0
             var taskIds: [String: UUID] = [:]
+            var queuedTasks: [TransferTask] = []
+            queuedTasks.reserveCapacity(plan.filesToTransfer.count)
             for file in plan.filesToTransfer {
                 totalQueueBytes += file.size
                 let fileItem = FileItem(
@@ -7755,9 +7767,12 @@ public final class DualPaneViewModel: ObservableObject {
                     isDirectory: false,
                     source: fromSource
                 )
-                let tid = TransferQueueManager.shared.enqueue(source: fileItem, targetDir: file.targetDirPath, isMove: isMove)
-                taskIds[file.sourcePath] = tid
+                let task = TransferTask(sourceItem: fileItem, targetDir: file.targetDirPath, isMove: isMove, totalBytes: file.size)
+                taskIds[file.sourcePath] = task.id
+                queuedTasks.append(task)
             }
+            // Одно изменение @Published на всю партию вместо поштучного enqueue
+            TransferQueueManager.shared.enqueueTasks(queuedTasks)
 
             var succeeded: [String] = []
             var failed: [(path: String, error: String)] = []
@@ -7969,7 +7984,10 @@ public final class DualPaneViewModel: ObservableObject {
                     }
 
                     let fileSize = file.size
-                    let onProgress: @Sendable (Double) -> Void = { @Sendable pct in
+                    // Троттлинг ДО перехода на главный актор: колбэк приходит на каждый чанк 256 КиБ
+                    let progressThrottle = ProgressThrottle()
+                    let onProgress: @Sendable (Double) -> Void = { @Sendable rawPct in
+                        guard let pct = progressThrottle.submit(rawPct) else { return }
                         Task { @MainActor [weak self] in
                             guard let self = self else { return }
                             let currentFileBytes = UInt64(Double(fileSize) * pct)
@@ -8063,7 +8081,11 @@ public final class DualPaneViewModel: ObservableObject {
             
             // Обновление медиатеки Android (MediaScanner)
             if !transferredMediaPaths.isEmpty {
-                PhoneConnectionManager.shared.notifyMediaScanner(paths: transferredMediaPaths, deviceId: self.remoteDriver.coordinator.deviceId)
+                let scanPaths = transferredMediaPaths
+                let scanDeviceId = self.remoteDriver.coordinator.deviceId
+                Task.detached(priority: .utility) {
+                    PhoneConnectionManager.shared.notifyMediaScanner(paths: scanPaths, deviceId: scanDeviceId)
+                }
             }
             
             if transferAborted {
