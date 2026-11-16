@@ -11,25 +11,17 @@ import androidx.core.app.NotificationCompat
 import com.macandroid.filemanager.server.EmbeddedServer
 
 /**
- * H2: подтверждение сопряжения на телефоне.
- *
- * Раньше в открытом 60-секундном окне первый предъявленный клиентский ключ
- * записывался в authorized_keys без какого-либо подтверждения: зарегистрировать
- * ключ мог любой хост в LAN или любой локальный процесс через `adb forward`.
- *
- * Теперь первый ключ только запоминается как заявка, а пользователь видит
- * уведомление с отпечатком клиентского ключа и подтверждает/отклоняет запись.
- * Отпечаток в формате `SHA256:...` совпадает с тем, что Mac показывает в окне
- * сопряжения, — сверка выполняется глазами на двух экранах.
+ * Кнопки подтверждения/отклонения сопряжения из уведомления (ТЗ 2.2).
+ * Receiver не экспортируется (exported=false), PendingIntent с FLAG_IMMUTABLE.
  */
 class PairingConfirmationReceiver : BroadcastReceiver() {
 
     override fun onReceive(context: Context, intent: Intent) {
         when (intent.action) {
             ACTION_CONFIRM -> {
-                val written = EmbeddedServer.confirmPendingPairing(context.filesDir)
-                Log.i(TAG, "Сопряжение подтверждено пользователем (ключ записан: $written)")
-                DaemonLog.write(context, "Сопряжение подтверждено пользователем (ключ записан: $written)")
+                val confirmed = EmbeddedServer.confirmPendingPairing()
+                Log.i(TAG, "Сопряжение подтверждено пользователем (одобрено: $confirmed)")
+                DaemonLog.write(context, "Сопряжение одобрено пользователем (ожидается повторное подключение)")
             }
             ACTION_REJECT -> {
                 EmbeddedServer.rejectPendingPairing()
@@ -37,7 +29,7 @@ class PairingConfirmationReceiver : BroadcastReceiver() {
                 DaemonLog.write(context, "Сопряжение отклонено пользователем")
             }
         }
-        context.getSystemService(NotificationManager::class.java)?.cancel(NOTIFICATION_ID)
+        cancelNotification(context)
     }
 
     companion object {
@@ -48,20 +40,31 @@ class PairingConfirmationReceiver : BroadcastReceiver() {
         const val ACTION_CONFIRM = "com.macandroid.filemanager.PAIRING_CONFIRM"
         const val ACTION_REJECT = "com.macandroid.filemanager.PAIRING_REJECT"
 
-        /** Уведомление с отпечатком клиентского ключа и кнопками решения. */
+        /**
+         * Уведомление с отпечатком клиентского ключа и кнопками «Принять» / «Отклонить».
+         */
         fun showConfirmationNotification(context: Context, clientKeyFingerprint: String) {
             val nm = context.getSystemService(NotificationManager::class.java) ?: return
             nm.createNotificationChannel(
                 NotificationChannel(CHANNEL_ID, "Сопряжение Mac", NotificationManager.IMPORTANCE_HIGH)
             )
+
+            val confirmIntent = Intent(context, PairingConfirmationReceiver::class.java).apply {
+                action = ACTION_CONFIRM
+            }
+            val rejectIntent = Intent(context, PairingConfirmationReceiver::class.java).apply {
+                action = ACTION_REJECT
+            }
+
             val confirm = PendingIntent.getBroadcast(
-                context, 0, Intent(context, PairingConfirmationReceiver::class.java).setAction(ACTION_CONFIRM),
+                context, 0, confirmIntent,
                 PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
             )
             val reject = PendingIntent.getBroadcast(
-                context, 1, Intent(context, PairingConfirmationReceiver::class.java).setAction(ACTION_REJECT),
+                context, 1, rejectIntent,
                 PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
             )
+
             val notification = NotificationCompat.Builder(context, CHANNEL_ID)
                 .setContentTitle("Сопряжение с Mac")
                 .setContentText("Разрешить доступ к файлам телефона? Ключ: $clientKeyFingerprint")
@@ -76,14 +79,20 @@ class PairingConfirmationReceiver : BroadcastReceiver() {
                 .setSmallIcon(android.R.drawable.stat_sys_warning)
                 .setPriority(NotificationCompat.PRIORITY_HIGH)
                 .setAutoCancel(false)
-                // P1.2 (dev-review): уведомление умирает вместе с окном сопряжения
-                // (EmbeddedServer.PAIRING_WINDOW_MILLIS = 60 с). Без этого «Разрешить»
-                // через 2 минуты молча ничего не делало: окно истекло, заявка очищалась.
                 .setTimeoutAfter(60_000L)
-                .addAction(0, "Разрешить", confirm)
+                .addAction(0, "Принять", confirm)
                 .addAction(0, "Отклонить", reject)
                 .build()
+
             nm.notify(NOTIFICATION_ID, notification)
+        }
+
+        fun cancelNotification(context: Context) {
+            try {
+                context.getSystemService(NotificationManager::class.java)?.cancel(NOTIFICATION_ID)
+            } catch (e: Exception) {
+                Log.w(TAG, "Не удалось отменить уведомление сопряжения", e)
+            }
         }
     }
 }

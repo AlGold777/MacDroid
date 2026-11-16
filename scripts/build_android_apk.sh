@@ -10,7 +10,9 @@ echo "=================================================="
 
 # Настройка JAVA_HOME если не задан
 if [ -z "$JAVA_HOME" ]; then
-    if [ -d "/opt/homebrew/opt/openjdk@17" ]; then
+    if [ -d "/Applications/Android Studio.app/Contents/jbr/Contents/Home" ]; then
+        export JAVA_HOME="/Applications/Android Studio.app/Contents/jbr/Contents/Home"
+    elif [ -d "/opt/homebrew/opt/openjdk@17" ]; then
         export JAVA_HOME="/opt/homebrew/opt/openjdk@17"
     elif [ -d "/Library/Java/JavaVirtualMachines" ]; then
         export JAVA_HOME="$(/usr/libexec/java_home -v 17 2>/dev/null || true)"

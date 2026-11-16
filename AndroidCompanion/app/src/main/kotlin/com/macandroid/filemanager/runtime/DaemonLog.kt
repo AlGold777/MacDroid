@@ -3,9 +3,8 @@ package com.macandroid.filemanager.runtime
 import android.content.Context
 import android.util.Log
 import java.io.File
-import java.text.SimpleDateFormat
-import java.util.Date
-import java.util.Locale
+import java.time.OffsetDateTime
+import java.time.format.DateTimeFormatter
 
 /**
  * Журнал событий демона (запуск, стоп, сбои, перезапуски по пробе).
@@ -18,6 +17,7 @@ object DaemonLog {
     private const val MAX_BYTES = 256L * 1024
     private const val KEEP_BYTES = 128 * 1024
     private const val NEWLINE: Byte = 10
+    private val FORMATTER = DateTimeFormatter.ISO_OFFSET_DATE_TIME
 
     /** Дописывает строку «ISO-время сообщение». Ошибки только логируются. */
     @Synchronized
@@ -26,7 +26,7 @@ object DaemonLog {
             val dir = context.getExternalFilesDir(null) ?: return
             val file = File(dir, FILE_NAME)
             if (file.exists() && file.length() > MAX_BYTES) trim(file)
-            val time = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSSZ", Locale.US).format(Date())
+            val time = OffsetDateTime.now().format(FORMATTER)
             file.appendText("$time $message\n", Charsets.UTF_8)
         } catch (e: Exception) {
             Log.w(TAG, "Не удалось записать daemon.log", e)
@@ -34,7 +34,7 @@ object DaemonLog {
     }
 
     /** Оставляет последние ~KEEP_BYTES байт, начиная с целой строки. */
-    private fun trim(file: File) {
+    internal fun trim(file: File) {
         val bytes = file.readBytes()
         var start = maxOf(0, bytes.size - KEEP_BYTES)
         while (start < bytes.size && bytes[start] != NEWLINE) start++

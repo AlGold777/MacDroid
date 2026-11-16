@@ -1,8 +1,11 @@
 package com.macandroid.filemanager.server
 
 import android.content.Context
+import android.os.SystemClock
 import android.util.Log
-import com.macandroid.filemanager.storage.StorageGateway
+import androidx.core.app.NotificationManagerCompat
+import com.macandroid.filemanager.runtime.DaemonLog
+import com.macandroid.filemanager.runtime.PairingConfirmationReceiver
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -11,25 +14,34 @@ import org.apache.sshd.common.config.keys.AuthorizedKeyEntry
 import org.apache.sshd.common.config.keys.KeyUtils
 import org.apache.sshd.common.config.keys.PublicKeyEntry
 import org.apache.sshd.common.file.virtualfs.VirtualFileSystemFactory
+import org.apache.sshd.common.session.Session
+import org.apache.sshd.common.session.SessionListener
 import org.apache.sshd.server.SshServer
 import org.apache.sshd.server.auth.pubkey.PublickeyAuthenticator
+import org.apache.sshd.server.channel.ChannelSessionFactory
+import org.apache.sshd.server.command.Command
+import org.apache.sshd.server.command.CommandFactory
+import org.apache.sshd.server.forward.RejectAllForwardingFilter
 import org.apache.sshd.server.keyprovider.SimpleGeneratorHostKeyProvider
 import org.apache.sshd.sftp.server.SftpSubsystemFactory
 import java.io.File
-import java.net.Inet4Address
-import java.net.NetworkInterface
+import java.net.InetSocketAddress
+import java.nio.charset.StandardCharsets
+import java.nio.file.Files
 import java.nio.file.Paths
+import java.nio.file.StandardCopyOption
 import java.security.PublicKey
+import java.text.SimpleDateFormat
 import java.util.Base64
 import java.util.Collections
-import com.macandroid.filemanager.runtime.PairingConfirmationReceiver
+import java.util.Date
+import java.util.Locale
+import java.util.concurrent.TimeUnit
 
 /**
- * SFTP/SSH-сервер телефона. Слушает Wi-Fi-адрес (wlan*) + loopback, если Wi-Fi определён;
- * иначе (H3) — только loopback: SSH не выставляется на cellular/все интерфейсы,
- * а USB-подключение через `adb forward` продолжает работать.
+ * SFTP/SSH-сервер телефона (ТЗ 2.1 - 2.4, 4.3, 5.2, 8.1).
  *
- * @param bindHost адрес для прослушивания; null — все интерфейсы (вызывающий код не использует).
+ * @param bindHost адрес для прослушивания. Если null — привязка ТОЛЬКО к 127.0.0.1 (ТЗ 2.1).
  */
 class EmbeddedServer(
     private val context: Context,
@@ -43,101 +55,104 @@ class EmbeddedServer(
     fun start() {
         if (sshd != null) return
 
-        if (System.getProperty("user.home").isNullOrEmpty()) {
-            System.setProperty("user.home", context.filesDir.absolutePath)
-        }
-
         val server = SshServer.setUpDefaultServer().apply {
             this.port = this@EmbeddedServer.port
-            // Кроме Wi-Fi адреса слушаем loopback: через него идёт `adb forward` (подключение по кабелю).
-            // MINA SSHD принимает список адресов через запятую.
-            bindHost?.let { this.host = listOf(it, "127.0.0.1").distinct().joinToString(",") }
 
-            // Хост-ключи сервера
+            // ТЗ 2.1: Fail-closed привязка к loopback:
+            // При отсутствии Wi-Fi (bindHost == null) сервер слушает ТОЛЬКО 127.0.0.1:2222.
+            // При наличии Wi-Fi слушаем Wi-Fi адрес и loopback для adb forward.
+            this.host = if (bindHost != null) {
+                listOf(bindHost, "127.0.0.1").distinct().joinToString(",")
+            } else {
+                "127.0.0.1"
+            }
+
+            // ТЗ 2.4: Хост-ключи сервера.
+            // setAlgorithm("Ed25519") только для генерации нового ключа.
+            // setOverwriteAllowed(false) — повреждённый файл вызывает ошибку, а не тихую перегенерацию.
             val hostKeyFile = File(context.filesDir, "hostkey.ser")
-            // M3: без setAlgorithm MINA 2.12 генерирует EC-ключ (nistp521), а README и pin-политика
-            // рассчитывают на Ed25519. EdDSA-провайдер уже в зависимостях (клиентские ключи Mac — Ed25519).
             keyPairProvider = SimpleGeneratorHostKeyProvider(hostKeyFile.toPath()).apply {
                 setAlgorithm("Ed25519")
+                setOverwriteAllowed(false)
             }
 
-            // H3 (MUX): без idle-timeout полузакрытая сессия держит PARTIAL_WAKE_LOCK
-            // вечно (мёртвый Mac без FIN). 15 мин — компромисс между долгими
-            // интерактивными сессиями и гарантированным освобождением блокировок.
-            this.properties["idle-timeout"] = java.util.concurrent.TimeUnit.MINUTES.toMillis(15).toString()
+            // ТЗ 4.3: Idle-timeout 5 минут и серверный heartbeat (каждые 20 с, wait 60 с)
+            this.properties["idle-timeout"] = TimeUnit.MINUTES.toMillis(5).toString()
+            this.properties["heartbeat-interval"] = TimeUnit.SECONDS.toMillis(20).toString()
+            this.properties["heartbeat-reply-wait"] = TimeUnit.SECONDS.toMillis(60).toString()
 
-            // SEC-01 FIX: Отключаем парольный вход без авторизации.
-            // Применяем строгую проверку открытого ключа (Public Key Auth)
+            // ТЗ 2.3: Ограничение возможностей SSH
             passwordAuthenticator = null
-            // M6: hardening дефолтов MINA 2.12:
-            // — keyboard-interactive не рекламируется (passwordAuthenticator отключён);
-            // — SSH-форвардинг запрещён (сервер — только SFTP/exec, не прокси);
-            // — единственный тип канала — session (DirectTcpipFactory убран).
             keyboardInteractiveAuthenticator = null
-            forwardingFilter = org.apache.sshd.server.forward.RejectAllForwardingFilter.INSTANCE
-            channelFactories = listOf(org.apache.sshd.server.channel.ChannelSessionFactory.INSTANCE)
+            forwardingFilter = RejectAllForwardingFilter.INSTANCE
+            channelFactories = listOf(ChannelSessionFactory.INSTANCE)
 
+            // ТЗ 2.2: TOFU с подтверждением и доказательством владения ключом (F6)
             publickeyAuthenticator = PublickeyAuthenticator { _, key: PublicKey, session ->
-                var accepted = false
-                synchronized(pairingLock) {
-                    val encodedKey = Base64.getEncoder().encodeToString(key.encoded)
-                    if (!authorizedKeysFile.exists() || authorizedKeysFile.length() == 0L) {
-                        if (isPairingModeActive) {
-                            // P1.2 (dev-review): заявка ПЕРЕЗАПИСЫВАЕТСЯ каждой новой попыткой —
-                            // случайный первый пакет больше не блокирует окно на 60 секунд.
-                            // Пользователь всегда подтверждает ключ СВЕЖЕЙ попытки (уведомление
-                            // по тем же ID обновляет показанный отпечаток).
-                            pendingPairingKeyOpenSsh = openSshLineFor(key)
-                            val fingerprint = try {
-                                KeyUtils.getFingerPrint(key)
-                            } catch (e: Exception) {
-                                "отпечаток недоступен"
-                            }
-                            PairingConfirmationReceiver.showConfirmationNotification(
-                                context.applicationContext, fingerprint
-                            )
-                            Log.i(TAG, "Запрос сопряжения: ждёт подтверждения на телефоне ($fingerprint)")
-                            // Отклоняем эту попытку: Mac переподключится после подтверждения на телефоне.
-                            accepted = false
-                        }
-                    } else {
-                        // Последующие подключения должны совпадать с уже сохранёнными ключами.
-                        val authorizedKeys = authorizedKeysFile.readLines()
-                            .map { it.trim() }
-                            .filter { it.isNotEmpty() }
+                val keyBytes = key.encoded
+                val remoteIp = (session.ioSession.remoteAddress as? InetSocketAddress)?.address?.hostAddress ?: "unknown"
+                val fingerprint = try { KeyUtils.getFingerPrint(key) } catch (e: Exception) { "unknown" }
 
-                        val knownKey = if (encodedKey in authorizedKeys) {
-                            true
+                synchronized(pairingLock) {
+                    if (isKeyAuthorized(key, authorizedKeysFile)) {
+                        session.setAttribute(ENROLLED_SESSION_KEY, true)
+                        return@PublickeyAuthenticator true
+                    }
+
+                    if (!isPairingModeActive) {
+                        DaemonLog.write(context, "Отказ в сопряжении (окно закрыто): отпечаток $fingerprint, IP $remoteIp")
+                        return@PublickeyAuthenticator false
+                    }
+
+                    val approved = approvedPairing
+                    if (approved != null && timeSource() < approved.expiresAt) {
+                        if (approved.keyBytes.contentEquals(keyBytes)) {
+                            // Ключ одобрен пользователем! Возвращаем true, чтобы MINA проверила криптографическую подпись.
+                            // Ключ НЕ записывается в authorized_keys здесь (будет записан только в SessionListener.Event.Authenticated).
+                            Log.i(TAG, "Ключ $fingerprint одобрен, передача на проверку подписи MINA")
+                            return@PublickeyAuthenticator true
                         } else {
-                            authorizedKeys.any { line ->
-                                line.startsWith("ssh-") && try {
-                                    val entry = AuthorizedKeyEntry.parseAuthorizedKeyEntry(line)
-                                    val resolved = entry?.resolvePublicKey(null, null, null)
-                                    resolved != null && KeyUtils.compareKeys(key, resolved)
-                                } catch (e: Exception) {
-                                    Log.w(TAG, "Не удалось разобрать строку authorized_keys", e)
-                                    false
-                                }
-                            }
+                            DaemonLog.write(context, "Отказ в сопряжении: ключ $fingerprint не совпадает с одобренным ${approved.fingerprint}")
+                            return@PublickeyAuthenticator false
                         }
-                        accepted = knownKey
+                    }
+
+                    // Если слот свободен — сохраняем заявку и показываем prompt
+                    if (pendingPairing == null) {
+                        pendingPairing = PendingPairing(
+                            key = key,
+                            keyBytes = keyBytes,
+                            fingerprint = fingerprint,
+                            sourceIp = remoteIp,
+                            createdAt = timeSource()
+                        )
+                        DaemonLog.write(context, "Заявка на сопряжение: ключ $fingerprint, IP $remoteIp — ожидает подтверждения")
+                        showPairingPrompt(context, fingerprint)
+                        return@PublickeyAuthenticator false
+                    } else {
+                        // Защита от флуда и подмены отпечатка
+                        DaemonLog.write(context, "Повторный offer проигнорирован (слот заявки занят): ключ $fingerprint, IP $remoteIp")
+                        return@PublickeyAuthenticator false
                     }
                 }
-                // Право на authorize_key получают только сессии, принятые в окне сопряжения (первый ключ)
-                // либо вошедшие уже сохранённым ключом (миграция legacy-устройств при закрытом окне).
-                session.setAttribute(ENROLLED_SESSION_KEY, accepted)
-                accepted
             }
 
-            // Корневой путь хранилища Android (поддержка внутренней памяти и SD/OTG карт).
-            // Принятый риск: корень целиком /storage (Android/data и obb на API 30+ недоступны и так);
-            // сужение до allowlist ломает доступ к SD/OTG-картам и не делается в этом исправлении.
+            // ТЗ 2.2 (Требование A): первый ключ записывается ТОЛЬКО в Event.Authenticated после проверки подписи
+            addSessionListener(object : SessionListener {
+                override fun sessionEvent(session: Session, event: SessionListener.Event) {
+                    if (event == SessionListener.Event.Authenticated) {
+                        onSessionAuthenticated(session, context)
+                    }
+                }
+            })
+
+            // Корневой путь хранилища Android
             val rootPath = Paths.get("/storage")
             fileSystemFactory = VirtualFileSystemFactory(rootPath)
 
-            // Обработка команд SSH exec (df, ping, authorize_key и служебные запросы MacHost)
-            commandFactory = org.apache.sshd.server.command.CommandFactory { _, command ->
-                object : org.apache.sshd.server.command.Command {
+            // Обработка команд SSH exec (ТЗ 5.2, 8.1)
+            commandFactory = CommandFactory { _, command ->
+                object : Command {
                     private var outStream: java.io.OutputStream? = null
                     private var exitCallback: org.apache.sshd.server.ExitCallback? = null
 
@@ -157,17 +172,16 @@ class EmbeddedServer(
                                 val totalBytes = totalBlocks * blockSize
                                 val availBytes = availBlocks * blockSize
                                 val usedBytes = totalBytes - availBytes
-                                // Реальный процент занятости (округление вверх, как в coreutils df)
                                 val usedPercent = if (totalBytes > 0) (usedBytes * 100 + totalBytes - 1) / totalBytes else 0L
 
                                 val output = "Filesystem 1B-blocks Used Available Use% Mounted on\n" +
                                         "/storage/emulated/0 $totalBytes $usedBytes $availBytes $usedPercent% /storage/emulated/0\n"
-                                outStream?.write(output.toByteArray(java.nio.charset.StandardCharsets.UTF_8))
+                                outStream?.write(output.toByteArray(StandardCharsets.UTF_8))
                                 outStream?.flush()
                                 exitCallback?.onExit(0)
                             } catch (e: Exception) {
                                 Log.e(TAG, "df: ошибка чтения StatFs", e)
-                                outStream?.write("df error: ${e.message}\n".toByteArray(java.nio.charset.StandardCharsets.UTF_8))
+                                outStream?.write("df error: ${e.message}\n".toByteArray(StandardCharsets.UTF_8))
                                 outStream?.flush()
                                 exitCallback?.onExit(1)
                             }
@@ -175,59 +189,37 @@ class EmbeddedServer(
                             val newKey = trimmed.substringAfter("authorize_key ").trim()
                             val sessionEnrolled = channel?.session?.getAttribute(ENROLLED_SESSION_KEY) == true
                             if (!isPairingModeActive && !sessionEnrolled) {
-                                outStream?.write("ERROR_NOT_ALLOWED\n".toByteArray(java.nio.charset.StandardCharsets.UTF_8))
+                                outStream?.write("ERROR_NOT_ALLOWED\n".toByteArray(StandardCharsets.UTF_8))
                                 outStream?.flush()
                                 exitCallback?.onExit(1)
                             } else if (newKey.isEmpty()) {
-                                outStream?.write("ERROR_EMPTY_KEY\n".toByteArray(java.nio.charset.StandardCharsets.UTF_8))
+                                outStream?.write("ERROR_EMPTY_KEY\n".toByteArray(StandardCharsets.UTF_8))
                                 outStream?.flush()
                                 exitCallback?.onExit(1)
                             } else if (parseSingleAuthorizedKey(newKey) == null) {
-                                outStream?.write("ERROR_INVALID_KEY\n".toByteArray(java.nio.charset.StandardCharsets.UTF_8))
+                                outStream?.write("ERROR_INVALID_KEY\n".toByteArray(StandardCharsets.UTF_8))
                                 outStream?.flush()
                                 exitCallback?.onExit(1)
                             } else {
-                                try {
-                                    synchronized(pairingLock) {
-                                        val currentKeys = if (authorizedKeysFile.exists()) {
-                                            authorizedKeysFile.readLines().map { it.trim() }.filter { it.isNotEmpty() }
-                                        } else {
-                                            emptyList()
-                                        }
-                                        if (!currentKeys.contains(newKey)) {
-                                            authorizedKeysFile.appendText(newKey + "\n")
-                                        }
+                                synchronized(pairingLock) {
+                                    val success = writeAuthorizedKeyAtomic(context.filesDir, newKey)
+                                    if (success) {
+                                        DaemonLog.write(context, "authorize_key: добавлен ключ $newKey")
+                                        outStream?.write("AUTHORIZED_OK\n".toByteArray(StandardCharsets.UTF_8))
+                                        outStream?.flush()
+                                        exitCallback?.onExit(0)
+                                    } else {
+                                        outStream?.write("ERROR_WRITE_FAILED\n".toByteArray(StandardCharsets.UTF_8))
+                                        outStream?.flush()
+                                        exitCallback?.onExit(1)
                                     }
-                                    outStream?.write("AUTHORIZED_OK\n".toByteArray(java.nio.charset.StandardCharsets.UTF_8))
-                                    outStream?.flush()
-                                    exitCallback?.onExit(0)
-                                } catch (e: Exception) {
-                                    Log.e(TAG, "authorize_key: не удалось записать authorized_keys", e)
-                                    outStream?.write("ERROR: ${e.message}\n".toByteArray(java.nio.charset.StandardCharsets.UTF_8))
-                                    outStream?.flush()
-                                    exitCallback?.onExit(1)
                                 }
                             }
-                        } else if (trimmed.startsWith("mediastore_query ")) {
-                            val folder = trimmed.substringAfter("mediastore_query ").trim()
-                            try {
-                                val storageGateway = StorageGateway(context)
-                                val result = storageGateway.queryMediaFolder(folder)
-                                outStream?.write(result.toByteArray(java.nio.charset.StandardCharsets.UTF_8))
-                                outStream?.flush()
-                                exitCallback?.onExit(0)
-                            } catch (e: Exception) {
-                                Log.e(TAG, "mediastore_query: ошибка запроса", e)
-                                outStream?.write("ERROR: ${e.message}\n".toByteArray(java.nio.charset.StandardCharsets.UTF_8))
-                                outStream?.flush()
-                                exitCallback?.onExit(1)
-                            }
                         } else {
-                            // M6: неизвестная команда — честный отказ, а не мнимый успех.
-                            // Проверить MacHost: служебные probe-команды добавлять в ветки выше.
-                            outStream?.write("ERROR_UNKNOWN_COMMAND\n".toByteArray(java.nio.charset.StandardCharsets.UTF_8))
+                            // ТЗ 8.1: Неизвестная команда — exit 1 и "UNKNOWN COMMAND\n"
+                            outStream?.write("UNKNOWN COMMAND\n".toByteArray(StandardCharsets.UTF_8))
                             outStream?.flush()
-                            exitCallback?.onExit(127)
+                            exitCallback?.onExit(1)
                         }
                     }
 
@@ -235,20 +227,14 @@ class EmbeddedServer(
                 }
             }
 
-            // SFTP Subsystem с перехватчиком событий коммита
-            val sftpFactory = SftpSubsystemFactory.Builder()
-                .build()
+            // SFTP Subsystem
+            val sftpFactory = SftpSubsystemFactory.Builder().build()
             val listener = CustomSftpEventListener(context)
             sftpListener = listener
             sftpFactory.addSftpEventListener(listener)
             subsystemFactories = Collections.singletonList(sftpFactory)
 
-            // Perf & FS Limiter: Увеличиваем буферы I/O и SSH channel window, ограничиваем дескрипторы для защиты памяти.
-            // Имена сверены с Apache MINA SSHD 2.12.0 (CoreModuleProperties, SftpModuleProperties): прежние
-            // "io-buffer-size" и "max-packet-length" в библиотеке не существуют и молча игнорировались.
-            // Окно 8 МБ — для непрерывного pipelining без частых ожиданий window-adjust ACK.
-            // Пакет канала 64 КБ (по умолчанию 32 КБ): крупнее нельзя — OpenSSH-клиент не принимает
-            // SSH-пакеты длиннее 256 КБ, а запас нужен на заголовки.
+            // Буферы I/O и лимиты
             val serverProps = this.properties
             serverProps["nio2-read-buf-size"] = (256 * 1024).toString()
             serverProps["window-size"] = (8L * 1024 * 1024).toString()
@@ -263,8 +249,6 @@ class EmbeddedServer(
         try {
             server.start()
         } catch (e: Exception) {
-            // Частично поднятый sshd (например, Wi-Fi-адрес открыт, loopback — нет) держит порт.
-            // Освобождаем его, иначе следующая попытка упадёт с EADDRINUSE.
             try {
                 server.stop(true)
             } catch (stopError: Exception) {
@@ -277,16 +261,14 @@ class EmbeddedServer(
         sshd = server
         liveSshd = server
 
-        // M22 (MUX): GC осиротевших .mcdpart старше 24 ч + очистка старых квитанций
+        // Очистка осиротевших временных файлов при старте
         val listener = sftpListener
-        val gateway = StorageGateway(context)
-        kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.IO).launch {
+        CoroutineScope(Dispatchers.IO).launch {
             try {
                 val roots = mutableListOf(context.filesDir)
                 val ext = android.os.Environment.getExternalStorageDirectory()
                 if (ext != null && ext.exists()) roots.add(ext)
                 listener?.collectStalePartFiles(roots)
-                gateway.purgeOldReceipts()
             } catch (e: Exception) {
                 Log.w(TAG, "Фоновая очистка при старте завершилась ошибкой", e)
             }
@@ -303,12 +285,10 @@ class EmbeddedServer(
     }
 
     /**
-     * Сброс сопряжения: удаляет файл authorized_keys, закрывает живые SSH-сессии,
-     * чтобы при следующем подключении сработал механизм сопряжения (TOFU).
-     * @return true, если файл был успешно удален или не существовал
+     * Сброс сопряжения: удаляет файл authorized_keys, закрывает активные сессии.
      */
     fun resetPairing(): Boolean {
-        closePairingWindow()
+        closePairingWindow(context)
         val deleted = synchronized(pairingLock) {
             if (authorizedKeysFile.exists()) authorizedKeysFile.delete() else true
         }
@@ -323,21 +303,32 @@ class EmbeddedServer(
     }
 
     /**
-     * Проверяет наличие сохраненных доверенных ключей (статус сопряжения).
+     * ТЗ 2.4: Проверяет наличие корректно разобранных доверенных ключей (а не по длине файла).
      */
     fun isPaired(): Boolean {
-        return authorizedKeysFile.exists() && authorizedKeysFile.length() > 0L
+        return synchronized(pairingLock) {
+            getParsedAuthorizedKeys(authorizedKeysFile).isNotEmpty()
+        }
     }
 
     /**
-     * SHA256-отпечаток хост-ключа sshd в формате `ssh-keygen -lf` (SHA256:...).
-     * Читает тот же hostkey.ser, что и сервер; null, если ключ ещё не создан.
+     * Список отпечатков всех доверенных ключей для UI (ТЗ 2.5).
+     */
+    fun getTrustedKeyFingerprints(): List<String> {
+        return synchronized(pairingLock) {
+            getParsedAuthorizedKeys(authorizedKeysFile).mapNotNull { key ->
+                try { KeyUtils.getFingerPrint(key) } catch (e: Exception) { null }
+            }
+        }
+    }
+
+    /**
+     * SHA256-отпечаток хост-ключа sshd.
      */
     fun hostKeyFingerprint(): String? {
         val hostKeyFile = File(context.filesDir, "hostkey.ser")
         if (!hostKeyFile.exists() || hostKeyFile.length() == 0L) return null
         return try {
-            // D2 (Qwen): безопасная загрузка без генератора нового ключа
             val provider = object : SimpleGeneratorHostKeyProvider(hostKeyFile.toPath()) {
                 override fun generateKeyPair(algorithm: String?): java.security.KeyPair? = null
             }
@@ -353,119 +344,297 @@ class EmbeddedServer(
         private const val TAG = "EmbeddedServer"
         private const val PAIRING_WINDOW_MILLIS = 60_000L
 
-        /** Общий lock на файл authorized_keys (auth, authorize_key, сброс). */
-        private val pairingLock = Any()
+        init {
+            if (java.security.Security.getProvider("EdDSA") == null) {
+                java.security.Security.addProvider(net.i2p.crypto.eddsa.EdDSASecurityProvider())
+            }
+        }
 
-        /** Признак сессии, вошедшей уже сохранённым ключом. */
+        @Volatile
+        var timeSource: () -> Long = { SystemClock.elapsedRealtime() }
+
+        /** Общий lock на сопряжение и authorized_keys. */
+        val pairingLock = Any()
+
+        /** Признак авторизованной сессии. */
         private val ENROLLED_SESSION_KEY = AttributeRepository.AttributeKey<Boolean>()
 
-        /** Запущенный sshd (для закрытия живых сессий из других экземпляров, например MainActivity). */
         @Volatile
         private var liveSshd: SshServer? = null
 
         @Volatile
-        private var pairingWindowEndsAt: Long = 0L
+        var pairingWindowEndsAt: Long = 0L
+            private set
 
         val isPairingModeActive: Boolean
-            get() = android.os.SystemClock.elapsedRealtime() < pairingWindowEndsAt
+            get() = timeSource() < pairingWindowEndsAt
 
-        fun openPairingWindow() {
-            // P1.2 (dev-review): каждая новая попытка сопряжения начинается с чистого листа.
-            pendingPairingKeyOpenSsh = null
-            pairingWindowEndsAt = android.os.SystemClock.elapsedRealtime() + PAIRING_WINDOW_MILLIS
-        }
+        data class PendingPairing(
+            val key: PublicKey,
+            val keyBytes: ByteArray,
+            val fingerprint: String,
+            val sourceIp: String,
+            val createdAt: Long
+        )
 
-        fun closePairingWindow() {
-            // P1.2 (dev-review): закрытое окно аннулирует и заявку — позднее «Разрешить»
-            // во вновь открытом окне не сможет записать ключ из старого окна.
-            pendingPairingKeyOpenSsh = null
-            pairingWindowEndsAt = 0L
-        }
+        data class ApprovedPairing(
+            val key: PublicKey,
+            val keyBytes: ByteArray,
+            val fingerprint: String,
+            val expiresAt: Long
+        )
 
-        // H2: заявка на сопряжение, ожидающая подтверждения пользователя на телефоне.
-        // P1.2 (dev-review): хранится строка authorized_keys (ssh-ed25519 AAAA…), а не
-        // сырой Base64-DER — файл на диске остаётся валидным для parseSingleAuthorizedKey
-        // и сторонних SSH-инструментов.
         @Volatile
-        var pendingPairingKeyOpenSsh: String? = null
+        var pendingPairing: PendingPairing? = null
+            private set
+
+        @Volatile
+        var approvedPairing: ApprovedPairing? = null
             private set
 
         /**
-         * Подтверждение сопряжения пользователем (кнопка «Разрешить» в уведомлении):
-         * атомарно записывает отложенный ключ в authorized_keys и закрывает окно.
-         * @return true, если ключ записан; false — заявки нет или окно уже закрыто.
+         * Обработчик для показа диалога сопряжения в foreground Activity,
+         * если POST_NOTIFICATIONS отклонено (ТЗ 2.2 fallback).
          */
-        fun confirmPendingPairing(filesDir: File): Boolean {
-            val key = pendingPairingKeyOpenSsh ?: return false
-            if (!isPairingModeActive) {
-                pendingPairingKeyOpenSsh = null
-                return false
+        @Volatile
+        var foregroundPromptCallback: ((fingerprint: String) -> Unit)? = null
+
+        fun openPairingWindow() {
+            synchronized(pairingLock) {
+                pendingPairing = null
+                approvedPairing = null
+                pairingWindowEndsAt = timeSource() + PAIRING_WINDOW_MILLIS
             }
-            return synchronized(pairingLock) {
-                try {
-                    val target = File(filesDir, "authorized_keys")
-                    val tmp = File(filesDir, "authorized_keys.tmp")
-                    tmp.writeText(key + "\n")
-                    if (!tmp.renameTo(target)) {
-                        tmp.delete()
-                        target.writeText(key + "\n")
-                    }
-                    true
-                } catch (e: Exception) {
-                    Log.e(TAG, "Не удалось записать authorized_keys", e)
-                    false
-                } finally {
-                    pendingPairingKeyOpenSsh = null
-                    closePairingWindow()
+        }
+
+        fun closePairingWindow(context: Context? = null) {
+            synchronized(pairingLock) {
+                val pending = pendingPairing
+                if (pending != null && context != null) {
+                    DaemonLog.write(context, "Окно сопряжения закрыто: заявка на ключ ${pending.fingerprint} аннулирована по таймауту")
+                }
+                pendingPairing = null
+                approvedPairing = null
+                pairingWindowEndsAt = 0L
+            }
+            context?.let { PairingConfirmationReceiver.cancelNotification(it) }
+        }
+
+        /**
+         * Подтверждение сопряжения пользователем («Принять» в уведомлении или диалоге).
+         * Переводит заявку в APPROVED для конкретных байтов ключа. Ключ ЕЩЁ НЕ записан.
+         */
+        fun confirmPendingPairing(): Boolean {
+            synchronized(pairingLock) {
+                val pending = pendingPairing ?: return false
+                if (!isPairingModeActive) {
+                    pendingPairing = null
+                    return false
+                }
+                approvedPairing = ApprovedPairing(
+                    key = pending.key,
+                    keyBytes = pending.keyBytes,
+                    fingerprint = pending.fingerprint,
+                    expiresAt = pairingWindowEndsAt
+                )
+                pendingPairing = null
+                return true
+            }
+        }
+
+        /**
+         * Отклонение заявки сопряжения («Отклонить»).
+         */
+        fun rejectPendingPairing() {
+            synchronized(pairingLock) {
+                pendingPairing = null
+                approvedPairing = null
+            }
+        }
+
+        /**
+         * Показ prompt'а сопряжения с fallback при отсутствии POST_NOTIFICATIONS.
+         */
+        private fun showPairingPrompt(context: Context, fingerprint: String) {
+            val notificationsEnabled = NotificationManagerCompat.from(context).areNotificationsEnabled()
+            if (notificationsEnabled) {
+                PairingConfirmationReceiver.showConfirmationNotification(context, fingerprint)
+            } else {
+                val callback = foregroundPromptCallback
+                if (callback != null) {
+                    // MainActivity на переднем плане
+                    callback.invoke(fingerprint)
+                } else {
+                    // ТЗ 2.2: Приложение в фоне без уведомлений — fail-closed!
+                    DaemonLog.write(
+                        context,
+                        "Отказ в сопряжении: нет разрешения на уведомления и приложение в фоне ($fingerprint)"
+                    )
                 }
             }
         }
 
-        /** Отклонение заявки (кнопка «Отклонить»). */
-        fun rejectPendingPairing() {
-            pendingPairingKeyOpenSsh = null
+        /**
+         * Вызывается из SessionListener при наступлении Event.Authenticated.
+         * Выполняет атомарную запись ключа ТОЛЬКО после успешной проверки криптографической подписи.
+         */
+        private fun onSessionAuthenticated(session: Session, context: Context) {
+            synchronized(pairingLock) {
+                val approved = approvedPairing
+                if (approved != null && timeSource() < approved.expiresAt) {
+                    val openSshLine = openSshLineFor(approved.key)
+                    val written = writeAuthorizedKeyAtomic(context.filesDir, openSshLine)
+                    if (written) {
+                        DaemonLog.write(
+                            context,
+                            "Сопряжение успешно: ключ ${approved.fingerprint} записан в authorized_keys после подтверждения подписи"
+                        )
+                        session.setAttribute(ENROLLED_SESSION_KEY, true)
+                        approvedPairing = null
+                        pendingPairing = null
+                        closePairingWindow(context)
+                    } else {
+                        DaemonLog.write(context, "Сбой записи authorized_keys для ключа ${approved.fingerprint}")
+                    }
+                }
+            }
         }
 
-        /** Строка authorized_keys (тип + base64 wire blob) из java PublicKey (API MINA 2.12). */
-        private fun openSshLineFor(key: PublicKey): String {
+        /**
+         * Атомарная запись в authorized_keys (ТЗ 2.4).
+         */
+        fun writeAuthorizedKeyAtomic(filesDir: File, newLine: String): Boolean {
+            val target = File(filesDir, "authorized_keys")
+            val tmp = File(filesDir, "authorized_keys.tmp")
+            return try {
+                val currentLines = if (target.exists()) {
+                    target.readLines(StandardCharsets.UTF_8).filter { it.isNotBlank() }
+                } else {
+                    emptyList()
+                }
+
+                if (!currentLines.contains(newLine)) {
+                    val updated = (currentLines + newLine).joinToString("\n") + "\n"
+                    tmp.writeText(updated, StandardCharsets.UTF_8)
+                    try {
+                        Files.move(
+                            tmp.toPath(),
+                            target.toPath(),
+                            StandardCopyOption.ATOMIC_MOVE,
+                            StandardCopyOption.REPLACE_EXISTING
+                        )
+                    } catch (e: java.nio.file.AtomicMoveNotSupportedException) {
+                        Log.w(TAG, "ATOMIC_MOVE не поддерживается, fallback renameTo", e)
+                        if (!tmp.renameTo(target)) {
+                            target.writeText(updated, StandardCharsets.UTF_8)
+                            tmp.delete()
+                        }
+                    }
+                }
+                true
+            } catch (e: Exception) {
+                Log.e(TAG, "Не удалось атомарно записать authorized_keys", e)
+                try { tmp.delete() } catch (_: Exception) {}
+                false
+            }
+        }
+
+        /**
+         * Проверка ключа по authorized_keys. Поддерживает OpenSSH и legacy Base64 (ТЗ 2.4).
+         */
+        fun isKeyAuthorized(key: PublicKey, authorizedKeysFile: File): Boolean {
+            if (!authorizedKeysFile.exists() || authorizedKeysFile.length() == 0L) return false
+            val parsedKeys = getParsedAuthorizedKeys(authorizedKeysFile)
+            for (authorizedKey in parsedKeys) {
+                if (KeyUtils.compareKeys(key, authorizedKey) || key.encoded.contentEquals(authorizedKey.encoded)) {
+                    return true
+                }
+            }
+            return false
+        }
+
+        /**
+         * Разбор всех валидных ключей из authorized_keys.
+         */
+        fun getParsedAuthorizedKeys(authorizedKeysFile: File): List<PublicKey> {
+            if (!authorizedKeysFile.exists() || authorizedKeysFile.length() == 0L) return emptyList()
+            val result = mutableListOf<PublicKey>()
+            try {
+                val lines = authorizedKeysFile.readLines(StandardCharsets.UTF_8)
+                    .map { it.trim() }
+                    .filter { it.isNotEmpty() && !it.startsWith("#") }
+
+                for (line in lines) {
+                    val key = parseSingleAuthorizedKey(line)
+                    if (key != null) {
+                        result.add(key)
+                    }
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "Ошибка чтения authorized_keys", e)
+            }
+            return result
+        }
+
+        /**
+         * Разбор одной строки authorized_keys (OpenSSH или raw Base64 DER).
+         */
+        fun parseSingleAuthorizedKey(line: String): PublicKey? {
+            if (line.contains('\n') || line.contains('\r')) return null
+
+            // 1. Формат OpenSSH (ssh-ed25519, ecdsa-sha2-, ssh-rsa)
+            if (line.startsWith("ssh-") || line.startsWith("ecdsa-")) {
+                return try {
+                    AuthorizedKeyEntry.parseAuthorizedKeyEntry(line)?.resolvePublicKey(null, null, null)
+                } catch (e: Exception) {
+                    null
+                }
+            }
+
+            // 2. Legacy-формат сырого Base64 DER (обратная совместимость)
+            return try {
+                val bytes = Base64.getDecoder().decode(line)
+                val keySpec = java.security.spec.X509EncodedKeySpec(bytes)
+                // Пробуем доступные фабрики
+                for (algo in listOf("EdDSA", "Ed25519", "EC", "RSA")) {
+                    try {
+                        val kf = if (algo == "EdDSA" && java.security.Security.getProvider("EdDSA") != null) {
+                            java.security.KeyFactory.getInstance("EdDSA", "EdDSA")
+                        } else {
+                            java.security.KeyFactory.getInstance(algo)
+                        }
+                        return kf.generatePublic(keySpec)
+                    } catch (_: Exception) {}
+                }
+                null
+            } catch (e: Exception) {
+                null
+            }
+        }
+
+        internal fun setPendingPairingForTesting(pending: PendingPairing?) {
+            pendingPairing = pending
+        }
+
+        internal fun setApprovedPairingForTesting(approved: ApprovedPairing?) {
+            approvedPairing = approved
+        }
+
+        /**
+         * Генерация строки в формате OpenSSH: `ssh-ed25519 AAAA... macdroid-<дата>`
+         */
+        fun openSshLineFor(key: PublicKey): String {
+            val dateStr = SimpleDateFormat("yyyyMMdd", Locale.US).format(Date())
+            val comment = "macdroid-$dateStr"
             return try {
                 val raw = PublicKeyEntry.toString(key).trim()
-                if (parseSingleAuthorizedKey(raw) != null) raw
-                else Base64.getEncoder().encodeToString(key.encoded)
+                if (raw.isNotEmpty() && parseSingleAuthorizedKey(raw) != null) {
+                    "$raw $comment"
+                } else {
+                    Base64.getEncoder().encodeToString(key.encoded)
+                }
             } catch (e: Exception) {
-                // Откат на старый формат: всё равно принимается веткой encodedKey in authorizedKeys
                 Base64.getEncoder().encodeToString(key.encoded)
-            }
-        }
-
-        /**
-         * IPv4-адрес активного Wi-Fi-интерфейса (wlan*), без loopback. null, если определить нельзя.
-         */
-        fun findWifiIpv4Address(): String? {
-            return try {
-                Collections.list(NetworkInterface.getNetworkInterfaces())
-                    .filter { it.isUp && !it.isLoopback && it.name.startsWith("wlan", ignoreCase = true) }
-                    .flatMap { Collections.list(it.inetAddresses) }
-                    .firstOrNull { it is Inet4Address && !it.isLoopbackAddress }
-                    ?.hostAddress
-            } catch (e: Exception) {
-                Log.w(TAG, "Не удалось определить адрес Wi-Fi", e)
-                null
-            }
-        }
-
-        /**
-         * Одна строка открытого ключа в формате authorized_keys (без переводов строк).
-         * @return разобранный публичный ключ или null, если строка некорректна.
-         */
-        private fun parseSingleAuthorizedKey(line: String): PublicKey? {
-            if (line.contains('\n') || line.contains('\r')) return null
-            if (!line.startsWith("ssh-") && !line.startsWith("ecdsa-sha2-")) return null
-            return try {
-                AuthorizedKeyEntry.parseAuthorizedKeyEntry(line)?.resolvePublicKey(null, null, null)
-            } catch (e: Exception) {
-                Log.w(TAG, "authorize_key: строка ключа не разобрана", e)
-                null
             }
         }
     }

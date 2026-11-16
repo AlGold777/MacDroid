@@ -1,7 +1,6 @@
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
-    id("com.google.devtools.ksp")
 }
 
 android {
@@ -12,13 +11,14 @@ android {
         applicationId = "com.macandroid.filemanager"
         minSdk = 26
         targetSdk = 34
-        versionCode = 22
-        versionName = "2.1.20"
+        versionCode = 23
+        versionName = "2.2.0"
     }
 
     buildTypes {
         release {
-            isMinifyEnabled = false
+            isMinifyEnabled = true
+            isShrinkResources = true
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
@@ -32,6 +32,9 @@ android {
     kotlinOptions {
         jvmTarget = "17"
     }
+    testOptions {
+        unitTests.isReturnDefaultValues = true
+    }
     packaging {
         resources {
             excludes += "/META-INF/{AL2.0,LGPL2.1}"
@@ -43,7 +46,7 @@ android {
     }
 }
 
-// Имя APK содержит версию: MacDroidCompanion-2.1.15.apk (и -release для релизной сборки)
+// Имя APK содержит версию: MacDroidCompanion-2.2.0.apk (и -release для релизной сборки)
 android.applicationVariants.all {
     val variant = this
     outputs.all {
@@ -55,8 +58,6 @@ android.applicationVariants.all {
 
 dependencies {
     implementation("androidx.core:core-ktx:1.12.0")
-    implementation("androidx.appcompat:appcompat:1.6.1")
-    implementation("com.google.android.material:material:1.11.0")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3")
 
     // Apache MINA SSHD + SFTP
@@ -64,8 +65,6 @@ dependencies {
     implementation("org.apache.sshd:sshd-sftp:2.12.0")
     implementation("net.i2p.crypto:eddsa:0.3.0")
 
-    // Room DB for Action Journal
-    implementation("androidx.room:room-runtime:2.6.1")
-    implementation("androidx.room:room-ktx:2.6.1")
-    ksp("androidx.room:room-compiler:2.6.1")
+    testImplementation("junit:junit:4.13.2")
+    testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.7.3")
 }

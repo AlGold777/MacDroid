@@ -1,10 +1,9 @@
 package com.macandroid.filemanager.server
 
 import android.content.Context
-import android.content.Intent
 import android.util.Log
-import com.macandroid.filemanager.runtime.FileDaemonService
-import com.macandroid.filemanager.storage.StorageGateway
+import com.macandroid.filemanager.runtime.SessionStateTracker
+import com.macandroid.filemanager.storage.MediaSyncHelper
 import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -19,20 +18,32 @@ import org.apache.sshd.sftp.server.AbstractSftpEventListenerAdapter
 import org.apache.sshd.sftp.server.FileHandle
 import java.io.File
 import java.nio.file.Path
-import java.util.concurrent.atomic.AtomicInteger
 
 class CustomSftpEventListener(
     private val context: Context,
-    private val storageGateway: StorageGateway = StorageGateway(context)
+    private val mediaSyncHelper: MediaSyncHelper = MediaSyncHelper.getInstance(context)
 ) : AbstractSftpEventListenerAdapter() {
 
     companion object {
         private const val TAG = "CustomSftpListener"
+
+        /**
+         * Строгий контракт временных файлов (ТЗ 5.3):
+         * - .<name>.mcdpart
+         * - <name>.mcdpart
+         * - .part.<id>.<name>
+         * - .<name>.part
+         *
+         * Файлы вроде "my.part.notes.txt" НЕ соответствуют паттерну.
+         */
+        val PART_FILE_REGEX = Regex("""^(?:\.(.+)\.mcdpart|\.part\.[^.]+\.(.+)|(.+)\.mcdpart|(?:\.(.+)\.part))$""")
+
+        fun isPartFile(filename: String): Boolean {
+            return PART_FILE_REGEX.matches(filename)
+        }
     }
 
-    private val activeSessions = AtomicInteger(0)
-
-    // C1: Асинхронный scope для операций StorageGateway с обработчиком ошибок
+    // Асинхронный scope для операций MediaSyncHelper с обработчиком ошибок
     private val ioScope = CoroutineScope(
         SupervisorJob() + Dispatchers.IO +
         CoroutineExceptionHandler { _, throwable ->
@@ -43,10 +54,9 @@ class CustomSftpEventListener(
     /** Отмена фоновых операций при остановке сервера. */
     fun dispose() = gracefulDispose()
 
-    // M20 (MUX): остановка/перепривязка ждёт завершения pending-квитанций
-    // и отложенного MediaScanner-скана вместо мгновенной отмены очереди
     fun gracefulDispose(timeoutMs: Long = 1500) {
         try {
+            mediaSyncHelper.dispose()
             runBlocking {
                 withTimeoutOrNull(timeoutMs) {
                     ioScope.coroutineContext[Job]?.let { job ->
@@ -61,38 +71,13 @@ class CustomSftpEventListener(
         }
     }
 
-    private fun setSyncActive(active: Boolean, sessionCount: Int = 0) {
-        try {
-            val intent = Intent(context, FileDaemonService::class.java).apply {
-                action = if (active) {
-                    FileDaemonService.ACTION_ACTIVE_SYNC_START
-                } else {
-                    FileDaemonService.ACTION_ACTIVE_SYNC_STOP
-                }
-                putExtra(FileDaemonService.EXTRA_SESSION_COUNT, sessionCount)
-            }
-            context.startService(intent)
-        } catch (e: Exception) {
-            Log.w(TAG, "Не удалось отправить сигнал активной передачи сервису", e)
-        }
-    }
-
     override fun initialized(session: ServerSession, version: Int) {
-        val count = activeSessions.incrementAndGet()
-        setSyncActive(true, count)
+        SessionStateTracker.onSessionOpened()
     }
 
     override fun destroying(session: ServerSession) {
-        val left = activeSessions.updateAndGet { if (it > 0) it - 1 else 0 }
-        if (left == 0) {
-            setSyncActive(false, 0)
-        } else {
-            setSyncActive(true, left)
-        }
+        SessionStateTracker.onSessionClosed()
     }
-
-    @Volatile
-    private var lastWakeLockPing: Long = 0
 
     override fun writing(
         session: ServerSession,
@@ -103,12 +88,7 @@ class CustomSftpEventListener(
         dataOffset: Int,
         dataLen: Int
     ) {
-        // L21 (MUX): elapsedRealtime() вместо wall-clock
-        val now = android.os.SystemClock.elapsedRealtime()
-        if (now - lastWakeLockPing > 30_000L) {
-            lastWakeLockPing = now
-            setSyncActive(true, activeSessions.get())
-        }
+        SessionStateTracker.recordIo()
     }
 
     override fun reading(
@@ -120,11 +100,7 @@ class CustomSftpEventListener(
         dataOffset: Int,
         dataLen: Int
     ) {
-        val now = android.os.SystemClock.elapsedRealtime()
-        if (now - lastWakeLockPing > 30_000L) {
-            lastWakeLockPing = now
-            setSyncActive(true, activeSessions.get())
-        }
+        SessionStateTracker.recordIo()
     }
 
     override fun moved(
@@ -138,20 +114,14 @@ class CustomSftpEventListener(
             val srcFile = src.toFile()
             val dstFile = dst.toFile()
 
-            // H4 (MUX): строго суффикс .mcdpart от MacHost (без ложных срабатываний на *.part.*)
-            val isPart = srcFile.name.endsWith(".mcdpart")
-            if (isPart) {
-                val actionId = srcFile.name.removePrefix(".").substringBeforeLast(".mcdpart")
-                // C3 (Qwen): синхронная запись квитанции до ACK rename
-                try {
-                    storageGateway.recordCommitSync(
-                        actionId = "mv_${actionId}_${System.nanoTime()}",
-                        requestHash = "sftp_rename_$actionId",
-                        sourcePath = srcFile.absolutePath,
-                        finalTargetFile = dstFile
-                    )
-                } catch (e: Exception) {
-                    Log.e(TAG, "recordCommitSync (moved) завершился ошибкой", e)
+            if (isPartFile(srcFile.name)) {
+                // Асинхронное оповещение MediaScanner без блокировки сокета (ТЗ 5.1)
+                ioScope.launch {
+                    try {
+                        mediaSyncHelper.notifyMediaScanner(dstFile.absolutePath)
+                    } catch (e: Exception) {
+                        Log.e(TAG, "notifyMediaScanner (moved) завершился ошибкой", e)
+                    }
                 }
             }
         }
@@ -165,36 +135,32 @@ class CustomSftpEventListener(
     ) {
         if (thrown == null) {
             val file = path.toFile()
-            // C2 (Qwen/PT-3): очистка временных .mcdpart самим оркестратором не является пользовательским удалением
-            if (file.name.endsWith(".mcdpart")) return
-            val actionId = "del_${file.name}_${System.nanoTime()}"
+            // Очистка временных .mcdpart не является пользовательским удалением
+            if (isPartFile(file.name)) return
+
             ioScope.launch {
                 runCatching {
-                    storageGateway.recordDeletion(
-                        actionId = actionId,
-                        requestHash = "sftp_remove_${file.name}",
-                        deletedFile = file
-                    )
-                }.onFailure { Log.e(TAG, "recordDeletion завершился ошибкой", it) }
+                    mediaSyncHelper.onFileDeleted(file)
+                }.onFailure { Log.e(TAG, "onFileDeleted завершился ошибкой", it) }
             }
         }
     }
 
-    // M22 (MUX): серверный GC осиротевших .mcdpart старше 24 ч
+    /** Серверный GC осиротевших .mcdpart старше 24 ч */
     fun collectStalePartFiles(rootDirs: List<File>, olderThanMs: Long = 24L * 60 * 60 * 1000) {
         val now = System.currentTimeMillis()
         for (root in rootDirs) {
             try {
                 if (!root.exists() || !root.isDirectory) continue
                 root.walkTopDown()
-                    .filter { it.name.endsWith(".mcdpart") && now - it.lastModified() > olderThanMs }
+                    .filter { isPartFile(it.name) && now - it.lastModified() > olderThanMs }
                     .forEach { part ->
                         if (part.delete()) {
-                            Log.i(TAG, "GC: удалён осиротевший .mcdpart ${part.absolutePath}")
+                            Log.i(TAG, "GC: удалён осиротевший временный файл ${part.absolutePath}")
                         }
                     }
             } catch (e: Exception) {
-                Log.w(TAG, "GC .mcdpart по ${root.absolutePath} завершился ошибкой", e)
+                Log.w(TAG, "GC временных файлов по ${root.absolutePath} завершился ошибкой", e)
             }
         }
     }

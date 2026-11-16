@@ -1,19 +1,17 @@
-# ProGuard rules for MacDroid Android Companion
+# ProGuard rules for MacDroid Android Companion v2.2 (ТЗ 6.1)
 
 # Apache MINA SSHD (SFTP / SSH Server)
 -keep class org.apache.sshd.** { *; }
 -dontwarn org.apache.sshd.**
+-dontwarn org.slf4j.**
 
-# BouncyCastle Cryptography Provider (Ed25519 & RSA Keys)
--keep class org.bouncycastle.** { *; }
--dontwarn org.bouncycastle.**
+# EdDSA Cryptography Provider (Ed25519 Keys)
+-keep class net.i2p.crypto.eddsa.** { *; }
+-dontwarn net.i2p.crypto.eddsa.**
 
-# Room Database & SQLite
--keep class androidx.room.** { *; }
--dontwarn androidx.room.**
--keep class * extends androidx.room.RoomDatabase
--keep @androidx.room.Entity class * { *; }
--keep @androidx.room.Dao interface * { *; }
+# javax.management stubs for Android compatibility
+-keep class javax.management.** { *; }
+-dontwarn javax.management.**
 
 # Kotlin Coroutines
 -keepnames class kotlinx.coroutines.internal.MainDispatcherFactory { *; }
