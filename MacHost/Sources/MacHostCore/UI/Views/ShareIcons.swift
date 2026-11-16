@@ -24,10 +24,44 @@ public enum ShareTarget: String, Sendable, CaseIterable {
     }
 }
 
-/// Векторная отрисовка иконок Telegram, WhatsApp и Gmail
+/// Векторная и нативная отрисовка иконок Telegram, WhatsApp и Gmail
 public enum ShareIconDrawer {
     
+    /// Получение нативной иконки приложения macOS по Bundle ID или пути установки
+    private static func appIcon(bundleIds: [String], fallbackPaths: [String], size: CGFloat) -> NSImage? {
+        let ws = NSWorkspace.shared
+        for bid in bundleIds {
+            if let url = ws.urlForApplication(withBundleIdentifier: bid) {
+                let icon = ws.icon(forFile: url.path)
+                return NSImage(size: NSSize(width: size, height: size), flipped: false) { rect in
+                    icon.draw(in: rect, from: .zero, operation: .sourceOver, fraction: 1.0)
+                    return true
+                }
+            }
+        }
+        for path in fallbackPaths {
+            if FileManager.default.fileExists(atPath: path) {
+                let icon = ws.icon(forFile: path)
+                return NSImage(size: NSSize(width: size, height: size), flipped: false) { rect in
+                    icon.draw(in: rect, from: .zero, operation: .sourceOver, fraction: 1.0)
+                    return true
+                }
+            }
+        }
+        return nil
+    }
+    
     public static func telegramImage(size: CGFloat = 20) -> NSImage {
+        // Нативная иконка Telegram macOS
+        if let icon = appIcon(
+            bundleIds: ["ru.keepcoder.Telegram", "com.tdesktop.Telegram"],
+            fallbackPaths: ["/Applications/Telegram.app"],
+            size: size
+        ) {
+            return icon
+        }
+        
+        // Векторный fallback
         return NSImage(size: NSSize(width: size, height: size), flipped: false) { rect in
             let circle = NSBezierPath(ovalIn: rect.insetBy(dx: 0.5, dy: 0.5))
             NSColor(red: 0.165, green: 0.671, blue: 0.933, alpha: 1.0).setFill()
@@ -52,6 +86,16 @@ public enum ShareIconDrawer {
     }
     
     public static func whatsAppImage(size: CGFloat = 20) -> NSImage {
+        // Нативная иконка WhatsApp macOS
+        if let icon = appIcon(
+            bundleIds: ["net.whatsapp.WhatsApp", "net.whatsapp.WhatsApp.desktop"],
+            fallbackPaths: ["/Applications/WhatsApp.app"],
+            size: size
+        ) {
+            return icon
+        }
+        
+        // Векторный fallback
         return NSImage(size: NSSize(width: size, height: size), flipped: false) { rect in
             let circle = NSBezierPath(ovalIn: rect.insetBy(dx: 0.5, dy: 0.5))
             NSColor(red: 0.145, green: 0.827, blue: 0.400, alpha: 1.0).setFill()
@@ -126,6 +170,13 @@ public enum ShareIconDrawer {
             NSColor(red: 0.918, green: 0.263, blue: 0.208, alpha: 1.0).setFill()
             mPath.fill()
             
+            // Тонкая красная линия сверху
+            let tBar = NSRect(x: left, y: top - 1.0 * s, width: right - left, height: 1.0 * s)
+            let tPath = NSBezierPath(rect: tBar)
+            NSColor(red: 0.918, green: 0.263, blue: 0.208, alpha: 1.0).setFill()
+            tPath.fill()
+            
+            // Нижняя красная полоса
             let bBar = NSRect(x: left, y: bottom, width: right - left, height: 1.6 * s)
             let bPath = NSBezierPath(rect: bBar)
             NSColor(red: 0.82, green: 0.2, blue: 0.15, alpha: 1.0).setFill()
