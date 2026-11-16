@@ -9,6 +9,7 @@ import kotlinx.coroutines.launch
 import org.apache.sshd.common.AttributeRepository
 import org.apache.sshd.common.config.keys.AuthorizedKeyEntry
 import org.apache.sshd.common.config.keys.KeyUtils
+import org.apache.sshd.common.config.keys.PublicKeyEntry
 import org.apache.sshd.common.file.virtualfs.VirtualFileSystemFactory
 import org.apache.sshd.server.SshServer
 import org.apache.sshd.server.auth.pubkey.PublickeyAuthenticator
@@ -82,22 +83,20 @@ class EmbeddedServer(
                     val encodedKey = Base64.getEncoder().encodeToString(key.encoded)
                     if (!authorizedKeysFile.exists() || authorizedKeysFile.length() == 0L) {
                         if (isPairingModeActive) {
-                            // H2: первый ключ НЕ записывается автоматически — иначе в 60-секундном
-                            // окне его регистрирует любой хост LAN / локальный процесс через adb forward.
-                            // Ключ запоминается как заявка; запись делает только явное подтверждение
-                            // пользователя на телефоне (уведомление PairingConfirmationReceiver).
-                            if (pendingPairingKeyBase64 == null) {
-                                pendingPairingKeyBase64 = encodedKey
-                                val fingerprint = try {
-                                    KeyUtils.getFingerPrint(key)
-                                } catch (e: Exception) {
-                                    "отпечаток недоступен"
-                                }
-                                PairingConfirmationReceiver.showConfirmationNotification(
-                                    context.applicationContext, fingerprint
-                                )
-                                Log.i(TAG, "Запрос сопряжения: ждёт подтверждения на телефоне ($fingerprint)")
+                            // P1.2 (dev-review): заявка ПЕРЕЗАПИСЫВАЕТСЯ каждой новой попыткой —
+                            // случайный первый пакет больше не блокирует окно на 60 секунд.
+                            // Пользователь всегда подтверждает ключ СВЕЖЕЙ попытки (уведомление
+                            // по тем же ID обновляет показанный отпечаток).
+                            pendingPairingKeyOpenSsh = openSshLineFor(key)
+                            val fingerprint = try {
+                                KeyUtils.getFingerPrint(key)
+                            } catch (e: Exception) {
+                                "отпечаток недоступен"
                             }
+                            PairingConfirmationReceiver.showConfirmationNotification(
+                                context.applicationContext, fingerprint
+                            )
+                            Log.i(TAG, "Запрос сопряжения: ждёт подтверждения на телефоне ($fingerprint)")
                             // Отклоняем эту попытку: Mac переподключится после подтверждения на телефоне.
                             accepted = false
                         }
@@ -371,49 +370,72 @@ class EmbeddedServer(
             get() = android.os.SystemClock.elapsedRealtime() < pairingWindowEndsAt
 
         fun openPairingWindow() {
+            // P1.2 (dev-review): каждая новая попытка сопряжения начинается с чистого листа.
+            pendingPairingKeyOpenSsh = null
             pairingWindowEndsAt = android.os.SystemClock.elapsedRealtime() + PAIRING_WINDOW_MILLIS
         }
 
         fun closePairingWindow() {
+            // P1.2 (dev-review): закрытое окно аннулирует и заявку — позднее «Разрешить»
+            // во вновь открытом окне не сможет записать ключ из старого окна.
+            pendingPairingKeyOpenSsh = null
             pairingWindowEndsAt = 0L
         }
 
         // H2: заявка на сопряжение, ожидающая подтверждения пользователя на телефоне.
-        // Хранится только в памяти: перезапуск приложения сбрасывает неподтверждённую заявку.
+        // P1.2 (dev-review): хранится строка authorized_keys (ssh-ed25519 AAAA…), а не
+        // сырой Base64-DER — файл на диске остаётся валидным для parseSingleAuthorizedKey
+        // и сторонних SSH-инструментов.
         @Volatile
-        var pendingPairingKeyBase64: String? = null
+        var pendingPairingKeyOpenSsh: String? = null
             private set
 
         /**
          * Подтверждение сопряжения пользователем (кнопка «Разрешить» в уведомлении):
-         * записывает отложенный ключ в authorized_keys и закрывает окно.
+         * атомарно записывает отложенный ключ в authorized_keys и закрывает окно.
          * @return true, если ключ записан; false — заявки нет или окно уже закрыто.
          */
         fun confirmPendingPairing(filesDir: File): Boolean {
-            val key = pendingPairingKeyBase64 ?: return false
+            val key = pendingPairingKeyOpenSsh ?: return false
             if (!isPairingModeActive) {
-                pendingPairingKeyBase64 = null
+                pendingPairingKeyOpenSsh = null
                 return false
             }
             return synchronized(pairingLock) {
                 try {
-                    // L23 (MUX): стандартный формат authorized_keys (ssh-ed25519 <base64>)
-                    val formattedKey = if (key.startsWith("ssh-")) key else "ssh-ed25519 $key"
-                    File(filesDir, "authorized_keys").writeText("$formattedKey\n")
+                    val target = File(filesDir, "authorized_keys")
+                    val tmp = File(filesDir, "authorized_keys.tmp")
+                    tmp.writeText(key + "\n")
+                    if (!tmp.renameTo(target)) {
+                        tmp.delete()
+                        target.writeText(key + "\n")
+                    }
                     true
                 } catch (e: Exception) {
                     Log.e(TAG, "Не удалось записать authorized_keys", e)
                     false
                 } finally {
-                    pendingPairingKeyBase64 = null
+                    pendingPairingKeyOpenSsh = null
                     closePairingWindow()
                 }
             }
         }
 
-        /** Отклонение заявки (кнопка «Отклонить» или истечение окна). */
+        /** Отклонение заявки (кнопка «Отклонить»). */
         fun rejectPendingPairing() {
-            pendingPairingKeyBase64 = null
+            pendingPairingKeyOpenSsh = null
+        }
+
+        /** Строка authorized_keys (тип + base64 wire blob) из java PublicKey (API MINA 2.12). */
+        private fun openSshLineFor(key: PublicKey): String {
+            return try {
+                val raw = PublicKeyEntry.toString(key).trim()
+                if (parseSingleAuthorizedKey(raw) != null) raw
+                else Base64.getEncoder().encodeToString(key.encoded)
+            } catch (e: Exception) {
+                // Откат на старый формат: всё равно принимается веткой encodedKey in authorizedKeys
+                Base64.getEncoder().encodeToString(key.encoded)
+            }
         }
 
         /**

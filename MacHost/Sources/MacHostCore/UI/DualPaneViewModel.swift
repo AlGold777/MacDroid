@@ -8360,7 +8360,10 @@ public final class DualPaneViewModel: ObservableObject {
                     // H2 (Z.ai): типизированный исход вместо Bool — транспортная ошибка больше не
                     // маскируется под «отказ переименования». SSH_FXP_RENAME без замены не затирает
                     // цель, появившуюся между resolvePhonePlacement и коммитом (MINA отказывает).
-                    let renameCode = try await orchestrator.transport.commitRename(oldPath: job.path, newPath: targetPath, replaceExisting: false)
+                    // P1.3 (dev-review): «Перезаписать» из диалога конфликтов обязан действовать.
+                    // Семантика та же, что у upload-коммита оркестратора (mayReplace).
+                    let replaceOnOverwrite = job.strategy == .overwrite || job.strategy == .overwriteIfNewer || job.strategy == .skipIfIdentical
+                    let renameCode = try await orchestrator.transport.commitRename(oldPath: job.path, newPath: targetPath, replaceExisting: replaceOnOverwrite)
                     if renameCode == .ok {
                         return .transferred
                     }

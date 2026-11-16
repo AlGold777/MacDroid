@@ -390,10 +390,11 @@ public final class SessionCoordinator: @unchecked Sendable {
         let socketDirectory = home.appendingPathComponent("Library/Caches/MCD", isDirectory: true)
         try FileManager.default.createDirectory(at: socketDirectory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
         try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: socketDirectory.path)
-        // M2: уборка осиротевших ControlMaster прошлых запусков (приложение могло упасть,
-        // disconnect() не вызван — мастер с -N и stdin=nullDevice живёт вечно на keepalive).
-        // Живым мастерам шлём `-O exit`, мёртвые файлы сокетов удаляем.
-        sweepStaleControlMasters(in: socketDirectory, port: targetPort)
+        // P2.1 (dev-review): sweep не должен задерживать подключение (N сокетов × 2 с ждали
+        // в connect-path). Уходит в фон: мастер текущего запуска ещё не создан, гонки нет.
+        Task.detached(priority: .utility) {
+            Self.sweepStaleControlMasters(in: socketDirectory, port: targetPort)
+        }
         let sockPath = Self.controlSocketPath(home: home)
         
         var interactiveChan: SFTPChannel?
@@ -620,7 +621,7 @@ public final class SessionCoordinator: @unchecked Sendable {
     /// M2: просит завершиться осиротевших мастеров прошлых запусков (`ssh -O exit` по сокету)
     /// и удаляет мёртвые файлы сокетов. Свежий сокет текущего подключения ещё не создан —
     /// sweep затрагивает только устаревшие.
-    private func sweepStaleControlMasters(in directory: URL, port: UInt16) {
+    private static func sweepStaleControlMasters(in directory: URL, port: UInt16) {
         let fm = FileManager.default
         guard let entries = try? fm.contentsOfDirectory(atPath: directory.path) else { return }
         for entry in entries where entry.hasPrefix("c_") {
@@ -634,12 +635,16 @@ public final class SessionCoordinator: @unchecked Sendable {
             let finished = DispatchSemaphore(value: 0)
             quit.terminationHandler = { _ in finished.signal() }
             guard (try? quit.run()) != nil else { continue }
-            if finished.wait(timeout: .now() + 2) == .timedOut {
+            // P2.1: 300 мс на процесс — локальный -O exit мгновенен, 2 с были запасом.
+            let finishedOnTime = finished.wait(timeout: .now() + .milliseconds(300)) == .success
+            if !finishedOnTime {
                 quit.terminate()
             }
             SSHTransportLog.write("ControlMaster sweep socket=\(entry) status=\(quit.terminationStatus)")
             // После -O exit живой мастер удаляет сокет сам; оставшийся файл — мёртвый, убираем.
-            if fm.fileExists(atPath: sock.path) {
+            // Только если ssh завершился штатно: таймаут может означать ЖИВОГО мастера второго
+            // запущенного Commander — его сокет трогать нельзя.
+            if finishedOnTime, fm.fileExists(atPath: sock.path) {
                 try? fm.removeItem(at: sock)
             }
         }

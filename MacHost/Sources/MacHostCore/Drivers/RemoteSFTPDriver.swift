@@ -75,6 +75,13 @@ public final class RemoteSFTPDriver: FileSystemDriver, @unchecked Sendable {
                 throw NSError(domain: "RemoteSFTPDriver", code: 1009, userInfo: [NSLocalizedDescriptionKey: "SFTP channel unavailable"])
             }
             
+            // P1.1 (dev-review): admission ДО открытия каталога. Серверный слот MINA
+            // (max-open-handles-per-session = 32) резервируется при обработке OPENDIR,
+            // поэтому acquire ПОСЛЕ ответа не защищает от отказа сервера и оставляет сироту.
+            guard await coordinator.budget.acquireHandle(waitingUpTo: 10) else {
+                throw NSError(domain: "RemoteSFTPDriver", code: 40, userInfo: [NSLocalizedDescriptionKey: "Исчерпан бюджет открытых хендлов SFTP (каталог \(nfcPath))"])
+            }
+            
             // 1. Открываем каталог через SSH_FXP_OPENDIR
             let openDirReqId = channel.allocateRequestId()
             var currentSftpPath = sftpPath
@@ -102,6 +109,8 @@ public final class RemoteSFTPDriver: FileSystemDriver, @unchecked Sendable {
             }
             
             guard openRespType == .handle else {
+                // P1.1: сервер каталог не открыл — хендла нет, слот возвращаем без CLOSE
+                coordinator.budget.releaseHandle()
                 throw NSError(
                     domain: "RemoteSFTPDriver",
                     code: 20,
@@ -109,23 +118,14 @@ public final class RemoteSFTPDriver: FileSystemDriver, @unchecked Sendable {
                 )
             }
             let (_, dirHandle) = try packetEngine.parseHandleResponse(data: openPayload)
-            // L6: opendir-хендл занимает серверный лимит (max-open-handles-per-session = 32) —
-            // учитываем его в SessionBudget, чтобы пик параллельных листингов + передачи
-            // ждали слота, а не получали отказ сервера.
-            let handleAcquired = await coordinator.budget.acquireHandle(waitingUpTo: 10)
-            if !handleAcquired {
+            // с этого места серверный слот точно занят; страховка была ДО OPENDIR (см. выше)
+            defer {
+                // P2.3 (dev-review): слот отдаём НЕМЕДЛЕННО. Ответ сервера на CLOSE не нужен:
+                // completion на деградировавшем соединении удерживал бюджет до 120 секунд.
+                coordinator.budget.releaseHandle()
                 let closeReqId = channel.allocateRequestId()
                 let closePacket = packetEngine.createClosePacket(requestId: closeReqId, handle: dirHandle)
                 channel.writeStreamingPacket(packet: closePacket, requestId: closeReqId) { _ in }
-                throw NSError(domain: "RemoteSFTPDriver", code: 40, userInfo: [NSLocalizedDescriptionKey: "Исчерпан бюджет открытых хендлов SFTP (каталог \(nfcPath))"])
-            }
-            defer {
-                let closeReqId = channel.allocateRequestId()
-                let closePacket = packetEngine.createClosePacket(requestId: closeReqId, handle: dirHandle)
-                // Слот освобождаем по ответу сервера (или по ошибке канала), а не по отправке CLOSE.
-                channel.writeStreamingPacket(packet: closePacket, requestId: closeReqId) { _ in
-                    self.coordinator.budget.releaseHandle()
-                }
             }
             
             var allEntries: [FileItem] = []

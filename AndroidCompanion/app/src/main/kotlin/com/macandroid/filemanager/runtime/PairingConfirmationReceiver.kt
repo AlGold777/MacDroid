@@ -76,6 +76,10 @@ class PairingConfirmationReceiver : BroadcastReceiver() {
                 .setSmallIcon(android.R.drawable.stat_sys_warning)
                 .setPriority(NotificationCompat.PRIORITY_HIGH)
                 .setAutoCancel(false)
+                // P1.2 (dev-review): уведомление умирает вместе с окном сопряжения
+                // (EmbeddedServer.PAIRING_WINDOW_MILLIS = 60 с). Без этого «Разрешить»
+                // через 2 минуты молча ничего не делало: окно истекло, заявка очищалась.
+                .setTimeoutAfter(60_000L)
                 .addAction(0, "Разрешить", confirm)
                 .addAction(0, "Отклонить", reject)
                 .build()

@@ -935,7 +935,8 @@ public final class TransportMultiplexer: @unchecked Sendable {
         let (total, totalOverflow) = vfs.blocks.multipliedReportingOverflow(by: vfs.frsize)
         guard !freeOverflow, !totalOverflow else {
             SSHTransportLog.write("STATVFS_UNTRUSTED bavail=\(vfs.bavail) blocks=\(vfs.blocks) frsize=\(vfs.frsize)")
-            return (free: 0, total: 0)
+            // P2.2 (dev-review): API опционален — (0,0) UI читает как «диск 0/0», нужно «неизвестно»
+            return nil
         }
         return (free: free, total: total)
     }
