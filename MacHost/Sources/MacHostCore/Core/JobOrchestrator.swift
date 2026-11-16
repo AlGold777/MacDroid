@@ -119,6 +119,16 @@ public final class JobOrchestrator: @unchecked Sendable {
         ownedLocalParts.insert(url)
     }
 
+    /// Атомарная регистрация временной части: false, если та же часть уже занята живой передачей.
+    private func tryBeginOwnedLocalPart(url: URL) -> Bool {
+        activePartsLock.lock()
+        defer { activePartsLock.unlock() }
+        guard !activeLocalPartURLs.contains(url), !ownedLocalParts.contains(url) else { return false }
+        activeLocalPartURLs.insert(url)
+        ownedLocalParts.insert(url)
+        return true
+    }
+
     /// Снятие регистрации владельцем; если при отмене очистка была запрошена — удаляем файл сейчас
     private func endOwnedLocalPart(url: URL) {
         activePartsLock.lock()
@@ -136,6 +146,15 @@ public final class JobOrchestrator: @unchecked Sendable {
         defer { activePartsLock.unlock() }
         activeRemotePartPaths.insert(path)
         ownedRemoteParts.insert(path)
+    }
+
+    private func tryBeginOwnedRemotePart(path: String) -> Bool {
+        activePartsLock.lock()
+        defer { activePartsLock.unlock() }
+        guard !activeRemotePartPaths.contains(path), !ownedRemoteParts.contains(path) else { return false }
+        activeRemotePartPaths.insert(path)
+        ownedRemoteParts.insert(path)
+        return true
     }
 
     /// Возвращает true, если удалённую часть нужно удалить (очистка была запрошена при живой передаче)
@@ -371,7 +390,10 @@ public final class JobOrchestrator: @unchecked Sendable {
         let srcKey = "\(deviceId):\(remotePath):\(stat.size):\(stat.mtime)"
         let fingerprint = SHA256.hash(data: Data(srcKey.utf8)).map { String(format: "%02x", $0) }.joined().prefix(8)
         let tempURL = localTargetDir.appendingPathComponent(".\(name).\(fingerprint).mcdpart")
-        beginOwnedLocalPart(url: tempURL)
+        guard tryBeginOwnedLocalPart(url: tempURL) else {
+            SSHTransportLog.write("ORCH_TRANSFER_CONCURRENT_SKIP tempURL=\(tempURL.path)")
+            return .skipped(reason: "Передача этого файла уже выполняется в другой операции")
+        }
         defer {
             endOwnedLocalPart(url: tempURL)
         }
@@ -751,7 +773,10 @@ public final class JobOrchestrator: @unchecked Sendable {
         let srcKey = "\(deviceId):\(localSourceURL.path):\(fileSize):\(mtime)"
         let fingerprint = SHA256.hash(data: Data(srcKey.utf8)).map { String(format: "%02x", $0) }.joined().prefix(8)
         let remoteTempPath = (remoteTargetDir as NSString).appendingPathComponent(".\(fileName).\(fingerprint).mcdpart").precomposedStringWithCanonicalMapping
-        beginOwnedRemotePart(path: remoteTempPath)
+        guard tryBeginOwnedRemotePart(path: remoteTempPath) else {
+            SSHTransportLog.write("ORCH_UPLOAD_CONCURRENT_SKIP remoteTempPath=\(remoteTempPath)")
+            return .skipped(reason: "Загрузка этого файла уже выполняется в другой операции")
+        }
         defer {
             if endOwnedRemotePart(path: remoteTempPath) {
                 // Очистка запрошена при отмене: удаляем удалённую часть после завершения владельца
@@ -906,6 +931,15 @@ public final class JobOrchestrator: @unchecked Sendable {
                       tempStat.size == fileSize else {
                     throw JobOrchestratorError.transferInterrupted(reason: "Размер загруженного на телефон файла не совпадает с оригиналом")
                 }
+            }
+
+            // F-H1 (Z.ai file-ops): зеркальная download-пути проверка снапшота.
+            let sourceAttrsNow = try FileManager.default.attributesOfItem(atPath: localSourceURL.path)
+            let sourceSizeNow = (sourceAttrsNow[.size] as? NSNumber)?.uint64Value ?? 0
+            let sourceMtimeNow = Int64(((sourceAttrsNow[.modificationDate] as? Date)?.timeIntervalSince1970) ?? 0)
+            guard sourceSizeNow == fileSize, sourceMtimeNow == mtime else {
+                SSHTransportLog.write("ORCH_UPLOAD_SOURCE_CHANGED path=\(localSourceURL.path) sizeWas=\(fileSize) sizeNow=\(sourceSizeNow) mtimeWas=\(mtime) mtimeNow=\(sourceMtimeNow)")
+                throw JobOrchestratorError.transferInterrupted(reason: "Исходный файл изменился во время копирования")
             }
 
             // 4. Commit: переименовываем временный .mcdpart файл в финальный

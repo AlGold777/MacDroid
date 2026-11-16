@@ -49,6 +49,10 @@ class FileDaemonService : Service() {
     @Volatile
     private var stopped = false
 
+    /** Количество активных SFTP-сессий (передаётся из CustomSftpEventListener). */
+    @Volatile
+    private var activeSftpSessions = 0
+
     /** Единственный ожидающий повтор запуска сервера. Доступ только под lifecycleLock. */
     private var retryJob: Job? = null
     /** Неудачные попытки подряд; сбрасывается при успешном старте. Доступ только под lifecycleLock. */
@@ -78,6 +82,7 @@ class FileDaemonService : Service() {
         const val ACTION_STOP = "com.macandroid.filemanager.ACTION_STOP"
         const val ACTION_ACTIVE_SYNC_START = "com.macandroid.filemanager.ACTION_ACTIVE_SYNC_START"
         const val ACTION_ACTIVE_SYNC_STOP = "com.macandroid.filemanager.ACTION_ACTIVE_SYNC_STOP"
+        const val EXTRA_SESSION_COUNT = "extra_session_count"
 
         @Volatile
         var isRunning: Boolean = false
@@ -182,8 +187,18 @@ class FileDaemonService : Service() {
                 stopSelf()
                 return START_NOT_STICKY
             }
-            ACTION_ACTIVE_SYNC_START -> acquireTransferLocks()
-            ACTION_ACTIVE_SYNC_STOP -> releaseTransferLocks()
+            ACTION_ACTIVE_SYNC_START -> {
+                val count = intent.getIntExtra(EXTRA_SESSION_COUNT, 1)
+                synchronized(lifecycleLock) { activeSftpSessions = count }
+                acquireTransferLocks()
+            }
+            ACTION_ACTIVE_SYNC_STOP -> {
+                val count = intent.getIntExtra(EXTRA_SESSION_COUNT, 0)
+                synchronized(lifecycleLock) { activeSftpSessions = count }
+                if (count == 0) {
+                    releaseTransferLocks()
+                }
+            }
             else -> {
                 // Запуск из приложения: проверяем sshd и поднимаем сервер, если он не работает или не отвечает
                 serviceScope.launch { checkServerHealth(fromApp = true) }
@@ -203,6 +218,9 @@ class FileDaemonService : Service() {
         val probed: EmbeddedServer
         synchronized(lifecycleLock) {
             if (stopped) return
+            // D1 (Qwen): рестарт по пробе рвёт активные передачи — не перезапускаем
+            // сервер, пока есть живые SFTP-сессии (следующий тик повторит проверку)
+            if (activeSftpSessions > 0) return
             if (retryJob != null) {
                 // Периодическая проверка не опережает ожидающий повтор; приложение — поднимает сервер сразу
                 if (fromApp) ensureServerLocked(refreshDiscovery = false)
@@ -218,7 +236,10 @@ class FileDaemonService : Service() {
             probed = current
         }
         // Перезапуск рвёт активные сессии: одной медленной пробы мало, нужна и вторая, с запасом
-        val failure = probeSftpPort(host, PROBE_TIMEOUT_MS)?.let { probeSftpPort(host, PROBE_RETRY_TIMEOUT_MS) } ?: return
+        // M19 (MUX): проба через loopback надёжнее при power-save Wi-Fi
+        val failure = probeSftpPort("127.0.0.1", PROBE_TIMEOUT_MS)
+            ?: probeSftpPort(host, PROBE_RETRY_TIMEOUT_MS)?.let { probeSftpPort("127.0.0.1", PROBE_RETRY_TIMEOUT_MS) }
+            ?: return
         synchronized(lifecycleLock) {
             if (stopped || server !== probed) return
             Log.w(TAG, "SFTP-порт не принимает подключения ($failure), перезапуск сервера")
@@ -254,6 +275,11 @@ class FileDaemonService : Service() {
             server = newServer
             boundHost = wanted
             isServerListening = true
+            // M21 (MUX): сервер поднят — окно засыпания закрыто, теперь можно отпустить
+            // прежние блокировки, если нет активных передач
+            if (activeSftpSessions == 0) {
+                releaseTransferLocks()
+            }
             // M3: отпечаток в журнале делает видимой молчаливую перегенерацию hostkey.ser
             DaemonLog.write(this, "SFTP-сервер запущен (адрес ${addressLabel(wanted)}, порт $SFTP_PORT, хост-ключ ${newServer.hostKeyFingerprint() ?: "неизвестен"})")
             // Сервер поднят: ожидающий повтор и счётчик неудач больше не нужны
@@ -338,8 +364,8 @@ class FileDaemonService : Service() {
         server = null
         boundHost = null
         isServerListening = false
-        // Остановка сервера закрывает все сессии: блокировки сна больше не нужны
-        releaseTransferLocks()
+        // M21 (MUX): при рестарте блокировки сна удерживаются до подъёма нового sshd,
+        // чтобы телефон не заснул между stopServerLocked и newServer.start()
     }
 
     private fun registerDiscoveryLocked() {
@@ -370,9 +396,16 @@ class FileDaemonService : Service() {
         }
     }
 
+    private var networkDebounceJob: Job? = null
+
     private fun onNetworkChanged(refreshDiscovery: Boolean) {
-        serviceScope.launch {
-            synchronized(lifecycleLock) { ensureServerLocked(refreshDiscovery = refreshDiscovery) }
+        // M18 (MUX): дебаунс 2 с — серия network-callback схлопывается в одну проверку
+        synchronized(lifecycleLock) {
+            networkDebounceJob?.cancel()
+            networkDebounceJob = serviceScope.launch {
+                delay(2_000)
+                synchronized(lifecycleLock) { ensureServerLocked(refreshDiscovery = refreshDiscovery) }
+            }
         }
     }
 

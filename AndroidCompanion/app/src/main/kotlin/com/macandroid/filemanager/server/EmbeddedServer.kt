@@ -3,6 +3,9 @@ package com.macandroid.filemanager.server
 import android.content.Context
 import android.util.Log
 import com.macandroid.filemanager.storage.StorageGateway
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
 import org.apache.sshd.common.AttributeRepository
 import org.apache.sshd.common.config.keys.AuthorizedKeyEntry
 import org.apache.sshd.common.config.keys.KeyUtils
@@ -56,6 +59,11 @@ class EmbeddedServer(
             keyPairProvider = SimpleGeneratorHostKeyProvider(hostKeyFile.toPath()).apply {
                 setAlgorithm("Ed25519")
             }
+
+            // H3 (MUX): без idle-timeout полузакрытая сессия держит PARTIAL_WAKE_LOCK
+            // вечно (мёртвый Mac без FIN). 15 мин — компромисс между долгими
+            // интерактивными сессиями и гарантированным освобождением блокировок.
+            this.properties["idle-timeout"] = java.util.concurrent.TimeUnit.MINUTES.toMillis(15).toString()
 
             // SEC-01 FIX: Отключаем парольный вход без авторизации.
             // Применяем строгую проверку открытого ключа (Public Key Auth)
@@ -269,6 +277,21 @@ class EmbeddedServer(
         }
         sshd = server
         liveSshd = server
+
+        // M22 (MUX): GC осиротевших .mcdpart старше 24 ч + очистка старых квитанций
+        val listener = sftpListener
+        val gateway = StorageGateway(context)
+        kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.IO).launch {
+            try {
+                val roots = mutableListOf(context.filesDir)
+                val ext = android.os.Environment.getExternalStorageDirectory()
+                if (ext != null && ext.exists()) roots.add(ext)
+                listener?.collectStalePartFiles(roots)
+                gateway.purgeOldReceipts()
+            } catch (e: Exception) {
+                Log.w(TAG, "Фоновая очистка при старте завершилась ошибкой", e)
+            }
+        }
     }
 
     fun stop() {
@@ -313,9 +336,13 @@ class EmbeddedServer(
      */
     fun hostKeyFingerprint(): String? {
         val hostKeyFile = File(context.filesDir, "hostkey.ser")
-        if (!hostKeyFile.exists()) return null
+        if (!hostKeyFile.exists() || hostKeyFile.length() == 0L) return null
         return try {
-            val keyPair = SimpleGeneratorHostKeyProvider(hostKeyFile.toPath()).loadKeys(null).firstOrNull()
+            // D2 (Qwen): безопасная загрузка без генератора нового ключа
+            val provider = object : SimpleGeneratorHostKeyProvider(hostKeyFile.toPath()) {
+                override fun generateKeyPair(algorithm: String?): java.security.KeyPair? = null
+            }
+            val keyPair = provider.loadKeys(null).firstOrNull()
             keyPair?.public?.let { KeyUtils.getFingerPrint(it) }
         } catch (e: Exception) {
             Log.w(TAG, "Не удалось прочитать отпечаток хост-ключа", e)
@@ -370,7 +397,9 @@ class EmbeddedServer(
             }
             return synchronized(pairingLock) {
                 try {
-                    File(filesDir, "authorized_keys").writeText(key + "\n")
+                    // L23 (MUX): стандартный формат authorized_keys (ssh-ed25519 <base64>)
+                    val formattedKey = if (key.startsWith("ssh-")) key else "ssh-ed25519 $key"
+                    File(filesDir, "authorized_keys").writeText("$formattedKey\n")
                     true
                 } catch (e: Exception) {
                     Log.e(TAG, "Не удалось записать authorized_keys", e)

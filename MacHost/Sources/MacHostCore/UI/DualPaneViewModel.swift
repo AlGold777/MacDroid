@@ -958,6 +958,23 @@ public final class DualPaneViewModel: ObservableObject {
             self?.confirmQuickLookDelete()
         }
         
+        // F-M9: обработчик повтора сбойных задач из очереди передач
+        queueManager.onRetryFailed = { [weak self] queuedTasks in
+            guard let self, !queuedTasks.isEmpty else { return }
+            let byGroup = Dictionary(grouping: queuedTasks) { task in
+                "\(task.sourceItem.source.rawValue)|\(task.targetDir)|\(task.isMove)"
+            }
+            for (_, tasks) in byGroup {
+                guard let first = tasks.first else { continue }
+                let paths = tasks.map { $0.sourceItem.path }
+                let fromSource = first.sourceItem.source
+                let targetDir = first.targetDir
+                let isMove = first.isMove
+                let toSide: PaneSide = (fromSource == self.leftSource) ? .right : .left
+                self.executeTransfer(paths: paths, fromSource: fromSource, toSide: toSide, targetDirPath: targetDir, isMove: isMove)
+            }
+        }
+        
         // Автоматическое обнаружение и подключение смартфона при старте
         if !isRunningTests {
             // Восстановленная вкладка телефона не подключается напрямую: соединение идёт по общему пути
@@ -7349,6 +7366,10 @@ public final class DualPaneViewModel: ObservableObject {
                                 try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
                             }
                             var firstDownloadError: Error?
+                            var failedFiles: [String] = []
+                            var completedFiles = 0
+                            let totalDroppedFiles = plan.filesToTransfer.count
+                            let dndProgressThrottle = ProgressThrottle()
                             for file in plan.filesToTransfer {
                                 let subDirURL = URL(fileURLWithPath: file.targetDirPath)
                                 do {
@@ -7360,11 +7381,23 @@ public final class DualPaneViewModel: ObservableObject {
                                         strategy: .overwrite
                                     ) { _ in }
                                 } catch {
+                                    failedFiles.append(file.sourcePath)
                                     SSHTransportLog.write("DND_DRAGOUT_FILE_FAILED path=\(file.sourcePath) error=\(error.localizedDescription)")
                                     if firstDownloadError == nil { firstDownloadError = error }
                                 }
+                                completedFiles += 1
+                                if dndProgressThrottle.submit(Double(completedFiles) / Double(max(1, totalDroppedFiles))) != nil {
+                                    let text = "Перетаскивание: \(completedFiles) из \(totalDroppedFiles)…"
+                                    Task { @MainActor [weak self] in self?.statusMessage = text }
+                                }
                             }
-                            if let firstDownloadError { throw firstDownloadError }
+                            if let firstDownloadError {
+                                SSHTransportLog.write("DND_DRAGOUT_PARTIAL ok=\(completedFiles - failedFiles.count) failed=\(failedFiles.count)")
+                                Task { @MainActor [weak self] in
+                                    self?.statusMessage = "Перетащено не полностью: \(failedFiles.count) из \(totalDroppedFiles) — часть файлов осталась во временной папке"
+                                }
+                                throw firstDownloadError
+                            }
                         } else {
                             try await orchestrator.executeCopyPhoneToMac(
                                 jobId: UUID().uuidString,

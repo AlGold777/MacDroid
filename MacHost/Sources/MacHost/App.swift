@@ -36,6 +36,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
     }
+
+    // L19 (MUX): при выходе — штатный разрыв ControlMaster (иначе осиротевший
+    // ssh-процесс и сокеты MCD накапливаются)
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        SessionCoordinator.shared.disconnect()
+        return .terminateNow
+    }
 }
 
 @main

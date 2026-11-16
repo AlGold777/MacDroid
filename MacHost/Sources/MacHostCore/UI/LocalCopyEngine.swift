@@ -54,8 +54,9 @@ public enum LocalCopyEngine {
 
         if isDir {
             // Клон всей папки одним вызовом (CLONE_NOFOLLOW = 1: симлинки остаются симлинками)
+            let measured = measure(path: src)
             if allowClone, clonefile(src, dst, 1) == 0 {
-                progress(measure(path: dst).bytes)
+                progress(measured.bytes)
                 return
             }
             if cancel.isCancelled { throw CancellationError() }

@@ -22,74 +22,6 @@ class StorageGateway(private val context: Context) {
     private val db = ActionJournalDb.getDatabase(context)
     private val dao = db.actionReceiptDao()
 
-    suspend fun commitFileAtomic(
-        actionId: String,
-        requestHash: String,
-        tempPartFile: File,
-        finalTargetFile: File
-    ): Boolean {
-        // Проверка идемпотентности: возможно операция уже была закоммичена
-        val existing = dao.getReceipt(actionId)
-        if (existing != null && existing.status == "COMMITTED" && finalTargetFile.exists()) {
-            return true
-        }
-
-        // Атомарное переименование
-        val renamed = tempPartFile.renameTo(finalTargetFile)
-        if (renamed) {
-            val receipt = ActionReceipt(
-                actionId = actionId,
-                requestHash = requestHash,
-                sourcePath = tempPartFile.absolutePath,
-                targetPath = finalTargetFile.absolutePath,
-                status = "COMMITTED",
-                timestamp = System.currentTimeMillis()
-            )
-            dao.insertReceipt(receipt)
-
-            // Уведомление системной медиатеки Android о новом файле
-            notifyMediaScanner(finalTargetFile.absolutePath)
-            return true
-        }
-        return false
-    }
-
-    suspend fun deleteFileVerified(
-        actionId: String,
-        requestHash: String,
-        fileToDelete: File
-    ): Boolean {
-        if (!fileToDelete.exists()) {
-            return true // Идемпотентно считаем удаленным
-        }
-        val deleted = fileToDelete.delete()
-        if (deleted) {
-            val receipt = ActionReceipt(
-                actionId = actionId,
-                requestHash = requestHash,
-                sourcePath = fileToDelete.absolutePath,
-                targetPath = "",
-                status = "DELETED",
-                timestamp = System.currentTimeMillis()
-            )
-            dao.insertReceipt(receipt)
-
-            // Удаление записи из системного каталога MediaStore, чтобы исключить 'битые' превью
-            try {
-                val uri = android.provider.MediaStore.Files.getContentUri("external")
-                context.contentResolver.delete(
-                    uri,
-                    "${android.provider.MediaStore.MediaColumns.DATA} = ?",
-                    arrayOf(fileToDelete.absolutePath)
-                )
-            } catch (e: Exception) {
-                Log.w(TAG, "MediaStore: не удалось удалить запись", e)
-            }
-            notifyMediaScanner(fileToDelete.absolutePath)
-        }
-        return deleted
-    }
-
     suspend fun recordCommit(
         actionId: String,
         requestHash: String,
@@ -106,6 +38,30 @@ class StorageGateway(private val context: Context) {
         )
         dao.insertReceipt(receipt)
         notifyMediaScanner(finalTargetFile.absolutePath)
+    }
+
+    // C3 (Qwen): синхронная запись квитанции до ACK rename (вызывается из moved())
+    fun recordCommitSync(
+        actionId: String,
+        requestHash: String,
+        sourcePath: String,
+        finalTargetFile: File
+    ) {
+        val receipt = ActionReceipt(
+            actionId = actionId,
+            requestHash = requestHash,
+            sourcePath = sourcePath,
+            targetPath = finalTargetFile.absolutePath,
+            status = "COMMITTED",
+            timestamp = System.currentTimeMillis()
+        )
+        dao.insertReceiptSync(receipt)
+        notifyMediaScanner(finalTargetFile.absolutePath)
+    }
+
+    // L24 (MUX): периодическая очистка журнала старше 30 дней (вызывается при старте сервера)
+    suspend fun purgeOldReceipts(olderThanMs: Long = 30L * 24 * 60 * 60 * 1000) {
+        dao.deleteOlderThan(System.currentTimeMillis() - olderThanMs)
     }
 
     suspend fun recordDeletion(

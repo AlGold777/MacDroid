@@ -178,8 +178,10 @@ public struct PhoneTrashService: Sendable {
         var result: [PhoneTrashEntry] = []
         result.reserveCapacity(children.count)
         for child in children {
-            guard child.isDirectory, let uuid = UUID(uuidString: child.name), uuid.uuidString.lowercased() == child.name else {
-                throw PhoneTrashError.damagedEntry(child.path)
+            guard child.isDirectory,
+                  let uuid = UUID(uuidString: child.name),
+                  uuid.uuidString.lowercased() == child.name else {
+                continue
             }
             let entryPath = trashRoot + "/" + child.name
             guard let payload = try await findChild(Self.payloadName, in: entryPath) else {

@@ -114,7 +114,8 @@ public final class TransportMultiplexer: @unchecked Sendable {
     /// concurrently changed entries instead of returning an unverified digest.
     public func digestRemoteFile(at path: String, expectedSize: UInt64, expectedMtime: Double) async throws -> String {
         try await ensureConnected()
-        guard let channel = coordinator.interactiveChannel else {
+        // TM-1: digest — bulk-нагрузка; interactive остаётся свободным для листинга и health-probe.
+        guard let channel = coordinator.bulkChannel ?? coordinator.interactiveChannel else {
             throw NSError(domain: "TransportMultiplexer", code: 1,
                           userInfo: [NSLocalizedDescriptionKey: "No active SFTP channel"])
         }
@@ -128,6 +129,15 @@ public final class TransportMultiplexer: @unchecked Sendable {
         let (sftpPath, before) = resolveAlternate
             ? try await resolveRemoteFile(path, channel: channel)
             : (path, try await statRemoteFile(path, channel: channel))
+
+        // TM-3: дескриптор digest входит в общий лимит 32 handle/сессия
+        let budget = coordinator.budget
+        guard await budget.acquireHandle(waitingUpTo: 30) else {
+            throw NSError(domain: "TransportMultiplexer", code: TransportMultiplexer.localHandleLimitCode,
+                          userInfo: [NSLocalizedDescriptionKey: "Exceeded max handles in SessionBudget (digest)"])
+        }
+        defer { budget.releaseHandle() }
+
         guard !before.isDirectory,
               before.size == expectedSize,
               Double(before.mtime) == expectedMtime else {
@@ -289,7 +299,8 @@ public final class TransportMultiplexer: @unchecked Sendable {
         var resultData = Data()
         resultData.reserveCapacity(Int(length))
         var readError: Error?
-        let maxChunk = UInt32(min(UInt64(64 * 1024), coordinator.serverLimits?.maxReadLen ?? UInt64(64 * 1024)))
+        // L16 (MUX): serverLimits через lock-акцессор
+        let maxChunk = UInt32(min(UInt64(64 * 1024), coordinator.currentServerLimits?.maxReadLen ?? UInt64(64 * 1024)))
         
         while resultData.count < Int(length) {
             if Task.isCancelled { break }

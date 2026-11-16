@@ -67,6 +67,7 @@ public final class TransferQueueManager: ObservableObject {
     public var onTaskPaused: (@MainActor (UUID) -> Void)?
     public var onTaskResumed: (@MainActor (UUID) -> Void)?
     public var onGlobalCancel: (@MainActor () -> Void)?
+    public var onRetryFailed: (@MainActor ([TransferTask]) -> Void)?
     
     public init() {}
     
@@ -276,6 +277,10 @@ public final class TransferQueueManager: ObservableObject {
                 tasks[i].eta = nil
                 count += 1
             }
+        }
+        if count > 0 {
+            // F-M9: раньше статусы менялись, но никто не исполнял задачи заново
+            onRetryFailed?(tasks.filter { $0.status == .queued })
         }
         return count
     }
