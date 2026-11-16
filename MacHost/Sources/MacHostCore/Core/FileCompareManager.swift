@@ -54,7 +54,7 @@ public enum CompareState: Equatable, Sendable {
     public var tooltip: String {
         switch self {
         case .ready:
-            return "Сравнить текстовые файлы"
+            return "Сравнить файлы (по содержимому)"
         case .noLeftFile(let reason):
             return reason
         case .noRightFile(let reason):

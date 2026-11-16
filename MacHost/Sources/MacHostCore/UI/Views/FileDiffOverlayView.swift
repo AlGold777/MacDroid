@@ -49,6 +49,11 @@ public struct FileDiffOverlayView: View {
                 
                 Divider()
                 
+                // Баннер ошибки сравнения файлов
+                if let errorMsg = vm.diffErrorMessage, vm.activeFileDiffResult == nil {
+                    diffErrorBanner(message: errorMsg)
+                }
+                
                 // Баннер изменения файла на диске (FR-38, FR-39)
                 if let side = vm.fileDiffChangedAlertSide {
                     fileChangedBanner(for: side)
@@ -288,26 +293,38 @@ public struct FileDiffOverlayView: View {
             Spacer(minLength: 0)
             
             if target != nil {
-                Menu {
-                    ForEach(TextEncodingOption.availableEncodings) { enc in
-                        Button(enc.name) {
-                            vm.changeFileEncoding(side: side, encoding: enc.encoding, name: enc.name)
+                let isDoc = FileEncodingDetector.isDocumentExtension(target?.fileItem.name ?? "")
+                if isDoc {
+                    Text(encodingName)
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundColor(.accentColor)
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background(Color.accentColor.opacity(0.12))
+                        .cornerRadius(4)
+                        .help("Форматированный документ (\(encodingName))")
+                } else {
+                    Menu {
+                        ForEach(TextEncodingOption.availableEncodings) { enc in
+                            Button(enc.name) {
+                                vm.changeFileEncoding(side: side, encoding: enc.encoding, name: enc.name)
+                            }
+                        }
+                    } label: {
+                        HStack(spacing: 2) {
+                            Text(encodingName)
+                                .font(.system(size: 11, weight: .medium))
+                            if isPresumed {
+                                Image(systemName: "questionmark.circle")
+                                    .font(.system(size: 10))
+                                    .foregroundColor(.orange)
+                            }
                         }
                     }
-                } label: {
-                    HStack(spacing: 2) {
-                        Text(encodingName)
-                            .font(.system(size: 11, weight: .medium))
-                        if isPresumed {
-                            Image(systemName: "questionmark.circle")
-                                .font(.system(size: 10))
-                                .foregroundColor(.orange)
-                        }
-                    }
+                    .menuStyle(.borderlessButton)
+                    .fixedSize()
+                    .help(isPresumed ? "Кодировка определена предположительно. Нажмите для смены." : "Кодировка файла")
                 }
-                .menuStyle(.borderlessButton)
-                .fixedSize()
-                .help(isPresumed ? "Кодировка определена предположительно. Нажмите для смены." : "Кодировка файла")
             }
         }
         .padding(.horizontal, 10)
@@ -355,9 +372,9 @@ public struct FileDiffOverlayView: View {
                 Text(side == .left ? "Левая панель" : "Правая панель")
                     .font(.system(size: 14, weight: .semibold))
                     .foregroundColor(.primary)
-                Text(statusMessage.isEmpty ? "Выберите текстовый файл" : statusMessage)
+                Text(statusMessage.isEmpty ? "Выберите файл (текст, PDF, Word)" : statusMessage)
                     .font(.system(size: 12))
-                    .foregroundColor(.secondary)
+                    .foregroundColor(statusMessage.isEmpty ? .secondary : .red)
                     .multilineTextAlignment(.center)
                     .padding(.horizontal, 24)
                 Text("Кликните файл в соответствующей панели снизу")
@@ -402,6 +419,20 @@ public struct FileDiffOverlayView: View {
             .help("Следующее отличие (F7)")
         }
         .fixedSize()
+    }
+    
+    // Баннер ошибки сравнения файлов
+    private func diffErrorBanner(message: String) -> some View {
+        HStack(spacing: 8) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .foregroundColor(.orange)
+            Text(message)
+                .font(.system(size: 12, weight: .medium))
+            Spacer()
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 6)
+        .background(Color.red.opacity(0.12))
     }
     
     // Баннер изменения файла (FR-38, FR-39)

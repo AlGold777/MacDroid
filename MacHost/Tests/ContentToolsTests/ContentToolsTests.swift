@@ -1,4 +1,6 @@
 import Foundation
+import AppKit
+import PDFKit
 import MacHostCore
 
 private struct TestFailure: Error, CustomStringConvertible {
@@ -782,6 +784,136 @@ private func runArchiveBrowserTests() async throws {
     }
 }
 
+private func runDocumentComparisonTests() async throws {
+    print("\n[ContentToolsTests] Testing Document Comparison (PDF, DOCX, DOC)...")
+    let tempDir = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("doc_diff_tests_\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: tempDir) }
+
+    // 1. Проверка распознавания расширений документов
+    try check(FileEncodingDetector.isDocumentExtension("contract.pdf"), "PDF recognized as document extension")
+    try check(FileEncodingDetector.isDocumentExtension("report.docx"), "DOCX recognized as document extension")
+    try check(FileEncodingDetector.isDocumentExtension("letter.doc"), "DOC recognized as document extension")
+    try check(FileEncodingDetector.isDocumentExtension("notes.rtf"), "RTF recognized as document extension")
+    try check(!FileEncodingDetector.isDocumentExtension("main.swift"), "Swift is not a document extension")
+    try check(!FileEncodingDetector.isDocumentExtension("image.png"), "PNG is not a document extension")
+
+    // 2. Тестирование создания и извлечения PDF файлов
+    let pdf1URL = tempDir.appendingPathComponent("doc1.pdf")
+    let pdf2URL = tempDir.appendingPathComponent("doc2.pdf")
+
+    func makeTestPDF(text: String, to url: URL) throws {
+        var mediaBox = CGRect(x: 0, y: 0, width: 300, height: 300)
+        let data = NSMutableData()
+        guard let consumer = CGDataConsumer(data: data as CFMutableData),
+              let ctx = CGContext(consumer: consumer, mediaBox: &mediaBox, nil) else {
+            throw TestFailure(description: "Failed to create CGContext for PDF")
+        }
+        ctx.beginPage(mediaBox: &mediaBox)
+        let attrStr = NSAttributedString(string: text)
+        let framesetter = CTFramesetterCreateWithAttributedString(attrStr as CFAttributedString)
+        let path = CGPath(rect: mediaBox, transform: nil)
+        let frame = CTFramesetterCreateFrame(framesetter, CFRangeMake(0, attrStr.length), path, nil)
+        CTFrameDraw(frame, ctx)
+        ctx.endPage()
+        ctx.closePDF()
+        try (data as Data).write(to: url)
+    }
+
+    try makeTestPDF(text: "Line 1 in PDF\nLine 2 matching\nLine 3 old text", to: pdf1URL)
+    try makeTestPDF(text: "Line 1 in PDF\nLine 2 matching\nLine 3 updated text\nLine 4 new addition", to: pdf2URL)
+
+    let valPDF1 = FileEncodingDetector.validateTextFile(fileURL: pdf1URL)
+    guard case .validText(let text1, _, let name1, _) = valPDF1 else {
+        throw TestFailure(description: "Failed to validate pdf1")
+    }
+    try check(name1 == "PDF", "PDF encoding name is 'PDF'")
+    try check(text1.contains("Line 1 in PDF"), "PDF 1 contains expected text")
+
+    let valPDF2 = FileEncodingDetector.validateTextFile(fileURL: pdf2URL)
+    guard case .validText(let text2, _, let name2, _) = valPDF2 else {
+        throw TestFailure(description: "Failed to validate pdf2")
+    }
+    try check(name2 == "PDF", "PDF 2 encoding name is 'PDF'")
+    try check(text2.contains("Line 4 new addition"), "PDF 2 contains added line")
+
+    // Сравнение PDF через TextDiffEngine
+    let diffResultPDF = TextDiffEngine.diff(textA: text1, textB: text2)
+    try check(!diffResultPDF.isIdentical, "Different PDFs are detected as non-identical")
+    try check(diffResultPDF.addedCount >= 1, "PDF diff correctly finds additions")
+
+    // Проверка идентичных PDF
+    let diffIdenticalPDF = TextDiffEngine.diff(textA: text1, textB: text1)
+    try check(diffIdenticalPDF.isIdentical, "Identical PDF comparison confirms identical content")
+
+    // 3. Тестирование извлечения и сравнения DOCX файлов
+    let txt1URL = tempDir.appendingPathComponent("word1.txt")
+    let txt2URL = tempDir.appendingPathComponent("word2.txt")
+    let docx1URL = tempDir.appendingPathComponent("word1.docx")
+    let docx2URL = tempDir.appendingPathComponent("word2.docx")
+
+    try "Header line\nShared line\nFirst draft text".write(to: txt1URL, atomically: true, encoding: .utf8)
+    try "Header line\nShared line\nFinal draft text\nExtra concluding line".write(to: txt2URL, atomically: true, encoding: .utf8)
+
+    // Конвертация в docx через textutil
+    let p1 = Process()
+    p1.executableURL = URL(fileURLWithPath: "/usr/bin/textutil")
+    p1.arguments = ["-convert", "docx", txt1URL.path, "-output", docx1URL.path]
+    try p1.run()
+    p1.waitUntilExit()
+
+    let p2 = Process()
+    p2.executableURL = URL(fileURLWithPath: "/usr/bin/textutil")
+    p2.arguments = ["-convert", "docx", txt2URL.path, "-output", docx2URL.path]
+    try p2.run()
+    p2.waitUntilExit()
+
+    let valDocx1 = FileEncodingDetector.validateTextFile(fileURL: docx1URL)
+    guard case .validText(let docxText1, _, let docxName1, _) = valDocx1 else {
+        throw TestFailure(description: "Failed to validate docx1")
+    }
+    try check(docxName1 == "DOCX", "DOCX encoding name is 'DOCX'")
+    try check(docxText1.contains("First draft text"), "DOCX 1 contains expected text")
+
+    let valDocx2 = FileEncodingDetector.validateTextFile(fileURL: docx2URL)
+    guard case .validText(let docxText2, _, let docxName2, _) = valDocx2 else {
+        throw TestFailure(description: "Failed to validate docx2")
+    }
+    try check(docxName2 == "DOCX", "DOCX 2 encoding name is 'DOCX'")
+    try check(docxText2.contains("Final draft text"), "DOCX 2 contains expected text")
+
+    let diffDocx = TextDiffEngine.diff(textA: docxText1, textB: docxText2)
+    try check(!diffDocx.isIdentical, "Different DOCX files detected as non-identical")
+    try check(diffDocx.addedCount > 0 || diffDocx.modifiedCount > 0, "DOCX diff tracks modifications")
+
+    // 4. Тестирование DOC файлов
+    let doc1URL = tempDir.appendingPathComponent("word1.doc")
+    let pDoc = Process()
+    pDoc.executableURL = URL(fileURLWithPath: "/usr/bin/textutil")
+    pDoc.arguments = ["-convert", "doc", txt1URL.path, "-output", doc1URL.path]
+    try pDoc.run()
+    pDoc.waitUntilExit()
+
+    let valDoc = FileEncodingDetector.validateTextFile(fileURL: doc1URL)
+    guard case .validText(let docText, _, let docName, _) = valDoc else {
+        throw TestFailure(description: "Failed to validate doc1")
+    }
+    try check(docName == "DOC", "DOC encoding name is 'DOC'")
+    try check(docText.contains("First draft text"), "DOC 1 contains expected text")
+
+    // 5. Кросс-сравнение форматов (DOCX vs DOC с одинаковым текстом)
+    let crossDiff = TextDiffEngine.diff(textA: docxText1.trimmingCharacters(in: .whitespacesAndNewlines),
+                                        textB: docText.trimmingCharacters(in: .whitespacesAndNewlines))
+    try check(crossDiff.isIdentical, "Cross-format comparison (DOCX vs DOC) with identical text confirms identity")
+
+    // 6. Проверка подсказки CompareState.ready
+    let dummyItem = FileItem(id: "1", name: "test.pdf", path: "/test.pdf", size: 100, mtime: 100, isDirectory: false)
+    let tLeft = CompareTarget(fileItem: dummyItem, canonicalPath: "/test1.pdf", isRemote: false)
+    let tRight = CompareTarget(fileItem: dummyItem, canonicalPath: "/test2.pdf", isRemote: false)
+    let state = CompareState.ready(left: tLeft, right: tRight)
+    try check(state.tooltip == "Сравнить файлы (по содержимому)", "Ready state tooltip is updated to include all file types")
+}
+
 @main
 private struct ContentToolsTestRunner {
     static func main() async {
@@ -791,6 +923,7 @@ private struct ContentToolsTestRunner {
             try await runDuplicateFinderTests()
             try await runDuplicateCleanupTests()
             try await runArchiveBrowserTests()
+            try await runDocumentComparisonTests()
             print("\n[ContentToolsTests] All content tools checks passed.")
         } catch {
             fputs("❌ [ContentToolsTests] \(error)\n", stderr)

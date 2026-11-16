@@ -4876,14 +4876,19 @@ public final class DualPaneViewModel: ObservableObject {
                     self.leftFileEncodingPresumed = presumed
                 case .binary(let reason), .readError(let reason):
                     self.diffErrorMessage = "Левый файл: \(reason)"
+                    self.diffLeftStatusMessage = reason
                     self.isDiffLoading = false
                     return
                 case .tooLarge(let sz, let lim):
-                    self.diffErrorMessage = "Левый файл больше лимита (\(sz / (1024 * 1024)) МБ > \(lim / (1024 * 1024)) МБ)"
+                    let msg = "Файл больше лимита (\(sz / (1024 * 1024)) МБ > \(lim / (1024 * 1024)) МБ)"
+                    self.diffErrorMessage = "Левый файл: \(msg)"
+                    self.diffLeftStatusMessage = msg
                     self.isDiffLoading = false
                     return
                 case .tooManyLines(let count, let lim):
-                    self.diffErrorMessage = "Левый файл содержит слишком много строк (\(count) > \(lim))"
+                    let msg = "Файл содержит слишком много строк (\(count) > \(lim))"
+                    self.diffErrorMessage = "Левый файл: \(msg)"
+                    self.diffLeftStatusMessage = msg
                     self.isDiffLoading = false
                     return
                 }
@@ -4899,14 +4904,19 @@ public final class DualPaneViewModel: ObservableObject {
                     self.rightFileEncodingPresumed = presumed
                 case .binary(let reason), .readError(let reason):
                     self.diffErrorMessage = "Правый файл: \(reason)"
+                    self.diffRightStatusMessage = reason
                     self.isDiffLoading = false
                     return
                 case .tooLarge(let sz, let lim):
-                    self.diffErrorMessage = "Правый файл больше лимита (\(sz / (1024 * 1024)) МБ > \(lim / (1024 * 1024)) МБ)"
+                    let msg = "Файл больше лимита (\(sz / (1024 * 1024)) МБ > \(lim / (1024 * 1024)) МБ)"
+                    self.diffErrorMessage = "Правый файл: \(msg)"
+                    self.diffRightStatusMessage = msg
                     self.isDiffLoading = false
                     return
                 case .tooManyLines(let count, let lim):
-                    self.diffErrorMessage = "Правый файл содержит слишком много строк (\(count) > \(lim))"
+                    let msg = "Файл содержит слишком много строк (\(count) > \(lim))"
+                    self.diffErrorMessage = "Правый файл: \(msg)"
+                    self.diffRightStatusMessage = msg
                     self.isDiffLoading = false
                     return
                 }
@@ -4970,18 +4980,47 @@ public final class DualPaneViewModel: ObservableObject {
                 }
                 guard !Task.isCancelled else { return }
                 let val = FileEncodingDetector.validateTextFile(fileURL: url)
-                if case .validText(let text, let enc, let name, let presumed) = val {
+                switch val {
+                case .validText(let text, let enc, let name, let presumed):
                     let lines = text.components(separatedBy: .newlines)
                     if side == .left {
                         self.leftFileEncoding = enc
                         self.leftFileEncodingName = name
                         self.leftFileEncodingPresumed = presumed
                         self.diffLeftPreviewLines = lines
+                        self.diffLeftStatusMessage = ""
                     } else {
                         self.rightFileEncoding = enc
                         self.rightFileEncodingName = name
                         self.rightFileEncodingPresumed = presumed
                         self.diffRightPreviewLines = lines
+                        self.diffRightStatusMessage = ""
+                    }
+                case .binary(let reason), .readError(let reason):
+                    if side == .left {
+                        self.diffLeftPreviewLines = []
+                        self.diffLeftStatusMessage = reason
+                    } else {
+                        self.diffRightPreviewLines = []
+                        self.diffRightStatusMessage = reason
+                    }
+                case .tooLarge(let sz, let lim):
+                    let msg = "Файл больше лимита (\(sz / (1024 * 1024)) МБ > \(lim / (1024 * 1024)) МБ)"
+                    if side == .left {
+                        self.diffLeftPreviewLines = []
+                        self.diffLeftStatusMessage = msg
+                    } else {
+                        self.diffRightPreviewLines = []
+                        self.diffRightStatusMessage = msg
+                    }
+                case .tooManyLines(let count, let lim):
+                    let msg = "Файл содержит слишком много строк (\(count) > \(lim))"
+                    if side == .left {
+                        self.diffLeftPreviewLines = []
+                        self.diffLeftStatusMessage = msg
+                    } else {
+                        self.diffRightPreviewLines = []
+                        self.diffRightStatusMessage = msg
                     }
                 }
             } catch {
