@@ -14,5 +14,9 @@ class CompanionApp : Application() {
         if (Security.getProvider("EdDSA") == null) {
             Security.addProvider(EdDSASecurityProvider())
         }
+        // ТЗ 5.1: Очистка устаревшей базы данных ActionJournalDb при старте
+        try {
+            deleteDatabase("action_journal.db")
+        } catch (_: Exception) {}
     }
 }
